@@ -1,5 +1,5 @@
 use crate::convert::{
-    edge_to_proto, node_id_from_proto, node_to_proto, uuid_to_proto,
+    edge_id_from_proto, edge_to_proto, node_id_from_proto, node_to_proto, uuid_to_proto,
 };
 use crate::proto::mesh_query_server::{MeshQuery, MeshQueryServer};
 use crate::proto::{
@@ -7,17 +7,33 @@ use crate::proto::{
     HealthResponse, NeighborInfo, NeighborRequest, NeighborResponse, NodesByLabelRequest,
     NodesByLabelResponse,
 };
+use crate::routing::Routing;
+use mesh_cluster::PeerId;
 use mesh_storage::Store;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 pub struct MeshService {
     store: Arc<Store>,
+    routing: Option<Arc<Routing>>,
 }
 
 impl MeshService {
+    /// Local-only service: every request is answered from the local store.
     pub fn new(store: Arc<Store>) -> Self {
-        Self { store }
+        Self {
+            store,
+            routing: None,
+        }
+    }
+
+    /// Routed service: point queries go to the partition owner; scan
+    /// queries scatter-gather across all known peers.
+    pub fn with_routing(store: Arc<Store>, routing: Arc<Routing>) -> Self {
+        Self {
+            store,
+            routing: Some(routing),
+        }
     }
 
     pub fn into_server(self) -> MeshQueryServer<Self> {
@@ -33,6 +49,10 @@ fn bad_request<E: std::fmt::Display>(e: E) -> Status {
     Status::invalid_argument(e.to_string())
 }
 
+fn no_client(peer: PeerId) -> Status {
+    Status::internal(format!("no client registered for peer {}", peer))
+}
+
 #[tonic::async_trait]
 impl MeshQuery for MeshService {
     async fn get_node(
@@ -44,6 +64,18 @@ impl MeshQuery for MeshService {
             .id
             .ok_or_else(|| Status::invalid_argument("missing id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
+
+        // Forward to the partition owner if this node doesn't live locally.
+        if let Some(routing) = &self.routing {
+            if !routing.cluster().is_local(id) {
+                let owner = routing.cluster().owner_of(id);
+                let mut client = routing.client_for(owner).ok_or_else(|| no_client(owner))?;
+                return client
+                    .get_node(GetNodeRequest { id: Some(id_proto) })
+                    .await;
+            }
+        }
+
         let node = self.store.get_node(id).map_err(internal)?;
         let (found, node) = match node {
             Some(n) => (true, Some(node_to_proto(&n).map_err(internal)?)),
@@ -56,29 +88,89 @@ impl MeshQuery for MeshService {
         &self,
         request: Request<GetEdgeRequest>,
     ) -> Result<Response<GetEdgeResponse>, Status> {
-        let id_proto = request
-            .into_inner()
+        let req = request.into_inner();
+        let id_proto = req
             .id
             .ok_or_else(|| Status::invalid_argument("missing id"))?;
-        let id = crate::convert::edge_id_from_proto(&id_proto).map_err(bad_request)?;
-        let edge = self.store.get_edge(id).map_err(internal)?;
-        let (found, edge) = match edge {
-            Some(e) => (true, Some(edge_to_proto(&e).map_err(internal)?)),
-            None => (false, None),
-        };
-        Ok(Response::new(GetEdgeResponse { found, edge }))
+        let local_only = req.local_only;
+        let id = edge_id_from_proto(&id_proto).map_err(bad_request)?;
+
+        // Always check local first — if the edge lives here, we're done.
+        if let Some(edge) = self.store.get_edge(id).map_err(internal)? {
+            let proto_edge = edge_to_proto(&edge).map_err(internal)?;
+            return Ok(Response::new(GetEdgeResponse {
+                found: true,
+                edge: Some(proto_edge),
+            }));
+        }
+
+        // Otherwise scatter-gather to each remote peer until one returns a hit.
+        // `local_only` on the forwarded request prevents infinite recursion.
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                let self_id = routing.cluster().self_id();
+                for peer_id in routing.cluster().membership().peer_ids() {
+                    if peer_id == self_id {
+                        continue;
+                    }
+                    let mut client =
+                        routing.client_for(peer_id).ok_or_else(|| no_client(peer_id))?;
+                    let resp = client
+                        .get_edge(GetEdgeRequest {
+                            id: Some(id_proto.clone()),
+                            local_only: true,
+                        })
+                        .await?;
+                    let inner = resp.into_inner();
+                    if inner.found {
+                        return Ok(Response::new(inner));
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(GetEdgeResponse {
+            found: false,
+            edge: None,
+        }))
     }
 
     async fn nodes_by_label(
         &self,
         request: Request<NodesByLabelRequest>,
     ) -> Result<Response<NodesByLabelResponse>, Status> {
-        let label = request.into_inner().label;
-        let ids = self.store.nodes_by_label(&label).map_err(internal)?;
-        let ids = ids
+        let req = request.into_inner();
+        let label = req.label;
+        let local_only = req.local_only;
+
+        let mut ids: Vec<_> = self
+            .store
+            .nodes_by_label(&label)
+            .map_err(internal)?
             .into_iter()
             .map(|id| uuid_to_proto(id.as_uuid()))
             .collect();
+
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                let self_id = routing.cluster().self_id();
+                for peer_id in routing.cluster().membership().peer_ids() {
+                    if peer_id == self_id {
+                        continue;
+                    }
+                    let mut client =
+                        routing.client_for(peer_id).ok_or_else(|| no_client(peer_id))?;
+                    let resp = client
+                        .nodes_by_label(NodesByLabelRequest {
+                            label: label.clone(),
+                            local_only: true,
+                        })
+                        .await?;
+                    ids.extend(resp.into_inner().ids);
+                }
+            }
+        }
+
         Ok(Response::new(NodesByLabelResponse { ids }))
     }
 
@@ -91,6 +183,19 @@ impl MeshQuery for MeshService {
             .node_id
             .ok_or_else(|| Status::invalid_argument("missing node_id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
+
+        if let Some(routing) = &self.routing {
+            if !routing.cluster().is_local(id) {
+                let owner = routing.cluster().owner_of(id);
+                let mut client = routing.client_for(owner).ok_or_else(|| no_client(owner))?;
+                return client
+                    .outgoing(NeighborRequest {
+                        node_id: Some(id_proto),
+                    })
+                    .await;
+            }
+        }
+
         let out = self.store.outgoing(id).map_err(internal)?;
         let neighbors = out
             .into_iter()
@@ -111,6 +216,19 @@ impl MeshQuery for MeshService {
             .node_id
             .ok_or_else(|| Status::invalid_argument("missing node_id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
+
+        if let Some(routing) = &self.routing {
+            if !routing.cluster().is_local(id) {
+                let owner = routing.cluster().owner_of(id);
+                let mut client = routing.client_for(owner).ok_or_else(|| no_client(owner))?;
+                return client
+                    .incoming(NeighborRequest {
+                        node_id: Some(id_proto),
+                    })
+                    .await;
+            }
+        }
+
         let inc = self.store.incoming(id).map_err(internal)?;
         let neighbors = inc
             .into_iter()

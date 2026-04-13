@@ -1,3 +1,4 @@
+use mesh_cluster::{Cluster, Peer, PeerId};
 use mesh_core::{Edge, Node};
 use mesh_rpc::convert::uuid_to_proto;
 use mesh_rpc::proto::mesh_query_client::MeshQueryClient;
@@ -5,7 +6,7 @@ use mesh_rpc::proto::{
     GetEdgeRequest, GetNodeRequest, HealthRequest, NeighborRequest, NodesByLabelRequest,
     UuidBytes,
 };
-use mesh_rpc::MeshService;
+use mesh_rpc::{MeshService, Routing};
 use mesh_storage::Store;
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,6 +114,7 @@ async fn nodes_by_label_returns_all_ids_for_label() {
     let resp = c
         .nodes_by_label(NodesByLabelRequest {
             label: "Person".into(),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -180,6 +182,7 @@ async fn get_edge_roundtrip() {
     let resp = c
         .get_edge(GetEdgeRequest {
             id: Some(uuid_to_proto(edge_id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -188,6 +191,218 @@ async fn get_edge_roundtrip() {
     let got = inner.edge.unwrap();
     assert_eq!(got.edge_type, "KNOWS");
     assert!(got.properties.contains_key("since"));
+}
+
+struct TwoPeer {
+    store_a: Arc<Store>,
+    store_b: Arc<Store>,
+    cluster_a: Arc<Cluster>,
+    client_addr_a: String,
+    _dirs: (TempDir, TempDir),
+}
+
+async fn spawn_two_peer() -> TwoPeer {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let store_a = Arc::new(Store::open(dir_a.path()).unwrap());
+    let store_b = Arc::new(Store::open(dir_b.path()).unwrap());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        Peer::new(PeerId(1), addr_a.to_string()),
+        Peer::new(PeerId(2), addr_b.to_string()),
+    ];
+
+    let cluster_a = Arc::new(Cluster::new(PeerId(1), 4, peers.clone()).unwrap());
+    let cluster_b = Arc::new(Cluster::new(PeerId(2), 4, peers.clone()).unwrap());
+    let routing_a = Arc::new(Routing::new(cluster_a.clone()).unwrap());
+    let routing_b = Arc::new(Routing::new(cluster_b.clone()).unwrap());
+
+    let service_a = MeshService::with_routing(store_a.clone(), routing_a);
+    let service_b = MeshService::with_routing(store_b.clone(), routing_b);
+
+    let stream_a = TcpListenerStream::new(listener_a);
+    let stream_b = TcpListenerStream::new(listener_b);
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_a.into_server())
+            .serve_with_incoming(stream_a)
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_b.into_server())
+            .serve_with_incoming(stream_b)
+            .await
+            .unwrap();
+    });
+
+    // Let both servers bind before the client connects.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    TwoPeer {
+        store_a,
+        store_b,
+        cluster_a,
+        client_addr_a: format!("http://{}", addr_a),
+        _dirs: (dir_a, dir_b),
+    }
+}
+
+fn put_node_on_owner(node: &Node, h: &TwoPeer) -> PeerId {
+    let owner = h.cluster_a.owner_of(node.id);
+    match owner {
+        PeerId(1) => h.store_a.put_node(node).unwrap(),
+        PeerId(2) => h.store_b.put_node(node).unwrap(),
+        other => panic!("unexpected owner {other:?}"),
+    }
+    owner
+}
+
+#[tokio::test]
+async fn routed_get_node_crosses_peers() {
+    let h = spawn_two_peer().await;
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+
+    let mut local_hits = 0;
+    let mut remote_hits = 0;
+
+    for i in 0..30 {
+        let node = Node::new()
+            .with_label("Person")
+            .with_property("i", i as i64);
+        put_node_on_owner(&node, &h);
+
+        let resp = client
+            .get_node(GetNodeRequest {
+                id: Some(uuid_to_proto(node.id.as_uuid())),
+            })
+            .await
+            .unwrap();
+        let inner = resp.into_inner();
+        assert!(inner.found, "node not found through routed client");
+        assert!(inner.node.unwrap().labels.contains(&"Person".to_string()));
+
+        if h.cluster_a.is_local(node.id) {
+            local_hits += 1;
+        } else {
+            remote_hits += 1;
+        }
+    }
+
+    assert!(local_hits > 0, "expected at least one local hit");
+    assert!(
+        remote_hits > 0,
+        "expected at least one forwarded (remote) hit"
+    );
+}
+
+#[tokio::test]
+async fn nodes_by_label_scatter_gathers_across_peers() {
+    let h = spawn_two_peer().await;
+
+    for i in 0..30 {
+        let n = Node::new()
+            .with_label("Worker")
+            .with_property("i", i as i64);
+        put_node_on_owner(&n, &h);
+    }
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let resp = client
+        .nodes_by_label(NodesByLabelRequest {
+            label: "Worker".into(),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.into_inner().ids.len(), 30);
+}
+
+#[tokio::test]
+async fn nodes_by_label_local_only_skips_remote() {
+    let h = spawn_two_peer().await;
+
+    let mut owned_by_a = 0;
+    for i in 0..30 {
+        let n = Node::new()
+            .with_label("Flag")
+            .with_property("i", i as i64);
+        let owner = put_node_on_owner(&n, &h);
+        if owner == PeerId(1) {
+            owned_by_a += 1;
+        }
+    }
+    assert!(owned_by_a > 0, "expected some local-to-A entries");
+    assert!(owned_by_a < 30, "expected some remote entries too");
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let resp = client
+        .nodes_by_label(NodesByLabelRequest {
+            label: "Flag".into(),
+            local_only: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.into_inner().ids.len(), owned_by_a);
+}
+
+#[tokio::test]
+async fn routed_outgoing_forwards_to_source_owner() {
+    let h = spawn_two_peer().await;
+
+    // Find a source owned by peer 2 so the query must be forwarded from peer 1.
+    let src = loop {
+        let n = Node::new();
+        if h.cluster_a.owner_of(n.id) == PeerId(2) {
+            break n;
+        }
+    };
+    let dst = Node::new();
+
+    h.store_b.put_node(&src).unwrap();
+    put_node_on_owner(&dst, &h);
+
+    // Edge stored on the source's owner (peer 2), matching the partitioning model.
+    let edge = Edge::new("KNOWS", src.id, dst.id);
+    h.store_b.put_edge(&edge).unwrap();
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let resp = client
+        .outgoing(NeighborRequest {
+            node_id: Some(uuid_to_proto(src.id.as_uuid())),
+        })
+        .await
+        .unwrap();
+    let neighbors = resp.into_inner().neighbors;
+    assert_eq!(neighbors.len(), 1);
+    assert_eq!(
+        neighbors[0].neighbor_id.as_ref().unwrap().value,
+        dst.id.as_bytes().to_vec()
+    );
+}
+
+#[tokio::test]
+async fn routed_get_node_missing_returns_not_found_on_either_peer() {
+    let h = spawn_two_peer().await;
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    // A random id that doesn't exist anywhere.
+    let resp = client
+        .get_node(GetNodeRequest {
+            id: Some(uuid_to_proto(mesh_core::NodeId::new().as_uuid())),
+        })
+        .await
+        .unwrap();
+    let inner = resp.into_inner();
+    assert!(!inner.found);
+    assert!(inner.node.is_none());
 }
 
 #[tokio::test]

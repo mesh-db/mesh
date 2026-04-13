@@ -8,6 +8,7 @@ description = "gRPC services for Mesh"
 [dependencies]
 mesh-core = { path = "../mesh-core" }
 mesh-storage = { path = "../mesh-storage" }
+mesh-cluster = { path = "../mesh-cluster" }
 tonic = "0.12"
 prost = "0.13"
 tokio = { workspace = true }
