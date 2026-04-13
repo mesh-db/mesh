@@ -119,6 +119,125 @@ fn detach_delete_removes_incident_edges_on_both_ends() {
 }
 
 #[test]
+fn nodes_by_label_finds_all_matching_nodes() {
+    let (store, _dir) = tmp_store();
+    let ada = Node::new().with_label("Person").with_property("name", "Ada");
+    let alan = Node::new().with_label("Person").with_property("name", "Alan");
+    let py = Node::new().with_label("Language").with_property("name", "Python");
+    store.put_node(&ada).unwrap();
+    store.put_node(&alan).unwrap();
+    store.put_node(&py).unwrap();
+
+    let mut people = store.nodes_by_label("Person").unwrap();
+    people.sort();
+    let mut expected = vec![ada.id, alan.id];
+    expected.sort();
+    assert_eq!(people, expected);
+
+    assert_eq!(store.nodes_by_label("Language").unwrap(), vec![py.id]);
+    assert!(store.nodes_by_label("Nonexistent").unwrap().is_empty());
+}
+
+#[test]
+fn multi_label_node_appears_under_each_label() {
+    let (store, _dir) = tmp_store();
+    let n = Node::new().with_label("Person").with_label("Employee");
+    store.put_node(&n).unwrap();
+
+    assert_eq!(store.nodes_by_label("Person").unwrap(), vec![n.id]);
+    assert_eq!(store.nodes_by_label("Employee").unwrap(), vec![n.id]);
+}
+
+#[test]
+fn put_node_diffs_labels_on_overwrite() {
+    let (store, _dir) = tmp_store();
+    let mut n = Node::new().with_label("Draft");
+    store.put_node(&n).unwrap();
+    assert_eq!(store.nodes_by_label("Draft").unwrap(), vec![n.id]);
+
+    n.labels = vec!["Published".to_string()];
+    store.put_node(&n).unwrap();
+
+    assert!(store.nodes_by_label("Draft").unwrap().is_empty());
+    assert_eq!(store.nodes_by_label("Published").unwrap(), vec![n.id]);
+}
+
+#[test]
+fn detach_delete_removes_label_entries() {
+    let (store, _dir) = tmp_store();
+    let n = Node::new().with_label("Doomed");
+    store.put_node(&n).unwrap();
+    store.detach_delete_node(n.id).unwrap();
+    assert!(store.nodes_by_label("Doomed").unwrap().is_empty());
+}
+
+#[test]
+fn edges_by_type_finds_all_matching_edges() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    let c = Node::new();
+    for n in [&a, &b, &c] {
+        store.put_node(n).unwrap();
+    }
+    let knows_ab = Edge::new("KNOWS", a.id, b.id);
+    let knows_ac = Edge::new("KNOWS", a.id, c.id);
+    let likes_bc = Edge::new("LIKES", b.id, c.id);
+    store.put_edge(&knows_ab).unwrap();
+    store.put_edge(&knows_ac).unwrap();
+    store.put_edge(&likes_bc).unwrap();
+
+    let mut knows = store.edges_by_type("KNOWS").unwrap();
+    knows.sort();
+    let mut expected = vec![knows_ab.id, knows_ac.id];
+    expected.sort();
+    assert_eq!(knows, expected);
+
+    assert_eq!(store.edges_by_type("LIKES").unwrap(), vec![likes_bc.id]);
+    assert!(store.edges_by_type("HATES").unwrap().is_empty());
+}
+
+#[test]
+fn delete_edge_removes_type_index_entry() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    let e = Edge::new("KNOWS", a.id, b.id);
+    store.put_edge(&e).unwrap();
+
+    store.delete_edge(e.id).unwrap();
+    assert!(store.edges_by_type("KNOWS").unwrap().is_empty());
+}
+
+#[test]
+fn detach_delete_removes_type_index_for_incident_edges() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    let e = Edge::new("KNOWS", a.id, b.id);
+    store.put_edge(&e).unwrap();
+
+    store.detach_delete_node(b.id).unwrap();
+    assert!(store.edges_by_type("KNOWS").unwrap().is_empty());
+}
+
+#[test]
+fn indexes_share_no_state_across_similar_prefixes() {
+    let (store, _dir) = tmp_store();
+    let p = Node::new().with_label("Pers");
+    let person = Node::new().with_label("Person");
+    store.put_node(&p).unwrap();
+    store.put_node(&person).unwrap();
+
+    assert_eq!(store.nodes_by_label("Pers").unwrap(), vec![p.id]);
+    assert_eq!(store.nodes_by_label("Person").unwrap(), vec![person.id]);
+}
+
+#[test]
 fn store_reopens_and_data_persists() {
     let dir = TempDir::new().unwrap();
     let node = Node::new().with_label("Persistent");

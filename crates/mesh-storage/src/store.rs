@@ -1,6 +1,9 @@
 use crate::{
     error::{Error, Result},
-    keys::{adj_key, edge_from_adj_key, node_from_adj_value},
+    keys::{
+        adj_key, edge_from_adj_key, id_from_str_index_key, label_index_key, label_index_prefix,
+        node_from_adj_value, type_index_key, type_index_prefix,
+    },
 };
 use mesh_core::{Edge, EdgeId, Node, NodeId};
 use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, DB};
@@ -10,8 +13,17 @@ const CF_NODES: &str = "nodes";
 const CF_EDGES: &str = "edges";
 const CF_ADJ_OUT: &str = "adj_out";
 const CF_ADJ_IN: &str = "adj_in";
+const CF_LABEL_INDEX: &str = "label_index";
+const CF_TYPE_INDEX: &str = "type_index";
 
-const ALL_CFS: &[&str] = &[CF_NODES, CF_EDGES, CF_ADJ_OUT, CF_ADJ_IN];
+const ALL_CFS: &[&str] = &[
+    CF_NODES,
+    CF_EDGES,
+    CF_ADJ_OUT,
+    CF_ADJ_IN,
+    CF_LABEL_INDEX,
+    CF_TYPE_INDEX,
+];
 
 pub struct Store {
     db: DB,
@@ -39,9 +51,33 @@ impl Store {
     }
 
     pub fn put_node(&self, node: &Node) -> Result<()> {
-        let cf = self.cf(CF_NODES)?;
+        let nodes_cf = self.cf(CF_NODES)?;
+        let label_cf = self.cf(CF_LABEL_INDEX)?;
+
+        let existing_labels: Vec<String> = match self.db.get_cf(nodes_cf, node.id.as_bytes())? {
+            Some(bytes) => {
+                let existing: Node = serde_json::from_slice(&bytes)?;
+                existing.labels
+            }
+            None => Vec::new(),
+        };
+
         let bytes = serde_json::to_vec(node)?;
-        self.db.put_cf(cf, node.id.as_bytes(), bytes)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(nodes_cf, node.id.as_bytes(), bytes);
+
+        for old in &existing_labels {
+            if !node.labels.contains(old) {
+                batch.delete_cf(label_cf, label_index_key(old, node.id));
+            }
+        }
+        for new in &node.labels {
+            if !existing_labels.contains(new) {
+                batch.put_cf(label_cf, label_index_key(new, node.id), EMPTY);
+            }
+        }
+
+        self.db.write(batch)?;
         Ok(())
     }
 
@@ -57,6 +93,7 @@ impl Store {
         let edges_cf = self.cf(CF_EDGES)?;
         let out_cf = self.cf(CF_ADJ_OUT)?;
         let in_cf = self.cf(CF_ADJ_IN)?;
+        let type_cf = self.cf(CF_TYPE_INDEX)?;
 
         let bytes = serde_json::to_vec(edge)?;
         let mut batch = WriteBatch::default();
@@ -71,6 +108,7 @@ impl Store {
             adj_key(edge.target, edge.id),
             edge.source.as_bytes(),
         );
+        batch.put_cf(type_cf, type_index_key(&edge.edge_type, edge.id), EMPTY);
         self.db.write(batch)?;
         Ok(())
     }
@@ -88,16 +126,19 @@ impl Store {
         let edges_cf = self.cf(CF_EDGES)?;
         let out_cf = self.cf(CF_ADJ_OUT)?;
         let in_cf = self.cf(CF_ADJ_IN)?;
+        let type_cf = self.cf(CF_TYPE_INDEX)?;
 
         let mut batch = WriteBatch::default();
         batch.delete_cf(edges_cf, id.as_bytes());
         batch.delete_cf(out_cf, adj_key(edge.source, id));
         batch.delete_cf(in_cf, adj_key(edge.target, id));
+        batch.delete_cf(type_cf, type_index_key(&edge.edge_type, id));
         self.db.write(batch)?;
         Ok(())
     }
 
     pub fn detach_delete_node(&self, id: NodeId) -> Result<()> {
+        let node = self.get_node(id)?;
         let outgoing = self.outgoing(id)?;
         let incoming = self.incoming(id)?;
 
@@ -105,14 +146,29 @@ impl Store {
         let edges_cf = self.cf(CF_EDGES)?;
         let out_cf = self.cf(CF_ADJ_OUT)?;
         let in_cf = self.cf(CF_ADJ_IN)?;
+        let label_cf = self.cf(CF_LABEL_INDEX)?;
+        let type_cf = self.cf(CF_TYPE_INDEX)?;
 
         let mut batch = WriteBatch::default();
+
+        if let Some(n) = &node {
+            for label in &n.labels {
+                batch.delete_cf(label_cf, label_index_key(label, id));
+            }
+        }
+
         for (edge_id, target) in &outgoing {
+            if let Some(e) = self.get_edge(*edge_id)? {
+                batch.delete_cf(type_cf, type_index_key(&e.edge_type, *edge_id));
+            }
             batch.delete_cf(edges_cf, edge_id.as_bytes());
             batch.delete_cf(out_cf, adj_key(id, *edge_id));
             batch.delete_cf(in_cf, adj_key(*target, *edge_id));
         }
         for (edge_id, source) in &incoming {
+            if let Some(e) = self.get_edge(*edge_id)? {
+                batch.delete_cf(type_cf, type_index_key(&e.edge_type, *edge_id));
+            }
             batch.delete_cf(edges_cf, edge_id.as_bytes());
             batch.delete_cf(out_cf, adj_key(*source, *edge_id));
             batch.delete_cf(in_cf, adj_key(id, *edge_id));
@@ -128,6 +184,42 @@ impl Store {
 
     pub fn incoming(&self, target: NodeId) -> Result<Vec<(EdgeId, NodeId)>> {
         self.scan_adj(CF_ADJ_IN, target)
+    }
+
+    pub fn nodes_by_label(&self, label: &str) -> Result<Vec<NodeId>> {
+        let cf = self.cf(CF_LABEL_INDEX)?;
+        let prefix = label_index_prefix(label);
+        let mut results = Vec::new();
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let bytes = id_from_str_index_key(CF_LABEL_INDEX, &key, label.len())?;
+            results.push(NodeId::from_bytes(bytes));
+        }
+        Ok(results)
+    }
+
+    pub fn edges_by_type(&self, edge_type: &str) -> Result<Vec<EdgeId>> {
+        let cf = self.cf(CF_TYPE_INDEX)?;
+        let prefix = type_index_prefix(edge_type);
+        let mut results = Vec::new();
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let bytes = id_from_str_index_key(CF_TYPE_INDEX, &key, edge_type.len())?;
+            results.push(EdgeId::from_bytes(bytes));
+        }
+        Ok(results)
     }
 
     fn scan_adj(&self, cf_name: &'static str, node: NodeId) -> Result<Vec<(EdgeId, NodeId)>> {
@@ -149,3 +241,5 @@ impl Store {
         Ok(results)
     }
 }
+
+const EMPTY: &[u8] = &[];
