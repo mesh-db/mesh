@@ -10,16 +10,16 @@ pub enum LogicalPlan {
     NodeScanAll {
         var: String,
     },
-    NodeScanByLabel {
+    NodeScanByLabels {
         var: String,
-        label: String,
+        labels: Vec<String>,
     },
     EdgeExpand {
         input: Box<LogicalPlan>,
         src_var: String,
         edge_var: Option<String>,
         dst_var: String,
-        dst_label: Option<String>,
+        dst_labels: Vec<String>,
         edge_type: Option<String>,
         direction: Direction,
     },
@@ -28,7 +28,7 @@ pub enum LogicalPlan {
         src_var: String,
         edge_var: Option<String>,
         dst_var: String,
-        dst_label: Option<String>,
+        dst_labels: Vec<String>,
         edge_type: Option<String>,
         direction: Direction,
         min_hops: u64,
@@ -101,10 +101,24 @@ pub struct CreateEdgeSpec {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SetAssignment {
-    pub var: String,
-    pub key: String,
-    pub value: Expr,
+pub enum SetAssignment {
+    Property {
+        var: String,
+        key: String,
+        value: Expr,
+    },
+    Labels {
+        var: String,
+        labels: Vec<String>,
+    },
+    Replace {
+        var: String,
+        properties: Vec<(String, Literal)>,
+    },
+    Merge {
+        var: String,
+        properties: Vec<(String, Literal)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +142,7 @@ pub enum AggregateFn {
 pub enum AggregateArg {
     Star,
     Expr(Expr),
+    DistinctExpr(Expr),
 }
 
 fn aggregate_fn_from_name(name: &str) -> Option<AggregateFn> {
@@ -239,7 +254,7 @@ fn add_create_node(
         Some(name) if bound_vars.contains(name) => CreateNodeSpec::Reference(name.clone()),
         _ => CreateNodeSpec::New {
             var: pattern.var.clone(),
-            labels: pattern.label.clone().into_iter().collect(),
+            labels: pattern.labels.clone(),
             properties: pattern.properties.clone(),
         },
     };
@@ -257,14 +272,15 @@ fn plan_pattern(pattern: &Pattern, pattern_idx: usize) -> Result<LogicalPlan> {
         .clone()
         .unwrap_or_else(|| format!("__p{}_a0", pattern_idx));
 
-    let mut plan = match &pattern.start.label {
-        Some(label) => LogicalPlan::NodeScanByLabel {
+    let mut plan = if pattern.start.labels.is_empty() {
+        LogicalPlan::NodeScanAll {
             var: start_var.clone(),
-            label: label.clone(),
-        },
-        None => LogicalPlan::NodeScanAll {
+        }
+    } else {
+        LogicalPlan::NodeScanByLabels {
             var: start_var.clone(),
-        },
+            labels: pattern.start.labels.clone(),
+        }
     };
 
     let mut current_var = start_var;
@@ -286,7 +302,7 @@ fn plan_pattern(pattern: &Pattern, pattern_idx: usize) -> Result<LogicalPlan> {
                 src_var: current_var.clone(),
                 edge_var: hop.rel.var.clone(),
                 dst_var: dst_var.clone(),
-                dst_label: hop.target.label.clone(),
+                dst_labels: hop.target.labels.clone(),
                 edge_type: hop.rel.edge_type.clone(),
                 direction: hop.rel.direction,
                 min_hops: vl.min,
@@ -298,7 +314,7 @@ fn plan_pattern(pattern: &Pattern, pattern_idx: usize) -> Result<LogicalPlan> {
                 src_var: current_var.clone(),
                 edge_var: hop.rel.var.clone(),
                 dst_var: dst_var.clone(),
-                dst_label: hop.target.label.clone(),
+                dst_labels: hop.target.labels.clone(),
                 edge_type: hop.rel.edge_type.clone(),
                 direction: hop.rel.direction,
             }
@@ -368,10 +384,24 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
         let assignments = stmt
             .set_items
             .iter()
-            .map(|s| SetAssignment {
-                var: s.var.clone(),
-                key: s.key.clone(),
-                value: s.value.clone(),
+            .map(|s| match s {
+                crate::ast::SetItem::Property { var, key, value } => SetAssignment::Property {
+                    var: var.clone(),
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+                crate::ast::SetItem::Labels { var, labels } => SetAssignment::Labels {
+                    var: var.clone(),
+                    labels: labels.clone(),
+                },
+                crate::ast::SetItem::Replace { var, properties } => SetAssignment::Replace {
+                    var: var.clone(),
+                    properties: properties.clone(),
+                },
+                crate::ast::SetItem::Merge { var, properties } => SetAssignment::Merge {
+                    var: var.clone(),
+                    properties: properties.clone(),
+                },
             })
             .collect();
         plan = LogicalPlan::SetProperty {
@@ -498,6 +528,15 @@ fn classify_return_items(
                         name
                     )))
                 }
+                CallArgs::DistinctExprs(es) if es.len() == 1 => {
+                    AggregateArg::DistinctExpr(es[0].clone())
+                }
+                CallArgs::DistinctExprs(_) => {
+                    return Err(Error::Plan(format!(
+                        "{}(DISTINCT ...) takes exactly one argument",
+                        name
+                    )))
+                }
             };
             let alias = item
                 .alias
@@ -528,7 +567,10 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Compare { left, right, .. } => {
             contains_aggregate(left) || contains_aggregate(right)
         }
-        Expr::Call { args: CallArgs::Exprs(es), .. } => es.iter().any(contains_aggregate),
+        Expr::Call { args: CallArgs::Exprs(es), .. }
+        | Expr::Call { args: CallArgs::DistinctExprs(es), .. } => {
+            es.iter().any(contains_aggregate)
+        }
         _ => false,
     }
 }

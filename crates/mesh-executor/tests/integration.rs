@@ -375,6 +375,212 @@ fn expand_yields_no_rows_when_no_edges() {
 }
 
 #[test]
+fn multi_label_node_pattern_matches_intersection() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (a:Person {name: 'Ada'})");
+    let employee = Node::new()
+        .with_label("Person")
+        .with_label("Employee")
+        .with_property("name", "Alan");
+    store.put_node(&employee).unwrap();
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person:Employee) RETURN n.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Alan");
+}
+
+#[test]
+fn multi_label_expand_target() {
+    let (store, _d) = open_store();
+    let alan = Node::new()
+        .with_label("Person")
+        .with_label("Employee")
+        .with_property("name", "Alan");
+    let ada = Node::new()
+        .with_label("Person")
+        .with_property("name", "Ada");
+    store.put_node(&alan).unwrap();
+    store.put_node(&ada).unwrap();
+    let e = mesh_core::Edge::new("KNOWS", ada.id, alan.id);
+    store.put_edge(&e).unwrap();
+
+    let rows = run(
+        &store,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person:Employee) RETURN a.name AS a, b.name AS b",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "Ada");
+    assert_eq!(str_prop(&rows[0], "b"), "Alan");
+}
+
+#[test]
+fn create_with_multi_label() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (n:Person:Employee {name: 'Alan'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (n:Person:Employee) RETURN labels(n) AS ls",
+    );
+    match rows[0].get("ls") {
+        Some(Value::List(items)) => {
+            let mut names: Vec<String> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::String(s)) => s.clone(),
+                    _ => panic!(),
+                })
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["Employee", "Person"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn set_label_adds_a_label() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+    run(&store, "MATCH (n:Person) SET n:Archived");
+
+    let rows = run(&store, "MATCH (n:Archived) RETURN n.name AS name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+
+    let rows2 = run(&store, "MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(rows2.len(), 1);
+}
+
+#[test]
+fn set_label_multiple_at_once() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+    run(&store, "MATCH (n:Person) SET n:Active:VIP");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person:Active:VIP) RETURN n.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn set_merge_map_overlays_properties() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {a: 1, b: 2})");
+
+    run(&store, "MATCH (n:X) SET n += {b: 20, c: 30}");
+
+    let rows = run(
+        &store,
+        "MATCH (n:X) RETURN n.a AS a, n.b AS b, n.c AS c",
+    );
+    assert_eq!(int_prop(&rows[0], "a"), 1);
+    assert_eq!(int_prop(&rows[0], "b"), 20);
+    assert_eq!(int_prop(&rows[0], "c"), 30);
+}
+
+#[test]
+fn set_replace_map_clears_other_properties() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {a: 1, b: 2})");
+
+    run(&store, "MATCH (n:X) SET n = {c: 3}");
+
+    let rows = run(
+        &store,
+        "MATCH (n:X) RETURN n.a AS a, n.b AS b, n.c AS c",
+    );
+    assert_eq!(rows[0].get("a"), Some(&Value::Null));
+    assert_eq!(rows[0].get("b"), Some(&Value::Null));
+    assert_eq!(int_prop(&rows[0], "c"), 3);
+}
+
+#[test]
+fn count_distinct_dedupes_values() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {dept: 'eng'})");
+    run(&store, "CREATE (n:Person {dept: 'eng'})");
+    run(&store, "CREATE (n:Person {dept: 'ops'})");
+    run(&store, "CREATE (n:Person {dept: 'ops'})");
+    run(&store, "CREATE (n:Person {dept: 'sales'})");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) RETURN count(DISTINCT n.dept) AS dcount",
+    );
+    assert_eq!(int_prop(&rows[0], "dcount"), 3);
+}
+
+#[test]
+fn count_distinct_vs_count_plain() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {dept: 'eng'})");
+    run(&store, "CREATE (n:Person {dept: 'eng'})");
+    run(&store, "CREATE (n:Person {dept: 'ops'})");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) RETURN count(n.dept) AS total, count(DISTINCT n.dept) AS uniq",
+    );
+    assert_eq!(int_prop(&rows[0], "total"), 3);
+    assert_eq!(int_prop(&rows[0], "uniq"), 2);
+}
+
+#[test]
+fn scalar_tointeger_from_string() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {s: '42'})");
+    let rows = run(&store, "MATCH (n:X) RETURN toInteger(n.s) AS i");
+    assert_eq!(int_prop(&rows[0], "i"), 42);
+}
+
+#[test]
+fn scalar_tointeger_from_invalid_string_returns_null() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {s: 'abc'})");
+    let rows = run(&store, "MATCH (n:X) RETURN toInteger(n.s) AS i");
+    assert_eq!(rows[0].get("i"), Some(&Value::Null));
+}
+
+#[test]
+fn scalar_tointeger_truncates_float() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {f: 3.7})");
+    let rows = run(&store, "MATCH (n:X) RETURN toInteger(n.f) AS i");
+    assert_eq!(int_prop(&rows[0], "i"), 3);
+}
+
+#[test]
+fn scalar_coalesce_picks_first_non_null() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (n:X) RETURN coalesce(n.nickname, n.name, 'unknown') AS out",
+    );
+    assert_eq!(str_prop(&rows[0], "out"), "Ada");
+}
+
+#[test]
+fn scalar_coalesce_all_null_returns_null() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (n:X) RETURN coalesce(n.missing1, n.missing2) AS out",
+    );
+    assert_eq!(rows[0].get("out"), Some(&Value::Null));
+}
+
+#[test]
 fn scalar_size_on_string_and_list() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:X {name: 'hello'})");

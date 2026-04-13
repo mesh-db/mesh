@@ -55,15 +55,15 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             assignments.clone(),
         )),
         LogicalPlan::NodeScanAll { var } => Box::new(NodeScanAllOp::new(var.clone())),
-        LogicalPlan::NodeScanByLabel { var, label } => {
-            Box::new(NodeScanByLabelOp::new(var.clone(), label.clone()))
+        LogicalPlan::NodeScanByLabels { var, labels } => {
+            Box::new(NodeScanByLabelsOp::new(var.clone(), labels.clone()))
         }
         LogicalPlan::EdgeExpand {
             input,
             src_var,
             edge_var,
             dst_var,
-            dst_label,
+            dst_labels,
             edge_type,
             direction,
         } => Box::new(EdgeExpandOp::new(
@@ -71,7 +71,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             src_var.clone(),
             edge_var.clone(),
             dst_var.clone(),
-            dst_label.clone(),
+            dst_labels.clone(),
             edge_type.clone(),
             *direction,
         )),
@@ -80,7 +80,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             src_var,
             edge_var,
             dst_var,
-            dst_label,
+            dst_labels,
             edge_type,
             direction,
             min_hops,
@@ -90,7 +90,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             src_var.clone(),
             edge_var.clone(),
             dst_var.clone(),
-            dst_label.clone(),
+            dst_labels.clone(),
             edge_type.clone(),
             *direction,
             *min_hops,
@@ -339,35 +339,113 @@ impl Operator for SetPropertyOp {
         match self.input.next(ctx)? {
             None => Ok(None),
             Some(mut row) => {
-                // Phase 1: evaluate RHS values against the original row bindings.
-                let mut computed: Vec<(String, String, Property)> =
-                    Vec::with_capacity(self.assignments.len());
-                for SetAssignment { var, key, value } in &self.assignments {
-                    let evaluated = eval_expr(value, &row)?;
-                    let prop = match evaluated {
-                        Value::Property(p) => p,
-                        Value::Null => Property::Null,
-                        Value::Node(_) | Value::Edge(_) | Value::List(_) => {
-                            return Err(Error::InvalidSetValue)
+                // Phase 1: evaluate any RHSes against the original row bindings.
+                enum Action {
+                    SetKey { var: String, key: String, prop: Property },
+                    AddLabels { var: String, labels: Vec<String> },
+                    Replace { var: String, props: Vec<(String, Property)> },
+                    Merge { var: String, props: Vec<(String, Property)> },
+                }
+                let mut actions: Vec<Action> = Vec::with_capacity(self.assignments.len());
+                for a in &self.assignments {
+                    match a {
+                        SetAssignment::Property { var, key, value } => {
+                            let evaluated = eval_expr(value, &row)?;
+                            let prop = value_to_property(evaluated)?;
+                            actions.push(Action::SetKey {
+                                var: var.clone(),
+                                key: key.clone(),
+                                prop,
+                            });
                         }
-                    };
-                    computed.push((var.clone(), key.clone(), prop));
+                        SetAssignment::Labels { var, labels } => {
+                            actions.push(Action::AddLabels {
+                                var: var.clone(),
+                                labels: labels.clone(),
+                            });
+                        }
+                        SetAssignment::Replace { var, properties } => {
+                            let props = properties
+                                .iter()
+                                .map(|(k, lit)| (k.clone(), literal_to_property(lit)))
+                                .collect();
+                            actions.push(Action::Replace {
+                                var: var.clone(),
+                                props,
+                            });
+                        }
+                        SetAssignment::Merge { var, properties } => {
+                            let props = properties
+                                .iter()
+                                .map(|(k, lit)| (k.clone(), literal_to_property(lit)))
+                                .collect();
+                            actions.push(Action::Merge {
+                                var: var.clone(),
+                                props,
+                            });
+                        }
+                    }
                 }
 
                 // Phase 2: apply updates in-place to the row bindings.
                 let mut updated_nodes: HashSet<String> = HashSet::new();
                 let mut updated_edges: HashSet<String> = HashSet::new();
-                for (var, key, prop) in computed {
-                    match row.get_mut(&var) {
-                        Some(Value::Node(n)) => {
-                            n.properties.insert(key, prop);
-                            updated_nodes.insert(var);
-                        }
-                        Some(Value::Edge(e)) => {
-                            e.properties.insert(key, prop);
-                            updated_edges.insert(var);
-                        }
-                        _ => return Err(Error::UnboundVariable(var)),
+                for action in actions {
+                    match action {
+                        Action::SetKey { var, key, prop } => match row.get_mut(&var) {
+                            Some(Value::Node(n)) => {
+                                n.properties.insert(key, prop);
+                                updated_nodes.insert(var);
+                            }
+                            Some(Value::Edge(e)) => {
+                                e.properties.insert(key, prop);
+                                updated_edges.insert(var);
+                            }
+                            _ => return Err(Error::UnboundVariable(var)),
+                        },
+                        Action::AddLabels { var, labels } => match row.get_mut(&var) {
+                            Some(Value::Node(n)) => {
+                                for label in labels {
+                                    if !n.labels.contains(&label) {
+                                        n.labels.push(label);
+                                    }
+                                }
+                                updated_nodes.insert(var);
+                            }
+                            _ => return Err(Error::UnboundVariable(var)),
+                        },
+                        Action::Replace { var, props } => match row.get_mut(&var) {
+                            Some(Value::Node(n)) => {
+                                n.properties.clear();
+                                for (k, v) in props {
+                                    n.properties.insert(k, v);
+                                }
+                                updated_nodes.insert(var);
+                            }
+                            Some(Value::Edge(e)) => {
+                                e.properties.clear();
+                                for (k, v) in props {
+                                    e.properties.insert(k, v);
+                                }
+                                updated_edges.insert(var);
+                            }
+                            _ => return Err(Error::UnboundVariable(var)),
+                        },
+                        Action::Merge { var, props } => match row.get_mut(&var) {
+                            Some(Value::Node(n)) => {
+                                for (k, v) in props {
+                                    n.properties.insert(k, v);
+                                }
+                                updated_nodes.insert(var);
+                            }
+                            Some(Value::Edge(e)) => {
+                                for (k, v) in props {
+                                    e.properties.insert(k, v);
+                                }
+                                updated_edges.insert(var);
+                            }
+                            _ => return Err(Error::UnboundVariable(var)),
+                        },
                     }
                 }
 
@@ -386,6 +464,14 @@ impl Operator for SetPropertyOp {
                 Ok(Some(row))
             }
         }
+    }
+}
+
+fn value_to_property(v: Value) -> Result<Property> {
+    match v {
+        Value::Property(p) => Ok(p),
+        Value::Null => Ok(Property::Null),
+        Value::Node(_) | Value::Edge(_) | Value::List(_) => Err(Error::InvalidSetValue),
     }
 }
 
@@ -424,41 +510,52 @@ impl Operator for NodeScanAllOp {
     }
 }
 
-struct NodeScanByLabelOp {
+struct NodeScanByLabelsOp {
     var: String,
-    label: String,
+    labels: Vec<String>,
     ids: Option<Vec<NodeId>>,
     cursor: usize,
 }
 
-impl NodeScanByLabelOp {
-    fn new(var: String, label: String) -> Self {
+impl NodeScanByLabelsOp {
+    fn new(var: String, labels: Vec<String>) -> Self {
         Self {
             var,
-            label,
+            labels,
             ids: None,
             cursor: 0,
         }
     }
 }
 
-impl Operator for NodeScanByLabelOp {
+impl Operator for NodeScanByLabelsOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         if self.ids.is_none() {
-            self.ids = Some(ctx.store.nodes_by_label(&self.label)?);
+            // Use the first label for the index scan, filter the rest per-node.
+            let primary = self
+                .labels
+                .first()
+                .expect("NodeScanByLabels must have at least one label");
+            self.ids = Some(ctx.store.nodes_by_label(primary)?);
         }
         let ids = self.ids.as_ref().unwrap();
         while self.cursor < ids.len() {
             let id = ids[self.cursor];
             self.cursor += 1;
             if let Some(node) = ctx.store.get_node(id)? {
-                let mut row = Row::new();
-                row.insert(self.var.clone(), Value::Node(node));
-                return Ok(Some(row));
+                if has_all_labels(&node, &self.labels) {
+                    let mut row = Row::new();
+                    row.insert(self.var.clone(), Value::Node(node));
+                    return Ok(Some(row));
+                }
             }
         }
         Ok(None)
     }
+}
+
+fn has_all_labels(node: &Node, labels: &[String]) -> bool {
+    labels.iter().all(|l| node.labels.contains(l))
 }
 
 struct EdgeExpandOp {
@@ -466,7 +563,7 @@ struct EdgeExpandOp {
     src_var: String,
     edge_var: Option<String>,
     dst_var: String,
-    dst_label: Option<String>,
+    dst_labels: Vec<String>,
     edge_type: Option<String>,
     direction: Direction,
     current_row: Option<Row>,
@@ -480,7 +577,7 @@ impl EdgeExpandOp {
         src_var: String,
         edge_var: Option<String>,
         dst_var: String,
-        dst_label: Option<String>,
+        dst_labels: Vec<String>,
         edge_type: Option<String>,
         direction: Direction,
     ) -> Self {
@@ -489,7 +586,7 @@ impl EdgeExpandOp {
             src_var,
             edge_var,
             dst_var,
-            dst_label,
+            dst_labels,
             edge_type,
             direction,
             current_row: None,
@@ -520,10 +617,8 @@ impl Operator for EdgeExpandOp {
                     Some(n) => n,
                     None => continue,
                 };
-                if let Some(l) = &self.dst_label {
-                    if !neighbor.labels.contains(l) {
-                        continue;
-                    }
+                if !has_all_labels(&neighbor, &self.dst_labels) {
+                    continue;
                 }
 
                 let base = self
@@ -567,7 +662,7 @@ struct VarLengthExpandOp {
     src_var: String,
     edge_var: Option<String>,
     dst_var: String,
-    dst_label: Option<String>,
+    dst_labels: Vec<String>,
     edge_type: Option<String>,
     direction: Direction,
     min_hops: u64,
@@ -585,7 +680,7 @@ impl VarLengthExpandOp {
         src_var: String,
         edge_var: Option<String>,
         dst_var: String,
-        dst_label: Option<String>,
+        dst_labels: Vec<String>,
         edge_type: Option<String>,
         direction: Direction,
         min_hops: u64,
@@ -596,7 +691,7 @@ impl VarLengthExpandOp {
             src_var,
             edge_var,
             dst_var,
-            dst_label,
+            dst_labels,
             edge_type,
             direction,
             min_hops,
@@ -634,10 +729,7 @@ impl VarLengthExpandOp {
 
         if depth >= self.min_hops && depth <= self.max_hops {
             let terminal_ok = match ctx.store.get_node(current_node)? {
-                Some(node) => self
-                    .dst_label
-                    .as_ref()
-                    .map_or(true, |l| node.labels.contains(l)),
+                Some(node) => has_all_labels(&node, &self.dst_labels),
                 None => false,
             };
             if terminal_ok {
@@ -928,9 +1020,23 @@ impl AggregateOp {
                         .iter()
                         .map(|a| AggState::initial(a.function))
                         .collect(),
+                    distinct_seen: self.aggregates.iter().map(|_| None).collect(),
                 }
             });
             for (i, spec) in self.aggregates.iter().enumerate() {
+                if let AggregateArg::DistinctExpr(expr) = &spec.arg {
+                    let v = eval_expr(expr, &row)?;
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    let key = value_key(&v);
+                    let seen = entry
+                        .distinct_seen[i]
+                        .get_or_insert_with(HashSet::new);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                }
                 entry.agg_states[i].update(&spec.arg, &row)?;
             }
         }
@@ -984,6 +1090,7 @@ impl Operator for AggregateOp {
 struct GroupState {
     key_values: Vec<Value>,
     agg_states: Vec<AggState>,
+    distinct_seen: Vec<Option<HashSet<String>>>,
 }
 
 enum AggState {
@@ -1025,7 +1132,7 @@ impl AggState {
         match self {
             AggState::Count(c) => match arg {
                 AggregateArg::Star => *c += 1,
-                AggregateArg::Expr(e) => {
+                AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => {
                     if !matches!(eval_expr(e, row)?, Value::Null) {
                         *c += 1;
                     }
@@ -1139,7 +1246,7 @@ impl AggState {
 fn expr_arg_value(arg: &AggregateArg, row: &Row) -> Result<Value> {
     match arg {
         AggregateArg::Star => Err(Error::AggregateTypeError),
-        AggregateArg::Expr(e) => eval_expr(e, row),
+        AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => eval_expr(e, row),
     }
 }
 

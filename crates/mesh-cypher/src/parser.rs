@@ -172,26 +172,12 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                     .next()
                     .ok_or_else(|| Error::Parse("empty set".into()))?;
                 for set_item_pair in set_items_pair.into_inner() {
-                    let mut ii = set_item_pair.into_inner();
-                    let prop_access = ii
+                    debug_assert_eq!(set_item_pair.as_rule(), Rule::set_item);
+                    let inner = set_item_pair
+                        .into_inner()
                         .next()
-                        .ok_or_else(|| Error::Parse("set item missing target".into()))?;
-                    let mut pa = prop_access.into_inner();
-                    let var = pa
-                        .next()
-                        .ok_or_else(|| Error::Parse("set target missing var".into()))?
-                        .as_str()
-                        .to_string();
-                    let key = pa
-                        .next()
-                        .ok_or_else(|| Error::Parse("set target missing key".into()))?
-                        .as_str()
-                        .to_string();
-                    let expr_pair = ii
-                        .next()
-                        .ok_or_else(|| Error::Parse("set item missing value".into()))?;
-                    let value = build_expression(expr_pair)?;
-                    set_items.push(SetItem { var, key, value });
+                        .ok_or_else(|| Error::Parse("empty set item".into()))?;
+                    set_items.push(build_set_item(inner)?);
                 }
             }
             Rule::delete_tail => {
@@ -416,9 +402,81 @@ fn parse_u64(s: &str) -> Result<u64> {
     s.parse().map_err(|_| Error::InvalidNumber(s.to_string()))
 }
 
+fn build_set_item(pair: Pair<Rule>) -> Result<SetItem> {
+    match pair.as_rule() {
+        Rule::set_label_item => {
+            let mut inner = pair.into_inner();
+            let var = inner
+                .next()
+                .ok_or_else(|| Error::Parse("set label missing var".into()))?
+                .as_str()
+                .to_string();
+            let mut labels = Vec::new();
+            for p in inner {
+                debug_assert_eq!(p.as_rule(), Rule::label_spec);
+                let id = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty label".into()))?;
+                labels.push(id.as_str().to_string());
+            }
+            Ok(SetItem::Labels { var, labels })
+        }
+        Rule::set_prop_item => {
+            let mut inner = pair.into_inner();
+            let prop_access = inner
+                .next()
+                .ok_or_else(|| Error::Parse("set prop missing target".into()))?;
+            let mut pa = prop_access.into_inner();
+            let var = pa
+                .next()
+                .ok_or_else(|| Error::Parse("set target missing var".into()))?
+                .as_str()
+                .to_string();
+            let key = pa
+                .next()
+                .ok_or_else(|| Error::Parse("set target missing key".into()))?
+                .as_str()
+                .to_string();
+            let expr_pair = inner
+                .next()
+                .ok_or_else(|| Error::Parse("set prop missing value".into()))?;
+            let value = build_expression(expr_pair)?;
+            Ok(SetItem::Property { var, key, value })
+        }
+        Rule::set_merge_item => {
+            let mut inner = pair.into_inner();
+            let var = inner
+                .next()
+                .ok_or_else(|| Error::Parse("set merge missing var".into()))?
+                .as_str()
+                .to_string();
+            let props_pair = inner
+                .next()
+                .ok_or_else(|| Error::Parse("set merge missing props".into()))?;
+            let properties = build_properties(props_pair)?;
+            Ok(SetItem::Merge { var, properties })
+        }
+        Rule::set_replace_item => {
+            let mut inner = pair.into_inner();
+            let var = inner
+                .next()
+                .ok_or_else(|| Error::Parse("set replace missing var".into()))?
+                .as_str()
+                .to_string();
+            let props_pair = inner
+                .next()
+                .ok_or_else(|| Error::Parse("set replace missing props".into()))?;
+            let properties = build_properties(props_pair)?;
+            Ok(SetItem::Replace { var, properties })
+        }
+        r => Err(Error::Parse(format!("unexpected set item rule: {:?}", r))),
+    }
+}
+
 fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {
     let mut var = None;
-    let mut label = None;
+    let mut labels = Vec::new();
     let mut properties = Vec::new();
 
     for p in pair.into_inner() {
@@ -429,7 +487,7 @@ fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {
                     .into_inner()
                     .next()
                     .ok_or_else(|| Error::Parse("empty label".into()))?;
-                label = Some(label_id.as_str().to_string());
+                labels.push(label_id.as_str().to_string());
             }
             Rule::properties => properties = build_properties(p)?,
             r => {
@@ -443,7 +501,7 @@ fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {
 
     Ok(NodePattern {
         var,
-        label,
+        labels,
         properties,
     })
 }
@@ -581,9 +639,20 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                     match inside.as_rule() {
                         Rule::count_star => CallArgs::Star,
                         Rule::fn_arg_list => {
-                            let exprs: Result<Vec<Expr>> =
-                                inside.into_inner().map(build_expression).collect();
-                            CallArgs::Exprs(exprs?)
+                            let mut distinct = false;
+                            let mut exprs: Vec<Expr> = Vec::new();
+                            for p in inside.into_inner() {
+                                if p.as_rule() == Rule::kw_distinct {
+                                    distinct = true;
+                                } else {
+                                    exprs.push(build_expression(p)?);
+                                }
+                            }
+                            if distinct {
+                                CallArgs::DistinctExprs(exprs)
+                            } else {
+                                CallArgs::Exprs(exprs)
+                            }
                         }
                         r => {
                             return Err(Error::Parse(format!(

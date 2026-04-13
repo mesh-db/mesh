@@ -68,6 +68,12 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             return Err(Error::UnknownScalarFunction(format!("{}(*)", name)))
         }
         CallArgs::Exprs(e) => e.as_slice(),
+        CallArgs::DistinctExprs(_) => {
+            return Err(Error::UnknownScalarFunction(format!(
+                "{}(DISTINCT ...) is only valid for aggregates",
+                name
+            )))
+        }
     };
     match name.to_ascii_lowercase().as_str() {
         "size" | "length" => {
@@ -155,6 +161,44 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
         "tostring" => {
             let v = single_arg(name, arg_exprs, row)?;
             Ok(value_to_string(v))
+        }
+        "tointeger" => {
+            let v = single_arg(name, arg_exprs, row)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Property(Property::Int64(i)) => {
+                    Ok(Value::Property(Property::Int64(i)))
+                }
+                Value::Property(Property::Float64(f)) => {
+                    Ok(Value::Property(Property::Int64(f as i64)))
+                }
+                Value::Property(Property::String(s)) => match s.trim().parse::<i64>() {
+                    Ok(n) => Ok(Value::Property(Property::Int64(n))),
+                    Err(_) => Ok(Value::Null),
+                },
+                Value::Property(Property::Bool(b)) => {
+                    Ok(Value::Property(Property::Int64(if b { 1 } else { 0 })))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "coalesce" => {
+            if arg_exprs.is_empty() {
+                return Err(Error::UnknownScalarFunction(
+                    "coalesce requires at least one argument".into(),
+                ));
+            }
+            for e in arg_exprs {
+                let v = eval_expr(e, row)?;
+                let is_null = matches!(
+                    v,
+                    Value::Null | Value::Property(Property::Null)
+                );
+                if !is_null {
+                    return Ok(v);
+                }
+            }
+            Ok(Value::Null)
         }
         _ => Err(Error::UnknownScalarFunction(name.to_string())),
     }

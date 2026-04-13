@@ -35,10 +35,24 @@ pub struct SortItem {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SetItem {
-    pub var: String,
-    pub key: String,
-    pub value: Expr,
+pub enum SetItem {
+    Property {
+        var: String,
+        key: String,
+        value: Expr,
+    },
+    Labels {
+        var: String,
+        labels: Vec<String>,
+    },
+    Replace {
+        var: String,
+        properties: Vec<(String, Literal)>,
+    },
+    Merge {
+        var: String,
+        properties: Vec<(String, Literal)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +97,7 @@ pub enum Direction {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodePattern {
     pub var: Option<String>,
-    pub label: Option<String>,
+    pub labels: Vec<String>,
     pub properties: Vec<(String, Literal)>,
 }
 
@@ -116,6 +130,7 @@ pub enum Expr {
 pub enum CallArgs {
     Star,
     Exprs(Vec<Expr>),
+    DistinctExprs(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

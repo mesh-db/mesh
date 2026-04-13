@@ -33,7 +33,11 @@ sort_dir = { kw_asc | kw_desc }
 
 set_tail = { kw_set ~ set_items }
 set_items = { set_item ~ ("," ~ set_item)* }
-set_item = { property_access ~ "=" ~ expression }
+set_item = { set_label_item | set_prop_item | set_merge_item | set_replace_item }
+set_label_item = { identifier ~ label_spec+ }
+set_prop_item = { property_access ~ "=" ~ expression }
+set_merge_item = { identifier ~ "+=" ~ properties }
+set_replace_item = { identifier ~ "=" ~ properties }
 
 delete_tail = { kw_detach? ~ kw_delete ~ delete_items }
 delete_items = { identifier ~ ("," ~ identifier)* }
@@ -55,7 +59,7 @@ range_max = { nn_integer }
 exact_range = { nn_integer }
 nn_integer = @{ ASCII_DIGIT+ }
 
-node_pattern = { "(" ~ identifier? ~ label_spec? ~ properties? ~ ")" }
+node_pattern = { "(" ~ identifier? ~ label_spec* ~ properties? ~ ")" }
 label_spec = { ":" ~ identifier }
 properties = { "{" ~ (property_entry ~ ("," ~ property_entry)*)? ~ "}" }
 property_entry = { identifier ~ ":" ~ literal }
@@ -88,7 +92,7 @@ primary = {
 function_call = { identifier ~ "(" ~ fn_args? ~ ")" }
 fn_args = { count_star | fn_arg_list }
 count_star = { "*" }
-fn_arg_list = { expression ~ ("," ~ expression)* }
+fn_arg_list = { kw_distinct? ~ expression ~ ("," ~ expression)* }
 
 property_access = { identifier ~ "." ~ identifier }
 

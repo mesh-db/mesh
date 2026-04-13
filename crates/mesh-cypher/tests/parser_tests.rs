@@ -18,7 +18,7 @@ fn unwrap_create(s: Statement) -> CreateStmt {
 fn empty_node_creation() {
     let c = unwrap_create(parse("CREATE ()").unwrap());
     assert!(c.patterns[0].start.var.is_none());
-    assert!(c.patterns[0].start.label.is_none());
+    assert!(c.patterns[0].start.labels.is_empty());
     assert!(c.patterns[0].start.properties.is_empty());
 }
 
@@ -26,7 +26,7 @@ fn empty_node_creation() {
 fn labeled_node_creation() {
     let c = unwrap_create(parse("CREATE (n:Person)").unwrap());
     assert_eq!(c.patterns[0].start.var.as_deref(), Some("n"));
-    assert_eq!(c.patterns[0].start.label.as_deref(), Some("Person"));
+    assert_eq!(c.patterns[0].start.labels.first().map(String::as_str), Some("Person"));
 }
 
 #[test]
@@ -45,14 +45,14 @@ fn labeled_node_with_properties() {
 fn anonymous_labeled_node() {
     let c = unwrap_create(parse("CREATE (:Tag)").unwrap());
     assert!(c.patterns[0].start.var.is_none());
-    assert_eq!(c.patterns[0].start.label.as_deref(), Some("Tag"));
+    assert_eq!(c.patterns[0].start.labels.first().map(String::as_str), Some("Tag"));
 }
 
 #[test]
 fn simple_match_return() {
     let m = unwrap_match(parse("MATCH (n:Person) RETURN n").unwrap());
     assert_eq!(m.patterns[0].start.var.as_deref(), Some("n"));
-    assert_eq!(m.patterns[0].start.label.as_deref(), Some("Person"));
+    assert_eq!(m.patterns[0].start.labels.first().map(String::as_str), Some("Person"));
     assert!(m.patterns[0].hops.is_empty());
     assert_eq!(m.return_items.len(), 1);
     assert_eq!(m.return_items[0].expr, Expr::Identifier("n".into()));
@@ -70,7 +70,7 @@ fn single_hop_directed() {
     assert_eq!(hop.rel.var.as_deref(), Some("r"));
     assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
     assert_eq!(hop.target.var.as_deref(), Some("b"));
-    assert_eq!(hop.target.label.as_deref(), Some("Person"));
+    assert_eq!(hop.target.labels.first().map(String::as_str), Some("Person"));
 }
 
 #[test]
@@ -164,8 +164,8 @@ fn match_requires_tail() {
 fn multi_pattern_match_parses() {
     let m = unwrap_match(parse("MATCH (a:Person), (b:Company) RETURN a, b").unwrap());
     assert_eq!(m.patterns.len(), 2);
-    assert_eq!(m.patterns[0].start.label.as_deref(), Some("Person"));
-    assert_eq!(m.patterns[1].start.label.as_deref(), Some("Company"));
+    assert_eq!(m.patterns[0].start.labels.first().map(String::as_str), Some("Person"));
+    assert_eq!(m.patterns[1].start.labels.first().map(String::as_str), Some("Company"));
 }
 
 #[test]
@@ -316,9 +316,9 @@ fn single_hop_has_no_var_length() {
 fn create_path_with_relationship() {
     let c = unwrap_create(parse("CREATE (a:Person)-[:KNOWS]->(b:Person)").unwrap());
     assert_eq!(c.patterns[0].hops.len(), 1);
-    assert_eq!(c.patterns[0].start.label.as_deref(), Some("Person"));
+    assert_eq!(c.patterns[0].start.labels.first().map(String::as_str), Some("Person"));
     assert_eq!(c.patterns[0].hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
-    assert_eq!(c.patterns[0].hops[0].target.label.as_deref(), Some("Person"));
+    assert_eq!(c.patterns[0].hops[0].target.labels.first().map(String::as_str), Some("Person"));
 }
 
 #[test]
@@ -349,9 +349,14 @@ fn match_delete_multiple_vars() {
 fn match_set_single() {
     let m = unwrap_match(parse("MATCH (n:Person) SET n.name = 'Ada'").unwrap());
     assert_eq!(m.set_items.len(), 1);
-    assert_eq!(m.set_items[0].var, "n");
-    assert_eq!(m.set_items[0].key, "name");
-    assert_eq!(m.set_items[0].value, Expr::Literal(Literal::String("Ada".into())));
+    match &m.set_items[0] {
+        SetItem::Property { var, key, value } => {
+            assert_eq!(var, "n");
+            assert_eq!(key, "name");
+            assert_eq!(*value, Expr::Literal(Literal::String("Ada".into())));
+        }
+        other => panic!("expected Property, got {other:?}"),
+    }
 }
 
 #[test]
@@ -360,8 +365,60 @@ fn match_set_multiple() {
         parse("MATCH (n:Person) SET n.name = 'Ada', n.age = 37").unwrap(),
     );
     assert_eq!(m.set_items.len(), 2);
-    assert_eq!(m.set_items[1].key, "age");
-    assert_eq!(m.set_items[1].value, Expr::Literal(Literal::Integer(37)));
+    match &m.set_items[1] {
+        SetItem::Property { key, value, .. } => {
+            assert_eq!(key, "age");
+            assert_eq!(*value, Expr::Literal(Literal::Integer(37)));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn match_set_labels() {
+    let m = unwrap_match(parse("MATCH (n) SET n:Archived").unwrap());
+    match &m.set_items[0] {
+        SetItem::Labels { var, labels } => {
+            assert_eq!(var, "n");
+            assert_eq!(labels, &vec!["Archived".to_string()]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn match_set_multi_label() {
+    let m = unwrap_match(parse("MATCH (n) SET n:Archived:Tagged").unwrap());
+    match &m.set_items[0] {
+        SetItem::Labels { labels, .. } => {
+            assert_eq!(labels, &vec!["Archived".to_string(), "Tagged".to_string()]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn match_set_merge_map() {
+    let m = unwrap_match(parse("MATCH (n) SET n += {age: 37, active: true}").unwrap());
+    match &m.set_items[0] {
+        SetItem::Merge { var, properties } => {
+            assert_eq!(var, "n");
+            assert_eq!(properties.len(), 2);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn match_set_replace_map() {
+    let m = unwrap_match(parse("MATCH (n) SET n = {name: 'Ada'}").unwrap());
+    match &m.set_items[0] {
+        SetItem::Replace { var, properties } => {
+            assert_eq!(var, "n");
+            assert_eq!(properties.len(), 1);
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
