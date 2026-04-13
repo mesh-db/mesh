@@ -375,6 +375,192 @@ fn expand_yields_no_rows_when_no_edges() {
 }
 
 #[test]
+fn scalar_size_on_string_and_list() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {name: 'hello'})");
+    let rows = run(
+        &store,
+        "MATCH (n:X) RETURN size(n.name) AS len",
+    );
+    assert_eq!(int_prop(&rows[0], "len"), 5);
+}
+
+#[test]
+fn scalar_labels_returns_list_of_strings() {
+    let (store, _d) = open_store();
+    // Multi-label node patterns aren't yet in the grammar — build directly.
+    let n = Node::new()
+        .with_label("Person")
+        .with_label("Employee")
+        .with_property("name", "Ada");
+    store.put_node(&n).unwrap();
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) RETURN labels(n) AS ls",
+    );
+    match rows[0].get("ls") {
+        Some(Value::List(items)) => {
+            let mut names: Vec<String> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::String(s)) => s.clone(),
+                    _ => panic!(),
+                })
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["Employee", "Person"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn scalar_keys_returns_sorted_list() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {b: 2, a: 1, c: 3})");
+    let rows = run(&store, "MATCH (n:X) RETURN keys(n) AS ks");
+    match rows[0].get("ks") {
+        Some(Value::List(items)) => {
+            let ks: Vec<String> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::String(s)) => s.clone(),
+                    _ => panic!(),
+                })
+                .collect();
+            assert_eq!(ks, vec!["a", "b", "c"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn scalar_type_on_edge() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person)-[:KNOWS]->(b:Person)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a)-[r]->(b) RETURN type(r) AS t",
+    );
+    assert_eq!(str_prop(&rows[0], "t"), "KNOWS");
+}
+
+#[test]
+fn scalar_tolower_and_toupper() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X {name: 'HeLLo'})");
+    let rows = run(
+        &store,
+        "MATCH (n:X) RETURN toLower(n.name) AS lo, toUpper(n.name) AS hi",
+    );
+    assert_eq!(str_prop(&rows[0], "lo"), "hello");
+    assert_eq!(str_prop(&rows[0], "hi"), "HELLO");
+}
+
+#[test]
+fn scalar_size_on_var_length_path_list() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Link {name: 'a'})-[:N]->(b:Link {name: 'b'})-[:N]->(c:Link {name: 'c'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Link)-[r:N*1..3]->(b:Link) WHERE a.name = 'a' AND b.name = 'c' RETURN size(r) AS hops",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "hops"), 2);
+}
+
+#[test]
+fn scalar_in_where_clause() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+    run(&store, "CREATE (n:Person {name: 'Alexandria'})");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) WHERE size(n.name) > 5 RETURN n.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Alexandria");
+}
+
+#[test]
+fn create_with_return_yields_new_node() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "CREATE (n:Person {name: 'Ada'}) RETURN n.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn match_set_with_return_sees_updated_value() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) SET n.age = 37 RETURN n.name AS name, n.age AS age",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+    assert_eq!(int_prop(&rows[0], "age"), 37);
+}
+
+#[test]
+fn match_create_with_return_yields_linked_pair() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (a:Person {name: 'Ada'})");
+
+    let rows = run(
+        &store,
+        "MATCH (a:Person) CREATE (a)-[:WORKS_AT]->(c:Company {name: 'Acme'}) RETURN a.name AS who, c.name AS co",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "who"), "Ada");
+    assert_eq!(str_prop(&rows[0], "co"), "Acme");
+}
+
+#[test]
+fn match_detach_delete_with_return_sees_pre_delete_row() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})-[:KNOWS]->(m:Person {name: 'Alan'})");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) WHERE n.name = 'Ada' DETACH DELETE n RETURN n.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+
+    // Verify Ada and her edge are actually gone.
+    let after = run(&store, "MATCH (n:Person) WHERE n.name = 'Ada' RETURN n");
+    assert!(after.is_empty());
+}
+
+#[test]
+fn match_create_with_return_and_aggregation() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+    run(&store, "CREATE (n:Person {name: 'Alan'})");
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) CREATE (p)-[:WORKS_AT]->(c:Company) RETURN count(*) AS total",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "total"), 2);
+}
+
+#[test]
 fn multi_pattern_cartesian_product() {
     let (store, _d) = open_store();
     run(&store, "CREATE (a:Person {name: 'Ada'})");
@@ -758,13 +944,14 @@ fn aggregate_with_filter_and_limit() {
 }
 
 #[test]
-fn unknown_scalar_function_rejected() {
+fn unknown_scalar_function_rejected_at_exec_time() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:X)");
 
     let stmt = parse("MATCH (n:X) RETURN unknownfn(n) AS v").unwrap();
-    // Plan step detects this: unknown function.
-    assert!(plan(&stmt).is_err());
+    let plan_tree = plan(&stmt).unwrap();
+    let err = execute(&plan_tree, &store).unwrap_err();
+    assert!(matches!(err, mesh_executor::Error::UnknownScalarFunction(_)));
 }
 
 fn build_chain(store: &Store) {

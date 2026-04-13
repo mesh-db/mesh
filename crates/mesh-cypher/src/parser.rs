@@ -36,13 +36,85 @@ fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
 }
 
 fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
-    let pattern_list_pair = pair
-        .into_inner()
-        .next()
-        .ok_or_else(|| Error::Parse("missing pattern list".into()))?;
+    let mut patterns: Vec<Pattern> = Vec::new();
+    let mut return_items = Vec::new();
+    let mut distinct = false;
+    let mut order_by: Vec<SortItem> = Vec::new();
+    let mut skip = None;
+    let mut limit = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::pattern_list => patterns = build_pattern_list(p)?,
+            Rule::return_tail => {
+                parse_return_tail(
+                    p,
+                    &mut return_items,
+                    &mut distinct,
+                    &mut order_by,
+                    &mut skip,
+                    &mut limit,
+                )?;
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in create: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+
+    if patterns.is_empty() {
+        return Err(Error::Parse("CREATE requires at least one pattern".into()));
+    }
+
     Ok(CreateStmt {
-        patterns: build_pattern_list(pattern_list_pair)?,
+        patterns,
+        return_items,
+        distinct,
+        order_by,
+        skip,
+        limit,
     })
+}
+
+fn parse_return_tail(
+    pair: Pair<Rule>,
+    return_items: &mut Vec<ReturnItem>,
+    distinct: &mut bool,
+    order_by: &mut Vec<SortItem>,
+    skip: &mut Option<i64>,
+    limit: &mut Option<i64>,
+) -> Result<()> {
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::kw_distinct => *distinct = true,
+            Rule::return_items => *return_items = build_return_items(inner)?,
+            Rule::order_by_clause => *order_by = build_order_by(inner)?,
+            Rule::skip_clause => {
+                let int_pair = inner
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty skip".into()))?;
+                *skip = Some(parse_integer(int_pair.as_str())?);
+            }
+            Rule::limit_clause => {
+                let int_pair = inner
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty limit".into()))?;
+                *limit = Some(parse_integer(int_pair.as_str())?);
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in return tail: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_pattern_list(pair: Pair<Rule>) -> Result<Vec<Pattern>> {
@@ -85,33 +157,14 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                 where_clause = Some(build_expression(expr_pair)?);
             }
             Rule::return_tail => {
-                for inner in p.into_inner() {
-                    match inner.as_rule() {
-                        Rule::kw_distinct => distinct = true,
-                        Rule::return_items => return_items = build_return_items(inner)?,
-                        Rule::order_by_clause => order_by = build_order_by(inner)?,
-                        Rule::skip_clause => {
-                            let int_pair = inner
-                                .into_inner()
-                                .next()
-                                .ok_or_else(|| Error::Parse("empty skip".into()))?;
-                            skip = Some(parse_integer(int_pair.as_str())?);
-                        }
-                        Rule::limit_clause => {
-                            let int_pair = inner
-                                .into_inner()
-                                .next()
-                                .ok_or_else(|| Error::Parse("empty limit".into()))?;
-                            limit = Some(parse_integer(int_pair.as_str())?);
-                        }
-                        r => {
-                            return Err(Error::Parse(format!(
-                                "unexpected rule in return tail: {:?}",
-                                r
-                            )))
-                        }
-                    }
-                }
+                parse_return_tail(
+                    p,
+                    &mut return_items,
+                    &mut distinct,
+                    &mut order_by,
+                    &mut skip,
+                    &mut limit,
+                )?;
             }
             Rule::set_tail => {
                 let set_items_pair = p

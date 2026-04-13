@@ -3,7 +3,7 @@ use crate::{
     value::{Row, Value},
 };
 use mesh_core::Property;
-use mesh_cypher::{CompareOp, Expr, Literal};
+use mesh_cypher::{CallArgs, CompareOp, Expr, Literal};
 use std::cmp::Ordering;
 
 pub(crate) fn eval_expr(expr: &Expr, row: &Row) -> Result<Value> {
@@ -58,7 +58,134 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row) -> Result<Value> {
             let vr = eval_expr(right, row)?;
             Ok(Value::Property(Property::Bool(compare(*op, &vl, &vr)?)))
         }
-        Expr::Call { name, .. } => Err(Error::UnknownScalarFunction(name.clone())),
+        Expr::Call { name, args } => call_scalar(name, args, row),
+    }
+}
+
+fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
+    let arg_exprs = match args {
+        CallArgs::Star => {
+            return Err(Error::UnknownScalarFunction(format!("{}(*)", name)))
+        }
+        CallArgs::Exprs(e) => e.as_slice(),
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "size" | "length" => {
+            let v = single_arg(name, arg_exprs, row)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::List(items) => {
+                    Ok(Value::Property(Property::Int64(items.len() as i64)))
+                }
+                Value::Property(Property::List(items)) => {
+                    Ok(Value::Property(Property::Int64(items.len() as i64)))
+                }
+                Value::Property(Property::String(s)) => {
+                    Ok(Value::Property(Property::Int64(s.chars().count() as i64)))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "labels" => {
+            let v = single_arg(name, arg_exprs, row)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Node(n) => Ok(Value::List(
+                    n.labels
+                        .into_iter()
+                        .map(|l| Value::Property(Property::String(l)))
+                        .collect(),
+                )),
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "keys" => {
+            let v = single_arg(name, arg_exprs, row)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Node(n) => {
+                    let mut keys: Vec<String> = n.properties.keys().cloned().collect();
+                    keys.sort();
+                    Ok(Value::List(
+                        keys.into_iter()
+                            .map(|k| Value::Property(Property::String(k)))
+                            .collect(),
+                    ))
+                }
+                Value::Edge(e) => {
+                    let mut keys: Vec<String> = e.properties.keys().cloned().collect();
+                    keys.sort();
+                    Ok(Value::List(
+                        keys.into_iter()
+                            .map(|k| Value::Property(Property::String(k)))
+                            .collect(),
+                    ))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "type" => {
+            let v = single_arg(name, arg_exprs, row)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Edge(e) => Ok(Value::Property(Property::String(e.edge_type))),
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "tolower" => {
+            let v = single_arg(name, arg_exprs, row)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Property(Property::String(s)) => {
+                    Ok(Value::Property(Property::String(s.to_lowercase())))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "toupper" => {
+            let v = single_arg(name, arg_exprs, row)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Property(Property::String(s)) => {
+                    Ok(Value::Property(Property::String(s.to_uppercase())))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "tostring" => {
+            let v = single_arg(name, arg_exprs, row)?;
+            Ok(value_to_string(v))
+        }
+        _ => Err(Error::UnknownScalarFunction(name.to_string())),
+    }
+}
+
+fn single_arg(name: &str, args: &[Expr], row: &Row) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::UnknownScalarFunction(format!(
+            "{} expects 1 argument, got {}",
+            name,
+            args.len()
+        )));
+    }
+    eval_expr(&args[0], row)
+}
+
+fn value_to_string(v: Value) -> Value {
+    match v {
+        Value::Null => Value::Null,
+        Value::Property(Property::String(s)) => Value::Property(Property::String(s)),
+        Value::Property(Property::Int64(i)) => {
+            Value::Property(Property::String(i.to_string()))
+        }
+        Value::Property(Property::Float64(f)) => {
+            Value::Property(Property::String(f.to_string()))
+        }
+        Value::Property(Property::Bool(b)) => {
+            Value::Property(Property::String(b.to_string()))
+        }
+        Value::Property(Property::Null) => Value::Null,
+        other => Value::Property(Property::String(format!("{:?}", other))),
     }
 }
 

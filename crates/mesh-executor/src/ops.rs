@@ -125,6 +125,8 @@ struct CreatePathOp {
     nodes: Vec<CreateNodeSpec>,
     edges: Vec<CreateEdgeSpec>,
     done: bool,
+    buffered: Option<Vec<Row>>,
+    cursor: usize,
 }
 
 impl CreatePathOp {
@@ -138,14 +140,21 @@ impl CreatePathOp {
             nodes,
             edges,
             done: false,
+            buffered: None,
+            cursor: 0,
         }
     }
 
-    fn apply(&self, ctx: &ExecCtx, row: &Row) -> Result<()> {
+    fn apply(&self, ctx: &ExecCtx, row: &Row) -> Result<Row> {
+        let mut out = row.clone();
         let mut node_ids: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
         for spec in &self.nodes {
             match spec {
-                CreateNodeSpec::New { labels, properties } => {
+                CreateNodeSpec::New {
+                    var,
+                    labels,
+                    properties,
+                } => {
                     let mut node = Node::new();
                     for label in labels {
                         node.labels.push(label.clone());
@@ -155,6 +164,9 @@ impl CreatePathOp {
                     }
                     ctx.store.put_node(&node)?;
                     node_ids.push(node.id);
+                    if let Some(v) = var {
+                        out.insert(v.clone(), Value::Node(node));
+                    }
                 }
                 CreateNodeSpec::Reference(name) => {
                     let id = match row.get(name) {
@@ -170,31 +182,47 @@ impl CreatePathOp {
             let dst = node_ids[spec.dst_idx];
             let edge = Edge::new(spec.edge_type.clone(), src, dst);
             ctx.store.put_edge(&edge)?;
+            if let Some(v) = &spec.var {
+                out.insert(v.clone(), Value::Edge(edge));
+            }
         }
-        Ok(())
+        Ok(out)
     }
 }
 
 impl Operator for CreatePathOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        if self.done {
-            return Ok(None);
-        }
-        self.done = true;
-
-        if let Some(input) = self.input.as_mut() {
+        if self.input.is_some() {
+            // Drain the whole input first, then replay sequentially. Draining up
+            // front avoids aliasing the source scan's cursor while we're writing
+            // to the store (node-label scans cache ids lazily on first call).
+            if let Some(buffered) = self.buffered.as_mut() {
+                if self.cursor < buffered.len() {
+                    let row = buffered[self.cursor].clone();
+                    self.cursor += 1;
+                    return Ok(Some(self.apply(ctx, &row)?));
+                }
+                return Ok(None);
+            }
             let mut rows: Vec<Row> = Vec::new();
-            while let Some(row) = input.next(ctx)? {
-                rows.push(row);
+            {
+                let input = self.input.as_mut().unwrap();
+                while let Some(row) = input.next(ctx)? {
+                    rows.push(row);
+                }
             }
-            for row in &rows {
-                self.apply(ctx, row)?;
-            }
+            self.buffered = Some(rows);
+            self.cursor = 0;
+            // Fall through to next call via recursion.
+            self.next(ctx)
         } else {
+            if self.done {
+                return Ok(None);
+            }
+            self.done = true;
             let empty = Row::new();
-            self.apply(ctx, &empty)?;
+            Ok(Some(self.apply(ctx, &empty)?))
         }
-        Ok(None)
     }
 }
 
@@ -264,31 +292,34 @@ impl DeleteOp {
 
 impl Operator for DeleteOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        while let Some(row) = self.input.next(ctx)? {
-            for var in &self.vars {
-                match row.get(var) {
-                    Some(Value::Node(n)) => {
-                        if self.detach {
-                            ctx.store.detach_delete_node(n.id)?;
-                        } else {
-                            let out = ctx.store.outgoing(n.id)?;
-                            let inc = ctx.store.incoming(n.id)?;
-                            if !out.is_empty() || !inc.is_empty() {
-                                return Err(Error::CannotDeleteAttachedNode);
+        match self.input.next(ctx)? {
+            None => Ok(None),
+            Some(row) => {
+                for var in &self.vars {
+                    match row.get(var) {
+                        Some(Value::Node(n)) => {
+                            if self.detach {
+                                ctx.store.detach_delete_node(n.id)?;
+                            } else {
+                                let out = ctx.store.outgoing(n.id)?;
+                                let inc = ctx.store.incoming(n.id)?;
+                                if !out.is_empty() || !inc.is_empty() {
+                                    return Err(Error::CannotDeleteAttachedNode);
+                                }
+                                ctx.store.detach_delete_node(n.id)?;
                             }
-                            ctx.store.detach_delete_node(n.id)?;
                         }
-                    }
-                    Some(Value::Edge(e)) => {
-                        if ctx.store.get_edge(e.id)?.is_some() {
-                            ctx.store.delete_edge(e.id)?;
+                        Some(Value::Edge(e)) => {
+                            if ctx.store.get_edge(e.id)?.is_some() {
+                                ctx.store.delete_edge(e.id)?;
+                            }
                         }
+                        _ => return Err(Error::UnboundVariable(var.clone())),
                     }
-                    _ => return Err(Error::UnboundVariable(var.clone())),
                 }
+                Ok(Some(row))
             }
         }
-        Ok(None)
     }
 }
 
@@ -305,45 +336,56 @@ impl SetPropertyOp {
 
 impl Operator for SetPropertyOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        while let Some(row) = self.input.next(ctx)? {
-            let mut node_updates: HashMap<String, Node> = HashMap::new();
-            let mut edge_updates: HashMap<String, Edge> = HashMap::new();
-
-            for SetAssignment { var, key, value } in &self.assignments {
-                let evaluated = eval_expr(value, &row)?;
-                let prop = match evaluated {
-                    Value::Property(p) => p,
-                    Value::Null => Property::Null,
-                    Value::Node(_) | Value::Edge(_) | Value::List(_) => {
-                        return Err(Error::InvalidSetValue)
-                    }
-                };
-
-                match row.get(var) {
-                    Some(Value::Node(n)) => {
-                        let entry = node_updates
-                            .entry(var.clone())
-                            .or_insert_with(|| n.clone());
-                        entry.properties.insert(key.clone(), prop);
-                    }
-                    Some(Value::Edge(e)) => {
-                        let entry = edge_updates
-                            .entry(var.clone())
-                            .or_insert_with(|| e.clone());
-                        entry.properties.insert(key.clone(), prop);
-                    }
-                    _ => return Err(Error::UnboundVariable(var.clone())),
+        match self.input.next(ctx)? {
+            None => Ok(None),
+            Some(mut row) => {
+                // Phase 1: evaluate RHS values against the original row bindings.
+                let mut computed: Vec<(String, String, Property)> =
+                    Vec::with_capacity(self.assignments.len());
+                for SetAssignment { var, key, value } in &self.assignments {
+                    let evaluated = eval_expr(value, &row)?;
+                    let prop = match evaluated {
+                        Value::Property(p) => p,
+                        Value::Null => Property::Null,
+                        Value::Node(_) | Value::Edge(_) | Value::List(_) => {
+                            return Err(Error::InvalidSetValue)
+                        }
+                    };
+                    computed.push((var.clone(), key.clone(), prop));
                 }
-            }
 
-            for node in node_updates.into_values() {
-                ctx.store.put_node(&node)?;
-            }
-            for edge in edge_updates.into_values() {
-                ctx.store.put_edge(&edge)?;
+                // Phase 2: apply updates in-place to the row bindings.
+                let mut updated_nodes: HashSet<String> = HashSet::new();
+                let mut updated_edges: HashSet<String> = HashSet::new();
+                for (var, key, prop) in computed {
+                    match row.get_mut(&var) {
+                        Some(Value::Node(n)) => {
+                            n.properties.insert(key, prop);
+                            updated_nodes.insert(var);
+                        }
+                        Some(Value::Edge(e)) => {
+                            e.properties.insert(key, prop);
+                            updated_edges.insert(var);
+                        }
+                        _ => return Err(Error::UnboundVariable(var)),
+                    }
+                }
+
+                // Phase 3: flush each mutated entity once to the store.
+                for var in &updated_nodes {
+                    if let Some(Value::Node(n)) = row.get(var) {
+                        ctx.store.put_node(n)?;
+                    }
+                }
+                for var in &updated_edges {
+                    if let Some(Value::Edge(e)) = row.get(var) {
+                        ctx.store.put_edge(e)?;
+                    }
+                }
+
+                Ok(Some(row))
             }
         }
-        Ok(None)
     }
 }
 

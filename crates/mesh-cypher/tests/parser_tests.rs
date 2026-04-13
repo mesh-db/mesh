@@ -109,6 +109,58 @@ fn single_hop_undirected() {
 }
 
 #[test]
+fn match_set_with_return_parses() {
+    let m = unwrap_match(
+        parse("MATCH (n:Person) SET n.age = 37 RETURN n").unwrap(),
+    );
+    assert_eq!(m.set_items.len(), 1);
+    assert_eq!(m.return_items.len(), 1);
+    assert_eq!(m.return_items[0].expr, Expr::Identifier("n".into()));
+}
+
+#[test]
+fn match_create_with_return_parses() {
+    let m = unwrap_match(
+        parse("MATCH (a:Person) CREATE (a)-[:WORKS_AT]->(c:Company) RETURN c").unwrap(),
+    );
+    assert_eq!(m.create_patterns.len(), 1);
+    assert_eq!(m.return_items.len(), 1);
+}
+
+#[test]
+fn match_delete_with_return_parses() {
+    let m = unwrap_match(
+        parse("MATCH (n:Person) DETACH DELETE n RETURN n.name").unwrap(),
+    );
+    assert!(m.delete.is_some());
+    assert_eq!(m.return_items.len(), 1);
+}
+
+#[test]
+fn pure_create_with_return_parses() {
+    let c = unwrap_create(parse("CREATE (n:Person {name: 'Ada'}) RETURN n").unwrap());
+    assert_eq!(c.patterns.len(), 1);
+    assert_eq!(c.return_items.len(), 1);
+}
+
+#[test]
+fn scalar_call_labels_parses() {
+    let m = unwrap_match(parse("MATCH (n) RETURN labels(n) AS ls").unwrap());
+    match &m.return_items[0].expr {
+        Expr::Call { name, args: CallArgs::Exprs(es) } => {
+            assert_eq!(name.to_lowercase(), "labels");
+            assert_eq!(es.len(), 1);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn match_requires_tail() {
+    assert!(parse("MATCH (n)").is_err());
+}
+
+#[test]
 fn multi_pattern_match_parses() {
     let m = unwrap_match(parse("MATCH (a:Person), (b:Company) RETURN a, b").unwrap());
     assert_eq!(m.patterns.len(), 2);

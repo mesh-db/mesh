@@ -7,6 +7,11 @@ pub enum Statement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateStmt {
     pub patterns: Vec<Pattern>,
+    pub return_items: Vec<ReturnItem>,
+    pub distinct: bool,
+    pub order_by: Vec<SortItem>,
+    pub skip: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

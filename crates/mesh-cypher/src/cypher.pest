@@ -4,12 +4,12 @@ query = { SOI ~ statement ~ EOI }
 
 statement = { create_stmt | match_stmt }
 
-create_stmt = { kw_create ~ pattern_list }
+create_stmt = { kw_create ~ pattern_list ~ return_tail? }
 
 match_stmt = {
     kw_match ~ pattern_list ~
     where_clause? ~
-    (return_tail | set_tail | delete_tail | create_tail)
+    (return_tail | ((set_tail | delete_tail | create_tail) ~ return_tail?))
 }
 
 pattern_list = { pattern ~ ("," ~ pattern)* }

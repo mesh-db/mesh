@@ -85,6 +85,7 @@ pub enum LogicalPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CreateNodeSpec {
     New {
+        var: Option<String>,
         labels: Vec<String>,
         properties: Vec<(String, Literal)>,
     },
@@ -93,6 +94,7 @@ pub enum CreateNodeSpec {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateEdgeSpec {
+    pub var: Option<String>,
     pub edge_type: String,
     pub src_idx: usize,
     pub dst_idx: usize,
@@ -163,11 +165,24 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
         )?;
     }
 
-    Ok(LogicalPlan::CreatePath {
+    let plan = LogicalPlan::CreatePath {
         input: None,
         nodes,
         edges,
-    })
+    };
+
+    if stmt.return_items.is_empty() {
+        Ok(plan)
+    } else {
+        apply_return_pipeline(
+            plan,
+            &stmt.return_items,
+            stmt.distinct,
+            &stmt.order_by,
+            stmt.skip,
+            stmt.limit,
+        )
+    }
 }
 
 fn build_create_pattern(
@@ -198,6 +213,7 @@ fn build_create_pattern(
         };
 
         edges.push(CreateEdgeSpec {
+            var: hop.rel.var.clone(),
             edge_type,
             src_idx,
             dst_idx,
@@ -222,6 +238,7 @@ fn add_create_node(
     let spec = match &pattern.var {
         Some(name) if bound_vars.contains(name) => CreateNodeSpec::Reference(name.clone()),
         _ => CreateNodeSpec::New {
+            var: pattern.var.clone(),
             labels: pattern.label.clone().into_iter().collect(),
             properties: pattern.properties.clone(),
         },
@@ -340,29 +357,14 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
         };
     }
 
-    if !stmt.create_patterns.is_empty() {
-        let mut nodes: Vec<CreateNodeSpec> = Vec::new();
-        let mut edges: Vec<CreateEdgeSpec> = Vec::new();
-        let mut var_idx: HashMap<String, usize> = HashMap::new();
-        for pattern in &stmt.create_patterns {
-            build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &all_vars)?;
-        }
-        return Ok(LogicalPlan::CreatePath {
-            input: Some(Box::new(plan)),
-            nodes,
-            edges,
-        });
-    }
-
+    // Apply at most one mutation to the pipeline (they are grammatically exclusive).
     if let Some(delete_clause) = &stmt.delete {
-        return Ok(LogicalPlan::Delete {
+        plan = LogicalPlan::Delete {
             input: Box::new(plan),
             detach: delete_clause.detach,
             vars: delete_clause.vars.clone(),
-        });
-    }
-
-    if !stmt.set_items.is_empty() {
+        };
+    } else if !stmt.set_items.is_empty() {
         let assignments = stmt
             .set_items
             .iter()
@@ -372,55 +374,55 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
                 value: s.value.clone(),
             })
             .collect();
-        return Ok(LogicalPlan::SetProperty {
+        plan = LogicalPlan::SetProperty {
             input: Box::new(plan),
             assignments,
-        });
+        };
+    } else if !stmt.create_patterns.is_empty() {
+        let mut nodes: Vec<CreateNodeSpec> = Vec::new();
+        let mut edges: Vec<CreateEdgeSpec> = Vec::new();
+        let mut var_idx: HashMap<String, usize> = HashMap::new();
+        for pattern in &stmt.create_patterns {
+            build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &all_vars)?;
+        }
+        plan = LogicalPlan::CreatePath {
+            input: Some(Box::new(plan)),
+            nodes,
+            edges,
+        };
     }
 
-    // Split return items into group keys and aggregate specs.
-    let mut group_keys: Vec<ReturnItem> = Vec::new();
-    let mut aggregates: Vec<AggregateSpec> = Vec::new();
-    for (idx, item) in stmt.return_items.iter().enumerate() {
-        if let Expr::Call { name, args } = &item.expr {
-            if let Some(func) = aggregate_fn_from_name(name) {
-                let agg_arg = match args {
-                    CallArgs::Star => {
-                        if !matches!(func, AggregateFn::Count) {
-                            return Err(Error::Plan(format!(
-                                "only count(*) accepts a star argument"
-                            )));
-                        }
-                        AggregateArg::Star
-                    }
-                    CallArgs::Exprs(es) if es.len() == 1 => AggregateArg::Expr(es[0].clone()),
-                    CallArgs::Exprs(_) => {
-                        return Err(Error::Plan(format!(
-                            "{} takes exactly one argument",
-                            name
-                        )))
-                    }
-                };
-                let alias = item
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| format!("{}_{}", name.to_lowercase(), idx));
-                aggregates.push(AggregateSpec {
-                    alias,
-                    function: func,
-                    arg: agg_arg,
-                });
-                continue;
-            }
-            return Err(Error::Plan(format!("unknown function: {}", name)));
-        }
-        if contains_aggregate(&item.expr) {
-            return Err(Error::Plan(
-                "aggregates must appear at the top of RETURN items".into(),
-            ));
-        }
-        group_keys.push(item.clone());
+    let has_mutation = stmt.delete.is_some()
+        || !stmt.set_items.is_empty()
+        || !stmt.create_patterns.is_empty();
+
+    if !stmt.return_items.is_empty() {
+        plan = apply_return_pipeline(
+            plan,
+            &stmt.return_items,
+            stmt.distinct,
+            &stmt.order_by,
+            stmt.skip,
+            stmt.limit,
+        )?;
+    } else if !has_mutation {
+        return Err(Error::Plan(
+            "MATCH must be followed by RETURN, SET, DELETE, or CREATE".into(),
+        ));
     }
+
+    Ok(plan)
+}
+
+fn apply_return_pipeline(
+    mut plan: LogicalPlan,
+    return_items: &[ReturnItem],
+    distinct: bool,
+    order_by: &[SortItem],
+    skip: Option<i64>,
+    limit: Option<i64>,
+) -> Result<LogicalPlan> {
+    let (group_keys, aggregates) = classify_return_items(return_items)?;
 
     plan = if !aggregates.is_empty() {
         LogicalPlan::Aggregate {
@@ -431,38 +433,91 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
     } else {
         LogicalPlan::Project {
             input: Box::new(plan),
-            items: stmt.return_items.clone(),
+            items: return_items.to_vec(),
         }
     };
 
-    if stmt.distinct {
+    if distinct {
         plan = LogicalPlan::Distinct {
             input: Box::new(plan),
         };
     }
 
-    if !stmt.order_by.is_empty() {
+    if !order_by.is_empty() {
         plan = LogicalPlan::OrderBy {
             input: Box::new(plan),
-            sort_items: stmt.order_by.clone(),
+            sort_items: order_by.to_vec(),
         };
     }
 
-    if let Some(skip) = stmt.skip {
+    if let Some(n) = skip {
         plan = LogicalPlan::Skip {
             input: Box::new(plan),
-            count: skip,
+            count: n,
         };
     }
 
-    if let Some(limit) = stmt.limit {
+    if let Some(n) = limit {
         plan = LogicalPlan::Limit {
             input: Box::new(plan),
-            count: limit,
+            count: n,
         };
     }
 
     Ok(plan)
+}
+
+fn classify_return_items(
+    items: &[ReturnItem],
+) -> Result<(Vec<ReturnItem>, Vec<AggregateSpec>)> {
+    let mut group_keys: Vec<ReturnItem> = Vec::new();
+    let mut aggregates: Vec<AggregateSpec> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let is_top_aggregate = matches!(
+            &item.expr,
+            Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some()
+        );
+        if is_top_aggregate {
+            let Expr::Call { name, args } = &item.expr else {
+                unreachable!()
+            };
+            let func = aggregate_fn_from_name(name).unwrap();
+            let agg_arg = match args {
+                CallArgs::Star => {
+                    if !matches!(func, AggregateFn::Count) {
+                        return Err(Error::Plan(
+                            "only count(*) accepts a star argument".into(),
+                        ));
+                    }
+                    AggregateArg::Star
+                }
+                CallArgs::Exprs(es) if es.len() == 1 => AggregateArg::Expr(es[0].clone()),
+                CallArgs::Exprs(_) => {
+                    return Err(Error::Plan(format!(
+                        "{} takes exactly one argument",
+                        name
+                    )))
+                }
+            };
+            let alias = item
+                .alias
+                .clone()
+                .unwrap_or_else(|| format!("{}_{}", name.to_lowercase(), idx));
+            aggregates.push(AggregateSpec {
+                alias,
+                function: func,
+                arg: agg_arg,
+            });
+        } else {
+            if contains_aggregate(&item.expr) {
+                return Err(Error::Plan(
+                    "aggregates must appear at the top of RETURN items".into(),
+                ));
+            }
+            group_keys.push(item.clone());
+        }
+    }
+    Ok((group_keys, aggregates))
 }
 
 fn contains_aggregate(expr: &Expr) -> bool {
