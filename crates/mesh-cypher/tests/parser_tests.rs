@@ -17,23 +17,23 @@ fn unwrap_create(s: Statement) -> CreateStmt {
 #[test]
 fn empty_node_creation() {
     let c = unwrap_create(parse("CREATE ()").unwrap());
-    assert!(c.node.var.is_none());
-    assert!(c.node.label.is_none());
-    assert!(c.node.properties.is_empty());
+    assert!(c.pattern.start.var.is_none());
+    assert!(c.pattern.start.label.is_none());
+    assert!(c.pattern.start.properties.is_empty());
 }
 
 #[test]
 fn labeled_node_creation() {
     let c = unwrap_create(parse("CREATE (n:Person)").unwrap());
-    assert_eq!(c.node.var.as_deref(), Some("n"));
-    assert_eq!(c.node.label.as_deref(), Some("Person"));
+    assert_eq!(c.pattern.start.var.as_deref(), Some("n"));
+    assert_eq!(c.pattern.start.label.as_deref(), Some("Person"));
 }
 
 #[test]
 fn labeled_node_with_properties() {
     let c = unwrap_create(parse(r#"CREATE (n:Person {name: "Ada", age: 37})"#).unwrap());
     assert_eq!(
-        c.node.properties,
+        c.pattern.start.properties,
         vec![
             ("name".into(), Literal::String("Ada".into())),
             ("age".into(), Literal::Integer(37)),
@@ -44,8 +44,8 @@ fn labeled_node_with_properties() {
 #[test]
 fn anonymous_labeled_node() {
     let c = unwrap_create(parse("CREATE (:Tag)").unwrap());
-    assert!(c.node.var.is_none());
-    assert_eq!(c.node.label.as_deref(), Some("Tag"));
+    assert!(c.pattern.start.var.is_none());
+    assert_eq!(c.pattern.start.label.as_deref(), Some("Tag"));
 }
 
 #[test]
@@ -106,6 +106,58 @@ fn single_hop_undirected() {
     let hop = &m.pattern.hops[0];
     assert_eq!(hop.rel.direction, Direction::Both);
     assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+}
+
+#[test]
+fn create_path_with_relationship() {
+    let c = unwrap_create(parse("CREATE (a:Person)-[:KNOWS]->(b:Person)").unwrap());
+    assert_eq!(c.pattern.hops.len(), 1);
+    assert_eq!(c.pattern.start.label.as_deref(), Some("Person"));
+    assert_eq!(c.pattern.hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(c.pattern.hops[0].target.label.as_deref(), Some("Person"));
+}
+
+#[test]
+fn match_delete() {
+    let m = unwrap_match(parse("MATCH (n:Person) DELETE n").unwrap());
+    let d = m.delete.unwrap();
+    assert!(!d.detach);
+    assert_eq!(d.vars, vec!["n".to_string()]);
+    assert!(m.return_items.is_empty());
+}
+
+#[test]
+fn match_detach_delete() {
+    let m = unwrap_match(parse("MATCH (n:Person) DETACH DELETE n").unwrap());
+    let d = m.delete.unwrap();
+    assert!(d.detach);
+    assert_eq!(d.vars, vec!["n".to_string()]);
+}
+
+#[test]
+fn match_delete_multiple_vars() {
+    let m = unwrap_match(parse("MATCH (a)-[r]->(b) DELETE r, a, b").unwrap());
+    let d = m.delete.unwrap();
+    assert_eq!(d.vars, vec!["r".to_string(), "a".to_string(), "b".to_string()]);
+}
+
+#[test]
+fn match_set_single() {
+    let m = unwrap_match(parse("MATCH (n:Person) SET n.name = 'Ada'").unwrap());
+    assert_eq!(m.set_items.len(), 1);
+    assert_eq!(m.set_items[0].var, "n");
+    assert_eq!(m.set_items[0].key, "name");
+    assert_eq!(m.set_items[0].value, Expr::Literal(Literal::String("Ada".into())));
+}
+
+#[test]
+fn match_set_multiple() {
+    let m = unwrap_match(
+        parse("MATCH (n:Person) SET n.name = 'Ada', n.age = 37").unwrap(),
+    );
+    assert_eq!(m.set_items.len(), 2);
+    assert_eq!(m.set_items[1].key, "age");
+    assert_eq!(m.set_items[1].value, Expr::Literal(Literal::Integer(37)));
 }
 
 #[test]
@@ -220,7 +272,7 @@ fn limit_only() {
 fn negative_and_float_literals() {
     let c = unwrap_create(parse(r#"CREATE (n {x: -3.14, y: -42, z: 2.5})"#).unwrap());
     assert_eq!(
-        c.node.properties,
+        c.pattern.start.properties,
         vec![
             ("x".into(), Literal::Float(-3.14)),
             ("y".into(), Literal::Integer(-42)),
@@ -233,7 +285,7 @@ fn negative_and_float_literals() {
 fn boolean_and_null_literals() {
     let c = unwrap_create(parse(r#"CREATE (n {a: true, b: false, c: null})"#).unwrap());
     assert_eq!(
-        c.node.properties,
+        c.pattern.start.properties,
         vec![
             ("a".into(), Literal::Boolean(true)),
             ("b".into(), Literal::Boolean(false)),
@@ -246,7 +298,7 @@ fn boolean_and_null_literals() {
 fn single_quoted_string() {
     let c = unwrap_create(parse("CREATE (n {name: 'Ada'})").unwrap());
     assert_eq!(
-        c.node.properties,
+        c.pattern.start.properties,
         vec![("name".into(), Literal::String("Ada".into()))]
     );
 }

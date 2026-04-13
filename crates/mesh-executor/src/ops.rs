@@ -3,9 +3,12 @@ use crate::{
     eval::{eval_expr, literal_to_property, to_bool},
     value::{Row, Value},
 };
-use mesh_core::{EdgeId, Node, NodeId};
-use mesh_cypher::{Direction, Expr, Literal, LogicalPlan, ReturnItem};
+use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
+use mesh_cypher::{
+    CreateEdgeSpec, CreateNodeSpec, Direction, Expr, LogicalPlan, ReturnItem, SetAssignment,
+};
 use mesh_storage::Store;
+use std::collections::HashMap;
 
 pub struct ExecCtx<'a> {
     pub store: &'a Store,
@@ -27,9 +30,18 @@ pub fn execute(plan: &LogicalPlan, store: &Store) -> Result<Vec<Row>> {
 
 fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
     match plan {
-        LogicalPlan::CreateNode { labels, properties } => {
-            Box::new(CreateNodeOp::new(labels.clone(), properties.clone()))
+        LogicalPlan::CreatePath { nodes, edges } => {
+            Box::new(CreatePathOp::new(nodes.clone(), edges.clone()))
         }
+        LogicalPlan::Delete {
+            input,
+            detach,
+            vars,
+        } => Box::new(DeleteOp::new(build_op(input), *detach, vars.clone())),
+        LogicalPlan::SetProperty { input, assignments } => Box::new(SetPropertyOp::new(
+            build_op(input),
+            assignments.clone(),
+        )),
         LogicalPlan::NodeScanAll { var } => Box::new(NodeScanAllOp::new(var.clone())),
         LogicalPlan::NodeScanByLabel { var, label } => {
             Box::new(NodeScanByLabelOp::new(var.clone(), label.clone()))
@@ -62,36 +74,146 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
     }
 }
 
-struct CreateNodeOp {
-    labels: Vec<String>,
-    properties: Vec<(String, Literal)>,
+struct CreatePathOp {
+    nodes: Vec<CreateNodeSpec>,
+    edges: Vec<CreateEdgeSpec>,
     done: bool,
 }
 
-impl CreateNodeOp {
-    fn new(labels: Vec<String>, properties: Vec<(String, Literal)>) -> Self {
+impl CreatePathOp {
+    fn new(nodes: Vec<CreateNodeSpec>, edges: Vec<CreateEdgeSpec>) -> Self {
         Self {
-            labels,
-            properties,
+            nodes,
+            edges,
             done: false,
         }
     }
 }
 
-impl Operator for CreateNodeOp {
+impl Operator for CreatePathOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         if self.done {
             return Ok(None);
         }
         self.done = true;
-        let mut node = Node::new();
-        for label in &self.labels {
-            node.labels.push(label.clone());
+
+        let mut node_ids: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
+        for spec in &self.nodes {
+            let mut node = Node::new();
+            for label in &spec.labels {
+                node.labels.push(label.clone());
+            }
+            for (k, v) in &spec.properties {
+                node.properties.insert(k.clone(), literal_to_property(v));
+            }
+            ctx.store.put_node(&node)?;
+            node_ids.push(node.id);
         }
-        for (k, v) in &self.properties {
-            node.properties.insert(k.clone(), literal_to_property(v));
+        for spec in &self.edges {
+            let src = node_ids[spec.src_idx];
+            let dst = node_ids[spec.dst_idx];
+            let edge = Edge::new(spec.edge_type.clone(), src, dst);
+            ctx.store.put_edge(&edge)?;
         }
-        ctx.store.put_node(&node)?;
+        Ok(None)
+    }
+}
+
+struct DeleteOp {
+    input: Box<dyn Operator>,
+    detach: bool,
+    vars: Vec<String>,
+}
+
+impl DeleteOp {
+    fn new(input: Box<dyn Operator>, detach: bool, vars: Vec<String>) -> Self {
+        Self {
+            input,
+            detach,
+            vars,
+        }
+    }
+}
+
+impl Operator for DeleteOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        while let Some(row) = self.input.next(ctx)? {
+            for var in &self.vars {
+                match row.get(var) {
+                    Some(Value::Node(n)) => {
+                        if self.detach {
+                            ctx.store.detach_delete_node(n.id)?;
+                        } else {
+                            let out = ctx.store.outgoing(n.id)?;
+                            let inc = ctx.store.incoming(n.id)?;
+                            if !out.is_empty() || !inc.is_empty() {
+                                return Err(Error::CannotDeleteAttachedNode);
+                            }
+                            ctx.store.detach_delete_node(n.id)?;
+                        }
+                    }
+                    Some(Value::Edge(e)) => {
+                        if ctx.store.get_edge(e.id)?.is_some() {
+                            ctx.store.delete_edge(e.id)?;
+                        }
+                    }
+                    _ => return Err(Error::UnboundVariable(var.clone())),
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+struct SetPropertyOp {
+    input: Box<dyn Operator>,
+    assignments: Vec<SetAssignment>,
+}
+
+impl SetPropertyOp {
+    fn new(input: Box<dyn Operator>, assignments: Vec<SetAssignment>) -> Self {
+        Self { input, assignments }
+    }
+}
+
+impl Operator for SetPropertyOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        while let Some(row) = self.input.next(ctx)? {
+            let mut node_updates: HashMap<String, Node> = HashMap::new();
+            let mut edge_updates: HashMap<String, Edge> = HashMap::new();
+
+            for SetAssignment { var, key, value } in &self.assignments {
+                let evaluated = eval_expr(value, &row)?;
+                let prop = match evaluated {
+                    Value::Property(p) => p,
+                    Value::Null => Property::Null,
+                    Value::Node(_) | Value::Edge(_) => return Err(Error::InvalidSetValue),
+                };
+
+                match row.get(var) {
+                    Some(Value::Node(n)) => {
+                        let entry = node_updates
+                            .entry(var.clone())
+                            .or_insert_with(|| n.clone());
+                        entry.properties.insert(key.clone(), prop);
+                    }
+                    Some(Value::Edge(e)) => {
+                        let entry = edge_updates
+                            .entry(var.clone())
+                            .or_insert_with(|| e.clone());
+                        entry.properties.insert(key.clone(), prop);
+                    }
+                    _ => return Err(Error::UnboundVariable(var.clone())),
+                }
+            }
+
+            for node in node_updates.into_values() {
+                ctx.store.put_node(&node)?;
+            }
+            for edge in edge_updates.into_values() {
+                ctx.store.put_edge(&edge)?;
+            }
+        }
         Ok(None)
     }
 }

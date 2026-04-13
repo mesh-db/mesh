@@ -12,7 +12,7 @@ fn open_store() -> (Store, TempDir) {
 
 fn run(store: &Store, q: &str) -> Vec<Row> {
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
-    let plan = plan(&stmt);
+    let plan = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
     execute(&plan, store).unwrap_or_else(|e| panic!("exec {q}: {e}"))
 }
 
@@ -167,6 +167,7 @@ fn missing_property_returns_null() {
     assert_eq!(rows[0].get("age"), Some(&Value::Null));
 }
 
+#[allow(dead_code)]
 struct Graph {
     ada: NodeId,
     alan: NodeId,
@@ -371,6 +372,203 @@ fn expand_yields_no_rows_when_no_edges() {
 
     let rows = run(&store, "MATCH (n:Loner)-->(m) RETURN m");
     assert!(rows.is_empty());
+}
+
+#[test]
+fn create_path_materializes_nodes_and_edge() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Alan'})",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS src, b.name AS dst",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "src"), "Ada");
+    assert_eq!(str_prop(&rows[0], "dst"), "Alan");
+}
+
+#[test]
+fn create_multi_hop_chain() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Alan'})-[:KNOWS]->(c:Person {name: 'Grace'})",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (a)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN a.name AS a, c.name AS c",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "Ada");
+    assert_eq!(str_prop(&rows[0], "c"), "Grace");
+}
+
+#[test]
+fn create_incoming_direction() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'})<-[:KNOWS]-(b:Person {name: 'Alan'})",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (src)-[:KNOWS]->(dst) RETURN src.name AS s, dst.name AS d",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "s"), "Alan");
+    assert_eq!(str_prop(&rows[0], "d"), "Ada");
+}
+
+#[test]
+fn create_undirected_rejected() {
+    let (store, _d) = open_store();
+    let stmt = parse("CREATE (a:P)-[:T]-(b:P)").unwrap();
+    let err = plan(&stmt).unwrap_err();
+    let _ = &store;
+    let msg = format!("{err}");
+    assert!(msg.contains("directed"), "msg: {msg}");
+}
+
+#[test]
+fn create_edge_without_type_rejected() {
+    let (store, _d) = open_store();
+    let stmt = parse("CREATE (a:P)-->(b:P)").unwrap();
+    let err = plan(&stmt).unwrap_err();
+    let _ = &store;
+    let msg = format!("{err}");
+    assert!(msg.contains("type"), "msg: {msg}");
+}
+
+#[test]
+fn detach_delete_removes_node_and_edges() {
+    let (store, _d) = open_store();
+    let _g = build_social_graph(&store);
+
+    run(&store, "MATCH (n:Person) WHERE n.name = 'Alan' DETACH DELETE n");
+
+    let alans = run(&store, "MATCH (n:Person) WHERE n.name = 'Alan' RETURN n");
+    assert!(alans.is_empty());
+    let knows = run(
+        &store,
+        "MATCH (a)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b",
+    );
+    for row in &knows {
+        assert_ne!(str_prop(row, "a"), "Alan");
+        assert_ne!(str_prop(row, "b"), "Alan");
+    }
+}
+
+#[test]
+fn plain_delete_errors_when_node_has_edges() {
+    let (store, _d) = open_store();
+    let _g = build_social_graph(&store);
+
+    let stmt = parse("MATCH (n:Person) WHERE n.name = 'Ada' DELETE n").unwrap();
+    let plan = plan(&stmt).unwrap();
+    let err = execute(&plan, &store).unwrap_err();
+    assert!(matches!(
+        err,
+        mesh_executor::Error::CannotDeleteAttachedNode
+    ));
+}
+
+#[test]
+fn plain_delete_succeeds_for_isolated_node() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Loner {name: 'Solo'})");
+    run(&store, "MATCH (n:Loner) DELETE n");
+    let rows = run(&store, "MATCH (n:Loner) RETURN n");
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn delete_edge_by_variable() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Alan'})",
+    );
+
+    run(&store, "MATCH (a)-[r:KNOWS]->(b) DELETE r");
+
+    let knows = run(&store, "MATCH (a)-[:KNOWS]->(b) RETURN a");
+    assert!(knows.is_empty());
+    // Nodes still exist
+    let people = run(&store, "MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(people.len(), 2);
+}
+
+#[test]
+fn set_property_on_node() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+
+    run(
+        &store,
+        "MATCH (n:Person) WHERE n.name = 'Ada' SET n.age = 37",
+    );
+
+    let rows = run(&store, "MATCH (n:Person) RETURN n.name AS name, n.age AS age");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+    assert_eq!(int_prop(&rows[0], "age"), 37);
+}
+
+#[test]
+fn set_multiple_properties_one_pass() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+
+    run(
+        &store,
+        "MATCH (n:Person) SET n.age = 37, n.active = true, n.title = 'Countess'",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) RETURN n.age AS age, n.active AS active, n.title AS title",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "age"), 37);
+    assert_eq!(
+        rows[0].get("active"),
+        Some(&Value::Property(Property::Bool(true)))
+    );
+    assert_eq!(str_prop(&rows[0], "title"), "Countess");
+}
+
+#[test]
+fn set_updates_label_index_preserving() {
+    // Verify the label index survives SET (put_node's label diff handles this).
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+    run(&store, "MATCH (n:Person) SET n.age = 37");
+    let rows = run(&store, "MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn set_on_edge_property() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Alan'})",
+    );
+    run(&store, "MATCH (a)-[r:KNOWS]->(b) SET r.since = 2020");
+
+    let rows = run(
+        &store,
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since = 2020 RETURN a.name AS a",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "Ada");
 }
 
 #[test]

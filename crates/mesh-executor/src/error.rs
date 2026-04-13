@@ -19,6 +19,12 @@ pub enum Error {
 
     #[error("unsupported comparison for type")]
     UnsupportedComparison,
+
+    #[error("cannot DELETE node with attached edges (use DETACH DELETE)")]
+    CannotDeleteAttachedNode,
+
+    #[error("SET value must be a primitive property, not a node or edge")]
+    InvalidSetValue,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

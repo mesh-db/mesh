@@ -7,6 +7,9 @@ pub enum Error {
 
     #[error("invalid number: {0}")]
     InvalidNumber(String),
+
+    #[error("plan error: {0}")]
+    Plan(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

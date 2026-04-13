@@ -36,12 +36,12 @@ fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
 }
 
 fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
-    let node_pattern = pair
+    let pattern_pair = pair
         .into_inner()
         .next()
-        .ok_or_else(|| Error::Parse("missing node pattern".into()))?;
+        .ok_or_else(|| Error::Parse("missing pattern".into()))?;
     Ok(CreateStmt {
-        node: build_node_pattern(node_pattern)?,
+        pattern: build_pattern(pattern_pair)?,
     })
 }
 
@@ -51,6 +51,8 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     let mut return_items = Vec::new();
     let mut skip = None;
     let mut limit = None;
+    let mut set_items = Vec::new();
+    let mut delete = None;
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -62,20 +64,81 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                     .ok_or_else(|| Error::Parse("empty where".into()))?;
                 where_clause = Some(build_expression(expr_pair)?);
             }
-            Rule::return_items => return_items = build_return_items(p)?,
-            Rule::skip_clause => {
-                let int_pair = p
-                    .into_inner()
-                    .next()
-                    .ok_or_else(|| Error::Parse("empty skip".into()))?;
-                skip = Some(parse_integer(int_pair.as_str())?);
+            Rule::return_tail => {
+                for inner in p.into_inner() {
+                    match inner.as_rule() {
+                        Rule::return_items => return_items = build_return_items(inner)?,
+                        Rule::skip_clause => {
+                            let int_pair = inner
+                                .into_inner()
+                                .next()
+                                .ok_or_else(|| Error::Parse("empty skip".into()))?;
+                            skip = Some(parse_integer(int_pair.as_str())?);
+                        }
+                        Rule::limit_clause => {
+                            let int_pair = inner
+                                .into_inner()
+                                .next()
+                                .ok_or_else(|| Error::Parse("empty limit".into()))?;
+                            limit = Some(parse_integer(int_pair.as_str())?);
+                        }
+                        r => {
+                            return Err(Error::Parse(format!(
+                                "unexpected rule in return tail: {:?}",
+                                r
+                            )))
+                        }
+                    }
+                }
             }
-            Rule::limit_clause => {
-                let int_pair = p
+            Rule::set_tail => {
+                let set_items_pair = p
                     .into_inner()
                     .next()
-                    .ok_or_else(|| Error::Parse("empty limit".into()))?;
-                limit = Some(parse_integer(int_pair.as_str())?);
+                    .ok_or_else(|| Error::Parse("empty set".into()))?;
+                for set_item_pair in set_items_pair.into_inner() {
+                    let mut ii = set_item_pair.into_inner();
+                    let prop_access = ii
+                        .next()
+                        .ok_or_else(|| Error::Parse("set item missing target".into()))?;
+                    let mut pa = prop_access.into_inner();
+                    let var = pa
+                        .next()
+                        .ok_or_else(|| Error::Parse("set target missing var".into()))?
+                        .as_str()
+                        .to_string();
+                    let key = pa
+                        .next()
+                        .ok_or_else(|| Error::Parse("set target missing key".into()))?
+                        .as_str()
+                        .to_string();
+                    let expr_pair = ii
+                        .next()
+                        .ok_or_else(|| Error::Parse("set item missing value".into()))?;
+                    let value = build_expression(expr_pair)?;
+                    set_items.push(SetItem { var, key, value });
+                }
+            }
+            Rule::delete_tail => {
+                let mut detach = false;
+                let mut vars = Vec::new();
+                for inner in p.into_inner() {
+                    match inner.as_rule() {
+                        Rule::kw_detach => detach = true,
+                        Rule::delete_items => {
+                            for id in inner.into_inner() {
+                                vars.push(id.as_str().to_string());
+                            }
+                        }
+                        r => {
+                            return Err(Error::Parse(format!(
+                                "unexpected rule in delete tail: {:?}",
+                                r
+                            )))
+                        }
+                    }
+                }
+                delete = Some(DeleteClause { detach, vars });
             }
             r => {
                 return Err(Error::Parse(format!(
@@ -92,6 +155,8 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         return_items,
         skip,
         limit,
+        set_items,
+        delete,
     })
 }
 

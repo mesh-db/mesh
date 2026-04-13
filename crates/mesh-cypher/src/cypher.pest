@@ -4,19 +4,30 @@ query = { SOI ~ statement ~ EOI }
 
 statement = { create_stmt | match_stmt }
 
-create_stmt = { kw_create ~ node_pattern }
+create_stmt = { kw_create ~ pattern }
 
 match_stmt = {
     kw_match ~ pattern ~
     where_clause? ~
-    kw_return ~ return_items ~
-    skip_clause? ~
-    limit_clause?
+    (return_tail | set_tail | delete_tail)
 }
 
 where_clause = { kw_where ~ expression }
 skip_clause = { kw_skip ~ integer }
 limit_clause = { kw_limit ~ integer }
+
+return_tail = {
+    kw_return ~ return_items ~
+    skip_clause? ~
+    limit_clause?
+}
+
+set_tail = { kw_set ~ set_items }
+set_items = { set_item ~ ("," ~ set_item)* }
+set_item = { property_access ~ "=" ~ expression }
+
+delete_tail = { kw_detach? ~ kw_delete ~ delete_items }
+delete_items = { identifier ~ ("," ~ identifier)* }
 
 pattern = { node_pattern ~ hop* }
 hop = { rel_pattern ~ node_pattern }
@@ -73,7 +84,8 @@ id_cont = _{ ASCII_ALPHANUMERIC | "_" }
 
 reserved = @{
     (^"create" | ^"match" | ^"where" | ^"return" | ^"skip" | ^"limit" |
-     ^"as" | ^"or" | ^"and" | ^"not" | ^"true" | ^"false" | ^"null")
+     ^"as" | ^"or" | ^"and" | ^"not" | ^"true" | ^"false" | ^"null" |
+     ^"set" | ^"delete" | ^"detach")
     ~ !id_cont
 }
 
@@ -87,3 +99,6 @@ kw_as = _{ ^"as" }
 kw_or = _{ ^"or" }
 kw_and = _{ ^"and" }
 kw_not = _{ ^"not" }
+kw_set = _{ ^"set" }
+kw_delete = _{ ^"delete" }
+kw_detach = { ^"detach" }

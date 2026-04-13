@@ -6,4 +6,4 @@ mod plan;
 pub use ast::*;
 pub use error::{Error, Result};
 pub use parser::parse;
-pub use plan::{plan, LogicalPlan};
+pub use plan::{plan, CreateEdgeSpec, CreateNodeSpec, LogicalPlan, SetAssignment};

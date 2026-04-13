@@ -6,7 +6,7 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateStmt {
-    pub node: NodePattern,
+    pub pattern: Pattern,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,6 +16,21 @@ pub struct MatchStmt {
     pub return_items: Vec<ReturnItem>,
     pub skip: Option<i64>,
     pub limit: Option<i64>,
+    pub set_items: Vec<SetItem>,
+    pub delete: Option<DeleteClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetItem {
+    pub var: String,
+    pub key: String,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteClause {
+    pub detach: bool,
+    pub vars: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
