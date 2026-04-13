@@ -1,0 +1,15 @@
+[package]
+name = "mesh-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Physical operators and query execution for Mesh"
+
+[dependencies]
+mesh-core = { path = "../mesh-core" }
+mesh-storage = { path = "../mesh-storage" }
+mesh-cypher = { path = "../mesh-cypher" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

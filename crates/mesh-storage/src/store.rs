@@ -2,7 +2,7 @@ use crate::{
     error::{Error, Result},
     keys::{
         adj_key, edge_from_adj_key, id_from_str_index_key, label_index_key, label_index_prefix,
-        node_from_adj_value, type_index_key, type_index_prefix,
+        node_from_adj_value, type_index_key, type_index_prefix, ID_LEN,
     },
 };
 use mesh_core::{Edge, EdgeId, Node, NodeId};
@@ -176,6 +176,25 @@ impl Store {
         batch.delete_cf(nodes_cf, id.as_bytes());
         self.db.write(batch)?;
         Ok(())
+    }
+
+    pub fn all_node_ids(&self) -> Result<Vec<NodeId>> {
+        let cf = self.cf(CF_NODES)?;
+        let mut results = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (key, _) = item?;
+            if key.len() != ID_LEN {
+                return Err(Error::CorruptBytes {
+                    cf: CF_NODES,
+                    expected: ID_LEN,
+                    actual: key.len(),
+                });
+            }
+            let mut bytes = [0u8; ID_LEN];
+            bytes.copy_from_slice(&key);
+            results.push(NodeId::from_bytes(bytes));
+        }
+        Ok(results)
     }
 
     pub fn outgoing(&self, source: NodeId) -> Result<Vec<(EdgeId, NodeId)>> {
