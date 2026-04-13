@@ -1,4 +1,4 @@
-use crate::ast::{CreateStmt, Expr, Literal, MatchStmt, ReturnItem, Statement};
+use crate::ast::{CreateStmt, Direction, Expr, Literal, MatchStmt, ReturnItem, Statement};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
@@ -8,6 +8,15 @@ pub enum LogicalPlan {
     NodeScanByLabel {
         var: String,
         label: String,
+    },
+    EdgeExpand {
+        input: Box<LogicalPlan>,
+        src_var: String,
+        edge_var: Option<String>,
+        dst_var: String,
+        dst_label: Option<String>,
+        edge_type: Option<String>,
+        direction: Direction,
     },
     Filter {
         input: Box<LogicalPlan>,
@@ -47,19 +56,41 @@ fn plan_create(stmt: &CreateStmt) -> LogicalPlan {
 }
 
 fn plan_match(stmt: &MatchStmt) -> LogicalPlan {
-    let var = stmt
-        .node
+    let start_var = stmt
+        .pattern
+        .start
         .var
         .clone()
-        .unwrap_or_else(|| "__anon".to_string());
+        .unwrap_or_else(|| "__a0".to_string());
 
-    let mut plan = match &stmt.node.label {
+    let mut plan = match &stmt.pattern.start.label {
         Some(label) => LogicalPlan::NodeScanByLabel {
-            var: var.clone(),
+            var: start_var.clone(),
             label: label.clone(),
         },
-        None => LogicalPlan::NodeScanAll { var: var.clone() },
+        None => LogicalPlan::NodeScanAll {
+            var: start_var.clone(),
+        },
     };
+
+    let mut current_var = start_var;
+    for (i, hop) in stmt.pattern.hops.iter().enumerate() {
+        let dst_var = hop
+            .target
+            .var
+            .clone()
+            .unwrap_or_else(|| format!("__a{}", i + 1));
+        plan = LogicalPlan::EdgeExpand {
+            input: Box::new(plan),
+            src_var: current_var.clone(),
+            edge_var: hop.rel.var.clone(),
+            dst_var: dst_var.clone(),
+            dst_label: hop.target.label.clone(),
+            edge_type: hop.rel.edge_type.clone(),
+            direction: hop.rel.direction,
+        };
+        current_var = dst_var;
+    }
 
     if let Some(predicate) = &stmt.where_clause {
         plan = LogicalPlan::Filter {

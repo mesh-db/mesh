@@ -7,7 +7,7 @@ statement = { create_stmt | match_stmt }
 create_stmt = { kw_create ~ node_pattern }
 
 match_stmt = {
-    kw_match ~ node_pattern ~
+    kw_match ~ pattern ~
     where_clause? ~
     kw_return ~ return_items ~
     skip_clause? ~
@@ -17,6 +17,16 @@ match_stmt = {
 where_clause = { kw_where ~ expression }
 skip_clause = { kw_skip ~ integer }
 limit_clause = { kw_limit ~ integer }
+
+pattern = { node_pattern ~ hop* }
+hop = { rel_pattern ~ node_pattern }
+
+rel_pattern = { rel_right | rel_left | rel_both }
+rel_right = { "-" ~ rel_detail? ~ "->" }
+rel_left = { "<-" ~ rel_detail? ~ "-" }
+rel_both = { "-" ~ rel_detail? ~ "-" }
+rel_detail = { "[" ~ identifier? ~ rel_type_spec? ~ "]" }
+rel_type_spec = { ":" ~ identifier }
 
 node_pattern = { "(" ~ identifier? ~ label_spec? ~ properties? ~ ")" }
 label_spec = { ":" ~ identifier }

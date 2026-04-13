@@ -1,10 +1,10 @@
 use crate::{
-    error::Result,
+    error::{Error, Result},
     eval::{eval_expr, literal_to_property, to_bool},
     value::{Row, Value},
 };
-use mesh_core::{Node, NodeId};
-use mesh_cypher::{Expr, Literal, LogicalPlan, ReturnItem};
+use mesh_core::{EdgeId, Node, NodeId};
+use mesh_cypher::{Direction, Expr, Literal, LogicalPlan, ReturnItem};
 use mesh_storage::Store;
 
 pub struct ExecCtx<'a> {
@@ -34,6 +34,23 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
         LogicalPlan::NodeScanByLabel { var, label } => {
             Box::new(NodeScanByLabelOp::new(var.clone(), label.clone()))
         }
+        LogicalPlan::EdgeExpand {
+            input,
+            src_var,
+            edge_var,
+            dst_var,
+            dst_label,
+            edge_type,
+            direction,
+        } => Box::new(EdgeExpandOp::new(
+            build_op(input),
+            src_var.clone(),
+            edge_var.clone(),
+            dst_var.clone(),
+            dst_label.clone(),
+            edge_type.clone(),
+            *direction,
+        )),
         LogicalPlan::Filter { input, predicate } => {
             Box::new(FilterOp::new(build_op(input), predicate.clone()))
         }
@@ -148,6 +165,107 @@ impl Operator for NodeScanByLabelOp {
             }
         }
         Ok(None)
+    }
+}
+
+struct EdgeExpandOp {
+    input: Box<dyn Operator>,
+    src_var: String,
+    edge_var: Option<String>,
+    dst_var: String,
+    dst_label: Option<String>,
+    edge_type: Option<String>,
+    direction: Direction,
+    current_row: Option<Row>,
+    pending: Vec<(EdgeId, NodeId)>,
+    pending_idx: usize,
+}
+
+impl EdgeExpandOp {
+    fn new(
+        input: Box<dyn Operator>,
+        src_var: String,
+        edge_var: Option<String>,
+        dst_var: String,
+        dst_label: Option<String>,
+        edge_type: Option<String>,
+        direction: Direction,
+    ) -> Self {
+        Self {
+            input,
+            src_var,
+            edge_var,
+            dst_var,
+            dst_label,
+            edge_type,
+            direction,
+            current_row: None,
+            pending: Vec::new(),
+            pending_idx: 0,
+        }
+    }
+}
+
+impl Operator for EdgeExpandOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            while self.pending_idx < self.pending.len() {
+                let (edge_id, neighbor_id) = self.pending[self.pending_idx];
+                self.pending_idx += 1;
+
+                let edge = match ctx.store.get_edge(edge_id)? {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if let Some(t) = &self.edge_type {
+                    if &edge.edge_type != t {
+                        continue;
+                    }
+                }
+
+                let neighbor = match ctx.store.get_node(neighbor_id)? {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if let Some(l) = &self.dst_label {
+                    if !neighbor.labels.contains(l) {
+                        continue;
+                    }
+                }
+
+                let base = self
+                    .current_row
+                    .as_ref()
+                    .expect("pending edges without source row");
+                let mut out = base.clone();
+                if let Some(ev) = &self.edge_var {
+                    out.insert(ev.clone(), Value::Edge(edge));
+                }
+                out.insert(self.dst_var.clone(), Value::Node(neighbor));
+                return Ok(Some(out));
+            }
+
+            match self.input.next(ctx)? {
+                None => return Ok(None),
+                Some(row) => {
+                    let src_id = match row.get(&self.src_var) {
+                        Some(Value::Node(n)) => n.id,
+                        _ => return Err(Error::UnboundVariable(self.src_var.clone())),
+                    };
+                    self.pending = match self.direction {
+                        Direction::Outgoing => ctx.store.outgoing(src_id)?,
+                        Direction::Incoming => ctx.store.incoming(src_id)?,
+                        Direction::Both => {
+                            let mut all = ctx.store.outgoing(src_id)?;
+                            all.extend(ctx.store.incoming(src_id)?);
+                            all
+                        }
+                    };
+                    self.pending_idx = 0;
+                    self.current_row = Some(row);
+                }
+            }
+        }
     }
 }
 

@@ -11,11 +11,37 @@ pub struct CreateStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchStmt {
-    pub node: NodePattern,
+    pub pattern: Pattern,
     pub where_clause: Option<Expr>,
     pub return_items: Vec<ReturnItem>,
     pub skip: Option<i64>,
     pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pattern {
+    pub start: NodePattern,
+    pub hops: Vec<Hop>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hop {
+    pub rel: RelPattern,
+    pub target: NodePattern,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelPattern {
+    pub var: Option<String>,
+    pub edge_type: Option<String>,
+    pub direction: Direction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Outgoing,
+    Incoming,
+    Both,
 }
 
 #[derive(Debug, Clone, PartialEq)]

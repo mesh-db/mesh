@@ -51,11 +51,73 @@ fn anonymous_labeled_node() {
 #[test]
 fn simple_match_return() {
     let m = unwrap_match(parse("MATCH (n:Person) RETURN n").unwrap());
-    assert_eq!(m.node.var.as_deref(), Some("n"));
-    assert_eq!(m.node.label.as_deref(), Some("Person"));
+    assert_eq!(m.pattern.start.var.as_deref(), Some("n"));
+    assert_eq!(m.pattern.start.label.as_deref(), Some("Person"));
+    assert!(m.pattern.hops.is_empty());
     assert_eq!(m.return_items.len(), 1);
     assert_eq!(m.return_items[0].expr, Expr::Identifier("n".into()));
     assert!(m.return_items[0].alias.is_none());
+}
+
+#[test]
+fn single_hop_directed() {
+    let m = unwrap_match(
+        parse("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b").unwrap(),
+    );
+    assert_eq!(m.pattern.hops.len(), 1);
+    let hop = &m.pattern.hops[0];
+    assert_eq!(hop.rel.direction, Direction::Outgoing);
+    assert_eq!(hop.rel.var.as_deref(), Some("r"));
+    assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(hop.target.var.as_deref(), Some("b"));
+    assert_eq!(hop.target.label.as_deref(), Some("Person"));
+}
+
+#[test]
+fn single_hop_anonymous_rel() {
+    let m = unwrap_match(parse("MATCH (a)-->(b) RETURN a, b").unwrap());
+    let hop = &m.pattern.hops[0];
+    assert_eq!(hop.rel.direction, Direction::Outgoing);
+    assert!(hop.rel.var.is_none());
+    assert!(hop.rel.edge_type.is_none());
+}
+
+#[test]
+fn single_hop_type_only() {
+    let m = unwrap_match(parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap());
+    let hop = &m.pattern.hops[0];
+    assert!(hop.rel.var.is_none());
+    assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(hop.rel.direction, Direction::Outgoing);
+}
+
+#[test]
+fn single_hop_incoming() {
+    let m = unwrap_match(parse("MATCH (a)<-[r:KNOWS]-(b) RETURN a, b").unwrap());
+    let hop = &m.pattern.hops[0];
+    assert_eq!(hop.rel.direction, Direction::Incoming);
+    assert_eq!(hop.rel.var.as_deref(), Some("r"));
+    assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+}
+
+#[test]
+fn single_hop_undirected() {
+    let m = unwrap_match(parse("MATCH (a)-[:KNOWS]-(b) RETURN a, b").unwrap());
+    let hop = &m.pattern.hops[0];
+    assert_eq!(hop.rel.direction, Direction::Both);
+    assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+}
+
+#[test]
+fn multi_hop_chain() {
+    let m = unwrap_match(
+        parse("MATCH (a)-[:KNOWS]->(b)-[:WORKS_AT]->(c) RETURN a, c").unwrap(),
+    );
+    assert_eq!(m.pattern.hops.len(), 2);
+    assert_eq!(m.pattern.hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(m.pattern.hops[0].target.var.as_deref(), Some("b"));
+    assert_eq!(m.pattern.hops[1].rel.edge_type.as_deref(), Some("WORKS_AT"));
+    assert_eq!(m.pattern.hops[1].target.var.as_deref(), Some("c"));
 }
 
 #[test]

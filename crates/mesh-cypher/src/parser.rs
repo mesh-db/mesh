@@ -46,7 +46,7 @@ fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
 }
 
 fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
-    let mut node = None;
+    let mut pattern = None;
     let mut where_clause = None;
     let mut return_items = Vec::new();
     let mut skip = None;
@@ -54,7 +54,7 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
 
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::node_pattern => node = Some(build_node_pattern(p)?),
+            Rule::pattern => pattern = Some(build_pattern(p)?),
             Rule::where_clause => {
                 let expr_pair = p
                     .into_inner()
@@ -87,11 +87,84 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     }
 
     Ok(MatchStmt {
-        node: node.ok_or_else(|| Error::Parse("missing node pattern".into()))?,
+        pattern: pattern.ok_or_else(|| Error::Parse("missing pattern".into()))?,
         where_clause,
         return_items,
         skip,
         limit,
+    })
+}
+
+fn build_pattern(pair: Pair<Rule>) -> Result<Pattern> {
+    let mut inner = pair.into_inner();
+    let start_pair = inner
+        .next()
+        .ok_or_else(|| Error::Parse("empty pattern".into()))?;
+    let start = build_node_pattern(start_pair)?;
+    let mut hops = Vec::new();
+    for hop_pair in inner {
+        debug_assert_eq!(hop_pair.as_rule(), Rule::hop);
+        hops.push(build_hop(hop_pair)?);
+    }
+    Ok(Pattern { start, hops })
+}
+
+fn build_hop(pair: Pair<Rule>) -> Result<Hop> {
+    let mut inner = pair.into_inner();
+    let rel_pair = inner
+        .next()
+        .ok_or_else(|| Error::Parse("missing rel in hop".into()))?;
+    let target_pair = inner
+        .next()
+        .ok_or_else(|| Error::Parse("missing target in hop".into()))?;
+    Ok(Hop {
+        rel: build_rel_pattern(rel_pair)?,
+        target: build_node_pattern(target_pair)?,
+    })
+}
+
+fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
+    debug_assert_eq!(pair.as_rule(), Rule::rel_pattern);
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty rel pattern".into()))?;
+    let direction = match inner.as_rule() {
+        Rule::rel_right => Direction::Outgoing,
+        Rule::rel_left => Direction::Incoming,
+        Rule::rel_both => Direction::Both,
+        r => return Err(Error::Parse(format!("unexpected rel rule: {:?}", r))),
+    };
+
+    let mut var = None;
+    let mut edge_type = None;
+    for p in inner.into_inner() {
+        if p.as_rule() == Rule::rel_detail {
+            for d in p.into_inner() {
+                match d.as_rule() {
+                    Rule::identifier => var = Some(d.as_str().to_string()),
+                    Rule::rel_type_spec => {
+                        let id = d
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| Error::Parse("empty rel type".into()))?;
+                        edge_type = Some(id.as_str().to_string());
+                    }
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rel detail rule: {:?}",
+                            r
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(RelPattern {
+        var,
+        edge_type,
+        direction,
     })
 }
 
