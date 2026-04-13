@@ -32,9 +32,19 @@ pub fn execute(plan: &LogicalPlan, store: &Store) -> Result<Vec<Row>> {
 
 fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
     match plan {
-        LogicalPlan::CreatePath { nodes, edges } => {
-            Box::new(CreatePathOp::new(nodes.clone(), edges.clone()))
-        }
+        LogicalPlan::CreatePath {
+            input,
+            nodes,
+            edges,
+        } => Box::new(CreatePathOp::new(
+            input.as_ref().map(|p| build_op(p)),
+            nodes.clone(),
+            edges.clone(),
+        )),
+        LogicalPlan::CartesianProduct { left, right } => Box::new(CartesianProductOp::new(
+            build_op(left),
+            (**right).clone(),
+        )),
         LogicalPlan::Delete {
             input,
             detach,
@@ -111,18 +121,57 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
 }
 
 struct CreatePathOp {
+    input: Option<Box<dyn Operator>>,
     nodes: Vec<CreateNodeSpec>,
     edges: Vec<CreateEdgeSpec>,
     done: bool,
 }
 
 impl CreatePathOp {
-    fn new(nodes: Vec<CreateNodeSpec>, edges: Vec<CreateEdgeSpec>) -> Self {
+    fn new(
+        input: Option<Box<dyn Operator>>,
+        nodes: Vec<CreateNodeSpec>,
+        edges: Vec<CreateEdgeSpec>,
+    ) -> Self {
         Self {
+            input,
             nodes,
             edges,
             done: false,
         }
+    }
+
+    fn apply(&self, ctx: &ExecCtx, row: &Row) -> Result<()> {
+        let mut node_ids: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
+        for spec in &self.nodes {
+            match spec {
+                CreateNodeSpec::New { labels, properties } => {
+                    let mut node = Node::new();
+                    for label in labels {
+                        node.labels.push(label.clone());
+                    }
+                    for (k, v) in properties {
+                        node.properties.insert(k.clone(), literal_to_property(v));
+                    }
+                    ctx.store.put_node(&node)?;
+                    node_ids.push(node.id);
+                }
+                CreateNodeSpec::Reference(name) => {
+                    let id = match row.get(name) {
+                        Some(Value::Node(n)) => n.id,
+                        _ => return Err(Error::UnboundVariable(name.clone())),
+                    };
+                    node_ids.push(id);
+                }
+            }
+        }
+        for spec in &self.edges {
+            let src = node_ids[spec.src_idx];
+            let dst = node_ids[spec.dst_idx];
+            let edge = Edge::new(spec.edge_type.clone(), src, dst);
+            ctx.store.put_edge(&edge)?;
+        }
+        Ok(())
     }
 }
 
@@ -133,25 +182,67 @@ impl Operator for CreatePathOp {
         }
         self.done = true;
 
-        let mut node_ids: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
-        for spec in &self.nodes {
-            let mut node = Node::new();
-            for label in &spec.labels {
-                node.labels.push(label.clone());
+        if let Some(input) = self.input.as_mut() {
+            let mut rows: Vec<Row> = Vec::new();
+            while let Some(row) = input.next(ctx)? {
+                rows.push(row);
             }
-            for (k, v) in &spec.properties {
-                node.properties.insert(k.clone(), literal_to_property(v));
+            for row in &rows {
+                self.apply(ctx, row)?;
             }
-            ctx.store.put_node(&node)?;
-            node_ids.push(node.id);
-        }
-        for spec in &self.edges {
-            let src = node_ids[spec.src_idx];
-            let dst = node_ids[spec.dst_idx];
-            let edge = Edge::new(spec.edge_type.clone(), src, dst);
-            ctx.store.put_edge(&edge)?;
+        } else {
+            let empty = Row::new();
+            self.apply(ctx, &empty)?;
         }
         Ok(None)
+    }
+}
+
+struct CartesianProductOp {
+    left: Box<dyn Operator>,
+    right_plan: LogicalPlan,
+    left_row: Option<Row>,
+    right_op: Option<Box<dyn Operator>>,
+}
+
+impl CartesianProductOp {
+    fn new(left: Box<dyn Operator>, right_plan: LogicalPlan) -> Self {
+        Self {
+            left,
+            right_plan,
+            left_row: None,
+            right_op: None,
+        }
+    }
+}
+
+impl Operator for CartesianProductOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            if self.left_row.is_none() {
+                match self.left.next(ctx)? {
+                    None => return Ok(None),
+                    Some(row) => {
+                        self.left_row = Some(row);
+                        self.right_op = Some(build_op(&self.right_plan));
+                    }
+                }
+            }
+            let right_op = self.right_op.as_mut().expect("right_op set");
+            match right_op.next(ctx)? {
+                Some(right_row) => {
+                    let mut combined = self.left_row.as_ref().unwrap().clone();
+                    for (k, v) in right_row {
+                        combined.insert(k, v);
+                    }
+                    return Ok(Some(combined));
+                }
+                None => {
+                    self.left_row = None;
+                    self.right_op = None;
+                }
+            }
+        }
     }
 }
 

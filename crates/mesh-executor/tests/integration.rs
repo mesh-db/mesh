@@ -374,6 +374,151 @@ fn expand_yields_no_rows_when_no_edges() {
     assert!(rows.is_empty());
 }
 
+#[test]
+fn multi_pattern_cartesian_product() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (a:Person {name: 'Ada'})");
+    run(&store, "CREATE (b:Person {name: 'Alan'})");
+    run(&store, "CREATE (c:Company {name: 'Acme'})");
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person), (c:Company) RETURN p.name AS person, c.name AS company",
+    );
+    assert_eq!(rows.len(), 2);
+    let mut pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "person"), str_prop(r, "company")))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Ada".to_string(), "Acme".to_string()),
+            ("Alan".to_string(), "Acme".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn multi_pattern_match_with_where_filters_join() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (a:Person {name: 'Ada', age: 37})");
+    run(&store, "CREATE (b:Person {name: 'Alan', age: 41})");
+    run(&store, "CREATE (c:Company {name: 'Acme', budget: 100})");
+    run(&store, "CREATE (d:Company {name: 'Beta', budget: 50})");
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person), (co:Company) WHERE p.age > 40 AND co.budget > 75 RETURN p.name AS p, co.name AS c",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "p"), "Alan");
+    assert_eq!(str_prop(&rows[0], "c"), "Acme");
+}
+
+#[test]
+fn multi_pattern_match_same_var_rejected() {
+    let (store, _d) = open_store();
+    let _ = &store;
+    let stmt = parse("MATCH (a), (a) RETURN a").unwrap();
+    let err = plan(&stmt).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("multiple MATCH patterns"), "msg: {msg}");
+}
+
+#[test]
+fn multi_pattern_create_builds_independent_nodes() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Alan'})",
+    );
+
+    let rows = run(&store, "MATCH (p:Person) RETURN p.name AS name");
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada", "Alan"]);
+}
+
+#[test]
+fn match_create_links_existing_nodes() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (a:Person {name: 'Ada'})");
+    run(&store, "CREATE (b:Person {name: 'Alan'})");
+
+    run(
+        &store,
+        "MATCH (a:Person), (b:Person) WHERE a.name = 'Ada' AND b.name = 'Alan' CREATE (a)-[:KNOWS]->(b)",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (a)-[:KNOWS]->(b) RETURN a.name AS src, b.name AS dst",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "src"), "Ada");
+    assert_eq!(str_prop(&rows[0], "dst"), "Alan");
+}
+
+#[test]
+fn match_create_can_introduce_new_node() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (a:Person {name: 'Ada'})");
+
+    run(
+        &store,
+        "MATCH (a:Person) CREATE (a)-[:WORKS_AT]->(c:Company {name: 'Acme'})",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (a:Person)-[:WORKS_AT]->(c:Company) RETURN a.name AS p, c.name AS co",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "p"), "Ada");
+    assert_eq!(str_prop(&rows[0], "co"), "Acme");
+}
+
+#[test]
+fn match_create_runs_once_per_matched_row() {
+    let (store, _d) = open_store();
+    // Three persons, each gets a fresh attached company
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+    run(&store, "CREATE (n:Person {name: 'Alan'})");
+    run(&store, "CREATE (n:Person {name: 'Grace'})");
+
+    run(
+        &store,
+        "MATCH (p:Person) CREATE (p)-[:WORKS_AT]->(c:Company)",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person)-[:WORKS_AT]->(c:Company) RETURN p.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada", "Alan", "Grace"]);
+
+    // Exactly 3 Company nodes were created.
+    let companies = run(&store, "MATCH (c:Company) RETURN c");
+    assert_eq!(companies.len(), 3);
+}
+
+#[test]
+fn match_create_self_loop_via_same_var() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Node {name: 'self'})");
+
+    run(&store, "MATCH (n:Node) CREATE (n)-[:LOOP]->(n)");
+
+    let rows = run(&store, "MATCH (a)-[:LOOP]->(b) RETURN a.name AS a, b.name AS b");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "self");
+    assert_eq!(str_prop(&rows[0], "b"), "self");
+}
+
 fn seed_people(store: &Store) {
     run(store, "CREATE (n:Person {name: 'Ada', age: 37, dept: 'eng'})");
     run(store, "CREATE (n:Person {name: 'Alan', age: 41, dept: 'eng'})");

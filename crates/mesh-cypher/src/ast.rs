@@ -6,12 +6,12 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateStmt {
-    pub pattern: Pattern,
+    pub patterns: Vec<Pattern>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchStmt {
-    pub pattern: Pattern,
+    pub patterns: Vec<Pattern>,
     pub where_clause: Option<Expr>,
     pub return_items: Vec<ReturnItem>,
     pub distinct: bool,
@@ -20,6 +20,7 @@ pub struct MatchStmt {
     pub limit: Option<i64>,
     pub set_items: Vec<SetItem>,
     pub delete: Option<DeleteClause>,
+    pub create_patterns: Vec<Pattern>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -17,23 +17,23 @@ fn unwrap_create(s: Statement) -> CreateStmt {
 #[test]
 fn empty_node_creation() {
     let c = unwrap_create(parse("CREATE ()").unwrap());
-    assert!(c.pattern.start.var.is_none());
-    assert!(c.pattern.start.label.is_none());
-    assert!(c.pattern.start.properties.is_empty());
+    assert!(c.patterns[0].start.var.is_none());
+    assert!(c.patterns[0].start.label.is_none());
+    assert!(c.patterns[0].start.properties.is_empty());
 }
 
 #[test]
 fn labeled_node_creation() {
     let c = unwrap_create(parse("CREATE (n:Person)").unwrap());
-    assert_eq!(c.pattern.start.var.as_deref(), Some("n"));
-    assert_eq!(c.pattern.start.label.as_deref(), Some("Person"));
+    assert_eq!(c.patterns[0].start.var.as_deref(), Some("n"));
+    assert_eq!(c.patterns[0].start.label.as_deref(), Some("Person"));
 }
 
 #[test]
 fn labeled_node_with_properties() {
     let c = unwrap_create(parse(r#"CREATE (n:Person {name: "Ada", age: 37})"#).unwrap());
     assert_eq!(
-        c.pattern.start.properties,
+        c.patterns[0].start.properties,
         vec![
             ("name".into(), Literal::String("Ada".into())),
             ("age".into(), Literal::Integer(37)),
@@ -44,16 +44,16 @@ fn labeled_node_with_properties() {
 #[test]
 fn anonymous_labeled_node() {
     let c = unwrap_create(parse("CREATE (:Tag)").unwrap());
-    assert!(c.pattern.start.var.is_none());
-    assert_eq!(c.pattern.start.label.as_deref(), Some("Tag"));
+    assert!(c.patterns[0].start.var.is_none());
+    assert_eq!(c.patterns[0].start.label.as_deref(), Some("Tag"));
 }
 
 #[test]
 fn simple_match_return() {
     let m = unwrap_match(parse("MATCH (n:Person) RETURN n").unwrap());
-    assert_eq!(m.pattern.start.var.as_deref(), Some("n"));
-    assert_eq!(m.pattern.start.label.as_deref(), Some("Person"));
-    assert!(m.pattern.hops.is_empty());
+    assert_eq!(m.patterns[0].start.var.as_deref(), Some("n"));
+    assert_eq!(m.patterns[0].start.label.as_deref(), Some("Person"));
+    assert!(m.patterns[0].hops.is_empty());
     assert_eq!(m.return_items.len(), 1);
     assert_eq!(m.return_items[0].expr, Expr::Identifier("n".into()));
     assert!(m.return_items[0].alias.is_none());
@@ -64,8 +64,8 @@ fn single_hop_directed() {
     let m = unwrap_match(
         parse("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b").unwrap(),
     );
-    assert_eq!(m.pattern.hops.len(), 1);
-    let hop = &m.pattern.hops[0];
+    assert_eq!(m.patterns[0].hops.len(), 1);
+    let hop = &m.patterns[0].hops[0];
     assert_eq!(hop.rel.direction, Direction::Outgoing);
     assert_eq!(hop.rel.var.as_deref(), Some("r"));
     assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
@@ -76,7 +76,7 @@ fn single_hop_directed() {
 #[test]
 fn single_hop_anonymous_rel() {
     let m = unwrap_match(parse("MATCH (a)-->(b) RETURN a, b").unwrap());
-    let hop = &m.pattern.hops[0];
+    let hop = &m.patterns[0].hops[0];
     assert_eq!(hop.rel.direction, Direction::Outgoing);
     assert!(hop.rel.var.is_none());
     assert!(hop.rel.edge_type.is_none());
@@ -85,7 +85,7 @@ fn single_hop_anonymous_rel() {
 #[test]
 fn single_hop_type_only() {
     let m = unwrap_match(parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap());
-    let hop = &m.pattern.hops[0];
+    let hop = &m.patterns[0].hops[0];
     assert!(hop.rel.var.is_none());
     assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
     assert_eq!(hop.rel.direction, Direction::Outgoing);
@@ -94,7 +94,7 @@ fn single_hop_type_only() {
 #[test]
 fn single_hop_incoming() {
     let m = unwrap_match(parse("MATCH (a)<-[r:KNOWS]-(b) RETURN a, b").unwrap());
-    let hop = &m.pattern.hops[0];
+    let hop = &m.patterns[0].hops[0];
     assert_eq!(hop.rel.direction, Direction::Incoming);
     assert_eq!(hop.rel.var.as_deref(), Some("r"));
     assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
@@ -103,9 +103,37 @@ fn single_hop_incoming() {
 #[test]
 fn single_hop_undirected() {
     let m = unwrap_match(parse("MATCH (a)-[:KNOWS]-(b) RETURN a, b").unwrap());
-    let hop = &m.pattern.hops[0];
+    let hop = &m.patterns[0].hops[0];
     assert_eq!(hop.rel.direction, Direction::Both);
     assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+}
+
+#[test]
+fn multi_pattern_match_parses() {
+    let m = unwrap_match(parse("MATCH (a:Person), (b:Company) RETURN a, b").unwrap());
+    assert_eq!(m.patterns.len(), 2);
+    assert_eq!(m.patterns[0].start.label.as_deref(), Some("Person"));
+    assert_eq!(m.patterns[1].start.label.as_deref(), Some("Company"));
+}
+
+#[test]
+fn multi_pattern_create_parses() {
+    let c = unwrap_create(parse("CREATE (a:Person), (b:Person)").unwrap());
+    assert_eq!(c.patterns.len(), 2);
+}
+
+#[test]
+fn match_create_tail_parses() {
+    let m = unwrap_match(
+        parse("MATCH (a:Person), (b:Person) CREATE (a)-[:KNOWS]->(b)").unwrap(),
+    );
+    assert_eq!(m.patterns.len(), 2);
+    assert_eq!(m.create_patterns.len(), 1);
+    assert_eq!(m.create_patterns[0].hops.len(), 1);
+    assert_eq!(
+        m.create_patterns[0].hops[0].rel.edge_type.as_deref(),
+        Some("KNOWS")
+    );
 }
 
 #[test]
@@ -176,7 +204,7 @@ fn distinct_and_order_by_combined() {
 #[test]
 fn var_length_exact_hops() {
     let m = unwrap_match(parse("MATCH (a)-[:KNOWS*3]->(b) RETURN b").unwrap());
-    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    let vl = m.patterns[0].hops[0].rel.var_length.unwrap();
     assert_eq!(vl.min, 3);
     assert_eq!(vl.max, 3);
 }
@@ -184,7 +212,7 @@ fn var_length_exact_hops() {
 #[test]
 fn var_length_bounded() {
     let m = unwrap_match(parse("MATCH (a)-[:KNOWS*1..3]->(b) RETURN b").unwrap());
-    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    let vl = m.patterns[0].hops[0].rel.var_length.unwrap();
     assert_eq!(vl.min, 1);
     assert_eq!(vl.max, 3);
 }
@@ -192,7 +220,7 @@ fn var_length_bounded() {
 #[test]
 fn var_length_min_only() {
     let m = unwrap_match(parse("MATCH (a)-[*2..]->(b) RETURN b").unwrap());
-    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    let vl = m.patterns[0].hops[0].rel.var_length.unwrap();
     assert_eq!(vl.min, 2);
     assert_eq!(vl.max, u64::MAX);
 }
@@ -200,7 +228,7 @@ fn var_length_min_only() {
 #[test]
 fn var_length_max_only() {
     let m = unwrap_match(parse("MATCH (a)-[*..4]->(b) RETURN b").unwrap());
-    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    let vl = m.patterns[0].hops[0].rel.var_length.unwrap();
     assert_eq!(vl.min, 1);
     assert_eq!(vl.max, 4);
 }
@@ -208,7 +236,7 @@ fn var_length_max_only() {
 #[test]
 fn var_length_unbounded_star() {
     let m = unwrap_match(parse("MATCH (a)-[*]->(b) RETURN b").unwrap());
-    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    let vl = m.patterns[0].hops[0].rel.var_length.unwrap();
     assert_eq!(vl.min, 1);
     assert_eq!(vl.max, u64::MAX);
 }
@@ -218,7 +246,7 @@ fn var_length_with_var_and_type() {
     let m = unwrap_match(
         parse("MATCH (a)-[r:KNOWS*1..3]->(b) RETURN r").unwrap(),
     );
-    let rel = &m.pattern.hops[0].rel;
+    let rel = &m.patterns[0].hops[0].rel;
     assert_eq!(rel.var.as_deref(), Some("r"));
     assert_eq!(rel.edge_type.as_deref(), Some("KNOWS"));
     let vl = rel.var_length.unwrap();
@@ -229,16 +257,16 @@ fn var_length_with_var_and_type() {
 #[test]
 fn single_hop_has_no_var_length() {
     let m = unwrap_match(parse("MATCH (a)-[r:KNOWS]->(b) RETURN b").unwrap());
-    assert!(m.pattern.hops[0].rel.var_length.is_none());
+    assert!(m.patterns[0].hops[0].rel.var_length.is_none());
 }
 
 #[test]
 fn create_path_with_relationship() {
     let c = unwrap_create(parse("CREATE (a:Person)-[:KNOWS]->(b:Person)").unwrap());
-    assert_eq!(c.pattern.hops.len(), 1);
-    assert_eq!(c.pattern.start.label.as_deref(), Some("Person"));
-    assert_eq!(c.pattern.hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
-    assert_eq!(c.pattern.hops[0].target.label.as_deref(), Some("Person"));
+    assert_eq!(c.patterns[0].hops.len(), 1);
+    assert_eq!(c.patterns[0].start.label.as_deref(), Some("Person"));
+    assert_eq!(c.patterns[0].hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(c.patterns[0].hops[0].target.label.as_deref(), Some("Person"));
 }
 
 #[test]
@@ -289,11 +317,11 @@ fn multi_hop_chain() {
     let m = unwrap_match(
         parse("MATCH (a)-[:KNOWS]->(b)-[:WORKS_AT]->(c) RETURN a, c").unwrap(),
     );
-    assert_eq!(m.pattern.hops.len(), 2);
-    assert_eq!(m.pattern.hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
-    assert_eq!(m.pattern.hops[0].target.var.as_deref(), Some("b"));
-    assert_eq!(m.pattern.hops[1].rel.edge_type.as_deref(), Some("WORKS_AT"));
-    assert_eq!(m.pattern.hops[1].target.var.as_deref(), Some("c"));
+    assert_eq!(m.patterns[0].hops.len(), 2);
+    assert_eq!(m.patterns[0].hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(m.patterns[0].hops[0].target.var.as_deref(), Some("b"));
+    assert_eq!(m.patterns[0].hops[1].rel.edge_type.as_deref(), Some("WORKS_AT"));
+    assert_eq!(m.patterns[0].hops[1].target.var.as_deref(), Some("c"));
 }
 
 #[test]
@@ -396,7 +424,7 @@ fn limit_only() {
 fn negative_and_float_literals() {
     let c = unwrap_create(parse(r#"CREATE (n {x: -3.14, y: -42, z: 2.5})"#).unwrap());
     assert_eq!(
-        c.pattern.start.properties,
+        c.patterns[0].start.properties,
         vec![
             ("x".into(), Literal::Float(-3.14)),
             ("y".into(), Literal::Integer(-42)),
@@ -409,7 +437,7 @@ fn negative_and_float_literals() {
 fn boolean_and_null_literals() {
     let c = unwrap_create(parse(r#"CREATE (n {a: true, b: false, c: null})"#).unwrap());
     assert_eq!(
-        c.pattern.start.properties,
+        c.patterns[0].start.properties,
         vec![
             ("a".into(), Literal::Boolean(true)),
             ("b".into(), Literal::Boolean(false)),
@@ -422,7 +450,7 @@ fn boolean_and_null_literals() {
 fn single_quoted_string() {
     let c = unwrap_create(parse("CREATE (n {name: 'Ada'})").unwrap());
     assert_eq!(
-        c.pattern.start.properties,
+        c.patterns[0].start.properties,
         vec![("name".into(), Literal::String("Ada".into()))]
     );
 }

@@ -36,17 +36,27 @@ fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
 }
 
 fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
-    let pattern_pair = pair
+    let pattern_list_pair = pair
         .into_inner()
         .next()
-        .ok_or_else(|| Error::Parse("missing pattern".into()))?;
+        .ok_or_else(|| Error::Parse("missing pattern list".into()))?;
     Ok(CreateStmt {
-        pattern: build_pattern(pattern_pair)?,
+        patterns: build_pattern_list(pattern_list_pair)?,
     })
 }
 
+fn build_pattern_list(pair: Pair<Rule>) -> Result<Vec<Pattern>> {
+    debug_assert_eq!(pair.as_rule(), Rule::pattern_list);
+    let mut patterns = Vec::new();
+    for p in pair.into_inner() {
+        debug_assert_eq!(p.as_rule(), Rule::pattern);
+        patterns.push(build_pattern(p)?);
+    }
+    Ok(patterns)
+}
+
 fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
-    let mut pattern = None;
+    let mut patterns: Vec<Pattern> = Vec::new();
     let mut where_clause = None;
     let mut return_items = Vec::new();
     let mut distinct = false;
@@ -55,10 +65,18 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     let mut limit = None;
     let mut set_items = Vec::new();
     let mut delete = None;
+    let mut create_patterns: Vec<Pattern> = Vec::new();
 
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::pattern => pattern = Some(build_pattern(p)?),
+            Rule::pattern_list => patterns = build_pattern_list(p)?,
+            Rule::create_tail => {
+                let list = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("create tail missing pattern list".into()))?;
+                create_patterns = build_pattern_list(list)?;
+            }
             Rule::where_clause => {
                 let expr_pair = p
                     .into_inner()
@@ -153,8 +171,12 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         }
     }
 
+    if patterns.is_empty() {
+        return Err(Error::Parse("missing pattern".into()));
+    }
+
     Ok(MatchStmt {
-        pattern: pattern.ok_or_else(|| Error::Parse("missing pattern".into()))?,
+        patterns,
         where_clause,
         return_items,
         distinct,
@@ -163,6 +185,7 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         limit,
         set_items,
         delete,
+        create_patterns,
     })
 }
 

@@ -1,9 +1,9 @@
 use crate::ast::{
-    CallArgs, CreateStmt, Direction, Expr, Literal, MatchStmt, NodePattern, ReturnItem, SortItem,
-    Statement,
+    CallArgs, CreateStmt, Direction, Expr, Literal, MatchStmt, NodePattern, Pattern, ReturnItem,
+    SortItem, Statement,
 };
 use crate::error::{Error, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
@@ -63,8 +63,13 @@ pub enum LogicalPlan {
         count: i64,
     },
     CreatePath {
+        input: Option<Box<LogicalPlan>>,
         nodes: Vec<CreateNodeSpec>,
         edges: Vec<CreateEdgeSpec>,
+    },
+    CartesianProduct {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
     },
     Delete {
         input: Box<LogicalPlan>,
@@ -78,9 +83,12 @@ pub enum LogicalPlan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct CreateNodeSpec {
-    pub labels: Vec<String>,
-    pub properties: Vec<(String, Literal)>,
+pub enum CreateNodeSpec {
+    New {
+        labels: Vec<String>,
+        properties: Vec<(String, Literal)>,
+    },
+    Reference(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,12 +151,37 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
     let mut nodes: Vec<CreateNodeSpec> = Vec::new();
     let mut edges: Vec<CreateEdgeSpec> = Vec::new();
     let mut var_idx: HashMap<String, usize> = HashMap::new();
+    let no_bindings: HashSet<String> = HashSet::new();
 
-    let start_idx = add_create_node(&mut nodes, &mut var_idx, &stmt.pattern.start);
+    for pattern in &stmt.patterns {
+        build_create_pattern(
+            pattern,
+            &mut nodes,
+            &mut edges,
+            &mut var_idx,
+            &no_bindings,
+        )?;
+    }
+
+    Ok(LogicalPlan::CreatePath {
+        input: None,
+        nodes,
+        edges,
+    })
+}
+
+fn build_create_pattern(
+    pattern: &Pattern,
+    nodes: &mut Vec<CreateNodeSpec>,
+    edges: &mut Vec<CreateEdgeSpec>,
+    var_idx: &mut HashMap<String, usize>,
+    bound_vars: &HashSet<String>,
+) -> Result<()> {
+    let start_idx = add_create_node(nodes, var_idx, bound_vars, &pattern.start);
     let mut prev_idx = start_idx;
 
-    for hop in &stmt.pattern.hops {
-        let target_idx = add_create_node(&mut nodes, &mut var_idx, &hop.target);
+    for hop in &pattern.hops {
+        let target_idx = add_create_node(nodes, var_idx, bound_vars, &hop.target);
 
         let edge_type = hop.rel.edge_type.clone().ok_or_else(|| {
             Error::Plan("CREATE relationship must specify a type (e.g. [:KNOWS])".into())
@@ -171,13 +204,13 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
         });
         prev_idx = target_idx;
     }
-
-    Ok(LogicalPlan::CreatePath { nodes, edges })
+    Ok(())
 }
 
 fn add_create_node(
     nodes: &mut Vec<CreateNodeSpec>,
     var_idx: &mut HashMap<String, usize>,
+    bound_vars: &HashSet<String>,
     pattern: &NodePattern,
 ) -> usize {
     if let Some(name) = &pattern.var {
@@ -186,25 +219,28 @@ fn add_create_node(
         }
     }
     let idx = nodes.len();
-    nodes.push(CreateNodeSpec {
-        labels: pattern.label.clone().into_iter().collect(),
-        properties: pattern.properties.clone(),
-    });
+    let spec = match &pattern.var {
+        Some(name) if bound_vars.contains(name) => CreateNodeSpec::Reference(name.clone()),
+        _ => CreateNodeSpec::New {
+            labels: pattern.label.clone().into_iter().collect(),
+            properties: pattern.properties.clone(),
+        },
+    };
+    nodes.push(spec);
     if let Some(name) = &pattern.var {
         var_idx.insert(name.clone(), idx);
     }
     idx
 }
 
-fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
-    let start_var = stmt
-        .pattern
+fn plan_pattern(pattern: &Pattern, pattern_idx: usize) -> Result<LogicalPlan> {
+    let start_var = pattern
         .start
         .var
         .clone()
-        .unwrap_or_else(|| "__a0".to_string());
+        .unwrap_or_else(|| format!("__p{}_a0", pattern_idx));
 
-    let mut plan = match &stmt.pattern.start.label {
+    let mut plan = match &pattern.start.label {
         Some(label) => LogicalPlan::NodeScanByLabel {
             var: start_var.clone(),
             label: label.clone(),
@@ -215,12 +251,12 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
     };
 
     let mut current_var = start_var;
-    for (i, hop) in stmt.pattern.hops.iter().enumerate() {
+    for (i, hop) in pattern.hops.iter().enumerate() {
         let dst_var = hop
             .target
             .var
             .clone()
-            .unwrap_or_else(|| format!("__a{}", i + 1));
+            .unwrap_or_else(|| format!("__p{}_a{}", pattern_idx, i + 1));
         plan = if let Some(vl) = hop.rel.var_length {
             if vl.min > vl.max {
                 return Err(Error::Plan(format!(
@@ -252,12 +288,70 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
         };
         current_var = dst_var;
     }
+    Ok(plan)
+}
+
+fn collect_pattern_vars(pattern: &Pattern, out: &mut HashSet<String>) {
+    if let Some(var) = &pattern.start.var {
+        out.insert(var.clone());
+    }
+    for hop in &pattern.hops {
+        if let Some(var) = &hop.rel.var {
+            out.insert(var.clone());
+        }
+        if let Some(var) = &hop.target.var {
+            out.insert(var.clone());
+        }
+    }
+}
+
+fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
+    // Validate no shared variable names across the pattern list (not yet supported).
+    let mut all_vars: HashSet<String> = HashSet::new();
+    for pattern in &stmt.patterns {
+        let mut this_vars: HashSet<String> = HashSet::new();
+        collect_pattern_vars(pattern, &mut this_vars);
+        for var in this_vars {
+            if !all_vars.insert(var.clone()) {
+                return Err(Error::Plan(format!(
+                    "variable '{}' appears in multiple MATCH patterns; not yet supported",
+                    var
+                )));
+            }
+        }
+    }
+
+    let mut plans: Vec<LogicalPlan> = Vec::new();
+    for (i, pattern) in stmt.patterns.iter().enumerate() {
+        plans.push(plan_pattern(pattern, i)?);
+    }
+    let mut plan = plans.remove(0);
+    for rhs in plans {
+        plan = LogicalPlan::CartesianProduct {
+            left: Box::new(plan),
+            right: Box::new(rhs),
+        };
+    }
 
     if let Some(predicate) = &stmt.where_clause {
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate: predicate.clone(),
         };
+    }
+
+    if !stmt.create_patterns.is_empty() {
+        let mut nodes: Vec<CreateNodeSpec> = Vec::new();
+        let mut edges: Vec<CreateEdgeSpec> = Vec::new();
+        let mut var_idx: HashMap<String, usize> = HashMap::new();
+        for pattern in &stmt.create_patterns {
+            build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &all_vars)?;
+        }
+        return Ok(LogicalPlan::CreatePath {
+            input: Some(Box::new(plan)),
+            nodes,
+            edges,
+        });
     }
 
     if let Some(delete_clause) = &stmt.delete {

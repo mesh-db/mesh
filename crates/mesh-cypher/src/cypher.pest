@@ -4,13 +4,16 @@ query = { SOI ~ statement ~ EOI }
 
 statement = { create_stmt | match_stmt }
 
-create_stmt = { kw_create ~ pattern }
+create_stmt = { kw_create ~ pattern_list }
 
 match_stmt = {
-    kw_match ~ pattern ~
+    kw_match ~ pattern_list ~
     where_clause? ~
-    (return_tail | set_tail | delete_tail)
+    (return_tail | set_tail | delete_tail | create_tail)
 }
+
+pattern_list = { pattern ~ ("," ~ pattern)* }
+create_tail = { kw_create ~ pattern_list }
 
 where_clause = { kw_where ~ expression }
 skip_clause = { kw_skip ~ integer }
