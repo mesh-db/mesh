@@ -6,6 +6,7 @@ pub enum Value {
     Node(Node),
     Edge(Edge),
     Property(Property),
+    List(Vec<Value>),
     Null,
 }
 

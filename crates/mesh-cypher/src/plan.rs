@@ -22,6 +22,17 @@ pub enum LogicalPlan {
         edge_type: Option<String>,
         direction: Direction,
     },
+    VarLengthExpand {
+        input: Box<LogicalPlan>,
+        src_var: String,
+        edge_var: Option<String>,
+        dst_var: String,
+        dst_label: Option<String>,
+        edge_type: Option<String>,
+        direction: Direction,
+        min_hops: u64,
+        max_hops: u64,
+    },
     Filter {
         input: Box<LogicalPlan>,
         predicate: Expr,
@@ -162,14 +173,34 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
             .var
             .clone()
             .unwrap_or_else(|| format!("__a{}", i + 1));
-        plan = LogicalPlan::EdgeExpand {
-            input: Box::new(plan),
-            src_var: current_var.clone(),
-            edge_var: hop.rel.var.clone(),
-            dst_var: dst_var.clone(),
-            dst_label: hop.target.label.clone(),
-            edge_type: hop.rel.edge_type.clone(),
-            direction: hop.rel.direction,
+        plan = if let Some(vl) = hop.rel.var_length {
+            if vl.min > vl.max {
+                return Err(Error::Plan(format!(
+                    "variable-length path min ({}) > max ({})",
+                    vl.min, vl.max
+                )));
+            }
+            LogicalPlan::VarLengthExpand {
+                input: Box::new(plan),
+                src_var: current_var.clone(),
+                edge_var: hop.rel.var.clone(),
+                dst_var: dst_var.clone(),
+                dst_label: hop.target.label.clone(),
+                edge_type: hop.rel.edge_type.clone(),
+                direction: hop.rel.direction,
+                min_hops: vl.min,
+                max_hops: vl.max,
+            }
+        } else {
+            LogicalPlan::EdgeExpand {
+                input: Box::new(plan),
+                src_var: current_var.clone(),
+                edge_var: hop.rel.var.clone(),
+                dst_var: dst_var.clone(),
+                dst_label: hop.target.label.clone(),
+                edge_type: hop.rel.edge_type.clone(),
+                direction: hop.rel.direction,
+            }
         };
         current_var = dst_var;
     }

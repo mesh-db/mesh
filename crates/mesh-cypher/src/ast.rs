@@ -50,6 +50,13 @@ pub struct RelPattern {
     pub var: Option<String>,
     pub edge_type: Option<String>,
     pub direction: Direction,
+    pub var_length: Option<VarLength>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VarLength {
+    pub min: u64,
+    pub max: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -36,8 +36,15 @@ rel_pattern = { rel_right | rel_left | rel_both }
 rel_right = { "-" ~ rel_detail? ~ "->" }
 rel_left = { "<-" ~ rel_detail? ~ "-" }
 rel_both = { "-" ~ rel_detail? ~ "-" }
-rel_detail = { "[" ~ identifier? ~ rel_type_spec? ~ "]" }
+rel_detail = { "[" ~ identifier? ~ rel_type_spec? ~ var_length? ~ "]" }
 rel_type_spec = { ":" ~ identifier }
+var_length = { "*" ~ var_length_range? }
+var_length_range = { bounded_range | exact_range }
+bounded_range = { range_min? ~ ".." ~ range_max? }
+range_min = { nn_integer }
+range_max = { nn_integer }
+exact_range = { nn_integer }
+nn_integer = @{ ASCII_DIGIT+ }
 
 node_pattern = { "(" ~ identifier? ~ label_spec? ~ properties? ~ ")" }
 label_spec = { ":" ~ identifier }

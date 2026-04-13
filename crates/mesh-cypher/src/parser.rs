@@ -203,6 +203,7 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
 
     let mut var = None;
     let mut edge_type = None;
+    let mut var_length = None;
     for p in inner.into_inner() {
         if p.as_rule() == Rule::rel_detail {
             for d in p.into_inner() {
@@ -214,6 +215,9 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
                             .next()
                             .ok_or_else(|| Error::Parse("empty rel type".into()))?;
                         edge_type = Some(id.as_str().to_string());
+                    }
+                    Rule::var_length => {
+                        var_length = Some(build_var_length(d)?);
                     }
                     r => {
                         return Err(Error::Parse(format!(
@@ -230,7 +234,75 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
         var,
         edge_type,
         direction,
+        var_length,
     })
+}
+
+fn build_var_length(pair: Pair<Rule>) -> Result<VarLength> {
+    debug_assert_eq!(pair.as_rule(), Rule::var_length);
+    let mut range_pair_opt = None;
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::var_length_range {
+            range_pair_opt = Some(inner);
+        }
+    }
+    let Some(range_pair) = range_pair_opt else {
+        return Ok(VarLength {
+            min: 1,
+            max: u64::MAX,
+        });
+    };
+    let inner = range_pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty var length range".into()))?;
+    match inner.as_rule() {
+        Rule::exact_range => {
+            let n_pair = inner
+                .into_inner()
+                .next()
+                .ok_or_else(|| Error::Parse("empty exact range".into()))?;
+            let n = parse_u64(n_pair.as_str())?;
+            Ok(VarLength { min: n, max: n })
+        }
+        Rule::bounded_range => {
+            let mut min = 1u64;
+            let mut max = u64::MAX;
+            for p in inner.into_inner() {
+                match p.as_rule() {
+                    Rule::range_min => {
+                        let n = p
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| Error::Parse("empty range min".into()))?;
+                        min = parse_u64(n.as_str())?;
+                    }
+                    Rule::range_max => {
+                        let n = p
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| Error::Parse("empty range max".into()))?;
+                        max = parse_u64(n.as_str())?;
+                    }
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rule in bounded range: {:?}",
+                            r
+                        )))
+                    }
+                }
+            }
+            Ok(VarLength { min, max })
+        }
+        r => Err(Error::Parse(format!(
+            "unexpected var length range rule: {:?}",
+            r
+        ))),
+    }
+}
+
+fn parse_u64(s: &str) -> Result<u64> {
+    s.parse().map_err(|_| Error::InvalidNumber(s.to_string()))
 }
 
 fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {

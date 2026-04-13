@@ -109,6 +109,65 @@ fn single_hop_undirected() {
 }
 
 #[test]
+fn var_length_exact_hops() {
+    let m = unwrap_match(parse("MATCH (a)-[:KNOWS*3]->(b) RETURN b").unwrap());
+    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 3);
+    assert_eq!(vl.max, 3);
+}
+
+#[test]
+fn var_length_bounded() {
+    let m = unwrap_match(parse("MATCH (a)-[:KNOWS*1..3]->(b) RETURN b").unwrap());
+    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+    assert_eq!(vl.max, 3);
+}
+
+#[test]
+fn var_length_min_only() {
+    let m = unwrap_match(parse("MATCH (a)-[*2..]->(b) RETURN b").unwrap());
+    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 2);
+    assert_eq!(vl.max, u64::MAX);
+}
+
+#[test]
+fn var_length_max_only() {
+    let m = unwrap_match(parse("MATCH (a)-[*..4]->(b) RETURN b").unwrap());
+    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+    assert_eq!(vl.max, 4);
+}
+
+#[test]
+fn var_length_unbounded_star() {
+    let m = unwrap_match(parse("MATCH (a)-[*]->(b) RETURN b").unwrap());
+    let vl = m.pattern.hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+    assert_eq!(vl.max, u64::MAX);
+}
+
+#[test]
+fn var_length_with_var_and_type() {
+    let m = unwrap_match(
+        parse("MATCH (a)-[r:KNOWS*1..3]->(b) RETURN r").unwrap(),
+    );
+    let rel = &m.pattern.hops[0].rel;
+    assert_eq!(rel.var.as_deref(), Some("r"));
+    assert_eq!(rel.edge_type.as_deref(), Some("KNOWS"));
+    let vl = rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+    assert_eq!(vl.max, 3);
+}
+
+#[test]
+fn single_hop_has_no_var_length() {
+    let m = unwrap_match(parse("MATCH (a)-[r:KNOWS]->(b) RETURN b").unwrap());
+    assert!(m.pattern.hops[0].rel.var_length.is_none());
+}
+
+#[test]
 fn create_path_with_relationship() {
     let c = unwrap_create(parse("CREATE (a:Person)-[:KNOWS]->(b:Person)").unwrap());
     assert_eq!(c.pattern.hops.len(), 1);

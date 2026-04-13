@@ -8,7 +8,7 @@ use mesh_cypher::{
     CreateEdgeSpec, CreateNodeSpec, Direction, Expr, LogicalPlan, ReturnItem, SetAssignment,
 };
 use mesh_storage::Store;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct ExecCtx<'a> {
     pub store: &'a Store,
@@ -62,6 +62,27 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             dst_label.clone(),
             edge_type.clone(),
             *direction,
+        )),
+        LogicalPlan::VarLengthExpand {
+            input,
+            src_var,
+            edge_var,
+            dst_var,
+            dst_label,
+            edge_type,
+            direction,
+            min_hops,
+            max_hops,
+        } => Box::new(VarLengthExpandOp::new(
+            build_op(input),
+            src_var.clone(),
+            edge_var.clone(),
+            dst_var.clone(),
+            dst_label.clone(),
+            edge_type.clone(),
+            *direction,
+            *min_hops,
+            *max_hops,
         )),
         LogicalPlan::Filter { input, predicate } => {
             Box::new(FilterOp::new(build_op(input), predicate.clone()))
@@ -187,7 +208,9 @@ impl Operator for SetPropertyOp {
                 let prop = match evaluated {
                     Value::Property(p) => p,
                     Value::Null => Property::Null,
-                    Value::Node(_) | Value::Edge(_) => return Err(Error::InvalidSetValue),
+                    Value::Node(_) | Value::Edge(_) | Value::List(_) => {
+                        return Err(Error::InvalidSetValue)
+                    }
                 };
 
                 match row.get(var) {
@@ -383,6 +406,176 @@ impl Operator for EdgeExpandOp {
                             all
                         }
                     };
+                    self.pending_idx = 0;
+                    self.current_row = Some(row);
+                }
+            }
+        }
+    }
+}
+
+struct VarLengthExpandOp {
+    input: Box<dyn Operator>,
+    src_var: String,
+    edge_var: Option<String>,
+    dst_var: String,
+    dst_label: Option<String>,
+    edge_type: Option<String>,
+    direction: Direction,
+    min_hops: u64,
+    max_hops: u64,
+    current_row: Option<Row>,
+    pending_paths: Vec<Vec<Edge>>,
+    pending_targets: Vec<NodeId>,
+    pending_idx: usize,
+}
+
+impl VarLengthExpandOp {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        input: Box<dyn Operator>,
+        src_var: String,
+        edge_var: Option<String>,
+        dst_var: String,
+        dst_label: Option<String>,
+        edge_type: Option<String>,
+        direction: Direction,
+        min_hops: u64,
+        max_hops: u64,
+    ) -> Self {
+        Self {
+            input,
+            src_var,
+            edge_var,
+            dst_var,
+            dst_label,
+            edge_type,
+            direction,
+            min_hops,
+            max_hops,
+            current_row: None,
+            pending_paths: Vec::new(),
+            pending_targets: Vec::new(),
+            pending_idx: 0,
+        }
+    }
+
+    fn enumerate(
+        &self,
+        ctx: &ExecCtx,
+        start: NodeId,
+    ) -> Result<(Vec<Vec<Edge>>, Vec<NodeId>)> {
+        let mut paths: Vec<Vec<Edge>> = Vec::new();
+        let mut targets: Vec<NodeId> = Vec::new();
+        let mut current: Vec<Edge> = Vec::new();
+        let mut used: HashSet<EdgeId> = HashSet::new();
+        self.dfs(ctx, start, &mut current, &mut used, &mut paths, &mut targets)?;
+        Ok((paths, targets))
+    }
+
+    fn dfs(
+        &self,
+        ctx: &ExecCtx,
+        current_node: NodeId,
+        path: &mut Vec<Edge>,
+        used: &mut HashSet<EdgeId>,
+        out_paths: &mut Vec<Vec<Edge>>,
+        out_targets: &mut Vec<NodeId>,
+    ) -> Result<()> {
+        let depth = path.len() as u64;
+
+        if depth >= self.min_hops && depth <= self.max_hops {
+            let terminal_ok = match ctx.store.get_node(current_node)? {
+                Some(node) => self
+                    .dst_label
+                    .as_ref()
+                    .map_or(true, |l| node.labels.contains(l)),
+                None => false,
+            };
+            if terminal_ok {
+                out_paths.push(path.clone());
+                out_targets.push(current_node);
+            }
+        }
+
+        if depth >= self.max_hops {
+            return Ok(());
+        }
+
+        let neighbors = match self.direction {
+            Direction::Outgoing => ctx.store.outgoing(current_node)?,
+            Direction::Incoming => ctx.store.incoming(current_node)?,
+            Direction::Both => {
+                let mut all = ctx.store.outgoing(current_node)?;
+                all.extend(ctx.store.incoming(current_node)?);
+                all
+            }
+        };
+
+        for (eid, neighbor_id) in neighbors {
+            if used.contains(&eid) {
+                continue;
+            }
+            let edge = match ctx.store.get_edge(eid)? {
+                Some(e) => e,
+                None => continue,
+            };
+            if let Some(t) = &self.edge_type {
+                if &edge.edge_type != t {
+                    continue;
+                }
+            }
+            used.insert(eid);
+            path.push(edge);
+            self.dfs(ctx, neighbor_id, path, used, out_paths, out_targets)?;
+            path.pop();
+            used.remove(&eid);
+        }
+
+        Ok(())
+    }
+}
+
+impl Operator for VarLengthExpandOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            while self.pending_idx < self.pending_paths.len() {
+                let i = self.pending_idx;
+                self.pending_idx += 1;
+
+                let target_id = self.pending_targets[i];
+                let target = match ctx.store.get_node(target_id)? {
+                    Some(n) => n,
+                    None => continue,
+                };
+
+                let base = self
+                    .current_row
+                    .as_ref()
+                    .expect("pending without source row");
+                let mut out = base.clone();
+                out.insert(self.dst_var.clone(), Value::Node(target));
+                if let Some(ev) = &self.edge_var {
+                    let edges: Vec<Value> = self.pending_paths[i]
+                        .iter()
+                        .cloned()
+                        .map(Value::Edge)
+                        .collect();
+                    out.insert(ev.clone(), Value::List(edges));
+                }
+                return Ok(Some(out));
+            }
+
+            match self.input.next(ctx)? {
+                None => return Ok(None),
+                Some(row) => {
+                    let src_id = match row.get(&self.src_var) {
+                        Some(Value::Node(n)) => n.id,
+                        _ => return Err(Error::UnboundVariable(self.src_var.clone())),
+                    };
+                    let (paths, targets) = self.enumerate(ctx, src_id)?;
+                    self.pending_paths = paths;
+                    self.pending_targets = targets;
                     self.pending_idx = 0;
                     self.current_row = Some(row);
                 }
