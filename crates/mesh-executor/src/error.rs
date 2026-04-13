@@ -25,6 +25,12 @@ pub enum Error {
 
     #[error("SET value must be a primitive property, not a node or edge")]
     InvalidSetValue,
+
+    #[error("function `{0}` is not a scalar function; only aggregate calls are supported")]
+    UnknownScalarFunction(String),
+
+    #[error("aggregate argument has unsupported type")]
+    AggregateTypeError,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -109,6 +109,71 @@ fn single_hop_undirected() {
 }
 
 #[test]
+fn order_by_single_asc_by_default() {
+    let m = unwrap_match(parse("MATCH (n) RETURN n ORDER BY n.name").unwrap());
+    assert_eq!(m.order_by.len(), 1);
+    assert!(!m.order_by[0].descending);
+}
+
+#[test]
+fn order_by_desc() {
+    let m = unwrap_match(parse("MATCH (n) RETURN n ORDER BY n.age DESC").unwrap());
+    assert!(m.order_by[0].descending);
+}
+
+#[test]
+fn order_by_multi_key() {
+    let m = unwrap_match(
+        parse("MATCH (n) RETURN n ORDER BY n.dept ASC, n.age DESC").unwrap(),
+    );
+    assert_eq!(m.order_by.len(), 2);
+    assert!(!m.order_by[0].descending);
+    assert!(m.order_by[1].descending);
+}
+
+#[test]
+fn distinct_flag_parsed() {
+    let m = unwrap_match(parse("MATCH (n) RETURN DISTINCT n.name").unwrap());
+    assert!(m.distinct);
+}
+
+#[test]
+fn count_star_call_parsed() {
+    let m = unwrap_match(parse("MATCH (n:Person) RETURN count(*)").unwrap());
+    match &m.return_items[0].expr {
+        Expr::Call { name, args } => {
+            assert_eq!(name.to_lowercase(), "count");
+            assert!(matches!(args, CallArgs::Star));
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
+}
+
+#[test]
+fn aggregate_call_with_expr_arg() {
+    let m = unwrap_match(
+        parse("MATCH (n:Person) RETURN avg(n.age) AS mean").unwrap(),
+    );
+    match &m.return_items[0].expr {
+        Expr::Call { name, args: CallArgs::Exprs(es) } => {
+            assert_eq!(name.to_lowercase(), "avg");
+            assert_eq!(es.len(), 1);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(m.return_items[0].alias.as_deref(), Some("mean"));
+}
+
+#[test]
+fn distinct_and_order_by_combined() {
+    let m = unwrap_match(
+        parse("MATCH (n) RETURN DISTINCT n.dept AS d ORDER BY d").unwrap(),
+    );
+    assert!(m.distinct);
+    assert_eq!(m.order_by.len(), 1);
+}
+
+#[test]
 fn var_length_exact_hops() {
     let m = unwrap_match(parse("MATCH (a)-[:KNOWS*3]->(b) RETURN b").unwrap());
     let vl = m.pattern.hops[0].rel.var_length.unwrap();

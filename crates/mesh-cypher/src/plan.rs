@@ -1,5 +1,6 @@
 use crate::ast::{
-    CreateStmt, Direction, Expr, Literal, MatchStmt, NodePattern, ReturnItem, Statement,
+    CallArgs, CreateStmt, Direction, Expr, Literal, MatchStmt, NodePattern, ReturnItem, SortItem,
+    Statement,
 };
 use crate::error::{Error, Result};
 use std::collections::HashMap;
@@ -40,6 +41,18 @@ pub enum LogicalPlan {
     Project {
         input: Box<LogicalPlan>,
         items: Vec<ReturnItem>,
+    },
+    Aggregate {
+        input: Box<LogicalPlan>,
+        group_keys: Vec<ReturnItem>,
+        aggregates: Vec<AggregateSpec>,
+    },
+    Distinct {
+        input: Box<LogicalPlan>,
+    },
+    OrderBy {
+        input: Box<LogicalPlan>,
+        sort_items: Vec<SortItem>,
     },
     Skip {
         input: Box<LogicalPlan>,
@@ -82,6 +95,41 @@ pub struct SetAssignment {
     pub var: String,
     pub key: String,
     pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateSpec {
+    pub alias: String,
+    pub function: AggregateFn,
+    pub arg: AggregateArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFn {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Collect,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateArg {
+    Star,
+    Expr(Expr),
+}
+
+fn aggregate_fn_from_name(name: &str) -> Option<AggregateFn> {
+    match name.to_ascii_lowercase().as_str() {
+        "count" => Some(AggregateFn::Count),
+        "sum" => Some(AggregateFn::Sum),
+        "avg" => Some(AggregateFn::Avg),
+        "min" => Some(AggregateFn::Min),
+        "max" => Some(AggregateFn::Max),
+        "collect" => Some(AggregateFn::Collect),
+        _ => None,
+    }
 }
 
 pub fn plan(statement: &Statement) -> Result<LogicalPlan> {
@@ -236,6 +284,76 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
         });
     }
 
+    // Split return items into group keys and aggregate specs.
+    let mut group_keys: Vec<ReturnItem> = Vec::new();
+    let mut aggregates: Vec<AggregateSpec> = Vec::new();
+    for (idx, item) in stmt.return_items.iter().enumerate() {
+        if let Expr::Call { name, args } = &item.expr {
+            if let Some(func) = aggregate_fn_from_name(name) {
+                let agg_arg = match args {
+                    CallArgs::Star => {
+                        if !matches!(func, AggregateFn::Count) {
+                            return Err(Error::Plan(format!(
+                                "only count(*) accepts a star argument"
+                            )));
+                        }
+                        AggregateArg::Star
+                    }
+                    CallArgs::Exprs(es) if es.len() == 1 => AggregateArg::Expr(es[0].clone()),
+                    CallArgs::Exprs(_) => {
+                        return Err(Error::Plan(format!(
+                            "{} takes exactly one argument",
+                            name
+                        )))
+                    }
+                };
+                let alias = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{}", name.to_lowercase(), idx));
+                aggregates.push(AggregateSpec {
+                    alias,
+                    function: func,
+                    arg: agg_arg,
+                });
+                continue;
+            }
+            return Err(Error::Plan(format!("unknown function: {}", name)));
+        }
+        if contains_aggregate(&item.expr) {
+            return Err(Error::Plan(
+                "aggregates must appear at the top of RETURN items".into(),
+            ));
+        }
+        group_keys.push(item.clone());
+    }
+
+    plan = if !aggregates.is_empty() {
+        LogicalPlan::Aggregate {
+            input: Box::new(plan),
+            group_keys,
+            aggregates,
+        }
+    } else {
+        LogicalPlan::Project {
+            input: Box::new(plan),
+            items: stmt.return_items.clone(),
+        }
+    };
+
+    if stmt.distinct {
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+    }
+
+    if !stmt.order_by.is_empty() {
+        plan = LogicalPlan::OrderBy {
+            input: Box::new(plan),
+            sort_items: stmt.order_by.clone(),
+        };
+    }
+
     if let Some(skip) = stmt.skip {
         plan = LogicalPlan::Skip {
             input: Box::new(plan),
@@ -250,8 +368,18 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
         };
     }
 
-    Ok(LogicalPlan::Project {
-        input: Box::new(plan),
-        items: stmt.return_items.clone(),
-    })
+    Ok(plan)
+}
+
+fn contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some() => true,
+        Expr::Not(inner) => contains_aggregate(inner),
+        Expr::And(a, b) | Expr::Or(a, b) => contains_aggregate(a) || contains_aggregate(b),
+        Expr::Compare { left, right, .. } => {
+            contains_aggregate(left) || contains_aggregate(right)
+        }
+        Expr::Call { args: CallArgs::Exprs(es), .. } => es.iter().any(contains_aggregate),
+        _ => false,
+    }
 }

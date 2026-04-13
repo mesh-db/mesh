@@ -1,13 +1,15 @@
 use crate::{
     error::{Error, Result},
-    eval::{eval_expr, literal_to_property, to_bool},
+    eval::{compare_values, eval_expr, literal_to_property, row_key, to_bool, value_key},
     value::{Row, Value},
 };
 use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use mesh_cypher::{
-    CreateEdgeSpec, CreateNodeSpec, Direction, Expr, LogicalPlan, ReturnItem, SetAssignment,
+    AggregateArg, AggregateFn, AggregateSpec, CreateEdgeSpec, CreateNodeSpec, Direction, Expr,
+    LogicalPlan, ReturnItem, SetAssignment, SortItem,
 };
 use mesh_storage::Store;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 pub struct ExecCtx<'a> {
@@ -89,6 +91,19 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
         }
         LogicalPlan::Project { input, items } => {
             Box::new(ProjectOp::new(build_op(input), items.clone()))
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_keys,
+            aggregates,
+        } => Box::new(AggregateOp::new(
+            build_op(input),
+            group_keys.clone(),
+            aggregates.clone(),
+        )),
+        LogicalPlan::Distinct { input } => Box::new(DistinctOp::new(build_op(input))),
+        LogicalPlan::OrderBy { input, sort_items } => {
+            Box::new(OrderByOp::new(build_op(input), sort_items.clone()))
         }
         LogicalPlan::Skip { input, count } => Box::new(SkipOp::new(build_op(input), *count)),
         LogicalPlan::Limit { input, count } => Box::new(LimitOp::new(build_op(input), *count)),
@@ -643,6 +658,355 @@ fn default_name(expr: &Expr, idx: usize) -> String {
         Expr::Identifier(s) => s.clone(),
         Expr::Property { var, key } => format!("{}.{}", var, key),
         _ => format!("col{}", idx),
+    }
+}
+
+struct DistinctOp {
+    input: Box<dyn Operator>,
+    seen: HashSet<String>,
+}
+
+impl DistinctOp {
+    fn new(input: Box<dyn Operator>) -> Self {
+        Self {
+            input,
+            seen: HashSet::new(),
+        }
+    }
+}
+
+impl Operator for DistinctOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        while let Some(row) = self.input.next(ctx)? {
+            let key = row_key(&row);
+            if self.seen.insert(key) {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+}
+
+struct OrderByOp {
+    input: Box<dyn Operator>,
+    sort_items: Vec<SortItem>,
+    sorted: Option<Vec<Row>>,
+    cursor: usize,
+}
+
+impl OrderByOp {
+    fn new(input: Box<dyn Operator>, sort_items: Vec<SortItem>) -> Self {
+        Self {
+            input,
+            sort_items,
+            sorted: None,
+            cursor: 0,
+        }
+    }
+}
+
+impl Operator for OrderByOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.sorted.is_none() {
+            let mut rows: Vec<Row> = Vec::new();
+            while let Some(row) = self.input.next(ctx)? {
+                rows.push(row);
+            }
+            let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut keys = Vec::with_capacity(self.sort_items.len());
+                for item in &self.sort_items {
+                    keys.push(eval_expr(&item.expr, &row)?);
+                }
+                keyed.push((keys, row));
+            }
+            let descs: Vec<bool> = self.sort_items.iter().map(|s| s.descending).collect();
+            keyed.sort_by(|a, b| {
+                for (i, (va, vb)) in a.0.iter().zip(b.0.iter()).enumerate() {
+                    let ord = compare_values(va, vb);
+                    let ord = if descs[i] { ord.reverse() } else { ord };
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+            self.sorted = Some(keyed.into_iter().map(|(_, r)| r).collect());
+        }
+        let rows = self.sorted.as_ref().unwrap();
+        if self.cursor < rows.len() {
+            let row = rows[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+struct AggregateOp {
+    input: Box<dyn Operator>,
+    group_keys: Vec<ReturnItem>,
+    aggregates: Vec<AggregateSpec>,
+    results: Option<Vec<Row>>,
+    cursor: usize,
+}
+
+impl AggregateOp {
+    fn new(
+        input: Box<dyn Operator>,
+        group_keys: Vec<ReturnItem>,
+        aggregates: Vec<AggregateSpec>,
+    ) -> Self {
+        Self {
+            input,
+            group_keys,
+            aggregates,
+            results: None,
+            cursor: 0,
+        }
+    }
+
+    fn compute(&mut self, ctx: &ExecCtx) -> Result<()> {
+        let mut groups: HashMap<String, GroupState> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+
+        // If there are no input rows AND no group keys, we still emit one row
+        // (e.g. `MATCH (n:Missing) RETURN count(*)` must yield one row with 0).
+        let mut saw_any = false;
+
+        while let Some(row) = self.input.next(ctx)? {
+            saw_any = true;
+            let mut key_values = Vec::with_capacity(self.group_keys.len());
+            for item in &self.group_keys {
+                key_values.push(eval_expr(&item.expr, &row)?);
+            }
+            let mut hash_key = String::new();
+            for v in &key_values {
+                hash_key.push_str(&value_key(v));
+                hash_key.push('|');
+            }
+            let entry = groups.entry(hash_key.clone()).or_insert_with(|| {
+                order.push(hash_key.clone());
+                GroupState {
+                    key_values: key_values.clone(),
+                    agg_states: self
+                        .aggregates
+                        .iter()
+                        .map(|a| AggState::initial(a.function))
+                        .collect(),
+                }
+            });
+            for (i, spec) in self.aggregates.iter().enumerate() {
+                entry.agg_states[i].update(&spec.arg, &row)?;
+            }
+        }
+
+        let mut out = Vec::new();
+        if !saw_any && self.group_keys.is_empty() && !self.aggregates.is_empty() {
+            // Empty group, single aggregate row
+            let mut row = Row::new();
+            for spec in &self.aggregates {
+                row.insert(spec.alias.clone(), AggState::initial(spec.function).finalize());
+            }
+            out.push(row);
+        } else {
+            for key in order {
+                let state = groups.remove(&key).unwrap();
+                let mut row = Row::new();
+                for (i, item) in self.group_keys.iter().enumerate() {
+                    let name = item
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| default_name(&item.expr, i));
+                    row.insert(name, state.key_values[i].clone());
+                }
+                for (i, spec) in self.aggregates.iter().enumerate() {
+                    row.insert(spec.alias.clone(), state.agg_states[i].finalize());
+                }
+                out.push(row);
+            }
+        }
+        self.results = Some(out);
+        Ok(())
+    }
+}
+
+impl Operator for AggregateOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.results.is_none() {
+            self.compute(ctx)?;
+        }
+        let rows = self.results.as_ref().unwrap();
+        if self.cursor < rows.len() {
+            let row = rows[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+struct GroupState {
+    key_values: Vec<Value>,
+    agg_states: Vec<AggState>,
+}
+
+enum AggState {
+    Count(i64),
+    Sum {
+        int_part: i64,
+        float_part: f64,
+        is_float: bool,
+    },
+    Avg {
+        total: f64,
+        count: i64,
+    },
+    Min(Option<Property>),
+    Max(Option<Property>),
+    Collect(Vec<Value>),
+}
+
+impl AggState {
+    fn initial(func: AggregateFn) -> Self {
+        match func {
+            AggregateFn::Count => AggState::Count(0),
+            AggregateFn::Sum => AggState::Sum {
+                int_part: 0,
+                float_part: 0.0,
+                is_float: false,
+            },
+            AggregateFn::Avg => AggState::Avg {
+                total: 0.0,
+                count: 0,
+            },
+            AggregateFn::Min => AggState::Min(None),
+            AggregateFn::Max => AggState::Max(None),
+            AggregateFn::Collect => AggState::Collect(Vec::new()),
+        }
+    }
+
+    fn update(&mut self, arg: &AggregateArg, row: &Row) -> Result<()> {
+        match self {
+            AggState::Count(c) => match arg {
+                AggregateArg::Star => *c += 1,
+                AggregateArg::Expr(e) => {
+                    if !matches!(eval_expr(e, row)?, Value::Null) {
+                        *c += 1;
+                    }
+                }
+            },
+            AggState::Sum {
+                int_part,
+                float_part,
+                is_float,
+            } => {
+                let v = expr_arg_value(arg, row)?;
+                match v {
+                    Value::Null => {}
+                    Value::Property(Property::Int64(i)) => *int_part += i,
+                    Value::Property(Property::Float64(f)) => {
+                        *float_part += f;
+                        *is_float = true;
+                    }
+                    _ => return Err(Error::AggregateTypeError),
+                }
+            }
+            AggState::Avg { total, count } => {
+                let v = expr_arg_value(arg, row)?;
+                match v {
+                    Value::Null => {}
+                    Value::Property(Property::Int64(i)) => {
+                        *total += i as f64;
+                        *count += 1;
+                    }
+                    Value::Property(Property::Float64(f)) => {
+                        *total += f;
+                        *count += 1;
+                    }
+                    _ => return Err(Error::AggregateTypeError),
+                }
+            }
+            AggState::Min(slot) => {
+                let v = expr_arg_value(arg, row)?;
+                if let Value::Property(p) = v {
+                    match slot {
+                        None => *slot = Some(p),
+                        Some(cur) => {
+                            if compare_values(
+                                &Value::Property(p.clone()),
+                                &Value::Property(cur.clone()),
+                            ) == Ordering::Less
+                            {
+                                *cur = p;
+                            }
+                        }
+                    }
+                }
+            }
+            AggState::Max(slot) => {
+                let v = expr_arg_value(arg, row)?;
+                if let Value::Property(p) = v {
+                    match slot {
+                        None => *slot = Some(p),
+                        Some(cur) => {
+                            if compare_values(
+                                &Value::Property(p.clone()),
+                                &Value::Property(cur.clone()),
+                            ) == Ordering::Greater
+                            {
+                                *cur = p;
+                            }
+                        }
+                    }
+                }
+            }
+            AggState::Collect(items) => {
+                let v = expr_arg_value(arg, row)?;
+                if !matches!(v, Value::Null) {
+                    items.push(v);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(&self) -> Value {
+        match self {
+            AggState::Count(c) => Value::Property(Property::Int64(*c)),
+            AggState::Sum {
+                int_part,
+                float_part,
+                is_float,
+            } => {
+                if *is_float {
+                    Value::Property(Property::Float64(*float_part + *int_part as f64))
+                } else {
+                    Value::Property(Property::Int64(*int_part))
+                }
+            }
+            AggState::Avg { total, count } => {
+                if *count == 0 {
+                    Value::Null
+                } else {
+                    Value::Property(Property::Float64(*total / *count as f64))
+                }
+            }
+            AggState::Min(slot) | AggState::Max(slot) => match slot {
+                Some(p) => Value::Property(p.clone()),
+                None => Value::Null,
+            },
+            AggState::Collect(items) => Value::List(items.clone()),
+        }
+    }
+}
+
+fn expr_arg_value(arg: &AggregateArg, row: &Row) -> Result<Value> {
+    match arg {
+        AggregateArg::Star => Err(Error::AggregateTypeError),
+        AggregateArg::Expr(e) => eval_expr(e, row),
     }
 }
 

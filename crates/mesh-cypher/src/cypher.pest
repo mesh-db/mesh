@@ -17,10 +17,16 @@ skip_clause = { kw_skip ~ integer }
 limit_clause = { kw_limit ~ integer }
 
 return_tail = {
-    kw_return ~ return_items ~
+    kw_return ~ kw_distinct? ~ return_items ~
+    order_by_clause? ~
     skip_clause? ~
     limit_clause?
 }
+
+order_by_clause = { ^"order" ~ ^"by" ~ sort_items }
+sort_items = { sort_item ~ ("," ~ sort_item)* }
+sort_item = { expression ~ sort_dir? }
+sort_dir = { kw_asc | kw_desc }
 
 set_tail = { kw_set ~ set_items }
 set_items = { set_item ~ ("," ~ set_item)* }
@@ -70,10 +76,16 @@ op_gt = { ">" }
 
 primary = {
     literal |
+    function_call |
     property_access |
     identifier |
     ("(" ~ expression ~ ")")
 }
+
+function_call = { identifier ~ "(" ~ fn_args? ~ ")" }
+fn_args = { count_star | fn_arg_list }
+count_star = { "*" }
+fn_arg_list = { expression ~ ("," ~ expression)* }
 
 property_access = { identifier ~ "." ~ identifier }
 
@@ -92,7 +104,8 @@ id_cont = _{ ASCII_ALPHANUMERIC | "_" }
 reserved = @{
     (^"create" | ^"match" | ^"where" | ^"return" | ^"skip" | ^"limit" |
      ^"as" | ^"or" | ^"and" | ^"not" | ^"true" | ^"false" | ^"null" |
-     ^"set" | ^"delete" | ^"detach")
+     ^"set" | ^"delete" | ^"detach" |
+     ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc")
     ~ !id_cont
 }
 
@@ -102,10 +115,15 @@ kw_where = _{ ^"where" }
 kw_return = _{ ^"return" }
 kw_skip = _{ ^"skip" }
 kw_limit = _{ ^"limit" }
-kw_as = _{ ^"as" }
-kw_or = _{ ^"or" }
-kw_and = _{ ^"and" }
-kw_not = _{ ^"not" }
+kw_as = @{ ^"as" ~ !id_cont }
+kw_or = @{ ^"or" ~ !id_cont }
+kw_and = @{ ^"and" ~ !id_cont }
+kw_not = @{ ^"not" ~ !id_cont }
 kw_set = _{ ^"set" }
 kw_delete = _{ ^"delete" }
-kw_detach = { ^"detach" }
+kw_detach = @{ ^"detach" ~ !id_cont }
+kw_order = _{ ^"order" }
+kw_by = _{ ^"by" }
+kw_asc = @{ ^"asc" ~ !id_cont }
+kw_desc = @{ ^"desc" ~ !id_cont }
+kw_distinct = @{ ^"distinct" ~ !id_cont }

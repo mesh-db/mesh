@@ -374,6 +374,254 @@ fn expand_yields_no_rows_when_no_edges() {
     assert!(rows.is_empty());
 }
 
+fn seed_people(store: &Store) {
+    run(store, "CREATE (n:Person {name: 'Ada', age: 37, dept: 'eng'})");
+    run(store, "CREATE (n:Person {name: 'Alan', age: 41, dept: 'eng'})");
+    run(store, "CREATE (n:Person {name: 'Grace', age: 85, dept: 'ops'})");
+    run(store, "CREATE (n:Person {name: 'Ada', age: 29, dept: 'ops'})");
+}
+
+#[test]
+fn order_by_property_ascending() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY age",
+    );
+    let ages: Vec<i64> = rows.iter().map(|r| int_prop(r, "age")).collect();
+    assert_eq!(ages, vec![29, 37, 41, 85]);
+}
+
+#[test]
+fn order_by_property_descending() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY age DESC",
+    );
+    let ages: Vec<i64> = rows.iter().map(|r| int_prop(r, "age")).collect();
+    assert_eq!(ages, vec![85, 41, 37, 29]);
+}
+
+#[test]
+fn order_by_multi_key_mixed_direction() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    // dept ASC, age DESC -> eng:41,37 then ops:85,29
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN p.name AS name, p.age AS age, p.dept AS dept ORDER BY dept, age DESC",
+    );
+    let pairs: Vec<(String, i64)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "dept"), int_prop(r, "age")))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("eng".to_string(), 41),
+            ("eng".to_string(), 37),
+            ("ops".to_string(), 85),
+            ("ops".to_string(), 29),
+        ]
+    );
+}
+
+#[test]
+fn order_by_then_limit() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY age DESC LIMIT 2",
+    );
+    let ages: Vec<i64> = rows.iter().map(|r| int_prop(r, "age")).collect();
+    assert_eq!(ages, vec![85, 41]);
+}
+
+#[test]
+fn distinct_dedupes_identical_projected_rows() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN DISTINCT p.dept AS dept",
+    );
+    let mut depts: Vec<String> = rows.iter().map(|r| str_prop(r, "dept")).collect();
+    depts.sort();
+    assert_eq!(depts, vec!["eng", "ops"]);
+}
+
+#[test]
+fn distinct_with_order_by() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN DISTINCT p.dept AS dept ORDER BY dept",
+    );
+    let depts: Vec<String> = rows.iter().map(|r| str_prop(r, "dept")).collect();
+    assert_eq!(depts, vec!["eng", "ops"]);
+}
+
+#[test]
+fn count_star_over_label() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN count(*) AS total",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "total"), 4);
+}
+
+#[test]
+fn count_empty_match_returns_zero() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "MATCH (p:NoSuchLabel) RETURN count(*) AS total",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "total"), 0);
+}
+
+#[test]
+fn count_expr_skips_null() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'with_age', age: 30})");
+    run(&store, "CREATE (n:Person {name: 'no_age'})");
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN count(p.age) AS c",
+    );
+    assert_eq!(int_prop(&rows[0], "c"), 1);
+}
+
+#[test]
+fn sum_and_avg_over_integer_property() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN sum(p.age) AS total, avg(p.age) AS mean",
+    );
+    assert_eq!(int_prop(&rows[0], "total"), 37 + 41 + 85 + 29);
+    match rows[0].get("mean") {
+        Some(Value::Property(Property::Float64(f))) => {
+            let expected = (37.0 + 41.0 + 85.0 + 29.0) / 4.0;
+            assert!((*f - expected).abs() < 1e-9);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn min_and_max_over_property() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN min(p.age) AS lo, max(p.age) AS hi",
+    );
+    assert_eq!(int_prop(&rows[0], "lo"), 29);
+    assert_eq!(int_prop(&rows[0], "hi"), 85);
+}
+
+#[test]
+fn collect_returns_list_of_names() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN collect(p.name) AS names",
+    );
+    match rows[0].get("names") {
+        Some(Value::List(items)) => {
+            assert_eq!(items.len(), 4);
+            let mut names: Vec<String> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::String(s)) => s.clone(),
+                    _ => panic!(),
+                })
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["Ada", "Ada", "Alan", "Grace"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn group_by_dept_with_count() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN p.dept AS dept, count(*) AS c ORDER BY dept",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(str_prop(&rows[0], "dept"), "eng");
+    assert_eq!(int_prop(&rows[0], "c"), 2);
+    assert_eq!(str_prop(&rows[1], "dept"), "ops");
+    assert_eq!(int_prop(&rows[1], "c"), 2);
+}
+
+#[test]
+fn group_by_dept_sum_age_ordered_desc() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN p.dept AS dept, sum(p.age) AS total ORDER BY total DESC",
+    );
+    assert_eq!(str_prop(&rows[0], "dept"), "ops");
+    assert_eq!(int_prop(&rows[0], "total"), 85 + 29);
+    assert_eq!(str_prop(&rows[1], "dept"), "eng");
+    assert_eq!(int_prop(&rows[1], "total"), 37 + 41);
+}
+
+#[test]
+fn aggregate_with_filter_and_limit() {
+    let (store, _d) = open_store();
+    seed_people(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE p.age > 30 RETURN p.dept AS dept, count(*) AS c ORDER BY dept LIMIT 1",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "dept"), "eng");
+    assert_eq!(int_prop(&rows[0], "c"), 2);
+}
+
+#[test]
+fn unknown_scalar_function_rejected() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:X)");
+
+    let stmt = parse("MATCH (n:X) RETURN unknownfn(n) AS v").unwrap();
+    // Plan step detects this: unknown function.
+    assert!(plan(&stmt).is_err());
+}
+
 fn build_chain(store: &Store) {
     // a -> b -> c -> d, all with label "Link" and a name property
     run(

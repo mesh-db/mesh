@@ -49,6 +49,8 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     let mut pattern = None;
     let mut where_clause = None;
     let mut return_items = Vec::new();
+    let mut distinct = false;
+    let mut order_by: Vec<SortItem> = Vec::new();
     let mut skip = None;
     let mut limit = None;
     let mut set_items = Vec::new();
@@ -67,7 +69,9 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
             Rule::return_tail => {
                 for inner in p.into_inner() {
                     match inner.as_rule() {
+                        Rule::kw_distinct => distinct = true,
                         Rule::return_items => return_items = build_return_items(inner)?,
+                        Rule::order_by_clause => order_by = build_order_by(inner)?,
                         Rule::skip_clause => {
                             let int_pair = inner
                                 .into_inner()
@@ -153,11 +157,42 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         pattern: pattern.ok_or_else(|| Error::Parse("missing pattern".into()))?,
         where_clause,
         return_items,
+        distinct,
+        order_by,
         skip,
         limit,
         set_items,
         delete,
     })
+}
+
+fn build_order_by(pair: Pair<Rule>) -> Result<Vec<SortItem>> {
+    let mut sort_items = Vec::new();
+    for inner in pair.into_inner() {
+        if inner.as_rule() != Rule::sort_items {
+            continue;
+        }
+        for sort_item_pair in inner.into_inner() {
+            debug_assert_eq!(sort_item_pair.as_rule(), Rule::sort_item);
+            let mut ii = sort_item_pair.into_inner();
+            let expr_pair = ii
+                .next()
+                .ok_or_else(|| Error::Parse("empty sort item".into()))?;
+            let expr = build_expression(expr_pair)?;
+            let descending = match ii.next() {
+                Some(dir_pair) if dir_pair.as_rule() == Rule::sort_dir => {
+                    let inside = dir_pair
+                        .into_inner()
+                        .next()
+                        .ok_or_else(|| Error::Parse("empty sort_dir".into()))?;
+                    matches!(inside.as_rule(), Rule::kw_desc)
+                }
+                _ => false,
+            };
+            sort_items.push(SortItem { expr, descending });
+        }
+    }
+    Ok(sort_items)
 }
 
 fn build_pattern(pair: Pair<Rule>) -> Result<Pattern> {
@@ -359,7 +394,9 @@ fn build_return_items(pair: Pair<Rule>) -> Result<Vec<ReturnItem>> {
     let mut items = Vec::new();
     for item_pair in pair.into_inner() {
         debug_assert_eq!(item_pair.as_rule(), Rule::return_item);
-        let mut inner = item_pair.into_inner();
+        let mut inner = item_pair
+            .into_inner()
+            .filter(|p| p.as_rule() != Rule::kw_as);
         let expr = build_expression(
             inner
                 .next()
@@ -379,7 +416,9 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 .ok_or_else(|| Error::Parse("empty expression".into()))?,
         ),
         Rule::or_expr => {
-            let mut inner = pair.into_inner();
+            let mut inner = pair
+                .into_inner()
+                .filter(|p| p.as_rule() != Rule::kw_or);
             let mut left = build_expression(
                 inner
                     .next()
@@ -392,7 +431,9 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             Ok(left)
         }
         Rule::and_expr => {
-            let mut inner = pair.into_inner();
+            let mut inner = pair
+                .into_inner()
+                .filter(|p| p.as_rule() != Rule::kw_and);
             let mut left = build_expression(
                 inner
                     .next()
@@ -405,12 +446,15 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             Ok(left)
         }
         Rule::not_expr => {
-            let first = pair
-                .into_inner()
+            let mut inner = pair.into_inner();
+            let first = inner
                 .next()
                 .ok_or_else(|| Error::Parse("empty not_expr".into()))?;
-            if first.as_rule() == Rule::not_expr {
-                Ok(Expr::Not(Box::new(build_expression(first)?)))
+            if first.as_rule() == Rule::kw_not {
+                let inner_not = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("NOT without operand".into()))?;
+                Ok(Expr::Not(Box::new(build_expression(inner_not)?)))
             } else {
                 build_expression(first)
             }
@@ -444,6 +488,38 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 .ok_or_else(|| Error::Parse("empty primary".into()))?,
         ),
         Rule::literal => Ok(Expr::Literal(build_literal(pair)?)),
+        Rule::function_call => {
+            let mut inner = pair.into_inner();
+            let name = inner
+                .next()
+                .ok_or_else(|| Error::Parse("function call missing name".into()))?
+                .as_str()
+                .to_string();
+            let args = match inner.next() {
+                None => CallArgs::Exprs(Vec::new()),
+                Some(fn_args_pair) => {
+                    let inside = fn_args_pair
+                        .into_inner()
+                        .next()
+                        .ok_or_else(|| Error::Parse("empty fn args".into()))?;
+                    match inside.as_rule() {
+                        Rule::count_star => CallArgs::Star,
+                        Rule::fn_arg_list => {
+                            let exprs: Result<Vec<Expr>> =
+                                inside.into_inner().map(build_expression).collect();
+                            CallArgs::Exprs(exprs?)
+                        }
+                        r => {
+                            return Err(Error::Parse(format!(
+                                "unexpected fn args inner: {:?}",
+                                r
+                            )))
+                        }
+                    }
+                }
+            };
+            Ok(Expr::Call { name, args })
+        }
         Rule::property_access => {
             let mut inner = pair.into_inner();
             let var = inner

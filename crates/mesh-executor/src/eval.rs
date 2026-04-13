@@ -58,7 +58,97 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row) -> Result<Value> {
             let vr = eval_expr(right, row)?;
             Ok(Value::Property(Property::Bool(compare(*op, &vl, &vr)?)))
         }
+        Expr::Call { name, .. } => Err(Error::UnknownScalarFunction(name.clone())),
     }
+}
+
+pub(crate) fn compare_values(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Property(ap), Value::Property(bp)) => compare_props(ap, bp),
+        _ => Ordering::Equal,
+    }
+}
+
+fn compare_props(a: &Property, b: &Property) -> Ordering {
+    match (a, b) {
+        (Property::Int64(a), Property::Int64(b)) => a.cmp(b),
+        (Property::String(a), Property::String(b)) => a.cmp(b),
+        (Property::Bool(a), Property::Bool(b)) => a.cmp(b),
+        (Property::Float64(a), Property::Float64(b)) => {
+            a.partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (Property::Int64(a), Property::Float64(b)) => (*a as f64)
+            .partial_cmp(b)
+            .unwrap_or(Ordering::Equal),
+        (Property::Float64(a), Property::Int64(b)) => a
+            .partial_cmp(&(*b as f64))
+            .unwrap_or(Ordering::Equal),
+        _ => Ordering::Equal,
+    }
+}
+
+pub(crate) fn value_key(v: &Value) -> String {
+    match v {
+        Value::Null => "~null".to_string(),
+        Value::Property(Property::Null) => "~null".to_string(),
+        Value::Property(Property::Bool(b)) => format!("b:{}", b),
+        Value::Property(Property::Int64(i)) => format!("i:{}", i),
+        Value::Property(Property::Float64(f)) => format!("f:{}", f.to_bits()),
+        Value::Property(Property::String(s)) => format!("s:{}", s),
+        Value::Property(Property::List(items)) => {
+            let mut out = String::from("pl:[");
+            for it in items {
+                out.push_str(&prop_key(it));
+                out.push(',');
+            }
+            out.push(']');
+            out
+        }
+        Value::Property(Property::Map(m)) => {
+            let mut keys: Vec<_> = m.keys().collect();
+            keys.sort();
+            let mut out = String::from("pm:{");
+            for k in keys {
+                out.push_str(k);
+                out.push('=');
+                out.push_str(&prop_key(&m[k]));
+                out.push(',');
+            }
+            out.push('}');
+            out
+        }
+        Value::Node(n) => format!("N:{}", n.id),
+        Value::Edge(e) => format!("E:{}", e.id),
+        Value::List(items) => {
+            let mut out = String::from("L:[");
+            for it in items {
+                out.push_str(&value_key(it));
+                out.push(',');
+            }
+            out.push(']');
+            out
+        }
+    }
+}
+
+fn prop_key(p: &Property) -> String {
+    value_key(&Value::Property(p.clone()))
+}
+
+pub(crate) fn row_key(row: &Row) -> String {
+    let mut keys: Vec<_> = row.keys().collect();
+    keys.sort();
+    let mut out = String::new();
+    for k in keys {
+        out.push_str(k);
+        out.push('=');
+        out.push_str(&value_key(&row[k]));
+        out.push(';');
+    }
+    out
 }
 
 fn literal_to_value(lit: &Literal) -> Value {
