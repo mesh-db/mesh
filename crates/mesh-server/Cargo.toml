@@ -1,0 +1,32 @@
+[package]
+name = "mesh-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mesh graph database server binary"
+
+[[bin]]
+name = "mesh-server"
+path = "src/main.rs"
+
+[lib]
+name = "mesh_server"
+path = "src/lib.rs"
+
+[dependencies]
+mesh-core = { path = "../mesh-core" }
+mesh-storage = { path = "../mesh-storage" }
+mesh-cluster = { path = "../mesh-cluster" }
+mesh-rpc = { path = "../mesh-rpc" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+toml = "0.8"
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.12"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
