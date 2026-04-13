@@ -1,0 +1,10 @@
+[package]
+name = "mesh-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cluster membership and partitioning for Mesh"
+
+[dependencies]
+mesh-core = { path = "../mesh-core" }
+thiserror.workspace = true

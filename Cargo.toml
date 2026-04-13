@@ -6,6 +6,7 @@ members = [
     "crates/mesh-cypher",
     "crates/mesh-executor",
     "crates/mesh-rpc",
+    "crates/mesh-cluster",
 ]
 
 [workspace.package]
