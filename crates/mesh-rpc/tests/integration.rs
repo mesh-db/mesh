@@ -1,10 +1,11 @@
 use mesh_cluster::{Cluster, Peer, PeerId};
 use mesh_core::{Edge, Node};
-use mesh_rpc::convert::uuid_to_proto;
+use mesh_rpc::convert::{edge_to_proto, node_to_proto, uuid_to_proto};
 use mesh_rpc::proto::mesh_query_client::MeshQueryClient;
+use mesh_rpc::proto::mesh_write_client::MeshWriteClient;
 use mesh_rpc::proto::{
-    GetEdgeRequest, GetNodeRequest, HealthRequest, NeighborRequest, NodesByLabelRequest,
-    UuidBytes,
+    DeleteEdgeRequest, DetachDeleteNodeRequest, GetEdgeRequest, GetNodeRequest, HealthRequest,
+    NeighborRequest, NodesByLabelRequest, PutEdgeRequest, PutNodeRequest, UuidBytes,
 };
 use mesh_rpc::{MeshService, Routing};
 use mesh_storage::Store;
@@ -32,7 +33,7 @@ async fn spawn_server() -> Harness {
 
     tokio::spawn(async move {
         Server::builder()
-            .add_service(service.into_server())
+            .add_service(service.into_query_server())
             .serve_with_incoming(stream)
             .await
             .unwrap();
@@ -230,14 +231,16 @@ async fn spawn_two_peer() -> TwoPeer {
 
     tokio::spawn(async move {
         Server::builder()
-            .add_service(service_a.into_server())
+            .add_service(service_a.clone().into_query_server())
+            .add_service(service_a.into_write_server())
             .serve_with_incoming(stream_a)
             .await
             .unwrap();
     });
     tokio::spawn(async move {
         Server::builder()
-            .add_service(service_b.into_server())
+            .add_service(service_b.clone().into_query_server())
+            .add_service(service_b.into_write_server())
             .serve_with_incoming(stream_b)
             .await
             .unwrap();
@@ -403,6 +406,288 @@ async fn routed_get_node_missing_returns_not_found_on_either_peer() {
     let inner = resp.into_inner();
     assert!(!inner.found);
     assert!(inner.node.is_none());
+}
+
+fn node_owned_by(owner: PeerId, h: &TwoPeer) -> Node {
+    for _ in 0..10_000 {
+        let n = Node::new();
+        if h.cluster_a.owner_of(n.id) == owner {
+            return n;
+        }
+    }
+    panic!("no node owned by {owner:?} after 10k tries");
+}
+
+async fn write_client(h: &TwoPeer) -> MeshWriteClient<tonic::transport::Channel> {
+    MeshWriteClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn routed_put_node_lands_on_owner_only() {
+    let h = spawn_two_peer().await;
+    let node = Node::new()
+        .with_label("Person")
+        .with_property("name", "Ada");
+    let node_id = node.id;
+    let proto_node = node_to_proto(&node).unwrap();
+
+    let mut client = write_client(&h).await;
+    client
+        .put_node(PutNodeRequest {
+            node: Some(proto_node),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    let owner = h.cluster_a.owner_of(node_id);
+    let (owner_store, other_store) = match owner {
+        PeerId(1) => (&h.store_a, &h.store_b),
+        PeerId(2) => (&h.store_b, &h.store_a),
+        other => panic!("unexpected owner {other:?}"),
+    };
+    assert!(owner_store.get_node(node_id).unwrap().is_some());
+    assert!(other_store.get_node(node_id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn routed_put_edge_lands_on_both_endpoint_owners() {
+    let h = spawn_two_peer().await;
+    let src = node_owned_by(PeerId(1), &h);
+    let dst = node_owned_by(PeerId(2), &h);
+
+    let mut client = write_client(&h).await;
+    client
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&src).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+    client
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&dst).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    let edge = Edge::new("KNOWS", src.id, dst.id).with_property("since", 2020_i64);
+    let edge_id = edge.id;
+    client
+        .put_edge(PutEdgeRequest {
+            edge: Some(edge_to_proto(&edge).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    // Both stores see the edge (each also holds complete local adjacency).
+    assert!(h.store_a.get_edge(edge_id).unwrap().is_some());
+    assert!(h.store_b.get_edge(edge_id).unwrap().is_some());
+    assert_eq!(h.store_a.outgoing(src.id).unwrap().len(), 1);
+    assert_eq!(h.store_b.incoming(dst.id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn routed_put_edge_same_owner_writes_once() {
+    let h = spawn_two_peer().await;
+    let src = node_owned_by(PeerId(1), &h);
+    let dst = loop {
+        let n = node_owned_by(PeerId(1), &h);
+        if n.id != src.id {
+            break n;
+        }
+    };
+
+    let mut client = write_client(&h).await;
+    client
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&src).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+    client
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&dst).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    let edge = Edge::new("T", src.id, dst.id);
+    let edge_id = edge.id;
+    client
+        .put_edge(PutEdgeRequest {
+            edge: Some(edge_to_proto(&edge).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    // Only peer 1 holds the edge; peer 2 is untouched.
+    assert!(h.store_a.get_edge(edge_id).unwrap().is_some());
+    assert!(h.store_b.get_edge(edge_id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn routed_delete_edge_removes_from_both_peers() {
+    let h = spawn_two_peer().await;
+    let src = node_owned_by(PeerId(1), &h);
+    let dst = node_owned_by(PeerId(2), &h);
+
+    let mut client = write_client(&h).await;
+    client
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&src).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+    client
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&dst).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    let edge = Edge::new("T", src.id, dst.id);
+    let edge_id = edge.id;
+    client
+        .put_edge(PutEdgeRequest {
+            edge: Some(edge_to_proto(&edge).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    // Both peers hold the edge.
+    assert!(h.store_a.get_edge(edge_id).unwrap().is_some());
+    assert!(h.store_b.get_edge(edge_id).unwrap().is_some());
+
+    client
+        .delete_edge(DeleteEdgeRequest {
+            edge_id: Some(uuid_to_proto(edge_id.as_uuid())),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    assert!(h.store_a.get_edge(edge_id).unwrap().is_none());
+    assert!(h.store_b.get_edge(edge_id).unwrap().is_none());
+    assert!(h.store_a.outgoing(src.id).unwrap().is_empty());
+    assert!(h.store_b.incoming(dst.id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn routed_detach_delete_node_cleans_up_everywhere() {
+    let h = spawn_two_peer().await;
+    let src = node_owned_by(PeerId(1), &h);
+    let dst = node_owned_by(PeerId(2), &h);
+
+    let mut client = write_client(&h).await;
+    client
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&src).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+    client
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&dst).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    let edge = Edge::new("KNOWS", src.id, dst.id);
+    let edge_id = edge.id;
+    client
+        .put_edge(PutEdgeRequest {
+            edge: Some(edge_to_proto(&edge).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    client
+        .detach_delete_node(DetachDeleteNodeRequest {
+            node_id: Some(uuid_to_proto(src.id.as_uuid())),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    // src gone from its owner, edge gone from both, dst still alive, dst has no incoming.
+    assert!(h.store_a.get_node(src.id).unwrap().is_none());
+    assert!(h.store_a.get_edge(edge_id).unwrap().is_none());
+    assert!(h.store_b.get_edge(edge_id).unwrap().is_none());
+    assert!(h.store_b.get_node(dst.id).unwrap().is_some());
+    assert!(h.store_b.incoming(dst.id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn write_then_routed_read_full_cycle() {
+    let h = spawn_two_peer().await;
+    let src = node_owned_by(PeerId(2), &h);
+    let dst = node_owned_by(PeerId(1), &h);
+
+    let mut writer = write_client(&h).await;
+    writer
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&src).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+    writer
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&dst).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+    let edge = Edge::new("LINKED", src.id, dst.id);
+    writer
+        .put_edge(PutEdgeRequest {
+            edge: Some(edge_to_proto(&edge).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    // Read via routed MeshQuery (connected to peer 1, but src is on peer 2).
+    let mut reader = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
+    let resp = reader
+        .get_node(GetNodeRequest {
+            id: Some(uuid_to_proto(src.id.as_uuid())),
+        })
+        .await
+        .unwrap();
+    assert!(resp.into_inner().found);
+
+    let resp = reader
+        .outgoing(NeighborRequest {
+            node_id: Some(uuid_to_proto(src.id.as_uuid())),
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.into_inner().neighbors.len(), 1);
+
+    let resp = reader
+        .incoming(NeighborRequest {
+            node_id: Some(uuid_to_proto(dst.id.as_uuid())),
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.into_inner().neighbors.len(), 1);
 }
 
 #[tokio::test]

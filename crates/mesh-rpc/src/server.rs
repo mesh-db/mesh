@@ -1,18 +1,23 @@
 use crate::convert::{
-    edge_id_from_proto, edge_to_proto, node_id_from_proto, node_to_proto, uuid_to_proto,
+    edge_from_proto, edge_id_from_proto, edge_to_proto, node_from_proto, node_id_from_proto,
+    node_to_proto, uuid_to_proto,
 };
 use crate::proto::mesh_query_server::{MeshQuery, MeshQueryServer};
+use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
+    DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest, DetachDeleteNodeResponse,
     GetEdgeRequest, GetEdgeResponse, GetNodeRequest, GetNodeResponse, HealthRequest,
     HealthResponse, NeighborInfo, NeighborRequest, NeighborResponse, NodesByLabelRequest,
-    NodesByLabelResponse,
+    NodesByLabelResponse, PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
 };
 use crate::routing::Routing;
 use mesh_cluster::PeerId;
 use mesh_storage::Store;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
+#[derive(Clone)]
 pub struct MeshService {
     store: Arc<Store>,
     routing: Option<Arc<Routing>>,
@@ -36,8 +41,12 @@ impl MeshService {
         }
     }
 
-    pub fn into_server(self) -> MeshQueryServer<Self> {
+    pub fn into_query_server(self) -> MeshQueryServer<Self> {
         MeshQueryServer::new(self)
+    }
+
+    pub fn into_write_server(self) -> MeshWriteServer<Self> {
+        MeshWriteServer::new(self)
     }
 }
 
@@ -69,7 +78,7 @@ impl MeshQuery for MeshService {
         if let Some(routing) = &self.routing {
             if !routing.cluster().is_local(id) {
                 let owner = routing.cluster().owner_of(id);
-                let mut client = routing.client_for(owner).ok_or_else(|| no_client(owner))?;
+                let mut client = routing.query_client(owner).ok_or_else(|| no_client(owner))?;
                 return client
                     .get_node(GetNodeRequest { id: Some(id_proto) })
                     .await;
@@ -114,7 +123,7 @@ impl MeshQuery for MeshService {
                         continue;
                     }
                     let mut client =
-                        routing.client_for(peer_id).ok_or_else(|| no_client(peer_id))?;
+                        routing.query_client(peer_id).ok_or_else(|| no_client(peer_id))?;
                     let resp = client
                         .get_edge(GetEdgeRequest {
                             id: Some(id_proto.clone()),
@@ -159,7 +168,7 @@ impl MeshQuery for MeshService {
                         continue;
                     }
                     let mut client =
-                        routing.client_for(peer_id).ok_or_else(|| no_client(peer_id))?;
+                        routing.query_client(peer_id).ok_or_else(|| no_client(peer_id))?;
                     let resp = client
                         .nodes_by_label(NodesByLabelRequest {
                             label: label.clone(),
@@ -187,7 +196,7 @@ impl MeshQuery for MeshService {
         if let Some(routing) = &self.routing {
             if !routing.cluster().is_local(id) {
                 let owner = routing.cluster().owner_of(id);
-                let mut client = routing.client_for(owner).ok_or_else(|| no_client(owner))?;
+                let mut client = routing.query_client(owner).ok_or_else(|| no_client(owner))?;
                 return client
                     .outgoing(NeighborRequest {
                         node_id: Some(id_proto),
@@ -220,7 +229,7 @@ impl MeshQuery for MeshService {
         if let Some(routing) = &self.routing {
             if !routing.cluster().is_local(id) {
                 let owner = routing.cluster().owner_of(id);
-                let mut client = routing.client_for(owner).ok_or_else(|| no_client(owner))?;
+                let mut client = routing.query_client(owner).ok_or_else(|| no_client(owner))?;
                 return client
                     .incoming(NeighborRequest {
                         node_id: Some(id_proto),
@@ -245,5 +254,163 @@ impl MeshQuery for MeshService {
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse { serving: true }))
+    }
+}
+
+#[tonic::async_trait]
+impl MeshWrite for MeshService {
+    async fn put_node(
+        &self,
+        request: Request<PutNodeRequest>,
+    ) -> Result<Response<PutNodeResponse>, Status> {
+        let req = request.into_inner();
+        let local_only = req.local_only;
+        let proto_node = req
+            .node
+            .ok_or_else(|| Status::invalid_argument("missing node"))?;
+        let node = node_from_proto(proto_node.clone()).map_err(bad_request)?;
+        let id = node.id;
+
+        // Route to the owner when we aren't it.
+        if let Some(routing) = &self.routing {
+            if !routing.cluster().is_local(id) && !local_only {
+                let owner = routing.cluster().owner_of(id);
+                let mut client = routing
+                    .write_client(owner)
+                    .ok_or_else(|| no_client(owner))?;
+                client
+                    .put_node(PutNodeRequest {
+                        node: Some(proto_node),
+                        local_only: true,
+                    })
+                    .await?;
+                return Ok(Response::new(PutNodeResponse {}));
+            }
+        }
+
+        self.store.put_node(&node).map_err(internal)?;
+        Ok(Response::new(PutNodeResponse {}))
+    }
+
+    async fn put_edge(
+        &self,
+        request: Request<PutEdgeRequest>,
+    ) -> Result<Response<PutEdgeResponse>, Status> {
+        let req = request.into_inner();
+        let local_only = req.local_only;
+        let proto_edge = req
+            .edge
+            .ok_or_else(|| Status::invalid_argument("missing edge"))?;
+        let edge = edge_from_proto(proto_edge.clone()).map_err(bad_request)?;
+
+        if let Some(routing) = &self.routing {
+            let cluster = routing.cluster();
+            let self_id = cluster.self_id();
+            let mut targets: HashSet<PeerId> = HashSet::new();
+            targets.insert(cluster.owner_of(edge.source));
+            targets.insert(cluster.owner_of(edge.target));
+            let self_is_target = targets.remove(&self_id);
+
+            if self_is_target {
+                self.store.put_edge(&edge).map_err(internal)?;
+            }
+
+            if !local_only {
+                for owner in targets {
+                    let mut client =
+                        routing.write_client(owner).ok_or_else(|| no_client(owner))?;
+                    client
+                        .put_edge(PutEdgeRequest {
+                            edge: Some(proto_edge.clone()),
+                            local_only: true,
+                        })
+                        .await?;
+                }
+            }
+
+            return Ok(Response::new(PutEdgeResponse {}));
+        }
+
+        // No routing — local-only behavior.
+        self.store.put_edge(&edge).map_err(internal)?;
+        Ok(Response::new(PutEdgeResponse {}))
+    }
+
+    async fn delete_edge(
+        &self,
+        request: Request<DeleteEdgeRequest>,
+    ) -> Result<Response<DeleteEdgeResponse>, Status> {
+        let req = request.into_inner();
+        let local_only = req.local_only;
+        let id_proto = req
+            .edge_id
+            .ok_or_else(|| Status::invalid_argument("missing edge_id"))?;
+        let id = edge_id_from_proto(&id_proto).map_err(bad_request)?;
+
+        // Local delete is idempotent (check-then-delete).
+        if self.store.get_edge(id).map_err(internal)?.is_some() {
+            self.store.delete_edge(id).map_err(internal)?;
+        }
+
+        // Scatter-gather to all other peers.
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                let self_id = routing.cluster().self_id();
+                for peer_id in routing.cluster().membership().peer_ids() {
+                    if peer_id == self_id {
+                        continue;
+                    }
+                    let mut client = routing
+                        .write_client(peer_id)
+                        .ok_or_else(|| no_client(peer_id))?;
+                    client
+                        .delete_edge(DeleteEdgeRequest {
+                            edge_id: Some(id_proto.clone()),
+                            local_only: true,
+                        })
+                        .await?;
+                }
+            }
+        }
+
+        Ok(Response::new(DeleteEdgeResponse {}))
+    }
+
+    async fn detach_delete_node(
+        &self,
+        request: Request<DetachDeleteNodeRequest>,
+    ) -> Result<Response<DetachDeleteNodeResponse>, Status> {
+        let req = request.into_inner();
+        let local_only = req.local_only;
+        let id_proto = req
+            .node_id
+            .ok_or_else(|| Status::invalid_argument("missing node_id"))?;
+        let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
+
+        // Local detach-delete is idempotent — no-op if the node isn't here.
+        self.store.detach_delete_node(id).map_err(internal)?;
+
+        // Scatter-gather so every peer cleans up any incident edges it owns.
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                let self_id = routing.cluster().self_id();
+                for peer_id in routing.cluster().membership().peer_ids() {
+                    if peer_id == self_id {
+                        continue;
+                    }
+                    let mut client = routing
+                        .write_client(peer_id)
+                        .ok_or_else(|| no_client(peer_id))?;
+                    client
+                        .detach_delete_node(DetachDeleteNodeRequest {
+                            node_id: Some(id_proto.clone()),
+                            local_only: true,
+                        })
+                        .await?;
+                }
+            }
+        }
+
+        Ok(Response::new(DetachDeleteNodeResponse {}))
     }
 }

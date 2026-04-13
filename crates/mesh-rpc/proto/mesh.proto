@@ -82,3 +82,37 @@ message HealthRequest {}
 message HealthResponse {
   bool serving = 1;
 }
+
+// Mutations. Writes for a node are routed to the partition owner; writes for
+// an edge land on both the source's owner and the target's owner so each
+// peer's local adjacency is complete for the nodes it owns.
+service MeshWrite {
+  rpc PutNode(PutNodeRequest) returns (PutNodeResponse);
+  rpc PutEdge(PutEdgeRequest) returns (PutEdgeResponse);
+  rpc DeleteEdge(DeleteEdgeRequest) returns (DeleteEdgeResponse);
+  rpc DetachDeleteNode(DetachDeleteNodeRequest) returns (DetachDeleteNodeResponse);
+}
+
+message PutNodeRequest {
+  Node node = 1;
+  bool local_only = 2;
+}
+message PutNodeResponse {}
+
+message PutEdgeRequest {
+  Edge edge = 1;
+  bool local_only = 2;
+}
+message PutEdgeResponse {}
+
+message DeleteEdgeRequest {
+  UuidBytes edge_id = 1;
+  bool local_only = 2;
+}
+message DeleteEdgeResponse {}
+
+message DetachDeleteNodeRequest {
+  UuidBytes node_id = 1;
+  bool local_only = 2;
+}
+message DetachDeleteNodeResponse {}

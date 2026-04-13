@@ -1,4 +1,5 @@
 use crate::proto::mesh_query_client::MeshQueryClient;
+use crate::proto::mesh_write_client::MeshWriteClient;
 use mesh_cluster::{Cluster, PeerId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,10 +43,19 @@ impl Routing {
         &self.cluster
     }
 
-    /// Returns a fresh [`MeshQueryClient`] over the cached channel to `peer`.
-    /// Returns `None` when `peer` is the local peer (no channel stored) or
-    /// not a known member.
-    pub fn client_for(&self, peer: PeerId) -> Option<MeshQueryClient<Channel>> {
-        self.channels.get(&peer).cloned().map(MeshQueryClient::new)
+    /// Returns the raw [`Channel`] to `peer`, or `None` if not registered
+    /// (either the local peer or an unknown member).
+    pub fn channel_for(&self, peer: PeerId) -> Option<Channel> {
+        self.channels.get(&peer).cloned()
+    }
+
+    /// Query-side client backed by the cached channel.
+    pub fn query_client(&self, peer: PeerId) -> Option<MeshQueryClient<Channel>> {
+        self.channel_for(peer).map(MeshQueryClient::new)
+    }
+
+    /// Write-side client backed by the cached channel.
+    pub fn write_client(&self, peer: PeerId) -> Option<MeshWriteClient<Channel>> {
+        self.channel_for(peer).map(MeshWriteClient::new)
     }
 }
