@@ -19,6 +19,10 @@ macro_rules! define_id {
                 Self(uuid)
             }
 
+            pub fn from_bytes(bytes: [u8; 16]) -> Self {
+                Self(Uuid::from_bytes(bytes))
+            }
+
             pub fn as_uuid(&self) -> Uuid {
                 self.0
             }

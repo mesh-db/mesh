@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/mesh-core",
+    "crates/mesh-storage",
 ]
 
 [workspace.package]
