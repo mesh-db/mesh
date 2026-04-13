@@ -1,0 +1,304 @@
+use crate::{
+    ast::*,
+    error::{Error, Result},
+};
+use pest::iterators::Pair;
+use pest::Parser as _;
+use pest_derive::Parser;
+
+#[derive(Parser)]
+#[grammar = "cypher.pest"]
+struct CypherParser;
+
+pub fn parse(input: &str) -> Result<Statement> {
+    let mut pairs =
+        CypherParser::parse(Rule::query, input).map_err(|e| Error::Parse(e.to_string()))?;
+    let query = pairs
+        .next()
+        .ok_or_else(|| Error::Parse("empty input".into()))?;
+    let statement = query
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::statement)
+        .ok_or_else(|| Error::Parse("missing statement".into()))?;
+    build_statement(statement)
+}
+
+fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty statement".into()))?;
+    match inner.as_rule() {
+        Rule::create_stmt => Ok(Statement::Create(build_create(inner)?)),
+        Rule::match_stmt => Ok(Statement::Match(build_match(inner)?)),
+        r => Err(Error::Parse(format!("unexpected rule: {:?}", r))),
+    }
+}
+
+fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
+    let node_pattern = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("missing node pattern".into()))?;
+    Ok(CreateStmt {
+        node: build_node_pattern(node_pattern)?,
+    })
+}
+
+fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
+    let mut node = None;
+    let mut where_clause = None;
+    let mut return_items = Vec::new();
+    let mut skip = None;
+    let mut limit = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::node_pattern => node = Some(build_node_pattern(p)?),
+            Rule::where_clause => {
+                let expr_pair = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty where".into()))?;
+                where_clause = Some(build_expression(expr_pair)?);
+            }
+            Rule::return_items => return_items = build_return_items(p)?,
+            Rule::skip_clause => {
+                let int_pair = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty skip".into()))?;
+                skip = Some(parse_integer(int_pair.as_str())?);
+            }
+            Rule::limit_clause => {
+                let int_pair = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty limit".into()))?;
+                limit = Some(parse_integer(int_pair.as_str())?);
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in match: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+
+    Ok(MatchStmt {
+        node: node.ok_or_else(|| Error::Parse("missing node pattern".into()))?,
+        where_clause,
+        return_items,
+        skip,
+        limit,
+    })
+}
+
+fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {
+    let mut var = None;
+    let mut label = None;
+    let mut properties = Vec::new();
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier => var = Some(p.as_str().to_string()),
+            Rule::label_spec => {
+                let label_id = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty label".into()))?;
+                label = Some(label_id.as_str().to_string());
+            }
+            Rule::properties => properties = build_properties(p)?,
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in node pattern: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+
+    Ok(NodePattern {
+        var,
+        label,
+        properties,
+    })
+}
+
+fn build_properties(pair: Pair<Rule>) -> Result<Vec<(String, Literal)>> {
+    let mut entries = Vec::new();
+    for entry_pair in pair.into_inner() {
+        debug_assert_eq!(entry_pair.as_rule(), Rule::property_entry);
+        let mut inner = entry_pair.into_inner();
+        let key = inner
+            .next()
+            .ok_or_else(|| Error::Parse("property key".into()))?
+            .as_str()
+            .to_string();
+        let lit_pair = inner
+            .next()
+            .ok_or_else(|| Error::Parse("property value".into()))?;
+        entries.push((key, build_literal(lit_pair)?));
+    }
+    Ok(entries)
+}
+
+fn build_return_items(pair: Pair<Rule>) -> Result<Vec<ReturnItem>> {
+    let mut items = Vec::new();
+    for item_pair in pair.into_inner() {
+        debug_assert_eq!(item_pair.as_rule(), Rule::return_item);
+        let mut inner = item_pair.into_inner();
+        let expr = build_expression(
+            inner
+                .next()
+                .ok_or_else(|| Error::Parse("return expr".into()))?,
+        )?;
+        let alias = inner.next().map(|p| p.as_str().to_string());
+        items.push(ReturnItem { expr, alias });
+    }
+    Ok(items)
+}
+
+fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
+    match pair.as_rule() {
+        Rule::expression => build_expression(
+            pair.into_inner()
+                .next()
+                .ok_or_else(|| Error::Parse("empty expression".into()))?,
+        ),
+        Rule::or_expr => {
+            let mut inner = pair.into_inner();
+            let mut left = build_expression(
+                inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty or_expr".into()))?,
+            )?;
+            for right in inner {
+                let right_expr = build_expression(right)?;
+                left = Expr::Or(Box::new(left), Box::new(right_expr));
+            }
+            Ok(left)
+        }
+        Rule::and_expr => {
+            let mut inner = pair.into_inner();
+            let mut left = build_expression(
+                inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty and_expr".into()))?,
+            )?;
+            for right in inner {
+                let right_expr = build_expression(right)?;
+                left = Expr::And(Box::new(left), Box::new(right_expr));
+            }
+            Ok(left)
+        }
+        Rule::not_expr => {
+            let first = pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| Error::Parse("empty not_expr".into()))?;
+            if first.as_rule() == Rule::not_expr {
+                Ok(Expr::Not(Box::new(build_expression(first)?)))
+            } else {
+                build_expression(first)
+            }
+        }
+        Rule::comparison => {
+            let mut inner = pair.into_inner();
+            let left = build_expression(
+                inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty comparison".into()))?,
+            )?;
+            if let Some(op_pair) = inner.next() {
+                let op = build_compare_op(op_pair)?;
+                let right = build_expression(
+                    inner
+                        .next()
+                        .ok_or_else(|| Error::Parse("missing comparison rhs".into()))?,
+                )?;
+                Ok(Expr::Compare {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            } else {
+                Ok(left)
+            }
+        }
+        Rule::primary => build_expression(
+            pair.into_inner()
+                .next()
+                .ok_or_else(|| Error::Parse("empty primary".into()))?,
+        ),
+        Rule::literal => Ok(Expr::Literal(build_literal(pair)?)),
+        Rule::property_access => {
+            let mut inner = pair.into_inner();
+            let var = inner
+                .next()
+                .ok_or_else(|| Error::Parse("property var".into()))?
+                .as_str()
+                .to_string();
+            let key = inner
+                .next()
+                .ok_or_else(|| Error::Parse("property key".into()))?
+                .as_str()
+                .to_string();
+            Ok(Expr::Property { var, key })
+        }
+        Rule::identifier => Ok(Expr::Identifier(pair.as_str().to_string())),
+        r => Err(Error::Parse(format!("unexpected rule in expression: {:?}", r))),
+    }
+}
+
+fn build_literal(pair: Pair<Rule>) -> Result<Literal> {
+    let lit_pair = if pair.as_rule() == Rule::literal {
+        pair.into_inner()
+            .next()
+            .ok_or_else(|| Error::Parse("empty literal".into()))?
+    } else {
+        pair
+    };
+    match lit_pair.as_rule() {
+        Rule::integer => Ok(Literal::Integer(parse_integer(lit_pair.as_str())?)),
+        Rule::float => Ok(Literal::Float(
+            lit_pair
+                .as_str()
+                .parse()
+                .map_err(|_| Error::InvalidNumber(lit_pair.as_str().into()))?,
+        )),
+        Rule::string => {
+            let inner = lit_pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| Error::Parse("empty string literal".into()))?;
+            Ok(Literal::String(inner.as_str().to_string()))
+        }
+        Rule::boolean_lit => Ok(Literal::Boolean(lit_pair.as_str().eq_ignore_ascii_case("true"))),
+        Rule::null_lit => Ok(Literal::Null),
+        r => Err(Error::Parse(format!("unexpected literal rule: {:?}", r))),
+    }
+}
+
+fn parse_integer(s: &str) -> Result<i64> {
+    s.parse().map_err(|_| Error::InvalidNumber(s.to_string()))
+}
+
+fn build_compare_op(pair: Pair<Rule>) -> Result<CompareOp> {
+    debug_assert_eq!(pair.as_rule(), Rule::comparison_op);
+    let op_pair = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty comparison op".into()))?;
+    Ok(match op_pair.as_rule() {
+        Rule::op_eq => CompareOp::Eq,
+        Rule::op_neq => CompareOp::Ne,
+        Rule::op_lt => CompareOp::Lt,
+        Rule::op_leq => CompareOp::Le,
+        Rule::op_gt => CompareOp::Gt,
+        Rule::op_geq => CompareOp::Ge,
+        r => return Err(Error::Parse(format!("unexpected op: {:?}", r))),
+    })
+}

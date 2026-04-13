@@ -1,0 +1,12 @@
+[package]
+name = "mesh-cypher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cypher parser and planner for Mesh"
+
+[dependencies]
+mesh-core = { path = "../mesh-core" }
+pest = "2"
+pest_derive = "2"
+thiserror.workspace = true

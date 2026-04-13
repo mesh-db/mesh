@@ -1,0 +1,79 @@
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+query = { SOI ~ statement ~ EOI }
+
+statement = { create_stmt | match_stmt }
+
+create_stmt = { kw_create ~ node_pattern }
+
+match_stmt = {
+    kw_match ~ node_pattern ~
+    where_clause? ~
+    kw_return ~ return_items ~
+    skip_clause? ~
+    limit_clause?
+}
+
+where_clause = { kw_where ~ expression }
+skip_clause = { kw_skip ~ integer }
+limit_clause = { kw_limit ~ integer }
+
+node_pattern = { "(" ~ identifier? ~ label_spec? ~ properties? ~ ")" }
+label_spec = { ":" ~ identifier }
+properties = { "{" ~ (property_entry ~ ("," ~ property_entry)*)? ~ "}" }
+property_entry = { identifier ~ ":" ~ literal }
+
+return_items = { return_item ~ ("," ~ return_item)* }
+return_item = { expression ~ (kw_as ~ identifier)? }
+
+expression = { or_expr }
+or_expr = { and_expr ~ (kw_or ~ and_expr)* }
+and_expr = { not_expr ~ (kw_and ~ not_expr)* }
+not_expr = { (kw_not ~ not_expr) | comparison }
+comparison = { primary ~ (comparison_op ~ primary)? }
+
+comparison_op = { op_neq | op_leq | op_geq | op_eq | op_lt | op_gt }
+op_eq = { "=" }
+op_neq = { "<>" }
+op_leq = { "<=" }
+op_geq = { ">=" }
+op_lt = { "<" }
+op_gt = { ">" }
+
+primary = {
+    literal |
+    property_access |
+    identifier |
+    ("(" ~ expression ~ ")")
+}
+
+property_access = { identifier ~ "." ~ identifier }
+
+literal = { float | integer | string | boolean_lit | null_lit }
+float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer = @{ "-"? ~ ASCII_DIGIT+ }
+string = ${ "\"" ~ string_dq ~ "\"" | "'" ~ string_sq ~ "'" }
+string_dq = @{ (!"\"" ~ ANY)* }
+string_sq = @{ (!"'" ~ ANY)* }
+boolean_lit = @{ (^"true" | ^"false") ~ !id_cont }
+null_lit = @{ ^"null" ~ !id_cont }
+
+identifier = @{ !reserved ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+id_cont = _{ ASCII_ALPHANUMERIC | "_" }
+
+reserved = @{
+    (^"create" | ^"match" | ^"where" | ^"return" | ^"skip" | ^"limit" |
+     ^"as" | ^"or" | ^"and" | ^"not" | ^"true" | ^"false" | ^"null")
+    ~ !id_cont
+}
+
+kw_create = _{ ^"create" }
+kw_match = _{ ^"match" }
+kw_where = _{ ^"where" }
+kw_return = _{ ^"return" }
+kw_skip = _{ ^"skip" }
+kw_limit = _{ ^"limit" }
+kw_as = _{ ^"as" }
+kw_or = _{ ^"or" }
+kw_and = _{ ^"and" }
+kw_not = _{ ^"not" }
