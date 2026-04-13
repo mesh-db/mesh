@@ -5,6 +5,7 @@ members = [
     "crates/mesh-storage",
     "crates/mesh-cypher",
     "crates/mesh-executor",
+    "crates/mesh-rpc",
 ]
 
 [workspace.package]

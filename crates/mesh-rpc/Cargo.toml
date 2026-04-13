@@ -1,0 +1,24 @@
+[package]
+name = "mesh-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "gRPC services for Mesh"
+
+[dependencies]
+mesh-core = { path = "../mesh-core" }
+mesh-storage = { path = "../mesh-storage" }
+tonic = "0.12"
+prost = "0.13"
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+thiserror.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"

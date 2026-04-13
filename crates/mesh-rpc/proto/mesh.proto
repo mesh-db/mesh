@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package mesh;
+
+// 16-byte UUIDv7 wrapped in a length-delimited bytes field.
+message UuidBytes {
+  bytes value = 1;
+}
+
+// Marker for the Null variant of Property.
+message NullValue {}
+
+// Primitive property value. List / Map variants are deferred.
+message Property {
+  oneof kind {
+    NullValue null_val = 1;
+    string string_val = 2;
+    int64 int_val = 3;
+    double float_val = 4;
+    bool bool_val = 5;
+  }
+}
+
+message Node {
+  UuidBytes id = 1;
+  repeated string labels = 2;
+  map<string, Property> properties = 3;
+}
+
+message Edge {
+  UuidBytes id = 1;
+  string edge_type = 2;
+  UuidBytes source = 3;
+  UuidBytes target = 4;
+  map<string, Property> properties = 5;
+}
+
+// (edge_id, neighbor_id) pair returned by adjacency lookups.
+message NeighborInfo {
+  UuidBytes edge_id = 1;
+  UuidBytes neighbor_id = 2;
+}
+
+// Read-only query service.
+service MeshQuery {
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc GetEdge(GetEdgeRequest) returns (GetEdgeResponse);
+  rpc NodesByLabel(NodesByLabelRequest) returns (NodesByLabelResponse);
+  rpc Outgoing(NeighborRequest) returns (NeighborResponse);
+  rpc Incoming(NeighborRequest) returns (NeighborResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message GetNodeRequest { UuidBytes id = 1; }
+message GetNodeResponse {
+  bool found = 1;
+  Node node = 2;
+}
+
+message GetEdgeRequest { UuidBytes id = 1; }
+message GetEdgeResponse {
+  bool found = 1;
+  Edge edge = 2;
+}
+
+message NodesByLabelRequest { string label = 1; }
+message NodesByLabelResponse { repeated UuidBytes ids = 1; }
+
+message NeighborRequest { UuidBytes node_id = 1; }
+message NeighborResponse { repeated NeighborInfo neighbors = 1; }
+
+message HealthRequest {}
+message HealthResponse {
+  bool serving = 1;
+}
