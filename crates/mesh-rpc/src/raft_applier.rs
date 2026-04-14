@@ -53,6 +53,18 @@ impl GraphStateMachine for StoreGraphApplier {
                     .detach_delete_node(*id)
                     .map_err(|e| e.to_string())
             }
+            GraphCommand::Batch(cmds) => {
+                // Sequential apply on top of the per-op idempotency above.
+                // Local atomicity isn't enforced (no Store-level WriteBatch
+                // yet), but it doesn't have to be: log replay re-applies
+                // the entire MeshLogEntry::Graph entry from the start, so a
+                // mid-batch crash recovers correctly because every sub-op
+                // is idempotent.
+                for cmd in cmds {
+                    self.apply(cmd)?;
+                }
+                Ok(())
+            }
         }
     }
 }

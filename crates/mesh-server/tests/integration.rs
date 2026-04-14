@@ -972,6 +972,163 @@ async fn cypher_create_replicates_through_raft_to_follower() {
 }
 
 #[tokio::test]
+async fn cypher_multi_write_query_commits_as_single_raft_entry() {
+    // Atomicity payoff: a Cypher query that writes two nodes and an edge
+    // should commit through Raft as exactly ONE log entry, so a crash
+    // mid-query can't leave a partial result on any replica. Verifies
+    // both the post-commit state on the follower and the leader's
+    // last_log_index advancing by 1, not 3.
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        PeerConfig {
+            id: 1,
+            address: addr_a.to_string(),
+        },
+        PeerConfig {
+            id: 2,
+            address: addr_b.to_string(),
+        },
+    ];
+    let config_a = ServerConfig {
+        self_id: 1,
+        listen_address: addr_a.to_string(),
+        data_dir: dir_a.path().to_path_buf(),
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap: true,
+    };
+    let config_b = ServerConfig {
+        self_id: 2,
+        listen_address: addr_b.to_string(),
+        data_dir: dir_b.path().to_path_buf(),
+        num_partitions: 4,
+        peers,
+        bootstrap: false,
+    };
+
+    let components_a = mesh_server::build_components(&config_a).await.unwrap();
+    let components_b = mesh_server::build_components(&config_b).await.unwrap();
+    let raft_a = components_a.raft.clone().unwrap();
+
+    let ServerComponents {
+        service: service_a,
+        raft: _,
+        raft_service: raft_service_a,
+    } = components_a;
+    let ServerComponents {
+        service: service_b,
+        raft: _,
+        raft_service: raft_service_b,
+    } = components_b;
+    let raft_service_a = raft_service_a.unwrap();
+    let raft_service_b = raft_service_b.unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_a.clone().into_query_server())
+            .add_service(service_a.into_write_server())
+            .add_service(raft_service_a.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_a))
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_b.clone().into_query_server())
+            .add_service(service_b.into_write_server())
+            .add_service(raft_service_b.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_b))
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    mesh_server::initialize_if_seed(&config_a, &raft_a)
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if raft_a.raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+
+    let last_log_before = raft_a
+        .raft
+        .metrics()
+        .borrow()
+        .last_log_index
+        .unwrap_or(0);
+
+    // Multi-write Cypher query: 2 PutNode + 1 PutEdge under the old
+    // one-entry-per-call model. With buffering this becomes 1 batch entry.
+    let mut query_a = MeshQueryClient::connect(format!("http://{}", addr_a))
+        .await
+        .unwrap();
+    query_a
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Grace'}) RETURN a, b".into(),
+        })
+        .await
+        .expect("multi-write CREATE should commit");
+
+    let last_log_after = raft_a
+        .raft
+        .metrics()
+        .borrow()
+        .last_log_index
+        .unwrap_or(0);
+    assert_eq!(
+        last_log_after - last_log_before,
+        1,
+        "multi-write query should consume exactly 1 raft log entry, \
+         got {} (before={last_log_before}, after={last_log_after})",
+        last_log_after - last_log_before
+    );
+
+    // Both nodes and the relationship should be visible on the follower
+    // after the single commit replicates.
+    let mut query_b = MeshQueryClient::connect(format!("http://{}", addr_b))
+        .await
+        .unwrap();
+    let mut visible = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let resp = query_b
+            .execute_cypher(ExecuteCypherRequest {
+                query: "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS a_name, b.name AS b_name".into(),
+            })
+            .await
+            .unwrap();
+        let rows: serde_json::Value =
+            serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+        let arr = rows.as_array().unwrap();
+        if arr.len() == 1 {
+            let row = &arr[0];
+            assert_eq!(row["a_name"]["Property"]["value"].as_str().unwrap(), "Ada");
+            assert_eq!(
+                row["b_name"]["Property"]["value"].as_str().unwrap(),
+                "Grace"
+            );
+            visible = true;
+            break;
+        }
+    }
+    assert!(
+        visible,
+        "follower didn't see the batched create-path replicate"
+    );
+}
+
+#[tokio::test]
 async fn two_peer_raft_replicates_via_server_components() {
     use std::time::Duration;
 

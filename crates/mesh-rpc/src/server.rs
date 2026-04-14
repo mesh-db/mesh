@@ -2,7 +2,7 @@ use crate::convert::{
     edge_from_proto, edge_id_from_proto, edge_to_proto, node_from_proto, node_id_from_proto,
     node_to_proto, uuid_to_proto,
 };
-use crate::executor_writer::RaftGraphWriter;
+use crate::executor_writer::BufferingGraphWriter;
 use crate::proto::mesh_query_server::{MeshQuery, MeshQueryServer};
 use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
@@ -297,26 +297,75 @@ impl MeshQuery for MeshService {
         let statement = mesh_cypher::parse(&query).map_err(bad_request)?;
         let plan = mesh_cypher::plan(&statement).map_err(bad_request)?;
 
-        // Executor runs on a blocking worker: mutating plans may call
-        // RaftGraphWriter, which internally does `Handle::block_on` on an
-        // async Raft propose — illegal from a runtime worker thread, fine
-        // from spawn_blocking. Reads go straight to the local store; every
-        // peer holds the full graph in the single-Raft-group model.
+        // Two-phase execution in cluster mode: run the plan against a
+        // BufferingGraphWriter that just collects mutations, then commit
+        // the whole buffer as one `GraphCommand::Batch` Raft entry. Gives
+        // a multi-write Cypher query single-commit atomicity — a crash
+        // mid-query can't leave behind a partial result on any replica.
+        //
+        // In single-node mode we still run synchronously against the local
+        // store directly, since there's no Raft group to commit to.
         let store = self.store.clone();
         let raft = self.raft.clone();
-        let rows = tokio::task::spawn_blocking(move || {
-            let store_ref: &Store = &store;
-            let rows = if let Some(raft) = raft {
-                let writer = RaftGraphWriter::new(raft);
-                execute_with_writer(&plan, store_ref, &writer as &dyn GraphWriter)
-            } else {
-                execute_with_writer(&plan, store_ref, store_ref as &dyn GraphWriter)
-            }?;
-            Ok::<_, mesh_executor::Error>(rows)
-        })
+        let (rows, batch) = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<mesh_executor::Row>, Option<Vec<GraphCommand>>), mesh_executor::Error> {
+                let store_ref: &Store = &store;
+                if raft.is_some() {
+                    let writer = BufferingGraphWriter::new();
+                    let rows =
+                        execute_with_writer(&plan, store_ref, &writer as &dyn GraphWriter)?;
+                    Ok((rows, Some(writer.into_commands())))
+                } else {
+                    let rows = execute_with_writer(
+                        &plan,
+                        store_ref,
+                        store_ref as &dyn GraphWriter,
+                    )?;
+                    Ok((rows, None))
+                }
+            },
+        )
         .await
         .map_err(|e| Status::internal(format!("executor task panicked: {e}")))?
         .map_err(|e| Status::internal(format!("cypher execution failed: {e}")))?;
+
+        if let (Some(raft), Some(commands)) = (&self.raft, batch) {
+            if !commands.is_empty() {
+                let entry = if commands.len() == 1 {
+                    commands.into_iter().next().unwrap()
+                } else {
+                    GraphCommand::Batch(commands)
+                };
+                match raft.propose_graph(entry).await {
+                    Ok(_) => {}
+                    Err(ClusterError::ForwardToLeader {
+                        leader_address: Some(addr),
+                        ..
+                    }) => {
+                        // Forward the *original* Cypher query to the leader
+                        // rather than the batch — the leader will re-execute
+                        // and re-buffer, which is the only safe thing to do
+                        // since GraphCommand::PutNode carries fresh ids that
+                        // would clash with anything else the leader has
+                        // already created.
+                        let endpoint = Endpoint::from_shared(format!("http://{}", addr))
+                            .map_err(|e| {
+                                Status::internal(format!(
+                                    "invalid leader address {addr}: {e}"
+                                ))
+                            })?;
+                        let mut client =
+                            crate::proto::mesh_query_client::MeshQueryClient::new(
+                                endpoint.connect_lazy(),
+                            );
+                        return client
+                            .execute_cypher(ExecuteCypherRequest { query })
+                            .await;
+                    }
+                    Err(e) => return Err(raft_propose_failed(e)),
+                }
+            }
+        }
 
         let rows_json = serde_json::to_vec(&rows)
             .map_err(|e| Status::internal(format!("encoding rows: {e}")))?;

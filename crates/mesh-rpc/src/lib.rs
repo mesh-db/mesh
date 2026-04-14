@@ -12,7 +12,7 @@ mod routing;
 mod server;
 
 pub use error::ConvertError;
-pub use executor_writer::RaftGraphWriter;
+pub use executor_writer::{BufferingGraphWriter, RaftGraphWriter};
 pub use raft_applier::StoreGraphApplier;
 pub use raft_network::{GrpcNetwork, GrpcNetworkError};
 pub use raft_service::MeshRaftService;

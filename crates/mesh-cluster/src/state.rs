@@ -37,14 +37,17 @@ pub enum ClusterCommand {
 /// peer's local store ends up with the same data.
 ///
 /// `PutNode` / `PutEdge` carry the full entity bytes; `DeleteEdge` /
-/// `DetachDeleteNode` carry only the id. Float properties on `Node`/`Edge`
-/// mean this enum can only derive `PartialEq`, not `Eq`.
+/// `DetachDeleteNode` carry only the id. `Batch` carries a sequence of
+/// mutations that must be applied as one Raft entry — used to give a
+/// multi-write Cypher query single-commit atomicity. Float properties on
+/// `Node`/`Edge` mean this enum can only derive `PartialEq`, not `Eq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GraphCommand {
     PutNode(Node),
     PutEdge(Edge),
     DeleteEdge(EdgeId),
     DetachDeleteNode(NodeId),
+    Batch(Vec<GraphCommand>),
 }
 
 /// Top-level Raft log entry: either a cluster-metadata mutation or a graph
