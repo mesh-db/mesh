@@ -33,11 +33,43 @@ fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
         Rule::match_stmt => Ok(Statement::Match(build_match(inner)?)),
         Rule::merge_stmt => Ok(Statement::Merge(build_merge(inner)?)),
         Rule::unwind_stmt => Ok(Statement::Unwind(build_unwind(inner)?)),
+        Rule::return_only_stmt => Ok(Statement::Return(build_return_only(inner)?)),
         Rule::create_index_stmt => Ok(Statement::CreateIndex(build_index_ddl(inner)?)),
         Rule::drop_index_stmt => Ok(Statement::DropIndex(build_index_ddl(inner)?)),
         Rule::show_indexes_stmt => Ok(Statement::ShowIndexes),
         r => Err(Error::Parse(format!("unexpected rule: {:?}", r))),
     }
+}
+
+/// Parse a bare `RETURN <items>` statement. The grammar wraps a
+/// single `return_tail`, so we just walk into it and reuse
+/// `parse_return_tail` to fill the projection / distinct / sort /
+/// skip / limit fields.
+fn build_return_only(pair: Pair<Rule>) -> Result<crate::ast::ReturnStmt> {
+    let mut return_items = Vec::new();
+    let mut distinct = false;
+    let mut order_by = Vec::new();
+    let mut skip = None;
+    let mut limit = None;
+    let tail = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("return_only_stmt missing return_tail".into()))?;
+    parse_return_tail(
+        tail,
+        &mut return_items,
+        &mut distinct,
+        &mut order_by,
+        &mut skip,
+        &mut limit,
+    )?;
+    Ok(crate::ast::ReturnStmt {
+        return_items,
+        distinct,
+        order_by,
+        skip,
+        limit,
+    })
 }
 
 /// Shared builder for the two DDL statements that carry a

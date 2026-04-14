@@ -1015,6 +1015,36 @@ fn where_eq_with_no_matching_index_does_not_rewrite() {
 }
 
 #[test]
+fn bare_return_parses_to_return_statement() {
+    match parse("RETURN 'hi' AS msg").unwrap() {
+        Statement::Return(r) => {
+            assert_eq!(r.return_items.len(), 1);
+            assert_eq!(r.return_items[0].alias.as_deref(), Some("msg"));
+        }
+        other => panic!("expected Statement::Return, got {other:?}"),
+    }
+}
+
+#[test]
+fn bare_return_supports_multiple_items() {
+    match parse("RETURN 1 AS a, 2 AS b, 'x' AS c").unwrap() {
+        Statement::Return(r) => assert_eq!(r.return_items.len(), 3),
+        other => panic!("expected Statement::Return, got {other:?}"),
+    }
+}
+
+#[test]
+fn bare_return_supports_skip_and_limit() {
+    match parse("RETURN 1 AS x SKIP 0 LIMIT 1").unwrap() {
+        Statement::Return(r) => {
+            assert_eq!(r.skip, Some(0));
+            assert_eq!(r.limit, Some(1));
+        }
+        other => panic!("expected Statement::Return, got {other:?}"),
+    }
+}
+
+#[test]
 fn pattern_prop_filter_plus_where_rewrites_through_chain() {
     // MATCH (n:Person {age: 30}) WHERE n.name = 'Ada' — pattern-prop
     // emits a Filter chain over NodeScanByLabels (since `age` isn't

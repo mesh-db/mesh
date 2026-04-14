@@ -4,9 +4,25 @@ pub enum Statement {
     Match(MatchStmt),
     Merge(MergeStmt),
     Unwind(UnwindStmt),
+    /// Bare `RETURN <items>` with no producer clause. Behaves like
+    /// `UNWIND [0] AS _ RETURN <items>` — produces exactly one row,
+    /// and the projection only references row-independent
+    /// expressions (literals, parameters, calls on those). Used by
+    /// drivers as a health-probe form (`RETURN 1`) and for
+    /// expression-only queries.
+    Return(ReturnStmt),
     CreateIndex(IndexDdl),
     DropIndex(IndexDdl),
     ShowIndexes,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnStmt {
+    pub return_items: Vec<ReturnItem>,
+    pub distinct: bool,
+    pub order_by: Vec<SortItem>,
+    pub skip: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 /// Declarative description of a property index for DDL statements.

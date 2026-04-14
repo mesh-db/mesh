@@ -4,8 +4,16 @@ query = { SOI ~ statement ~ EOI }
 
 statement = {
     create_index_stmt | drop_index_stmt | show_indexes_stmt |
-    unwind_stmt | merge_stmt | create_stmt | match_stmt
+    unwind_stmt | merge_stmt | create_stmt | match_stmt | return_only_stmt
 }
+
+// Bare `RETURN <expr> AS alias` with no producer clause — Neo4j's
+// canonical health-probe form (`RETURN 1`). Reuses the existing
+// `return_tail` rule so the projection / DISTINCT / ORDER BY /
+// SKIP / LIMIT all behave identically to a clause-attached
+// RETURN. Lowered by the planner to a single-element UNWIND so the
+// executor's Project pipeline produces exactly one row.
+return_only_stmt = { return_tail }
 
 create_stmt = { kw_create ~ pattern_list ~ return_tail? }
 merge_stmt  = { kw_merge ~ node_pattern ~ return_tail? }

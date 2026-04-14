@@ -2165,3 +2165,58 @@ fn index_seek_with_residual_property_filter() {
     assert_eq!(rows.len(), 1);
     assert_eq!(int_prop(&rows[0], "age"), 37);
 }
+
+#[test]
+fn bare_return_literal_string_emits_one_row() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN 'Hello from Neo4j!' AS message");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "message"), "Hello from Neo4j!");
+}
+
+#[test]
+fn bare_return_integer_literal() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN 1 AS x");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "x"), 1);
+}
+
+#[test]
+fn bare_return_multiple_items() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN 1 AS a, 'two' AS b, true AS c");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "a"), 1);
+    assert_eq!(str_prop(&rows[0], "b"), "two");
+    assert!(matches!(
+        rows[0].get("c"),
+        Some(Value::Property(Property::Bool(true)))
+    ));
+}
+
+#[test]
+fn bare_return_with_parameter() {
+    let (store, _d) = open_store();
+    let mut params = ParamMap::new();
+    params.insert(
+        "greeting".into(),
+        Value::Property(Property::String("hi".into())),
+    );
+    let rows = run_with_params(&store, "RETURN $greeting AS g", &params);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "g"), "hi");
+}
+
+#[test]
+fn bare_return_does_not_leak_placeholder_column() {
+    // The lowering uses a synthetic UNWIND with an unutterable
+    // variable name; the Project step must drop it from the
+    // emitted row so clients only see the named projections.
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN 42 AS answer");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.len(), 1, "row should contain only the projected column");
+    assert!(row.contains_key("answer"));
+}

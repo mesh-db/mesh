@@ -1,6 +1,6 @@
 use crate::ast::{
-    CallArgs, CreateStmt, Direction, Expr, IndexDdl, MatchStmt, MergeStmt, NodePattern, Pattern,
-    ReturnItem, SortItem, Statement, UnwindStmt,
+    CallArgs, CreateStmt, Direction, Expr, IndexDdl, Literal, MatchStmt, MergeStmt, NodePattern,
+    Pattern, ReturnItem, ReturnStmt, SortItem, Statement, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -250,6 +250,7 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
         Statement::Match(m) => plan_match(m, ctx),
         Statement::Merge(m) => plan_merge(m),
         Statement::Unwind(u) => plan_unwind(u),
+        Statement::Return(r) => plan_return_only(r),
         Statement::CreateIndex(IndexDdl { label, property }) => {
             Ok(LogicalPlan::CreatePropertyIndex {
                 label: label.clone(),
@@ -262,6 +263,32 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
         }),
         Statement::ShowIndexes => Ok(LogicalPlan::ShowPropertyIndexes),
     }
+}
+
+/// Lower a bare `RETURN <items>` to a single-row producer plus the
+/// usual return pipeline. Implemented as `UNWIND [0] AS __bare_return`
+/// so the executor's existing `UnwindOp` produces exactly one row,
+/// after which `Project` overwrites the bound variable with the
+/// caller's projection (the placeholder column is dropped because
+/// `Project` returns only the explicitly-named items).
+///
+/// The choice of `0` for the placeholder value is arbitrary —
+/// projections can't reference `__bare_return` (the parser
+/// guarantees there's no MATCH binding it), and the executor's
+/// `UnwindOp` only cares that the source list has length 1.
+fn plan_return_only(stmt: &ReturnStmt) -> Result<LogicalPlan> {
+    let producer = LogicalPlan::Unwind {
+        var: "__bare_return".to_string(),
+        expr: Expr::List(vec![Expr::Literal(Literal::Integer(0))]),
+    };
+    apply_return_pipeline(
+        producer,
+        &stmt.return_items,
+        stmt.distinct,
+        &stmt.order_by,
+        stmt.skip,
+        stmt.limit,
+    )
 }
 
 fn plan_unwind(stmt: &UnwindStmt) -> Result<LogicalPlan> {
