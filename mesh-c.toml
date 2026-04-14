@@ -1,7 +1,7 @@
-self_id = 2
-listen_address = "127.0.0.1:7002"
-data_dir = "/tmp/mesh-data-b"
-bolt_address = "127.0.0.1:7688"
+self_id = 3
+listen_address = "127.0.0.1:7003"
+data_dir = "/tmp/mesh-data-c"
+bolt_address = "127.0.0.1:7689"
 num_partitions = 4
 
 [[peers]]
