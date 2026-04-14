@@ -7,8 +7,20 @@
 
 use mesh_cluster::raft::GraphStateMachine;
 use mesh_cluster::GraphCommand;
+use mesh_core::{Edge, Node};
 use mesh_storage::{Store, StoreMutation};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// On-the-wire format for a graph snapshot blob. Carries every node and
+/// every edge in the local store as one JSON document. Cheap to write and
+/// parse for small graphs; a future step can replace this with a streaming
+/// rocksdb checkpoint when datasets grow.
+#[derive(Debug, Serialize, Deserialize)]
+struct GraphSnapshot {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+}
 
 pub struct StoreGraphApplier {
     store: Arc<Store>,
@@ -64,6 +76,39 @@ impl GraphStateMachine for StoreGraphApplier {
                 self.store.apply_batch(&flat).map_err(|e| e.to_string())
             }
         }
+    }
+
+    fn snapshot(&self) -> Result<Vec<u8>, String> {
+        let nodes = self.store.all_nodes().map_err(|e| e.to_string())?;
+        let edges = self.store.all_edges().map_err(|e| e.to_string())?;
+        serde_json::to_vec(&GraphSnapshot { nodes, edges }).map_err(|e| e.to_string())
+    }
+
+    fn restore(&self, snapshot: &[u8]) -> Result<(), String> {
+        // Empty blob means the snapshot didn't include graph data (e.g.,
+        // a cluster-state-only test). Leave the local store alone.
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        let parsed: GraphSnapshot =
+            serde_json::from_slice(snapshot).map_err(|e| e.to_string())?;
+
+        // Replace the local store contents wholesale: clear, then apply
+        // the snapshot's nodes + edges as one atomic batch so a crash
+        // mid-restore still recovers from the leader's snapshot on the
+        // next reconnect.
+        self.store.clear_all().map_err(|e| e.to_string())?;
+        let mut mutations: Vec<StoreMutation> =
+            Vec::with_capacity(parsed.nodes.len() + parsed.edges.len());
+        for n in parsed.nodes {
+            mutations.push(StoreMutation::PutNode(n));
+        }
+        for e in parsed.edges {
+            mutations.push(StoreMutation::PutEdge(e));
+        }
+        self.store
+            .apply_batch(&mutations)
+            .map_err(|e| e.to_string())
     }
 }
 

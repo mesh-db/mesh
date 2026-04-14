@@ -252,6 +252,45 @@ impl Store {
         Ok(())
     }
 
+    /// Walk every node in the store. Used for snapshot construction; not
+    /// suitable as a query primitive since it materializes the full set.
+    pub fn all_nodes(&self) -> Result<Vec<Node>> {
+        let cf = self.cf(CF_NODES)?;
+        let mut nodes = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (_, value) = item?;
+            nodes.push(serde_json::from_slice(&value)?);
+        }
+        Ok(nodes)
+    }
+
+    /// Walk every edge in the store. Used for snapshot construction.
+    pub fn all_edges(&self) -> Result<Vec<Edge>> {
+        let cf = self.cf(CF_EDGES)?;
+        let mut edges = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (_, value) = item?;
+            edges.push(serde_json::from_slice(&value)?);
+        }
+        Ok(edges)
+    }
+
+    /// Drop every key from every column family. Used by snapshot install
+    /// to wipe local state before applying the leader's snapshot. Cheap
+    /// for empty / small stores; for large stores this is O(n).
+    pub fn clear_all(&self) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        for cf_name in ALL_CFS {
+            let cf = self.cf(cf_name)?;
+            for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+                let (key, _) = item?;
+                batch.delete_cf(cf, key);
+            }
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
     pub fn all_node_ids(&self) -> Result<Vec<NodeId>> {
         let cf = self.cf(CF_NODES)?;
         let mut results = Vec::new();

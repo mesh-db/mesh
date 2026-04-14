@@ -972,6 +972,202 @@ async fn cypher_create_replicates_through_raft_to_follower() {
 }
 
 #[tokio::test]
+async fn auto_snapshot_fires_and_persists_graph_data() {
+    // Helper local to this test — spawns the server with a shutdown
+    // channel so we can fully release the rocksdb file lock and reopen
+    // the store from disk in the verification phase.
+    struct RunningPeer {
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        join: tokio::task::JoinHandle<()>,
+    }
+    fn spawn_peer(listener: TcpListener, components: ServerComponents) -> RunningPeer {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let ServerComponents {
+            service,
+            raft: _,
+            raft_service,
+        } = components;
+        let raft_service = raft_service.unwrap();
+        let join = tokio::spawn(async move {
+            let shutdown = async {
+                let _ = shutdown_rx.await;
+            };
+            Server::builder()
+                .add_service(service.clone().into_query_server())
+                .add_service(service.into_write_server())
+                .add_service(raft_service.into_server())
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    shutdown,
+                )
+                .await
+                .unwrap();
+        });
+        RunningPeer {
+            shutdown: shutdown_tx,
+            join,
+        }
+    }
+
+    // Two-part validation of auto-snapshots:
+    //   1. After enough committed log entries (snapshot_policy.LogsSinceLast(16)),
+    //      the leader produces a snapshot whose meta is reflected in raft
+    //      metrics and whose persisted blob round-trips through restore on
+    //      a fresh local store.
+    //   2. The snapshot blob is a `PersistedSnapshot` carrying both
+    //      ClusterState AND the graph applier's nodes/edges — so a brand
+    //      new replica receiving InstallSnapshot ends up with the leader's
+    //      full graph data, not just cluster metadata.
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        PeerConfig {
+            id: 1,
+            address: addr_a.to_string(),
+        },
+        PeerConfig {
+            id: 2,
+            address: addr_b.to_string(),
+        },
+    ];
+    let config_a = ServerConfig {
+        self_id: 1,
+        listen_address: addr_a.to_string(),
+        data_dir: dir_a.path().to_path_buf(),
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap: true,
+    };
+    let config_b = ServerConfig {
+        self_id: 2,
+        listen_address: addr_b.to_string(),
+        data_dir: dir_b.path().to_path_buf(),
+        num_partitions: 4,
+        peers,
+        bootstrap: false,
+    };
+
+    let components_a = mesh_server::build_components(&config_a).await.unwrap();
+    let components_b = mesh_server::build_components(&config_b).await.unwrap();
+    let raft_a = components_a.raft.clone().unwrap();
+
+    let peer_a = spawn_peer(listener_a, components_a);
+    let _peer_b = spawn_peer(listener_b, components_b);
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    mesh_server::initialize_if_seed(&config_a, &raft_a)
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if raft_a.raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+
+    // Drive enough Cypher creates to cross the snapshot threshold.
+    let mut query_a = MeshQueryClient::connect(format!("http://{}", addr_a))
+        .await
+        .unwrap();
+    for i in 0..20 {
+        query_a
+            .execute_cypher(ExecuteCypherRequest {
+                query: format!(
+                    "CREATE (n:Person {{idx: {i}}}) RETURN n"
+                ),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Poll the leader's metrics until the snapshot field reflects an
+    // auto-built snapshot. openraft fires the snapshot asynchronously
+    // after the threshold is crossed, so a small wait is required.
+    let mut snapshot_seen = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(snap) = raft_a.raft.metrics().borrow().snapshot {
+            snapshot_seen = Some(snap);
+            break;
+        }
+    }
+    let snap_meta = snapshot_seen
+        .expect("leader should have built a snapshot after 20 commits");
+    // openraft fires a snapshot once enough entries have accumulated since
+    // the previous one; the threshold is approximate. We just need the
+    // auto-snapshot path to have run at all.
+    assert!(
+        snap_meta.index >= 10,
+        "snapshot should cover a meaningful chunk of the log, got {snap_meta:?}"
+    );
+
+    // Verify the snapshot persisted to disk by re-opening the leader's
+    // raft store directly. The PersistedSnapshot blob should contain BOTH
+    // a non-empty graph payload and the cluster state.
+    use mesh_cluster::raft::{MemStore, PersistedSnapshot};
+    use mesh_cluster::{ClusterState, Membership, Peer, PartitionMap};
+
+    // Stop A's raft cleanly so we can reopen the rocksdb handle. Order:
+    // shut openraft's internal task, then stop the gRPC server (which
+    // drops the Arc<RaftCluster> inside MeshService), then release our
+    // local Arc. After that, the rocksdb file lock for dir_a/raft is
+    // free for a fresh MemStore to take.
+    raft_a.raft.shutdown().await.unwrap();
+    peer_a.shutdown.send(()).unwrap();
+    peer_a.join.await.unwrap();
+    drop(raft_a);
+    drop(query_a);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let reopened = MemStore::open_persistent(
+        dir_a.path().join("raft"),
+        ClusterState::new(
+            Membership::new(vec![Peer::new(PeerId(1), addr_a.to_string())]),
+            PartitionMap::round_robin(&[PeerId(1)], 1).unwrap(),
+        ),
+        None,
+    )
+    .unwrap();
+
+    let inner = reopened.inner();
+    let guard = inner.read().await;
+    let (_meta, raw) = guard
+        .snapshot
+        .as_ref()
+        .expect("auto-snapshot should be persisted on disk");
+    let payload: PersistedSnapshot =
+        serde_json::from_slice(raw).expect("snapshot must be a PersistedSnapshot");
+    assert!(
+        !payload.graph.is_empty(),
+        "snapshot's graph blob should be populated after CREATE-heavy workload"
+    );
+    // ClusterState should at least carry the bootstrapped 2-peer membership.
+    assert_eq!(payload.cluster.membership.len(), 2);
+
+    // Decode the graph blob shape — it's the StoreGraphApplier's
+    // GraphSnapshot { nodes, edges } JSON. We only care that nodes are present.
+    let graph_value: serde_json::Value =
+        serde_json::from_slice(&payload.graph).unwrap();
+    let nodes = graph_value["nodes"].as_array().unwrap();
+    // The snapshot may have fired before every CREATE was applied — what
+    // matters is that the graph payload carries *some* of the data, not
+    // just the cluster metadata. A previous-version snapshot with only
+    // ClusterState would land here with `nodes` absent or empty.
+    assert!(
+        nodes.len() >= 5,
+        "graph snapshot should contain a meaningful slice of created nodes, got {}",
+        nodes.len()
+    );
+}
+
+#[tokio::test]
 async fn cypher_multi_write_query_commits_as_single_raft_entry() {
     // Atomicity payoff: a Cypher query that writes two nodes and an edge
     // should commit through Raft as exactly ONE log entry, so a crash

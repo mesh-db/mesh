@@ -83,6 +83,16 @@ pub type NodeId = u64;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyResponse;
 
+/// Wire format for a Raft snapshot. Carries both the cluster-metadata
+/// state and the opaque graph blob produced by [`GraphStateMachine::snapshot`].
+/// On install we split it back apart, hand the graph blob to
+/// [`GraphStateMachine::restore`], and replace the cluster state in place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSnapshot {
+    pub cluster: ClusterState,
+    pub graph: Vec<u8>,
+}
+
 openraft::declare_raft_types!(
     /// Type binding for Mesh's Raft consensus layer. `D = MeshLogEntry`
     /// so a single Raft group replicates both cluster metadata changes
@@ -104,6 +114,24 @@ pub trait GraphStateMachine: std::fmt::Debug + Send + Sync + 'static {
     /// Apply a single graph mutation. Errors are surfaced as strings for
     /// simplicity; a future step will introduce a typed error.
     fn apply(&self, command: &GraphCommand) -> std::result::Result<(), String>;
+
+    /// Serialize the current graph state as an opaque snapshot blob. Called
+    /// by [`MemSnapshotBuilder::build_snapshot`] so a snapshot also captures
+    /// the full graph data (not just cluster metadata).
+    ///
+    /// Default impl returns an empty blob, suitable for cluster-state-only
+    /// callers (tests).
+    fn snapshot(&self) -> std::result::Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Replace the local graph state with the contents of `snapshot`. Called
+    /// by `install_snapshot` when a follower receives a snapshot from the
+    /// leader. Implementations should treat the snapshot as authoritative
+    /// — wipe any prior state before applying.
+    fn restore(&self, _snapshot: &[u8]) -> std::result::Result<(), String> {
+        Ok(())
+    }
 }
 
 impl From<crate::PeerId> for NodeId {
@@ -119,12 +147,16 @@ impl From<NodeId> for crate::PeerId {
 }
 
 /// Default Raft config tuned for tests — short heartbeats and elections so
-/// the single-node bootstrap path resolves quickly.
+/// the single-node bootstrap path resolves quickly. Also enables automatic
+/// snapshots after every 16 committed log entries and aggressive log
+/// compaction so older entries can be purged once a snapshot covers them.
 pub fn default_config() -> openraft::Config {
     openraft::Config {
         heartbeat_interval: 250,
         election_timeout_min: 500,
         election_timeout_max: 1000,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(16),
+        max_in_snapshot_log_to_keep: 0,
         ..openraft::Config::default()
     }
 }
@@ -495,14 +527,30 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> std::result::Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let state: ClusterState = serde_json::from_slice(&data).map_err(|e| {
-            StorageError::from(StorageIOError::read_snapshot(Some(meta.signature()), &e))
-        })?;
+        let payload: PersistedSnapshot =
+            serde_json::from_slice(&data).map_err(|e| {
+                StorageError::from(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &e,
+                ))
+            })?;
         let mut inner = self.inner.write().await;
-        inner.state = state;
+        inner.state = payload.cluster;
         inner.last_applied = meta.last_log_id;
         inner.stored_membership = meta.last_membership.clone();
         inner.snapshot = Some((meta.clone(), data.clone()));
+
+        // Hand the opaque graph blob to the applier so the local store
+        // ends up exactly matching the leader's. Done while holding the
+        // inner lock so concurrent applies can't interleave with restore.
+        if let Some(applier) = &inner.graph_applier {
+            applier.restore(&payload.graph).map_err(|e| {
+                StorageError::from(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e),
+                ))
+            })?;
+        }
 
         if let Some(db) = inner.persistent.as_ref() {
             let mut batch = WriteBatch::default();
@@ -552,7 +600,22 @@ impl RaftSnapshotBuilder<MeshRaftConfig> for MemSnapshotBuilder {
     ) -> std::result::Result<Snapshot<MeshRaftConfig>, StorageError<NodeId>> {
         let mut inner = self.inner.write().await;
         inner.snapshot_counter += 1;
-        let data = serde_json::to_vec(&inner.state).map_err(|e| {
+        // Bundle cluster metadata + the graph applier's opaque blob into
+        // a single PersistedSnapshot. A snapshot received by a follower
+        // restores BOTH halves so a brand-new replica can catch up from
+        // an InstallSnapshot alone, without needing the leader's full log.
+        let graph = if let Some(applier) = &inner.graph_applier {
+            applier
+                .snapshot()
+                .map_err(|e| StorageIOError::read_state_machine(&std::io::Error::other(e)))?
+        } else {
+            Vec::new()
+        };
+        let payload = PersistedSnapshot {
+            cluster: inner.state.clone(),
+            graph,
+        };
+        let data = serde_json::to_vec(&payload).map_err(|e| {
             StorageError::from(StorageIOError::read_state_machine(&e))
         })?;
         let meta = SnapshotMeta {
