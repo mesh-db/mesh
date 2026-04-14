@@ -3,6 +3,7 @@ use crate::convert::{
 };
 use crate::proto::{
     AllNodeIdsRequest, GetEdgeRequest, GetNodeRequest, NeighborRequest, NodesByLabelRequest,
+    NodesByPropertyRequest,
 };
 use crate::routing::Routing;
 use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
@@ -253,23 +254,50 @@ impl GraphReader for PartitionedGraphReader {
         property: &str,
         value: &Property,
     ) -> ExecResult<Vec<NodeId>> {
-        // Phase A placeholder: the planner never emits IndexSeek in
-        // routing mode (CREATE INDEX is rejected at the server layer
-        // until Phase C), so this code path is unreachable via real
-        // queries. A correct-but-slow fallback still satisfies the
-        // trait contract if something else ever calls it: scatter the
-        // label scan, then probe each candidate via the normal point
-        // read and match the property locally.
-        let candidates = self.nodes_by_label(label)?;
-        let mut out = Vec::new();
-        for id in candidates {
-            if let Some(n) = self.get_node(id)? {
-                if n.properties.get(property) == Some(value) {
+        // Scatter-gather via the dedicated `NodesByProperty` RPC.
+        // Every peer answers from its local property-index CF; each
+        // peer owns a disjoint slice of the graph so unioning the
+        // results is correct. The value is JSON-encoded once and the
+        // blob reused across every remote call.
+        let value_json = serde_json::to_vec(value).map_err(|e| Self::remote(e))?;
+        let mut seen: HashSet<NodeId> = self
+            .local
+            .nodes_by_property(label, property, value)?
+            .into_iter()
+            .collect();
+        let label = label.to_string();
+        let property = property.to_string();
+        let routing = self.routing.clone();
+        let remote: ExecResult<Vec<NodeId>> = self.block(async move {
+            let self_id = routing.cluster().self_id();
+            let mut out: Vec<NodeId> = Vec::new();
+            for peer_id in routing.cluster().membership().peer_ids() {
+                if peer_id == self_id {
+                    continue;
+                }
+                let mut client = routing.query_client(peer_id).ok_or_else(|| {
+                    ExecError::Remote(format!("no client registered for peer {}", peer_id))
+                })?;
+                let resp = client
+                    .nodes_by_property(NodesByPropertyRequest {
+                        label: label.clone(),
+                        property: property.clone(),
+                        value_json: value_json.clone(),
+                        local_only: true,
+                    })
+                    .await
+                    .map_err(Self::remote)?;
+                for id_proto in resp.into_inner().ids {
+                    let id = node_id_from_proto(&id_proto).map_err(Self::remote)?;
                     out.push(id);
                 }
             }
+            Ok(out)
+        });
+        for id in remote? {
+            seen.insert(id);
         }
-        Ok(out)
+        Ok(seen.into_iter().collect())
     }
 }
 

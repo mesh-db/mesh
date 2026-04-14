@@ -253,13 +253,16 @@ impl<'a> TxCoordinator<'a> {
                 GraphCommand::Batch(inner) => {
                     self.group_into(groups, all_peers, inner);
                 }
-                // Routing mode rejects DDL at the server layer until
-                // Phase C wires up the parallel fan-out path. If a
-                // command ever reaches the coordinator despite that,
-                // it's a routing bug — log and drop rather than
-                // silently mis-grouping.
+                // DDL is split out of the command list by
+                // `split_ddl` in `commit_buffered_commands` before
+                // it reaches the coordinator, so seeing one here is
+                // an internal bug rather than user-visible state.
                 GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => {
-                    tracing::error!("property-index DDL reached routing coordinator; dropping");
+                    debug_assert!(
+                        false,
+                        "DDL command reached the routing coordinator; \
+                         it should have been split out by split_ddl"
+                    );
                 }
             }
         }

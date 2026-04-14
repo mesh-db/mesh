@@ -9,10 +9,12 @@ use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
     AllNodeIdsRequest, AllNodeIdsResponse, BatchPhase, BatchWriteRequest, BatchWriteResponse,
-    DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest, DetachDeleteNodeResponse,
-    ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse, GetNodeRequest,
-    GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo, NeighborRequest,
-    NeighborResponse, NodesByLabelRequest, NodesByLabelResponse, PutEdgeRequest, PutEdgeResponse,
+    CreatePropertyIndexRequest, CreatePropertyIndexResponse, DeleteEdgeRequest, DeleteEdgeResponse,
+    DetachDeleteNodeRequest, DetachDeleteNodeResponse, DropPropertyIndexRequest,
+    DropPropertyIndexResponse, ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest,
+    GetEdgeResponse, GetNodeRequest, GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo,
+    NeighborRequest, NeighborResponse, NodesByLabelRequest, NodesByLabelResponse,
+    NodesByPropertyRequest, NodesByPropertyResponse, PutEdgeRequest, PutEdgeResponse,
     PutNodeRequest, PutNodeResponse,
 };
 use crate::routing::Routing;
@@ -215,23 +217,13 @@ impl MeshService {
     ) -> std::result::Result<(Vec<mesh_executor::Row>, Vec<GraphCommand>), Status> {
         let statement = mesh_cypher::parse(&query).map_err(bad_request)?;
 
-        // Schema DDL replication: Raft mode propagates via the log
-        // (each peer's `StoreGraphApplier` runs `create_property_index`
-        // locally when the `CreateIndex` entry commits). Routing
-        // mode still needs parallel fan-out with rollback, which
-        // lands in Phase C — reject DDL there for now.
-        let is_ddl = matches!(
-            statement,
-            mesh_cypher::Statement::CreateIndex(_)
-                | mesh_cypher::Statement::DropIndex(_)
-                | mesh_cypher::Statement::ShowIndexes
-        );
-        if is_ddl && self.routing.is_some() {
-            return Err(Status::unimplemented(
-                "property-index DDL is not yet supported in routing mode; \
-                 single-node and Raft modes are supported in this release",
-            ));
-        }
+        // Schema DDL replication is wired up across every mode now:
+        // - Single-node: applied directly through the store.
+        // - Raft: replicated via `propose_graph(GraphCommand::CreateIndex)`,
+        //   each peer's `StoreGraphApplier` runs the local create.
+        // - Routing: parallel fan-out with rollback in
+        //   `replicate_index_ddl_routing`, called from
+        //   `commit_buffered_commands`.
 
         // Populate the planner context with the registered indexes so
         // `MATCH (n:Label {prop: ...})` can rewrite to `IndexSeek`
@@ -315,11 +307,25 @@ impl MeshService {
             return Ok(());
         }
         if let Some(routing) = &self.routing {
+            // Schema DDL isn't keyed to a partition and doesn't fit
+            // the 2PC coordinator model — it applies globally. Split
+            // DDL out of the batch, fan it out to every peer with
+            // rollback-on-failure, then hand any remaining graph
+            // mutations to the coordinator as usual. A query that's
+            // DDL-only (the common case) never touches the
+            // coordinator at all.
+            let (ddl, graph) = split_ddl(commands);
+            if !ddl.is_empty() {
+                self.replicate_index_ddl_routing(routing, &ddl).await?;
+            }
+            if graph.is_empty() {
+                return Ok(());
+            }
             let mut coordinator = TxCoordinator::new(&self.store, &self.pending_batches, routing);
             if let Some(log) = self.coordinator_log.as_deref() {
                 coordinator = coordinator.with_log(log);
             }
-            coordinator.run(commands).await?;
+            coordinator.run(graph).await?;
             return Ok(());
         }
         if let Some(raft) = &self.raft {
@@ -342,6 +348,104 @@ impl MeshService {
         // Single-node: apply the batch directly through the store's
         // atomic apply_batch helper (one rocksdb WriteBatch).
         apply_prepared_batch(&self.store, &commands).map_err(internal)?;
+        Ok(())
+    }
+
+    /// Routing-mode DDL fan-out with rollback. Apply every entry in
+    /// `ddl` (a list of `CreateIndex` / `DropIndex` commands) to the
+    /// local store first, then RPC every other peer in parallel. If
+    /// any peer rejects the change, invert each successful
+    /// application — including the local one — so the cluster
+    /// doesn't end up with half the peers holding an index that the
+    /// others don't.
+    ///
+    /// Rollback is best-effort: a compensating failure is logged but
+    /// doesn't propagate, since there's no safer fallback. In
+    /// practice this only matters for CREATE failures; DROP has to
+    /// re-backfill from the live local graph on rollback and
+    /// succeeds as long as the store is still reachable.
+    async fn replicate_index_ddl_routing(
+        &self,
+        routing: &Arc<Routing>,
+        ddl: &[GraphCommand],
+    ) -> std::result::Result<(), Status> {
+        // Local apply first — if this fails we haven't touched any
+        // peer, so the caller's error is clean.
+        for cmd in ddl {
+            apply_ddl_to_store(cmd, &self.store).map_err(internal)?;
+        }
+
+        let self_id = routing.cluster().self_id();
+        let remote_peers: Vec<PeerId> = routing
+            .cluster()
+            .membership()
+            .peer_ids()
+            .filter(|p| *p != self_id)
+            .collect();
+
+        // Parallel fan-out. `try_remote_ddl_on_peer` applies every
+        // entry in `ddl` to the target peer sequentially; if the
+        // peer succeeds on the first and fails on the second, the
+        // partial state is recorded via the return value and the
+        // top-level rollback undoes the successes.
+        let mut handles = Vec::with_capacity(remote_peers.len());
+        for peer_id in &remote_peers {
+            let ddl = ddl.to_vec();
+            let client = routing
+                .write_client(*peer_id)
+                .ok_or_else(|| no_client(*peer_id))?;
+            let peer_id = *peer_id;
+            handles.push(tokio::spawn(async move {
+                let result = try_remote_ddl_on_peer(client, &ddl).await;
+                (peer_id, result)
+            }));
+        }
+
+        let mut succeeded: Vec<PeerId> = Vec::new();
+        let mut first_error: Option<Status> = None;
+        for h in handles {
+            match h.await {
+                Ok((peer_id, Ok(()))) => succeeded.push(peer_id),
+                Ok((_, Err(status))) => {
+                    if first_error.is_none() {
+                        first_error = Some(status);
+                    }
+                }
+                Err(join_err) => {
+                    if first_error.is_none() {
+                        first_error = Some(Status::internal(format!(
+                            "ddl fan-out task panicked: {join_err}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            // Compensate the local application and every successful
+            // peer. Failures during rollback are logged and swallowed
+            // — the user already sees the original error.
+            for cmd in ddl.iter().rev() {
+                let inverse = invert_ddl(cmd);
+                if let Err(e) = apply_ddl_to_store(&inverse, &self.store) {
+                    tracing::error!(error = %e, "local DDL rollback failed");
+                }
+            }
+            for peer_id in succeeded {
+                if let Some(client) = routing.write_client(peer_id) {
+                    if let Err(e) = try_remote_ddl_on_peer(
+                        client,
+                        &ddl.iter().rev().map(invert_ddl).collect::<Vec<_>>(),
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, peer = peer_id.0, "remote DDL rollback failed");
+                    }
+                }
+            }
+            return Err(err);
+        }
+
         Ok(())
     }
 
@@ -657,6 +761,98 @@ pub(crate) fn apply_prepared_batch(
     store.apply_batch(&flat)
 }
 
+/// Apply a single DDL [`GraphCommand`] directly to `store`. Non-DDL
+/// variants are a no-op — the caller filters them out beforehand.
+fn apply_ddl_to_store(
+    cmd: &GraphCommand,
+    store: &Store,
+) -> std::result::Result<(), mesh_storage::Error> {
+    match cmd {
+        GraphCommand::CreateIndex { label, property } => {
+            store.create_property_index(label, property)
+        }
+        GraphCommand::DropIndex { label, property } => store.drop_property_index(label, property),
+        _ => Ok(()),
+    }
+}
+
+/// Compute the inverse of a DDL command so
+/// [`MeshService::replicate_index_ddl_routing`] can roll back
+/// successful applications on a partial failure. `CreateIndex`
+/// inverts to `DropIndex` and vice versa. Non-DDL variants aren't
+/// expected here — callers only pass DDL.
+fn invert_ddl(cmd: &GraphCommand) -> GraphCommand {
+    match cmd {
+        GraphCommand::CreateIndex { label, property } => GraphCommand::DropIndex {
+            label: label.clone(),
+            property: property.clone(),
+        },
+        GraphCommand::DropIndex { label, property } => GraphCommand::CreateIndex {
+            label: label.clone(),
+            property: property.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Send every `ddl` command to a single peer via the write client,
+/// sequentially. Returns `Ok(())` only when every entry succeeds.
+async fn try_remote_ddl_on_peer(
+    mut client: crate::proto::mesh_write_client::MeshWriteClient<tonic::transport::Channel>,
+    ddl: &[GraphCommand],
+) -> std::result::Result<(), Status> {
+    for cmd in ddl {
+        match cmd {
+            GraphCommand::CreateIndex { label, property } => {
+                client
+                    .create_property_index(CreatePropertyIndexRequest {
+                        label: label.clone(),
+                        property: property.clone(),
+                    })
+                    .await?;
+            }
+            GraphCommand::DropIndex { label, property } => {
+                client
+                    .drop_property_index(DropPropertyIndexRequest {
+                        label: label.clone(),
+                        property: property.clone(),
+                    })
+                    .await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Partition a flat command list into `(ddl, graph)` where `ddl`
+/// holds `CreateIndex` / `DropIndex` entries and `graph` holds
+/// everything else. Nested `Batch` variants are recursed into and
+/// re-wrapped: the non-DDL children of a batch stay together inside
+/// a new `Batch` so the coordinator still commits them atomically.
+///
+/// Used by routing-mode [`MeshService::commit_buffered_commands`] so
+/// DDL can take its own fan-out path instead of going through the
+/// 2PC coordinator (which is keyed to per-partition mutations).
+pub(crate) fn split_ddl(cmds: Vec<GraphCommand>) -> (Vec<GraphCommand>, Vec<GraphCommand>) {
+    let mut ddl = Vec::new();
+    let mut graph = Vec::new();
+    for cmd in cmds {
+        match cmd {
+            GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => ddl.push(cmd),
+            GraphCommand::Batch(inner) => {
+                let (nested_ddl, nested_graph) = split_ddl(inner);
+                ddl.extend(nested_ddl);
+                if !nested_graph.is_empty() {
+                    graph.push(GraphCommand::Batch(nested_graph));
+                }
+            }
+            other => graph.push(other),
+        }
+    }
+    (ddl, graph)
+}
+
 /// Walk the command tree and invoke DDL side-effects directly on the
 /// store. Called ahead of `flatten_commands` by `apply_prepared_batch`
 /// so index backfill reads see the pre-batch graph state.
@@ -835,6 +1031,54 @@ impl MeshQuery for MeshService {
         }
 
         Ok(Response::new(NodesByLabelResponse { ids }))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "nodes_by_property"))]
+    async fn nodes_by_property(
+        &self,
+        request: Request<NodesByPropertyRequest>,
+    ) -> Result<Response<NodesByPropertyResponse>, Status> {
+        let req = request.into_inner();
+        let label = req.label;
+        let property = req.property;
+        let local_only = req.local_only;
+        // Decode the JSON-carried Property value. A malformed blob
+        // is a client bug, surface as InvalidArgument.
+        let value: mesh_core::Property = serde_json::from_slice(&req.value_json)
+            .map_err(|e| Status::invalid_argument(format!("value_json: {e}")))?;
+
+        let mut ids: Vec<_> = self
+            .store
+            .nodes_by_property(&label, &property, &value)
+            .map_err(internal)?
+            .into_iter()
+            .map(|id| uuid_to_proto(id.as_uuid()))
+            .collect();
+
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                let self_id = routing.cluster().self_id();
+                for peer_id in routing.cluster().membership().peer_ids() {
+                    if peer_id == self_id {
+                        continue;
+                    }
+                    let mut client = routing
+                        .query_client(peer_id)
+                        .ok_or_else(|| no_client(peer_id))?;
+                    let resp = client
+                        .nodes_by_property(NodesByPropertyRequest {
+                            label: label.clone(),
+                            property: property.clone(),
+                            value_json: req.value_json.clone(),
+                            local_only: true,
+                        })
+                        .await?;
+                    ids.extend(resp.into_inner().ids);
+                }
+            }
+        }
+
+        Ok(Response::new(NodesByPropertyResponse { ids }))
     }
 
     #[tracing::instrument(skip_all, fields(rpc = "outgoing"))]
@@ -1272,5 +1516,32 @@ impl MeshWrite for MeshService {
                 Ok(Response::new(BatchWriteResponse {}))
             }
         }
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "create_property_index"))]
+    async fn create_property_index(
+        &self,
+        request: Request<CreatePropertyIndexRequest>,
+    ) -> Result<Response<CreatePropertyIndexResponse>, Status> {
+        // Local-only: the routing-mode fan-out caller is responsible
+        // for calling this RPC on every peer. In Raft mode it's
+        // unused — DDL replicates via `propose_graph` instead.
+        let req = request.into_inner();
+        self.store
+            .create_property_index(&req.label, &req.property)
+            .map_err(internal)?;
+        Ok(Response::new(CreatePropertyIndexResponse {}))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "drop_property_index"))]
+    async fn drop_property_index(
+        &self,
+        request: Request<DropPropertyIndexRequest>,
+    ) -> Result<Response<DropPropertyIndexResponse>, Status> {
+        let req = request.into_inner();
+        self.store
+            .drop_property_index(&req.label, &req.property)
+            .map_err(internal)?;
+        Ok(Response::new(DropPropertyIndexResponse {}))
     }
 }

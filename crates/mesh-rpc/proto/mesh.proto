@@ -46,6 +46,10 @@ service MeshQuery {
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc GetEdge(GetEdgeRequest) returns (GetEdgeResponse);
   rpc NodesByLabel(NodesByLabelRequest) returns (NodesByLabelResponse);
+  // Equality lookup through a property index. The routing-mode
+  // partitioned reader scatter-gathers this across every peer and
+  // unions the results; each peer answers from its local index CF.
+  rpc NodesByProperty(NodesByPropertyRequest) returns (NodesByPropertyResponse);
   rpc AllNodeIds(AllNodeIdsRequest) returns (AllNodeIdsResponse);
   rpc Outgoing(NeighborRequest) returns (NeighborResponse);
   rpc Incoming(NeighborRequest) returns (NeighborResponse);
@@ -94,6 +98,18 @@ message NodesByLabelRequest {
 }
 message NodesByLabelResponse { repeated UuidBytes ids = 1; }
 
+message NodesByPropertyRequest {
+  string label = 1;
+  string property = 2;
+  // serde_json-encoded `mesh_core::Property`. JSON keeps the proto
+  // out of the recursive Property schema; the routing-mode client
+  // encodes the value once per scatter-gather and reuses the blob
+  // across every peer call.
+  bytes value_json = 3;
+  bool local_only = 4;
+}
+message NodesByPropertyResponse { repeated UuidBytes ids = 1; }
+
 message NeighborRequest {
   UuidBytes node_id = 1;
   // When true, the server answers only from its local store and does not
@@ -137,6 +153,16 @@ service MeshWrite {
   // Each peer stages the PREPARE in memory and applies it atomically
   // through one rocksdb WriteBatch at COMMIT time.
   rpc BatchWrite(BatchWriteRequest) returns (BatchWriteResponse);
+  // Apply a property-index creation to this peer's local store.
+  // Used by the routing-mode DDL fan-out: the receiving peer runs
+  // its local create, then calls this RPC on every other peer in
+  // parallel. Idempotent — re-creating an existing index is a
+  // no-op at the store layer.
+  rpc CreatePropertyIndex(CreatePropertyIndexRequest) returns (CreatePropertyIndexResponse);
+  // Tear down a property index on this peer's local store. Mirrors
+  // `CreatePropertyIndex`: used as both the user-initiated DROP
+  // fan-out and the compensating rollback for a partial create.
+  rpc DropPropertyIndex(DropPropertyIndexRequest) returns (DropPropertyIndexResponse);
 }
 
 enum BatchPhase {
@@ -181,6 +207,18 @@ message DetachDeleteNodeRequest {
   bool local_only = 2;
 }
 message DetachDeleteNodeResponse {}
+
+message CreatePropertyIndexRequest {
+  string label = 1;
+  string property = 2;
+}
+message CreatePropertyIndexResponse {}
+
+message DropPropertyIndexRequest {
+  string label = 1;
+  string property = 2;
+}
+message DropPropertyIndexResponse {}
 
 // Raft consensus RPCs. Each payload field carries a serde-serialized openraft
 // request/response struct, so the wire schema stays stable even as openraft's

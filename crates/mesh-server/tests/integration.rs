@@ -276,6 +276,116 @@ async fn two_peer_cluster_via_config_routes_writes_and_reads() {
     }
 }
 
+#[tokio::test]
+async fn cypher_create_index_replicates_through_routing_fan_out() {
+    // Phase C payoff: routing-mode CREATE INDEX fans out from the
+    // receiving peer to every other peer in parallel, every peer's
+    // local store backfills against its own slice of the graph,
+    // and a subsequent MATCH on either peer plans through
+    // IndexSeek + scatter-gather so the result is the union of
+    // both partitions' matches.
+    let (h_a, h_b) = spawn_two_peer_cluster().await;
+
+    // Seed nodes through peer A. The routing reader sends each one
+    // to its partition owner, so the 20-node set ends up roughly
+    // split between A and B.
+    let mut writer_a = MeshWriteClient::connect(h_a.address.clone()).await.unwrap();
+    for i in 0..20 {
+        let n = Node::new()
+            .with_label("Person")
+            .with_property("name", format!("user-{i}"))
+            .with_property("age", i as i64);
+        writer_a
+            .put_node(PutNodeRequest {
+                node: Some(node_to_proto(&n).unwrap()),
+                local_only: false,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut q_a = MeshQueryClient::connect(h_a.address.clone()).await.unwrap();
+    let mut q_b = MeshQueryClient::connect(h_b.address.clone()).await.unwrap();
+
+    // CREATE INDEX through peer A. The DDL fan-out applies locally,
+    // then RPCs peer B's CreatePropertyIndex handler in parallel,
+    // and each peer's backfill walks its own label index.
+    q_a.execute_cypher(ExecuteCypherRequest {
+        query: "CREATE INDEX FOR (p:Person) ON (p.name)".into(),
+        params_json: vec![],
+    })
+    .await
+    .expect("CREATE INDEX in routing mode should fan out cleanly");
+
+    // SHOW INDEXES on peer B sees the replicated registry entry.
+    let show_resp = q_b
+        .execute_cypher(ExecuteCypherRequest {
+            query: "SHOW INDEXES".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    let show_rows: serde_json::Value =
+        serde_json::from_slice(&show_resp.into_inner().rows_json).unwrap();
+    let arr = show_rows.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0]["label"]["Property"]["value"].as_str().unwrap(),
+        "Person"
+    );
+
+    // MATCH from peer A pulls through the partitioned reader's
+    // nodes_by_property scatter-gather: peer A returns its local
+    // matches, peer B returns its local matches, the union is the
+    // full row. Try a name we know is in the seed set.
+    let match_resp = q_a
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (p:Person {name: 'user-7'}) RETURN p.age AS age".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    let match_rows: serde_json::Value =
+        serde_json::from_slice(&match_resp.into_inner().rows_json).unwrap();
+    let arr = match_rows.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["age"]["Property"]["value"].as_i64().unwrap(), 7);
+
+    // Same query from peer B — different scatter-gather origin,
+    // identical answer.
+    let match_resp_b = q_b
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (p:Person {name: 'user-13'}) RETURN p.age AS age".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    let arr_b: serde_json::Value =
+        serde_json::from_slice(&match_resp_b.into_inner().rows_json).unwrap();
+    let arr_b = arr_b.as_array().unwrap();
+    assert_eq!(arr_b.len(), 1);
+    assert_eq!(arr_b[0]["age"]["Property"]["value"].as_i64().unwrap(), 13);
+
+    // DROP INDEX also fans out. After the round-trip, SHOW on A
+    // returns empty.
+    q_a.execute_cypher(ExecuteCypherRequest {
+        query: "DROP INDEX FOR (p:Person) ON (p.name)".into(),
+        params_json: vec![],
+    })
+    .await
+    .unwrap();
+    let after_drop = q_a
+        .execute_cypher(ExecuteCypherRequest {
+            query: "SHOW INDEXES".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    let drop_rows: serde_json::Value =
+        serde_json::from_slice(&after_drop.into_inner().rows_json).unwrap();
+    assert!(drop_rows.as_array().unwrap().is_empty());
+}
+
 #[test]
 fn config_bootstrap_flag_defaults_to_false_and_parses_when_set() {
     let toml_no_bootstrap = r#"
