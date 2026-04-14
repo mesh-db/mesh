@@ -3,6 +3,7 @@ mod error;
 mod membership;
 mod partition_map;
 mod partitioner;
+pub mod raft;
 mod state;
 
 pub use cluster::Cluster;

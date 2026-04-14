@@ -7,6 +7,7 @@ description = "Cluster membership and partitioning for Mesh"
 
 [dependencies]
 mesh-core = { path = "../mesh-core" }
+openraft = { version = "0.9", features = ["serde"] }
 serde = { workspace = true }
 thiserror.workspace = true
 

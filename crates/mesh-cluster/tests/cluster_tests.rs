@@ -1,3 +1,4 @@
+use mesh_cluster::raft::{ApplyResponse, MeshRaftConfig, NodeId as RaftNodeId};
 use mesh_cluster::{
     Cluster, ClusterCommand, Error, PartitionId, PartitionMap, Partitioner, Peer, PeerId,
 };
@@ -340,6 +341,40 @@ fn apply_routing_reflects_state_changes() {
         saw_new_peer_owner,
         "Rebalance should allow the new peer to own at least one partition"
     );
+}
+
+#[test]
+fn openraft_type_config_binds_domain_types() {
+    // The declare_raft_types! macro at mesh_cluster::raft ties ClusterCommand
+    // to D and ApplyResponse to R. If this compiles, the TypeConfig is usable
+    // as an openraft input and every follow-up trait impl can rely on the
+    // same type bindings.
+    fn _assert_config_type<C: openraft::RaftTypeConfig>() {}
+    _assert_config_type::<MeshRaftConfig>();
+}
+
+#[test]
+fn openraft_config_defaults_tuned_for_tests() {
+    let config = mesh_cluster::raft::default_config();
+    assert_eq!(config.heartbeat_interval, 250);
+    assert!(config.election_timeout_min < config.election_timeout_max);
+}
+
+#[test]
+fn raft_node_id_is_isomorphic_to_peer_id() {
+    let pid = PeerId(42);
+    let nid: RaftNodeId = pid.into();
+    assert_eq!(nid, 42);
+    let back: PeerId = nid.into();
+    assert_eq!(back, pid);
+}
+
+#[test]
+fn apply_response_roundtrips_through_serde() {
+    let r = ApplyResponse::default();
+    let bytes = serde_json::to_vec(&r).unwrap();
+    let back: ApplyResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(r, back);
 }
 
 #[test]
