@@ -253,6 +253,14 @@ impl<'a> TxCoordinator<'a> {
                 GraphCommand::Batch(inner) => {
                     self.group_into(groups, all_peers, inner);
                 }
+                // Routing mode rejects DDL at the server layer until
+                // Phase C wires up the parallel fan-out path. If a
+                // command ever reaches the coordinator despite that,
+                // it's a routing bug — log and drop rather than
+                // silently mis-grouping.
+                GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => {
+                    tracing::error!("property-index DDL reached routing coordinator; dropping");
+                }
             }
         }
     }

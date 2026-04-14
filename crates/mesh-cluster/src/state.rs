@@ -48,6 +48,21 @@ pub enum GraphCommand {
     DeleteEdge(EdgeId),
     DetachDeleteNode(NodeId),
     Batch(Vec<GraphCommand>),
+    /// Declare a property index on every replica. Reaches every peer
+    /// through the Raft log, so the resulting `(label, property)`
+    /// index is consistent across the cluster and each peer's
+    /// `StoreGraphApplier` runs its own backfill against the local
+    /// graph copy.
+    CreateIndex {
+        label: String,
+        property: String,
+    },
+    /// Tear down a property index across every replica. Mirrors
+    /// `CreateIndex` — idempotent when the index doesn't exist.
+    DropIndex {
+        label: String,
+        property: String,
+    },
 }
 
 /// Top-level Raft log entry: either a cluster-metadata mutation or a graph

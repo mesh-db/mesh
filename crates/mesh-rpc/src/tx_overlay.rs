@@ -95,6 +95,14 @@ impl TxOverlayState {
                 self.deleted_nodes.insert(*id);
             }
             GraphCommand::Batch(inner) => self.apply_commands(inner),
+            // DDL commands have no representation in the per-tx
+            // overlay — they change the schema of the underlying
+            // store rather than introducing transient node/edge
+            // state. A Bolt BEGIN/COMMIT block that mixes DDL with
+            // graph writes will still see the DDL effect on commit
+            // via the applier path; the overlay just doesn't have
+            // to pretend the index is already there mid-tx.
+            GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => {}
         }
     }
 
@@ -181,6 +189,12 @@ impl<'a> GraphReader for OverlayGraphReader<'a> {
             }
         }
         Ok(result.into_iter().collect())
+    }
+
+    fn list_property_indexes(&self) -> ExecResult<Vec<(String, String)>> {
+        // Index DDL lives on the store, not in the per-tx overlay,
+        // so read-through to the base is correct even mid-tx.
+        self.base.list_property_indexes()
     }
 
     fn nodes_by_property(

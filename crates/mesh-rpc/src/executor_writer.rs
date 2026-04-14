@@ -46,6 +46,20 @@ impl GraphWriter for RaftGraphWriter {
     fn detach_delete_node(&self, id: NodeId) -> ExecResult<()> {
         self.propose(GraphCommand::DetachDeleteNode(id))
     }
+
+    fn create_property_index(&self, label: &str, property: &str) -> ExecResult<()> {
+        self.propose(GraphCommand::CreateIndex {
+            label: label.to_string(),
+            property: property.to_string(),
+        })
+    }
+
+    fn drop_property_index(&self, label: &str, property: &str) -> ExecResult<()> {
+        self.propose(GraphCommand::DropIndex {
+            label: label.to_string(),
+            property: property.to_string(),
+        })
+    }
 }
 
 /// Executor write sink that accumulates mutations in memory instead of
@@ -105,6 +119,22 @@ impl GraphWriter for BufferingGraphWriter {
             .lock()
             .unwrap()
             .push(GraphCommand::DetachDeleteNode(id));
+        Ok(())
+    }
+
+    fn create_property_index(&self, label: &str, property: &str) -> ExecResult<()> {
+        self.buffer.lock().unwrap().push(GraphCommand::CreateIndex {
+            label: label.to_string(),
+            property: property.to_string(),
+        });
+        Ok(())
+    }
+
+    fn drop_property_index(&self, label: &str, property: &str) -> ExecResult<()> {
+        self.buffer.lock().unwrap().push(GraphCommand::DropIndex {
+            label: label.to_string(),
+            property: property.to_string(),
+        });
         Ok(())
     }
 }

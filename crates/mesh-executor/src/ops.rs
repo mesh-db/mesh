@@ -67,7 +67,7 @@ pub fn execute_with_reader(
     // side-effect on the backing store, not a row-producing query.
     // Short-circuit here so `build_op` stays a pure plan-to-operator
     // mapping and doesn't need DDL-specific cases.
-    if let Some(rows) = try_execute_ddl(plan, writer)? {
+    if let Some(rows) = try_execute_ddl(plan, reader, writer)? {
         return Ok(rows);
     }
     let mut op = build_op(plan);
@@ -92,7 +92,11 @@ pub fn execute_with_reader(
 /// an empty SUCCESS — mirrors how Neo4j reports schema writes.
 /// `SHOW INDEXES` returns one row per registered index with
 /// `label`, `property`, and `state` columns.
-fn try_execute_ddl(plan: &LogicalPlan, writer: &dyn GraphWriter) -> Result<Option<Vec<Row>>> {
+fn try_execute_ddl(
+    plan: &LogicalPlan,
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+) -> Result<Option<Vec<Row>>> {
     match plan {
         LogicalPlan::CreatePropertyIndex { label, property } => {
             writer.create_property_index(label, property)?;
@@ -103,7 +107,10 @@ fn try_execute_ddl(plan: &LogicalPlan, writer: &dyn GraphWriter) -> Result<Optio
             Ok(Some(vec![ddl_ack_row("dropped", label, property)]))
         }
         LogicalPlan::ShowPropertyIndexes => {
-            let specs = writer.list_property_indexes()?;
+            // SHOW is a pure read — source it from the reader so
+            // overlay/partitioned readers deliver the right view
+            // without round-tripping through a writer.
+            let specs = reader.list_property_indexes()?;
             let rows = specs
                 .into_iter()
                 .map(|(label, property)| {

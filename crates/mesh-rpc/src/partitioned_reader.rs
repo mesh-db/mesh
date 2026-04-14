@@ -232,6 +232,21 @@ impl GraphReader for PartitionedGraphReader {
         })
     }
 
+    fn list_property_indexes(&self) -> ExecResult<Vec<(String, String)>> {
+        // Phase B: routing mode still rejects index DDL at the server
+        // layer, so every peer's index registry is empty in
+        // practice. Reading from the local store is consistent with
+        // what the server-layer DDL path will eventually produce
+        // once Phase C lands (each peer holds the full registry
+        // after fan-out).
+        Ok(self
+            .local
+            .list_property_indexes()
+            .into_iter()
+            .map(|s| (s.label, s.property))
+            .collect())
+    }
+
     fn nodes_by_property(
         &self,
         label: &str,

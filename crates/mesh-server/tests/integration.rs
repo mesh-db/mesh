@@ -1035,6 +1035,213 @@ async fn cypher_create_replicates_through_raft_to_follower() {
 }
 
 #[tokio::test]
+async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
+    // Phase B payoff: `CREATE INDEX` issued on the leader lands as
+    // a `GraphCommand::CreateIndex` in the Raft log, every peer's
+    // `StoreGraphApplier` runs `store.create_property_index`
+    // locally (backfilling its own replica), and a subsequent
+    // `MATCH` on the *follower* plans through `IndexSeek` — proving
+    // that both the write (DDL propagation) and the read (planner
+    // context sourced from local `Store::list_property_indexes`)
+    // are consistent across replicas.
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        PeerConfig {
+            id: 1,
+            address: addr_a.to_string(),
+        },
+        PeerConfig {
+            id: 2,
+            address: addr_b.to_string(),
+        },
+    ];
+    let config_a = ServerConfig {
+        self_id: 1,
+        listen_address: addr_a.to_string(),
+        data_dir: dir_a.path().to_path_buf(),
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap: true,
+        bolt_address: None,
+        mode: None,
+    };
+    let config_b = ServerConfig {
+        self_id: 2,
+        listen_address: addr_b.to_string(),
+        data_dir: dir_b.path().to_path_buf(),
+        num_partitions: 4,
+        peers,
+        bootstrap: false,
+        bolt_address: None,
+        mode: None,
+    };
+
+    let components_a = mesh_server::build_components(&config_a).await.unwrap();
+    let components_b = mesh_server::build_components(&config_b).await.unwrap();
+    let raft_a = components_a.raft.clone().unwrap();
+
+    let ServerComponents {
+        service: service_a,
+        raft: _,
+        raft_service: raft_service_a,
+    } = components_a;
+    let ServerComponents {
+        service: service_b,
+        raft: _,
+        raft_service: raft_service_b,
+    } = components_b;
+    let raft_service_a = raft_service_a.unwrap();
+    let raft_service_b = raft_service_b.unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_a.clone().into_query_server())
+            .add_service(service_a.into_write_server())
+            .add_service(raft_service_a.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_a))
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_b.clone().into_query_server())
+            .add_service(service_b.into_write_server())
+            .add_service(raft_service_b.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_b))
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    mesh_server::initialize_if_seed(&config_a, &raft_a)
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if raft_a.raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+
+    let mut query_a = MeshQueryClient::connect(format!("http://{}", addr_a))
+        .await
+        .unwrap();
+    // Seed with a few pre-existing nodes so the index's backfill
+    // path gets exercised on every peer's local store.
+    query_a
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE (n:Person {name: 'Ada', age: 37})".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    query_a
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE (n:Person {name: 'Bob', age: 28})".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+
+    // CREATE INDEX — goes through the Raft log as a GraphCommand::CreateIndex.
+    let create_resp = query_a
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE INDEX FOR (p:Person) ON (p.name)".into(),
+            params_json: vec![],
+        })
+        .await
+        .expect("CREATE INDEX via Cypher should commit on leader");
+    let create_rows: serde_json::Value =
+        serde_json::from_slice(&create_resp.into_inner().rows_json).unwrap();
+    assert_eq!(create_rows.as_array().unwrap().len(), 1);
+
+    // Wait for follower B to apply the committed CreateIndex entry.
+    // We probe via SHOW INDEXES on peer B.
+    let mut query_b = MeshQueryClient::connect(format!("http://{}", addr_b))
+        .await
+        .unwrap();
+    let mut show_rows_on_b: Option<serde_json::Value> = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let resp = query_b
+            .execute_cypher(ExecuteCypherRequest {
+                query: "SHOW INDEXES".into(),
+                params_json: vec![],
+            })
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+        if rows.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            show_rows_on_b = Some(rows);
+            break;
+        }
+    }
+    let rows_b = show_rows_on_b.expect("follower never saw the replicated CREATE INDEX");
+    let first = &rows_b.as_array().unwrap()[0];
+    assert_eq!(
+        first["label"]["Property"]["value"].as_str().unwrap(),
+        "Person"
+    );
+    assert_eq!(
+        first["property"]["Property"]["value"].as_str().unwrap(),
+        "name"
+    );
+
+    // MATCH with pattern property on the follower. The follower's
+    // local `Store::list_property_indexes` returns the replicated
+    // spec, so the planner rewrites to `IndexSeek` and the backfill
+    // entries written by B's applier satisfy the lookup.
+    let match_resp = query_b
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (p:Person {name: 'Ada'}) RETURN p.age AS age".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    let match_rows: serde_json::Value =
+        serde_json::from_slice(&match_resp.into_inner().rows_json).unwrap();
+    let arr = match_rows.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["age"]["Property"]["value"].as_i64().unwrap(), 37);
+
+    // DROP INDEX — also replicates. After apply, SHOW INDEXES on B
+    // should come back empty.
+    query_a
+        .execute_cypher(ExecuteCypherRequest {
+            query: "DROP INDEX FOR (p:Person) ON (p.name)".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    let mut drained = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let resp = query_b
+            .execute_cypher(ExecuteCypherRequest {
+                query: "SHOW INDEXES".into(),
+                params_json: vec![],
+            })
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+        if rows.as_array().map(|a| a.is_empty()).unwrap_or(false) {
+            drained = true;
+            break;
+        }
+    }
+    assert!(
+        drained,
+        "follower never saw the replicated DROP INDEX clear the registry"
+    );
+}
+
+#[tokio::test]
 async fn wiped_follower_catches_up_via_install_snapshot() {
     // The end-to-end snapshot catch-up payoff: a follower can be wiped
     // entirely (data_dir gone — no log, no vote, no state machine state,

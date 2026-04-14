@@ -215,21 +215,21 @@ impl MeshService {
     ) -> std::result::Result<(Vec<mesh_executor::Row>, Vec<GraphCommand>), Status> {
         let statement = mesh_cypher::parse(&query).map_err(bad_request)?;
 
-        // Schema DDL is single-node only in Phase A. Raft and routing
-        // modes need coordinated DDL (Raft-log replication for the
-        // former, parallel fan-out for the latter) — both land in
-        // follow-up phases. Surface the limitation with a clear
-        // error rather than silently accepting on one peer.
+        // Schema DDL replication: Raft mode propagates via the log
+        // (each peer's `StoreGraphApplier` runs `create_property_index`
+        // locally when the `CreateIndex` entry commits). Routing
+        // mode still needs parallel fan-out with rollback, which
+        // lands in Phase C — reject DDL there for now.
         let is_ddl = matches!(
             statement,
             mesh_cypher::Statement::CreateIndex(_)
                 | mesh_cypher::Statement::DropIndex(_)
                 | mesh_cypher::Statement::ShowIndexes
         );
-        if is_ddl && (self.routing.is_some() || self.raft.is_some()) {
+        if is_ddl && self.routing.is_some() {
             return Err(Status::unimplemented(
-                "property-index DDL is only supported in single-node mode in this release; \
-                 cross-peer index replication lands in a follow-up phase",
+                "property-index DDL is not yet supported in routing mode; \
+                 single-node and Raft modes are supported in this release",
             ));
         }
 
@@ -610,6 +610,14 @@ fn leader_redirect_address(status: &Status) -> Option<String> {
 /// Flatten a tree of [`GraphCommand`] (which may nest `Batch` variants)
 /// into a flat `Vec<StoreMutation>` so `Store::apply_batch` can commit
 /// them as one rocksdb `WriteBatch`.
+///
+/// DDL commands (`CreateIndex` / `DropIndex`) are intentionally not
+/// handled here — they can't be expressed as a `StoreMutation` because
+/// the backfill step needs to read the live graph, and an uncommitted
+/// `WriteBatch` isn't queryable. Callers going through
+/// [`apply_prepared_batch`] get correct split semantics for free;
+/// direct callers of `flatten_commands` must ensure the batch has
+/// already been stripped of DDL entries.
 pub(crate) fn flatten_commands(cmds: &[GraphCommand], out: &mut Vec<mesh_storage::StoreMutation>) {
     use mesh_storage::StoreMutation;
     for cmd in cmds {
@@ -619,19 +627,56 @@ pub(crate) fn flatten_commands(cmds: &[GraphCommand], out: &mut Vec<mesh_storage
             GraphCommand::DeleteEdge(id) => out.push(StoreMutation::DeleteEdge(*id)),
             GraphCommand::DetachDeleteNode(id) => out.push(StoreMutation::DetachDeleteNode(*id)),
             GraphCommand::Batch(inner) => flatten_commands(inner, out),
+            // Skip silently; the caller is responsible for applying
+            // DDL through `Store::create_property_index` /
+            // `Store::drop_property_index` before (or alongside)
+            // this batch.
+            GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => {}
         }
     }
 }
 
 /// Apply a prepared batch to `store` atomically. Used by both the
 /// `BatchWrite` commit phase and the in-process coordinator shortcut.
+///
+/// Index DDL in the batch is applied up-front via
+/// `Store::create_property_index` / `drop_property_index` (each in
+/// its own rocksdb batch), then the remaining graph mutations commit
+/// as one atomic `apply_batch`. Cypher statements don't mix DDL and
+/// graph writes so this ordering doesn't affect typical workloads.
 pub(crate) fn apply_prepared_batch(
     store: &Store,
     cmds: &[GraphCommand],
 ) -> std::result::Result<(), mesh_storage::Error> {
+    apply_ddl_commands(cmds, store)?;
     let mut flat = Vec::with_capacity(cmds.len());
     flatten_commands(cmds, &mut flat);
+    if flat.is_empty() {
+        return Ok(());
+    }
     store.apply_batch(&flat)
+}
+
+/// Walk the command tree and invoke DDL side-effects directly on the
+/// store. Called ahead of `flatten_commands` by `apply_prepared_batch`
+/// so index backfill reads see the pre-batch graph state.
+fn apply_ddl_commands(
+    cmds: &[GraphCommand],
+    store: &Store,
+) -> std::result::Result<(), mesh_storage::Error> {
+    for cmd in cmds {
+        match cmd {
+            GraphCommand::CreateIndex { label, property } => {
+                store.create_property_index(label, property)?;
+            }
+            GraphCommand::DropIndex { label, property } => {
+                store.drop_property_index(label, property)?;
+            }
+            GraphCommand::Batch(inner) => apply_ddl_commands(inner, store)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn raft_propose_failed<E: std::fmt::Display>(e: E) -> Status {

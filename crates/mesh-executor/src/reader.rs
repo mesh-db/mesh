@@ -30,6 +30,13 @@ pub trait GraphReader: Send + Sync {
         property: &str,
         value: &Property,
     ) -> Result<Vec<NodeId>>;
+    /// Snapshot the `(label, property)` pairs of every property
+    /// index visible through this reader. Used by `SHOW INDEXES`.
+    /// Default impl returns empty — the `Store` reader overrides,
+    /// and partitioned/overlay readers delegate to their bases.
+    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
     fn outgoing(&self, id: NodeId) -> Result<Vec<(EdgeId, NodeId)>>;
     fn incoming(&self, id: NodeId) -> Result<Vec<(EdgeId, NodeId)>>;
 }
@@ -58,6 +65,13 @@ impl GraphReader for Store {
         value: &Property,
     ) -> Result<Vec<NodeId>> {
         Ok(Store::nodes_by_property(self, label, property, value)?)
+    }
+
+    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(Store::list_property_indexes(self)
+            .into_iter()
+            .map(|s| (s.label, s.property))
+            .collect())
     }
 
     fn outgoing(&self, id: NodeId) -> Result<Vec<(EdgeId, NodeId)>> {

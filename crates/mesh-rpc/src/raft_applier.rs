@@ -87,10 +87,31 @@ impl GraphStateMachine for StoreGraphApplier {
                 // the Cypher query lands or none does, even across a
                 // process crash. Nested Batch variants are flattened
                 // because `Store::apply_batch` only knows the leaf ops.
-                let mut flat = Vec::with_capacity(cmds.len());
-                flatten_into(cmds, &mut flat)?;
-                self.store.apply_batch(&flat).map_err(|e| e.to_string())
+                //
+                // DDL (CreateIndex / DropIndex) can't be expressed as a
+                // StoreMutation because the backfill step needs to read
+                // the live CF_NODES, which an uncommitted WriteBatch
+                // isn't queryable against. So we apply any DDL
+                // commands in the batch first (each in its own small
+                // batch), then the leaf graph ops in one atomic
+                // WriteBatch. Cypher never mixes DDL with graph
+                // writes in a single query, so this ordering is only
+                // exercised on path that don't actually interleave.
+                let mut flat: Vec<StoreMutation> = Vec::with_capacity(cmds.len());
+                apply_ddl_and_collect(cmds, &self.store, &mut flat)?;
+                if !flat.is_empty() {
+                    self.store.apply_batch(&flat).map_err(|e| e.to_string())?;
+                }
+                Ok(())
             }
+            GraphCommand::CreateIndex { label, property } => self
+                .store
+                .create_property_index(label, property)
+                .map_err(|e| e.to_string()),
+            GraphCommand::DropIndex { label, property } => self
+                .store
+                .drop_property_index(label, property)
+                .map_err(|e| e.to_string()),
         }
     }
 
@@ -356,14 +377,36 @@ impl<'a> ArchiveReader<'a> {
     }
 }
 
-fn flatten_into(cmds: &[GraphCommand], out: &mut Vec<StoreMutation>) -> Result<(), String> {
+/// Walk `cmds` and apply any `CreateIndex`/`DropIndex` entries
+/// immediately to `store` (each one gets its own small rocksdb
+/// WriteBatch inside the `Store` methods). Non-DDL leaves are
+/// collected into `out` so the caller can commit them as one
+/// atomic `apply_batch`. Nested `Batch` variants are recursed
+/// into, mirroring `flatten_into`.
+///
+/// Splitting DDL out of the main batch is necessary because the
+/// backfill step reads the live `CF_NODES`, and an uncommitted
+/// `WriteBatch` isn't queryable — a DDL entry interleaved with
+/// `PutNode` entries in the same batch would produce an index
+/// that misses the new nodes.
+fn apply_ddl_and_collect(
+    cmds: &[GraphCommand],
+    store: &Store,
+    out: &mut Vec<StoreMutation>,
+) -> Result<(), String> {
     for cmd in cmds {
         match cmd {
             GraphCommand::PutNode(n) => out.push(StoreMutation::PutNode(n.clone())),
             GraphCommand::PutEdge(e) => out.push(StoreMutation::PutEdge(e.clone())),
             GraphCommand::DeleteEdge(id) => out.push(StoreMutation::DeleteEdge(*id)),
             GraphCommand::DetachDeleteNode(id) => out.push(StoreMutation::DetachDeleteNode(*id)),
-            GraphCommand::Batch(inner) => flatten_into(inner, out)?,
+            GraphCommand::Batch(inner) => apply_ddl_and_collect(inner, store, out)?,
+            GraphCommand::CreateIndex { label, property } => store
+                .create_property_index(label, property)
+                .map_err(|e| e.to_string())?,
+            GraphCommand::DropIndex { label, property } => store
+                .drop_property_index(label, property)
+                .map_err(|e| e.to_string())?,
         }
     }
     Ok(())
