@@ -1,9 +1,12 @@
+use mesh_cluster::ClusterCommand;
+use mesh_cluster::PeerId;
 use mesh_core::Node;
 use mesh_rpc::convert::{node_to_proto, uuid_to_proto};
 use mesh_rpc::proto::mesh_query_client::MeshQueryClient;
 use mesh_rpc::proto::mesh_write_client::MeshWriteClient;
 use mesh_rpc::proto::{GetNodeRequest, HealthRequest, PutNodeRequest};
 use mesh_server::config::{PeerConfig, ServerConfig};
+use mesh_server::ServerComponents;
 use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -92,6 +95,7 @@ async fn spawn_single_node_server() -> Harness {
         data_dir: dir.path().to_path_buf(),
         num_partitions: 4,
         peers: vec![],
+        bootstrap: false,
     };
 
     let service = mesh_server::build_service(&config).unwrap();
@@ -141,6 +145,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         data_dir: dir_a.path().to_path_buf(),
         num_partitions: 4,
         peers: peers.clone(),
+        bootstrap: false,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -148,6 +153,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         data_dir: dir_b.path().to_path_buf(),
         num_partitions: 4,
         peers,
+        bootstrap: false,
     };
 
     let service_a = mesh_server::build_service(&config_a).unwrap();
@@ -258,4 +264,207 @@ async fn two_peer_cluster_via_config_routes_writes_and_reads() {
         assert!(inner.found, "routed get_node miss for {id}");
         assert_eq!(inner.node.unwrap().labels, vec!["Employee"]);
     }
+}
+
+#[test]
+fn config_bootstrap_flag_defaults_to_false_and_parses_when_set() {
+    let toml_no_bootstrap = r#"
+        self_id = 1
+        listen_address = "127.0.0.1:7001"
+        data_dir = "/tmp/mesh"
+    "#;
+    let cfg = ServerConfig::from_toml_str(toml_no_bootstrap).unwrap();
+    assert!(!cfg.bootstrap);
+
+    let toml_bootstrap = r#"
+        self_id = 1
+        listen_address = "127.0.0.1:7001"
+        data_dir = "/tmp/mesh"
+        bootstrap = true
+
+        [[peers]]
+        id = 1
+        address = "127.0.0.1:7001"
+
+        [[peers]]
+        id = 2
+        address = "127.0.0.1:7002"
+    "#;
+    let cfg = ServerConfig::from_toml_str(toml_bootstrap).unwrap();
+    assert!(cfg.bootstrap);
+    assert_eq!(cfg.peers.len(), 2);
+}
+
+#[tokio::test]
+async fn build_components_single_node_has_no_raft() {
+    let dir = TempDir::new().unwrap();
+    let config = ServerConfig {
+        self_id: 1,
+        listen_address: "127.0.0.1:0".into(),
+        data_dir: dir.path().to_path_buf(),
+        num_partitions: 4,
+        peers: vec![],
+        bootstrap: false,
+    };
+    let components = mesh_server::build_components(&config).await.unwrap();
+    assert!(components.raft.is_none());
+    assert!(components.raft_service.is_none());
+}
+
+#[tokio::test]
+async fn build_components_multi_peer_builds_raft() {
+    let dir = TempDir::new().unwrap();
+    let config = ServerConfig {
+        self_id: 1,
+        listen_address: "127.0.0.1:0".into(),
+        data_dir: dir.path().to_path_buf(),
+        num_partitions: 4,
+        peers: vec![
+            PeerConfig {
+                id: 1,
+                address: "127.0.0.1:7001".into(),
+            },
+            PeerConfig {
+                id: 2,
+                address: "127.0.0.1:7002".into(),
+            },
+        ],
+        bootstrap: false,
+    };
+    let components = mesh_server::build_components(&config).await.unwrap();
+    assert!(components.raft.is_some());
+    assert!(components.raft_service.is_some());
+}
+
+#[tokio::test]
+async fn two_peer_raft_replicates_via_server_components() {
+    use std::time::Duration;
+
+    // Bind two real listeners so we know the addresses up front.
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        PeerConfig {
+            id: 1,
+            address: addr_a.to_string(),
+        },
+        PeerConfig {
+            id: 2,
+            address: addr_b.to_string(),
+        },
+    ];
+    let config_a = ServerConfig {
+        self_id: 1,
+        listen_address: addr_a.to_string(),
+        data_dir: dir_a.path().to_path_buf(),
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap: true,
+    };
+    let config_b = ServerConfig {
+        self_id: 2,
+        listen_address: addr_b.to_string(),
+        data_dir: dir_b.path().to_path_buf(),
+        num_partitions: 4,
+        peers,
+        bootstrap: false,
+    };
+
+    // Build components for both peers.
+    let components_a = mesh_server::build_components(&config_a).await.unwrap();
+    let components_b = mesh_server::build_components(&config_b).await.unwrap();
+
+    // Pull the Raft handles before destructuring components into the server tasks.
+    let raft_a = components_a.raft.clone().unwrap();
+    let raft_b = components_b.raft.clone().unwrap();
+
+    let ServerComponents {
+        service: service_a,
+        raft: _,
+        raft_service: raft_service_a,
+    } = components_a;
+    let ServerComponents {
+        service: service_b,
+        raft: _,
+        raft_service: raft_service_b,
+    } = components_b;
+
+    let raft_service_a = raft_service_a.unwrap();
+    let raft_service_b = raft_service_b.unwrap();
+
+    // Spawn both binary-equivalent gRPC servers (Query + Write + Raft).
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_a.clone().into_query_server())
+            .add_service(service_a.into_write_server())
+            .add_service(raft_service_a.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_a))
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_b.clone().into_query_server())
+            .add_service(service_b.into_write_server())
+            .add_service(raft_service_b.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_b))
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Bootstrap only peer A (matches the binary's serve() flow).
+    mesh_server::initialize_if_seed(&config_a, &raft_a)
+        .await
+        .expect("seed peer should bootstrap");
+    // (initialize_if_seed on B is a no-op because bootstrap = false.)
+    mesh_server::initialize_if_seed(&config_b, &raft_b)
+        .await
+        .expect("non-seed peer should be a no-op");
+
+    // Wait for leadership to converge.
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let metrics = raft_a.raft.metrics().borrow().clone();
+        if metrics.current_leader == Some(1) {
+            break;
+        }
+    }
+
+    // Propose a real ClusterCommand on the leader.
+    raft_a
+        .propose(ClusterCommand::AddPeer {
+            id: PeerId(3),
+            address: "10.0.0.3:7003".into(),
+        })
+        .await
+        .expect("propose should succeed on leader");
+
+    let state_a = raft_a.current_state().await;
+    assert!(state_a.membership.contains(PeerId(3)));
+
+    // Peer B should see the replicated change within 4 seconds.
+    let mut replicated = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let state_b = raft_b.current_state().await;
+        if state_b.membership.contains(PeerId(3)) {
+            assert_eq!(
+                state_b.membership.address(PeerId(3)),
+                Some("10.0.0.3:7003")
+            );
+            replicated = true;
+            break;
+        }
+    }
+    assert!(
+        replicated,
+        "peer B did not receive the replicated command via the binary path"
+    );
 }

@@ -1,18 +1,34 @@
 pub mod config;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use config::ServerConfig;
-use mesh_cluster::{Cluster, Peer, PeerId};
-use mesh_rpc::{MeshService, Routing};
+use mesh_cluster::raft::{BasicNode, RaftCluster};
+use mesh_cluster::{Cluster, ClusterState, Membership, PartitionMap, Peer, PeerId};
+use mesh_rpc::{GrpcNetwork, MeshRaftService, MeshService, Routing};
 use mesh_storage::Store;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
-/// Construct the [`MeshService`] described by `config`: opens the on-disk
-/// store and builds a [`Cluster`] + [`Routing`] when peers are configured.
-/// Single-node deployments (empty `peers`) return a local-only service.
+/// Bundle of everything the binary needs to serve a peer: the storage-backed
+/// query/write service, an optional Raft cluster (built when `peers` is
+/// non-empty), and the matching gRPC service handler for incoming Raft RPCs.
+///
+/// Tests can destructure this and compose a tonic server manually; the
+/// binary uses [`serve`] which handles bootstrap, server task spawning, and
+/// graceful Ctrl-C shutdown.
+pub struct ServerComponents {
+    pub service: MeshService,
+    pub raft: Option<Arc<RaftCluster>>,
+    pub raft_service: Option<MeshRaftService>,
+}
+
+/// Build the storage-backed [`MeshService`] for a single-node deployment.
+/// Kept as a sync entry point for legacy callers; multi-peer deployments
+/// should go through [`build_components`] instead.
 pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
     std::fs::create_dir_all(&config.data_dir).with_context(|| {
         format!("creating data dir {}", config.data_dir.display())
@@ -40,35 +56,134 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
     Ok(MeshService::with_routing(store, routing))
 }
 
+/// Build the full [`ServerComponents`] bundle. For multi-peer configs this
+/// also constructs a [`RaftCluster`] backed by a [`GrpcNetwork`] pointing at
+/// the other peers, plus a [`MeshRaftService`] handler for incoming Raft
+/// RPCs. Single-node configs return `raft: None` / `raft_service: None`.
+pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents> {
+    let service = build_service(config)?;
+
+    if config.peers.is_empty() {
+        return Ok(ServerComponents {
+            service,
+            raft: None,
+            raft_service: None,
+        });
+    }
+
+    // Build the initial cluster state Raft will manage.
+    let peers: Vec<Peer> = config
+        .peers
+        .iter()
+        .map(|p| Peer::new(PeerId(p.id), p.address.clone()))
+        .collect();
+    let membership = Membership::new(peers);
+    let peer_ids: Vec<PeerId> = membership.peer_ids().collect();
+    let partition_map = PartitionMap::round_robin(&peer_ids, config.num_partitions)
+        .context("building partition map")?;
+    let initial_state = ClusterState::new(membership, partition_map);
+
+    // GrpcNetwork only registers channels for peers other than self.
+    let peer_map: Vec<(u64, String)> = config
+        .peers
+        .iter()
+        .filter(|p| p.id != config.self_id)
+        .map(|p| (p.id, p.address.clone()))
+        .collect();
+    let network = GrpcNetwork::new(peer_map).context("building grpc network")?;
+
+    let raft_cluster = RaftCluster::new(config.self_id, initial_state, network)
+        .await
+        .context("building raft cluster")?;
+    let raft_service = MeshRaftService::new(raft_cluster.raft.clone());
+    let raft = Arc::new(raft_cluster);
+
+    Ok(ServerComponents {
+        service,
+        raft: Some(raft),
+        raft_service: Some(raft_service),
+    })
+}
+
+/// Initialize the seed peer's Raft instance with the configured member list.
+/// No-op on non-seed peers and on single-node configs.
+pub async fn initialize_if_seed(config: &ServerConfig, raft: &RaftCluster) -> Result<()> {
+    if !config.bootstrap {
+        return Ok(());
+    }
+    let members: BTreeMap<u64, BasicNode> = config
+        .peers
+        .iter()
+        .map(|p| (p.id, BasicNode::new(p.address.clone())))
+        .collect();
+    raft.initialize(members)
+        .await
+        .context("seeding raft cluster")
+}
+
 /// Bind the configured listen address and serve until Ctrl-C.
+///
+/// For multi-peer configs this also bootstraps the Raft cluster (if
+/// `bootstrap = true`) after the gRPC server is listening, so the seed peer
+/// can immediately replicate the initial membership entry to followers.
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    let service = build_service(&config)?;
+    let components = build_components(&config).await?;
     let listener = TcpListener::bind(&config.listen_address)
         .await
         .with_context(|| format!("binding {}", config.listen_address))?;
-    serve_with_listener(service, listener).await
-}
-
-/// Serve a pre-built service on a pre-bound listener until Ctrl-C.
-/// Exposed so tests can bind `127.0.0.1:0` and capture the actual port.
-pub async fn serve_with_listener(
-    service: MeshService,
-    listener: TcpListener,
-) -> Result<()> {
     let local_addr = listener.local_addr()?;
     tracing::info!(addr = %local_addr, "mesh-server listening");
 
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("received shutdown signal");
-    };
+    let raft_handle = components.raft.clone();
+    let ServerComponents {
+        service,
+        raft: _,
+        raft_service,
+    } = components;
 
-    Server::builder()
-        .add_service(service.clone().into_query_server())
-        .add_service(service.into_write_server())
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
-        .await
-        .context("gRPC server error")?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+    let server_task = tokio::spawn(async move {
+        let mut router = Server::builder()
+            .add_service(service.clone().into_query_server())
+            .add_service(service.into_write_server());
+        if let Some(rs) = raft_service {
+            router = router.add_service(rs.into_server());
+        }
+        let shutdown = async {
+            let _ = shutdown_rx.await;
+            tracing::info!("received shutdown signal");
+        };
+        router
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+            .await
+            .context("gRPC server error")
+    });
+
+    // Give the server a moment to bind before we start trying to send Raft
+    // RPCs to peers.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    if let Some(raft) = &raft_handle {
+        if let Err(e) = initialize_if_seed(&config, raft).await {
+            // Don't crash the server on bootstrap failure — log and continue.
+            // openraft retries network errors, so transient peer-unreachable
+            // failures during initial replication eventually resolve.
+            tracing::warn!("raft bootstrap failed: {e:#}");
+        } else if config.bootstrap {
+            tracing::info!(
+                peers = config.peers.len(),
+                "raft cluster bootstrapped"
+            );
+        }
+    }
+
+    tokio::signal::ctrl_c().await.ok();
+    let _ = shutdown_tx.send(());
+
+    match server_task.await {
+        Ok(result) => result?,
+        Err(e) => return Err(anyhow!("server task panicked: {e}")),
+    }
     Ok(())
 }

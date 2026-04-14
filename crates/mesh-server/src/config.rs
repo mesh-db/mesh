@@ -24,6 +24,13 @@ pub struct ServerConfig {
     /// Cluster member list. Empty for a single-node deployment.
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+
+    /// Marks this peer as the seed that calls `Raft::initialize` to bootstrap
+    /// the cluster. Exactly one peer per cluster should have this set on its
+    /// first start; on subsequent starts it should be `false`. Ignored in
+    /// single-node (empty peers) deployments.
+    #[serde(default)]
+    pub bootstrap: bool,
 }
 
 fn default_num_partitions() -> u32 {

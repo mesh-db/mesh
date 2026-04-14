@@ -17,9 +17,10 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::storage::{Adaptor, LogState, RaftLogReader, RaftSnapshotBuilder, Snapshot};
+pub use openraft::BasicNode;
 use openraft::{
-    BasicNode, Entry, EntryPayload, LogId, OptionalSend, Raft, RaftStorage, SnapshotMeta,
-    StorageError, StorageIOError, StoredMembership, Vote,
+    Entry, EntryPayload, LogId, OptionalSend, Raft, RaftStorage, SnapshotMeta, StorageError,
+    StorageIOError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
