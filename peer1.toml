@@ -1,0 +1,13 @@
+self_id = 1
+listen_address = "127.0.0.1:17381"
+data_dir = "/tmp/mesh-raft-data/peer1"
+num_partitions = 4
+bootstrap = true
+
+[[peers]]
+id = 1
+address = "127.0.0.1:17381"
+
+[[peers]]
+id = 2
+address = "127.0.0.1:17382"
