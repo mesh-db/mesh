@@ -111,6 +111,21 @@ impl MeshService {
         self.pending_batches.clone().spawn_sweeper(interval)
     }
 
+    /// Spawn the coordinator-log rotator as a background task.
+    /// Returns `None` when the service has no coordinator log (i.e.
+    /// single-node or Raft mode), since there's nothing to rotate.
+    /// The caller is responsible for aborting the returned handle on
+    /// shutdown.
+    pub fn spawn_log_rotator(
+        &self,
+        interval: std::time::Duration,
+        min_completed: usize,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.coordinator_log
+            .as_ref()
+            .map(|log| log.clone().spawn_rotator(interval, min_completed))
+    }
+
     pub fn into_query_server(self) -> MeshQueryServer<Self> {
         MeshQueryServer::new(self)
     }

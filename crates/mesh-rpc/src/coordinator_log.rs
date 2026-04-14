@@ -171,9 +171,20 @@ impl CoordinatorLog {
     /// for completed transactions that no longer need a log trail.
     ///
     /// Uses a sibling temp file + atomic rename so a crash mid-compact
-    /// leaves the original log intact.
+    /// leaves the original log intact. **Holds the file mutex for the
+    /// entire operation** so concurrent `append` calls block until
+    /// compaction finishes — otherwise a writer could race the rename
+    /// and lose its entry against the old inode.
     pub fn compact(&self, keep_txids: &HashSet<String>) -> std::io::Result<()> {
-        let entries = self.read_all()?;
+        // Take the mutex first so concurrent append() calls wait until
+        // we're done. For a typical live-rotation cadence (60s with a
+        // few thousand entries) the pause is milliseconds.
+        let mut slot = self.file.lock().unwrap();
+
+        // Fresh read-only handle to walk the current on-disk contents.
+        // Using a separate handle from the locked one keeps the read
+        // path simple — the lock is really about serializing writes.
+        let entries = read_all_from_path(&self.path)?;
         let tmp_path = self.path.with_extension("jsonl.tmp");
 
         {
@@ -193,18 +204,117 @@ impl CoordinatorLog {
             tmp.sync_data()?;
         }
 
-        // Atomic rename — and then swap the live file handle so future
-        // appends hit the compacted file.
+        // Atomic rename — anything appended *before* we took the mutex
+        // is on disk via the read we did above. Anything trying to
+        // append *now* is blocked on the lock we're still holding.
         std::fs::rename(&tmp_path, &self.path)?;
         let new_handle = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&self.path)?;
-        let mut slot = self.file.lock().unwrap();
         *slot = new_handle;
         Ok(())
     }
+
+    /// Walk the log, identify transactions that are fully completed,
+    /// and compact them out if at least `min_completed` of them have
+    /// accumulated. Returns the number of completed transactions
+    /// dropped — `0` means either the log is already clean or the
+    /// threshold wasn't met.
+    ///
+    /// Used by the background rotator task so a healthy cluster's log
+    /// stays bounded in steady state instead of growing linearly with
+    /// lifetime transaction count. Skipping the rewrite when few
+    /// completed entries are present avoids rewriting the whole file
+    /// for trivial savings.
+    pub fn compact_completed(&self, min_completed: usize) -> std::io::Result<usize> {
+        let entries = self.read_all()?;
+        let state = reconstruct_state(&entries);
+
+        let completed_count = state.values().filter(|s| s.completed).count();
+        if completed_count < min_completed {
+            return Ok(0);
+        }
+
+        let keep: HashSet<String> = state
+            .values()
+            .filter(|s| !s.completed)
+            .map(|s| s.txid.clone())
+            .collect();
+        self.compact(&keep)?;
+        Ok(completed_count)
+    }
+
+    /// Spawn a background task that calls [`Self::compact_completed`]
+    /// every `interval`. The returned handle should be aborted on
+    /// shutdown so the task doesn't outlive the service.
+    ///
+    /// The first sweep fires one `interval` after this call returns —
+    /// never immediately — so the recovery path (which runs just
+    /// before the rotator is spawned) has a chance to finish before
+    /// the first compaction tries to rewrite the log.
+    pub fn spawn_rotator(
+        self: std::sync::Arc<Self>,
+        interval: std::time::Duration,
+        min_completed: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Absorb tokio's immediate first tick.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match self.compact_completed(min_completed) {
+                    Ok(0) => {}
+                    Ok(dropped) => {
+                        tracing::info!(dropped, "compacted coordinator log",);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "coordinator log compaction failed");
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Default interval between background log rotations. Picked to
+/// match the staging sweeper's cadence so operators see the two
+/// maintenance tasks fire on similar schedules.
+pub const DEFAULT_ROTATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Default threshold of completed transactions before compaction
+/// actually runs. Avoids rewriting the file for trivial savings.
+pub const DEFAULT_MIN_COMPLETED: usize = 100;
+
+/// Read-only parser over a log file path. Extracted from
+/// [`CoordinatorLog::read_all`] so [`CoordinatorLog::compact`] can
+/// walk the on-disk entries while holding the write mutex without
+/// calling the method-form `read_all` (which would be fine but is a
+/// bit indirect).
+fn read_all_from_path(path: &Path) -> std::io::Result<Vec<TxLogEntry>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TxLogEntry>(&line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "stopping coordinator log parse at malformed line",
+                );
+                break;
+            }
+        }
+    }
+    Ok(entries)
 }
 
 /// Per-txid aggregate derived from the raw log entries. Built by
@@ -374,6 +484,155 @@ mod tests {
         let after = log.read_all().unwrap();
         assert_eq!(after.len(), 2);
         assert!(after.iter().all(|e| e.txid() == "t_live"));
+    }
+
+    #[test]
+    fn compact_completed_drops_finished_txids_above_threshold() {
+        let dir = TempDir::new().unwrap();
+        let log = CoordinatorLog::open(dir.path().join("log.jsonl")).unwrap();
+
+        // Three fully-completed txids + one in-flight txid with no
+        // decision yet. Threshold = 2 → should run and drop all three
+        // completed entries' worth of log lines (3 × 3 = 9 lines).
+        for i in 0..3 {
+            let txid = format!("done-{i}");
+            log.append(&TxLogEntry::Prepared {
+                txid: txid.clone(),
+                groups: dummy_groups(),
+            })
+            .unwrap();
+            log.append(&TxLogEntry::CommitDecision { txid: txid.clone() })
+                .unwrap();
+            log.append(&TxLogEntry::Completed { txid }).unwrap();
+        }
+        log.append(&TxLogEntry::Prepared {
+            txid: "inflight".into(),
+            groups: dummy_groups(),
+        })
+        .unwrap();
+
+        let dropped = log.compact_completed(2).unwrap();
+        assert_eq!(dropped, 3, "all three completed txids should be dropped");
+
+        let after = log.read_all().unwrap();
+        // Only the in-flight txid's Prepared entry survives.
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].txid(), "inflight");
+    }
+
+    #[test]
+    fn compact_completed_skips_below_threshold() {
+        let dir = TempDir::new().unwrap();
+        let log = CoordinatorLog::open(dir.path().join("log.jsonl")).unwrap();
+
+        // One fully-completed txid — below a threshold of 5.
+        log.append(&TxLogEntry::Prepared {
+            txid: "solo".into(),
+            groups: dummy_groups(),
+        })
+        .unwrap();
+        log.append(&TxLogEntry::CommitDecision {
+            txid: "solo".into(),
+        })
+        .unwrap();
+        log.append(&TxLogEntry::Completed {
+            txid: "solo".into(),
+        })
+        .unwrap();
+
+        let dropped = log.compact_completed(5).unwrap();
+        assert_eq!(dropped, 0, "below threshold → no compaction");
+
+        // File still holds all three entries.
+        let after = log.read_all().unwrap();
+        assert_eq!(after.len(), 3);
+    }
+
+    #[test]
+    fn compact_completed_ignores_undecided_txids() {
+        // Mix of one committed and one still-pending tx; the pending
+        // tx's entries must survive even when we're over the
+        // threshold for the completed one.
+        let dir = TempDir::new().unwrap();
+        let log = CoordinatorLog::open(dir.path().join("log.jsonl")).unwrap();
+
+        log.append(&TxLogEntry::Prepared {
+            txid: "done".into(),
+            groups: dummy_groups(),
+        })
+        .unwrap();
+        log.append(&TxLogEntry::CommitDecision {
+            txid: "done".into(),
+        })
+        .unwrap();
+        log.append(&TxLogEntry::Completed {
+            txid: "done".into(),
+        })
+        .unwrap();
+        log.append(&TxLogEntry::Prepared {
+            txid: "pending".into(),
+            groups: dummy_groups(),
+        })
+        .unwrap();
+
+        let dropped = log.compact_completed(1).unwrap();
+        assert_eq!(dropped, 1);
+
+        let after = log.read_all().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].txid(), "pending");
+        // Subsequent appends keep working against the compacted file.
+        log.append(&TxLogEntry::CommitDecision {
+            txid: "pending".into(),
+        })
+        .unwrap();
+        let after2 = log.read_all().unwrap();
+        assert_eq!(after2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn spawn_rotator_compacts_completed_entries_in_background() {
+        // Stage a mix of completed and pending entries, spawn the
+        // rotator with a short interval, and verify the completed
+        // entries are gone while the pending one survives.
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("log.jsonl");
+        let log = CoordinatorLog::open(&log_path).unwrap();
+
+        for i in 0..4 {
+            let txid = format!("done-{i}");
+            log.append(&TxLogEntry::Prepared {
+                txid: txid.clone(),
+                groups: dummy_groups(),
+            })
+            .unwrap();
+            log.append(&TxLogEntry::CommitDecision { txid: txid.clone() })
+                .unwrap();
+            log.append(&TxLogEntry::Completed { txid }).unwrap();
+        }
+        log.append(&TxLogEntry::Prepared {
+            txid: "pending".into(),
+            groups: dummy_groups(),
+        })
+        .unwrap();
+
+        let log_arc = std::sync::Arc::new(log);
+        let handle = log_arc
+            .clone()
+            .spawn_rotator(std::time::Duration::from_millis(20), 1);
+
+        // Two cycles' worth of wall time.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let after = log_arc.read_all().unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "rotator should have compacted completed entries"
+        );
+        assert_eq!(after[0].txid(), "pending");
     }
 
     #[test]

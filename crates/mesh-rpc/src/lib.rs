@@ -17,7 +17,10 @@ mod staging;
 mod tx_coordinator;
 mod tx_overlay;
 
-pub use coordinator_log::{CoordinatorLog, TxDecision, TxLogEntry, TxState};
+pub use coordinator_log::{
+    CoordinatorLog, TxDecision, TxLogEntry, TxState, DEFAULT_MIN_COMPLETED,
+    DEFAULT_ROTATION_INTERVAL,
+};
 pub use error::ConvertError;
 pub use executor_writer::{BufferingGraphWriter, RaftGraphWriter};
 pub use partitioned_reader::PartitionedGraphReader;

@@ -200,6 +200,16 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // restarting to trigger the recovery log path.
     let staging_sweeper = service.spawn_staging_sweeper(mesh_rpc::DEFAULT_SWEEP_INTERVAL);
 
+    // Background rotator for the coordinator's durable 2PC log.
+    // Periodically drops already-completed transaction entries so
+    // the log doesn't grow linearly with lifetime tx count in a
+    // long-running cluster. Returns None in single-node / Raft
+    // modes where there's no coordinator log to rotate.
+    let log_rotator = service.spawn_log_rotator(
+        mesh_rpc::DEFAULT_ROTATION_INTERVAL,
+        mesh_rpc::DEFAULT_MIN_COMPLETED,
+    );
+
     // Optional Bolt listener. Binds before we start the gRPC server so
     // that a port-in-use error at startup is immediately fatal rather
     // than surfacing only on the first Bolt client connection.
@@ -259,6 +269,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
 
     staging_sweeper.abort();
     let _ = staging_sweeper.await;
+
+    if let Some(handle) = log_rotator {
+        handle.abort();
+        let _ = handle.await;
+    }
 
     if let Some(handle) = bolt_task {
         handle.abort();
