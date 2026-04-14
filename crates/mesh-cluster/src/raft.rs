@@ -378,7 +378,17 @@ pub struct RaftCluster {
 }
 
 impl RaftCluster {
-    pub async fn new_single_node(id: NodeId, initial_state: ClusterState) -> Result<Self> {
+    /// Create a Raft instance with the given network factory. Does **not**
+    /// call `initialize` — the caller is responsible for bootstrapping the
+    /// cluster exactly once on the designated seed peer via [`initialize`].
+    pub async fn new<N>(
+        id: NodeId,
+        initial_state: ClusterState,
+        network: N,
+    ) -> Result<Self>
+    where
+        N: RaftNetworkFactory<MeshRaftConfig>,
+    {
         let config = Arc::new(
             default_config()
                 .validate()
@@ -386,19 +396,34 @@ impl RaftCluster {
         );
         let store = MemStore::new(initial_state);
         let (log_store, state_machine) = Adaptor::new(store.clone());
-        let network = NoOpNetwork;
 
         let raft = Raft::new(id, config, network, log_store, state_machine)
             .await
             .map_err(|e| Error::Raft(e.to_string()))?;
 
+        Ok(Self { id, raft, store })
+    }
+
+    /// Bootstrap the cluster with the provided member set. Only call on the
+    /// seed peer.
+    pub async fn initialize(&self, members: BTreeMap<NodeId, BasicNode>) -> Result<()> {
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|e| Error::Raft(e.to_string()))
+    }
+
+    /// Convenience: create a single-node cluster and initialize it in one step.
+    pub async fn new_single_node(id: NodeId, initial_state: ClusterState) -> Result<Self> {
+        let cluster = Self::new(id, initial_state, NoOpNetwork).await?;
         let mut members = BTreeSet::new();
         members.insert(id);
-        raft.initialize(members)
+        cluster
+            .raft
+            .initialize(members)
             .await
             .map_err(|e| Error::Raft(e.to_string()))?;
-
-        Ok(Self { id, raft, store })
+        Ok(cluster)
     }
 
     pub async fn propose(&self, command: ClusterCommand) -> Result<ApplyResponse> {

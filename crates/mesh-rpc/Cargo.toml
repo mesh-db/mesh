@@ -9,6 +9,9 @@ description = "gRPC services for Mesh"
 mesh-core = { path = "../mesh-core" }
 mesh-storage = { path = "../mesh-storage" }
 mesh-cluster = { path = "../mesh-cluster" }
+openraft = { version = "0.9", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tonic = "0.12"
 prost = "0.13"
 tokio = { workspace = true }

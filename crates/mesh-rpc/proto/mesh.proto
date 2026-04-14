@@ -116,3 +116,21 @@ message DetachDeleteNodeRequest {
   bool local_only = 2;
 }
 message DetachDeleteNodeResponse {}
+
+// Raft consensus RPCs. Each payload field carries a serde-serialized openraft
+// request/response struct, so the wire schema stays stable even as openraft's
+// internal types evolve and we don't have to mirror every internal field in
+// proto.
+service MeshRaft {
+  rpc AppendEntries(RaftRpcRequest) returns (RaftRpcResponse);
+  rpc Vote(RaftRpcRequest) returns (RaftRpcResponse);
+  rpc InstallSnapshot(RaftRpcRequest) returns (RaftRpcResponse);
+}
+
+message RaftRpcRequest {
+  bytes payload = 1;
+}
+
+message RaftRpcResponse {
+  bytes payload = 1;
+}
