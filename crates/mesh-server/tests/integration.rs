@@ -1,6 +1,8 @@
+use mesh_cluster::raft::RaftCluster;
 use mesh_cluster::ClusterCommand;
 use mesh_cluster::PeerId;
 use mesh_core::Node;
+use std::sync::Arc;
 use mesh_rpc::convert::{node_to_proto, uuid_to_proto};
 use mesh_rpc::proto::mesh_query_client::MeshQueryClient;
 use mesh_rpc::proto::mesh_write_client::MeshWriteClient;
@@ -633,6 +635,199 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
     assert!(
         replicated,
         "follower didn't receive the replicated PutNode via the binary path"
+    );
+}
+
+#[tokio::test]
+async fn peer_restart_recovers_persistent_raft_state() {
+    // The payoff from persistent raft storage: peer B can be killed and
+    // brought back up against its existing data_dir, and it rejoins the
+    // cluster as a functioning follower. Nodes written before the restart
+    // survive (log + vote hydrated from disk → state machine replayed),
+    // and nodes written after the restart replicate normally.
+
+    struct RunningPeer {
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        join: tokio::task::JoinHandle<()>,
+    }
+
+    fn spawn_peer(listener: TcpListener, components: ServerComponents) -> RunningPeer {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let ServerComponents {
+            service,
+            raft: _,
+            raft_service,
+        } = components;
+        let raft_service = raft_service.unwrap();
+        let join = tokio::spawn(async move {
+            let shutdown = async {
+                let _ = shutdown_rx.await;
+            };
+            Server::builder()
+                .add_service(service.clone().into_query_server())
+                .add_service(service.into_write_server())
+                .add_service(raft_service.into_server())
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    shutdown,
+                )
+                .await
+                .unwrap();
+        });
+        RunningPeer {
+            shutdown: shutdown_tx,
+            join,
+        }
+    }
+
+    async fn wait_for_node(
+        reader: &mut MeshQueryClient<tonic::transport::Channel>,
+        id: mesh_core::NodeId,
+    ) -> bool {
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let resp = reader
+                .get_node(GetNodeRequest {
+                    id: Some(uuid_to_proto(id.as_uuid())),
+                })
+                .await
+                .unwrap();
+            if resp.into_inner().found {
+                return true;
+            }
+        }
+        false
+    }
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        PeerConfig {
+            id: 1,
+            address: addr_a.to_string(),
+        },
+        PeerConfig {
+            id: 2,
+            address: addr_b.to_string(),
+        },
+    ];
+    let config_a = ServerConfig {
+        self_id: 1,
+        listen_address: addr_a.to_string(),
+        data_dir: dir_a.path().to_path_buf(),
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap: true,
+    };
+    let config_b = ServerConfig {
+        self_id: 2,
+        listen_address: addr_b.to_string(),
+        data_dir: dir_b.path().to_path_buf(),
+        num_partitions: 4,
+        peers,
+        bootstrap: false,
+    };
+
+    let components_a = mesh_server::build_components(&config_a).await.unwrap();
+    let components_b = mesh_server::build_components(&config_b).await.unwrap();
+
+    let raft_a: Arc<RaftCluster> = components_a.raft.clone().unwrap();
+    let raft_b_v1: Arc<RaftCluster> = components_b.raft.clone().unwrap();
+
+    let _peer_a = spawn_peer(listener_a, components_a);
+    let peer_b_v1 = spawn_peer(listener_b, components_b);
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    mesh_server::initialize_if_seed(&config_a, &raft_a)
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if raft_a.raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+
+    // Pre-restart: write node X via the leader and wait for it to replicate
+    // to peer B. This gives B a non-trivial persistent log to recover from.
+    let mut writer = MeshWriteClient::connect(format!("http://{}", addr_a))
+        .await
+        .unwrap();
+    let node_x = Node::new()
+        .with_label("Person")
+        .with_property("name", "X");
+    let x_id = node_x.id;
+    writer
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&node_x).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    let mut reader_b = MeshQueryClient::connect(format!("http://{}", addr_b))
+        .await
+        .unwrap();
+    assert!(
+        wait_for_node(&mut reader_b, x_id).await,
+        "pre-restart: node X didn't replicate to B"
+    );
+    drop(reader_b);
+
+    // Shut peer B down. Order matters: stop openraft's internal task first
+    // so the tonic server task isn't handling raft RPCs against a half-dead
+    // raft; then stop the server; then release the Arc so the underlying
+    // rocksdb handles drop and the data_dir lock is freed.
+    raft_b_v1.raft.shutdown().await.unwrap();
+    peer_b_v1.shutdown.send(()).unwrap();
+    peer_b_v1.join.await.unwrap();
+    drop(raft_b_v1);
+
+    // Give the runtime a tick to actually drop the service/store Arcs that
+    // were moved into the server task.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Restart peer B on the same address + same data_dir. build_components
+    // hits MemStore::open_persistent, which reads vote + log back from disk.
+    let listener_b2 = TcpListener::bind(addr_b).await.unwrap();
+    let components_b2 = mesh_server::build_components(&config_b).await.unwrap();
+    let _peer_b_v2 = spawn_peer(listener_b2, components_b2);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Post-restart: write node Y on the leader. With 2 peers and quorum = 2,
+    // this only commits once the restarted B is back in the replication set,
+    // so success here proves B is a functioning follower again.
+    let node_y = Node::new()
+        .with_label("Person")
+        .with_property("name", "Y");
+    let y_id = node_y.id;
+    writer
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&node_y).unwrap()),
+            local_only: false,
+        })
+        .await
+        .expect("post-restart write should commit once B rejoins");
+
+    // Reads on the restarted B should see both X (persisted pre-restart)
+    // and Y (replicated post-restart).
+    let mut reader_b2 = MeshQueryClient::connect(format!("http://{}", addr_b))
+        .await
+        .unwrap();
+    assert!(
+        wait_for_node(&mut reader_b2, x_id).await,
+        "restarted B lost pre-restart node X — persistence failed"
+    );
+    assert!(
+        wait_for_node(&mut reader_b2, y_id).await,
+        "restarted B didn't receive post-restart node Y — not a functioning follower"
     );
 }
 
