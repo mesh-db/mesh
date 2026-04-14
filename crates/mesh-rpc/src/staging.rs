@@ -87,6 +87,7 @@ impl ParticipantStaging {
                 staged_at: Instant::now(),
             },
         );
+        crate::metrics::PENDING_2PC_STAGED.set(map.len() as i64);
         Ok(())
     }
 
@@ -94,11 +95,10 @@ impl ParticipantStaging {
     /// "not prepared" — either the coordinator never sent PREPARE, or
     /// the TTL sweeper has already dropped the entry.
     pub fn take(&self, txid: &str) -> Option<Vec<GraphCommand>> {
-        self.entries
-            .lock()
-            .unwrap()
-            .remove(txid)
-            .map(|e| e.commands)
+        let mut map = self.entries.lock().unwrap();
+        let result = map.remove(txid).map(|e| e.commands);
+        crate::metrics::PENDING_2PC_STAGED.set(map.len() as i64);
+        result
     }
 
     /// True iff `txid` currently has a staged entry. Used only by
@@ -123,6 +123,7 @@ impl ParticipantStaging {
         let now = Instant::now();
         let ttl = self.ttl;
         map.retain(|_, entry| now.saturating_duration_since(entry.staged_at) < ttl);
+        crate::metrics::PENDING_2PC_STAGED.set(map.len() as i64);
         before - map.len()
     }
 

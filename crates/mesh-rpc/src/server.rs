@@ -209,6 +209,10 @@ impl MeshService {
     /// With an empty `prev_commands`, this collapses to the normal
     /// auto-commit read path — the overlay is a no-op and every read
     /// hits the base reader directly.
+    #[tracing::instrument(
+        skip_all,
+        fields(query_len = query.len(), prev_commands = prev_commands.len())
+    )]
     pub async fn execute_cypher_in_tx(
         &self,
         query: String,
@@ -239,6 +243,29 @@ impl MeshService {
                 .collect(),
         };
         let plan = mesh_cypher::plan_with_context(&statement, &planner_ctx).map_err(bad_request)?;
+
+        // Metric increments. The mode label is set once per query
+        // and reused for both the counter and the latency
+        // histogram so dashboards can compute a per-mode mean
+        // latency (sum / count). The IndexSeek count walks the
+        // plan tree once — cheap relative to the query itself.
+        let mode_label = if self.routing.is_some() {
+            crate::metrics::MODE_ROUTING
+        } else if self.raft.is_some() {
+            crate::metrics::MODE_RAFT
+        } else {
+            crate::metrics::MODE_SINGLE
+        };
+        crate::metrics::CYPHER_QUERIES_TOTAL
+            .with_label_values(&[mode_label])
+            .inc();
+        let _timer = crate::metrics::CYPHER_QUERY_DURATION_SECONDS
+            .with_label_values(&[mode_label])
+            .start_timer();
+        let seek_count = count_index_seeks(&plan);
+        if seek_count > 0 {
+            crate::metrics::CYPHER_INDEX_SEEKS_TOTAL.inc_by(seek_count);
+        }
 
         let store = self.store.clone();
         let routing = self.routing.clone();
@@ -299,6 +326,7 @@ impl MeshService {
     /// mode the [`TxCoordinator`] groups by destination peer and runs
     /// the existing 2PC protocol. Single-node mode writes directly to
     /// the local store.
+    #[tracing::instrument(skip_all, fields(cmd_count = commands.len()))]
     pub async fn commit_buffered_commands(
         &self,
         commands: Vec<GraphCommand>,
@@ -325,8 +353,20 @@ impl MeshService {
             if let Some(log) = self.coordinator_log.as_deref() {
                 coordinator = coordinator.with_log(log);
             }
-            coordinator.run(graph).await?;
-            return Ok(());
+            match coordinator.run(graph).await {
+                Ok(()) => {
+                    crate::metrics::TWO_PHASE_COMMIT_TOTAL
+                        .with_label_values(&["committed"])
+                        .inc();
+                    return Ok(());
+                }
+                Err(e) => {
+                    crate::metrics::TWO_PHASE_COMMIT_TOTAL
+                        .with_label_values(&["aborted"])
+                        .inc();
+                    return Err(e);
+                }
+            }
         }
         if let Some(raft) = &self.raft {
             let entry = if commands.len() == 1 {
@@ -335,14 +375,29 @@ impl MeshService {
                 GraphCommand::Batch(commands)
             };
             return match raft.propose_graph(entry).await {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    crate::metrics::RAFT_PROPOSALS_TOTAL
+                        .with_label_values(&["committed"])
+                        .inc();
+                    Ok(())
+                }
                 Err(ClusterError::ForwardToLeader {
                     leader_address: Some(addr),
                     ..
-                }) => Err(Status::failed_precondition(format!(
-                    "raft leader is at {addr}; reconnect and retry there"
-                ))),
-                Err(e) => Err(raft_propose_failed(e)),
+                }) => {
+                    crate::metrics::RAFT_PROPOSALS_TOTAL
+                        .with_label_values(&["forwarded"])
+                        .inc();
+                    Err(Status::failed_precondition(format!(
+                        "raft leader is at {addr}; reconnect and retry there"
+                    )))
+                }
+                Err(e) => {
+                    crate::metrics::RAFT_PROPOSALS_TOTAL
+                        .with_label_values(&["failed"])
+                        .inc();
+                    Err(raft_propose_failed(e))
+                }
             };
         }
         // Single-node: apply the batch directly through the store's
@@ -364,6 +419,7 @@ impl MeshService {
     /// practice this only matters for CREATE failures; DROP has to
     /// re-backfill from the live local graph on rollback and
     /// succeeds as long as the store is still reachable.
+    #[tracing::instrument(skip_all, fields(ddl_count = ddl.len()))]
     async fn replicate_index_ddl_routing(
         &self,
         routing: &Arc<Routing>,
@@ -759,6 +815,38 @@ pub(crate) fn apply_prepared_batch(
         return Ok(());
     }
     store.apply_batch(&flat)
+}
+
+/// Count the number of `IndexSeek` plan nodes in `plan`,
+/// recursively. Used by `execute_cypher_in_tx` to bump the
+/// `mesh_cypher_index_seeks_total` counter once per query — cheap
+/// because plans are tiny, and accurate enough for usage tracking
+/// without instrumenting the executor itself.
+fn count_index_seeks(plan: &mesh_cypher::LogicalPlan) -> u64 {
+    use mesh_cypher::LogicalPlan as P;
+    match plan {
+        P::IndexSeek { .. } => 1,
+        P::Filter { input, .. }
+        | P::Project { input, .. }
+        | P::Aggregate { input, .. }
+        | P::Distinct { input }
+        | P::OrderBy { input, .. }
+        | P::Skip { input, .. }
+        | P::Limit { input, .. }
+        | P::Delete { input, .. }
+        | P::SetProperty { input, .. }
+        | P::EdgeExpand { input, .. }
+        | P::VarLengthExpand { input, .. } => count_index_seeks(input),
+        P::CartesianProduct { left, right } => count_index_seeks(left) + count_index_seeks(right),
+        P::CreatePath { input, .. } => input.as_deref().map(count_index_seeks).unwrap_or(0),
+        P::NodeScanAll { .. }
+        | P::NodeScanByLabels { .. }
+        | P::MergeNode { .. }
+        | P::Unwind { .. }
+        | P::CreatePropertyIndex { .. }
+        | P::DropPropertyIndex { .. }
+        | P::ShowPropertyIndexes => 0,
+    }
 }
 
 /// Apply a single DDL [`GraphCommand`] directly to `store`. Non-DDL

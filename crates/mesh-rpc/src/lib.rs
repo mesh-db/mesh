@@ -6,6 +6,7 @@ pub mod convert;
 mod coordinator_log;
 mod error;
 mod executor_writer;
+pub mod metrics;
 mod partitioned_reader;
 mod raft_applier;
 mod raft_network;

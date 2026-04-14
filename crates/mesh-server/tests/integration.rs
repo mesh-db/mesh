@@ -99,6 +99,7 @@ async fn spawn_single_node_server() -> Harness {
         peers: vec![],
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -151,6 +152,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         peers: peers.clone(),
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: Some(mesh_server::config::ClusterMode::Routing),
     };
     let config_b = ServerConfig {
@@ -161,6 +163,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: Some(mesh_server::config::ClusterMode::Routing),
     };
 
@@ -426,6 +429,7 @@ async fn build_components_single_node_has_no_raft() {
         peers: vec![],
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let components = mesh_server::build_components(&config).await.unwrap();
@@ -453,6 +457,7 @@ async fn build_components_multi_peer_builds_raft() {
         ],
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let components = mesh_server::build_components(&config).await.unwrap();
@@ -483,6 +488,7 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
         ],
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: Some(mesh_server::config::ClusterMode::Routing),
     };
     let components = mesh_server::build_components(&config).await.unwrap();
@@ -533,6 +539,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -543,6 +550,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -690,6 +698,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -700,6 +709,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -894,6 +904,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -904,6 +915,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -1035,6 +1047,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -1045,6 +1058,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -1179,6 +1193,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -1189,6 +1204,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -1418,6 +1434,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b1 = ServerConfig {
@@ -1428,6 +1445,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         peers: peers.clone(),
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -1521,6 +1539,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -1660,6 +1679,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -1670,6 +1690,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -1828,6 +1849,7 @@ async fn cypher_merge_replicates_through_raft() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -1838,6 +1860,7 @@ async fn cypher_merge_replicates_through_raft() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -1976,6 +1999,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -1986,6 +2010,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -2127,6 +2152,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -2137,6 +2163,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        metrics_address: None,
         mode: None,
     };
 
@@ -2228,5 +2255,114 @@ async fn two_peer_raft_replicates_via_server_components() {
     assert!(
         replicated,
         "peer B did not receive the replicated command via the binary path"
+    );
+}
+
+#[tokio::test]
+async fn metrics_endpoint_serves_prometheus_text_with_workload() {
+    // Spin up a single-node service, mount the metrics axum app on a
+    // separate listener, run a workload that exercises both a
+    // generic Cypher query and an indexed MATCH, then HTTP GET the
+    // metrics endpoint and verify the counters reflect the work.
+    //
+    // Counters are process-global, so we capture before/after and
+    // assert deltas rather than absolute values — the test is
+    // robust to other tests running in parallel within the same
+    // cargo binary.
+    let dir = TempDir::new().unwrap();
+    let config = ServerConfig {
+        self_id: 1,
+        listen_address: "127.0.0.1:0".into(),
+        data_dir: dir.path().to_path_buf(),
+        num_partitions: 4,
+        peers: vec![],
+        bootstrap: false,
+        bolt_address: None,
+        metrics_address: None,
+        mode: None,
+    };
+
+    let service = mesh_server::build_service(&config).unwrap();
+    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+    let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_addr = metrics_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service.clone().into_query_server())
+            .add_service(service.into_write_server())
+            .serve_with_incoming(TcpListenerStream::new(grpc_listener))
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        mesh_server::metrics::run_listener(metrics_listener)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let queries_before = mesh_rpc::metrics::CYPHER_QUERIES_TOTAL
+        .with_label_values(&[mesh_rpc::metrics::MODE_SINGLE])
+        .get();
+    let seeks_before = mesh_rpc::metrics::CYPHER_INDEX_SEEKS_TOTAL.get();
+
+    // Workload: create an index, seed nodes, run an indexed MATCH.
+    let mut q = MeshQueryClient::connect(format!("http://{}", grpc_addr))
+        .await
+        .unwrap();
+    q.execute_cypher(ExecuteCypherRequest {
+        query: "CREATE INDEX FOR (p:Person) ON (p.name)".into(),
+        params_json: vec![],
+    })
+    .await
+    .unwrap();
+    q.execute_cypher(ExecuteCypherRequest {
+        query: "CREATE (:Person {name: 'Ada'})".into(),
+        params_json: vec![],
+    })
+    .await
+    .unwrap();
+    q.execute_cypher(ExecuteCypherRequest {
+        query: "MATCH (p:Person {name: 'Ada'}) RETURN p.name AS n".into(),
+        params_json: vec![],
+    })
+    .await
+    .unwrap();
+
+    let queries_after = mesh_rpc::metrics::CYPHER_QUERIES_TOTAL
+        .with_label_values(&[mesh_rpc::metrics::MODE_SINGLE])
+        .get();
+    let seeks_after = mesh_rpc::metrics::CYPHER_INDEX_SEEKS_TOTAL.get();
+
+    assert!(
+        queries_after - queries_before >= 3,
+        "expected at least 3 queries to register on counter, before={queries_before} after={queries_after}"
+    );
+    assert!(
+        seeks_after - seeks_before >= 1,
+        "indexed MATCH should have bumped the IndexSeek counter, before={seeks_before} after={seeks_after}"
+    );
+
+    // HTTP scrape — verify the endpoint actually returns Prometheus
+    // text and includes our metric names.
+    let body = reqwest::get(format!("http://{}/metrics", metrics_addr))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("mesh_cypher_queries_total"),
+        "metrics body missing cypher counter: {body}"
+    );
+    assert!(
+        body.contains("mesh_cypher_index_seeks_total"),
+        "metrics body missing index seek counter"
+    );
+    assert!(
+        body.contains("mesh_cypher_query_duration_seconds"),
+        "metrics body missing query duration histogram"
     );
 }

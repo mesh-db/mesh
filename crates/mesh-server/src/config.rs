@@ -65,6 +65,15 @@ pub struct ServerConfig {
     #[serde(default)]
     pub bolt_address: Option<String>,
 
+    /// Optional address for the Prometheus metrics endpoint (e.g.
+    /// `127.0.0.1:9090`). When present, the server binds a tiny
+    /// HTTP listener serving `GET /metrics` with the Prometheus
+    /// text encoding of every registered counter / gauge /
+    /// histogram. Omit to disable metrics export entirely; the
+    /// in-process counters still increment regardless.
+    #[serde(default)]
+    pub metrics_address: Option<String>,
+
     /// Cluster operating mode. Omitted → inferred from `peers` (empty
     /// → Single, non-empty → Raft) for backward compatibility with
     /// configs from before this field existed. Set explicitly to

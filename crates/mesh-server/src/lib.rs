@@ -1,5 +1,6 @@
 pub mod bolt;
 pub mod config;
+pub mod metrics;
 pub mod value_conv;
 
 use anyhow::{anyhow, Context, Result};
@@ -256,6 +257,24 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         None
     };
 
+    // Optional Prometheus metrics endpoint. Same fail-fast bind
+    // model as Bolt — port-in-use is fatal at startup rather than
+    // a confusing 500 the first time something scrapes.
+    let metrics_task = if let Some(metrics_addr) = config.metrics_address.as_ref() {
+        let metrics_listener = TcpListener::bind(metrics_addr)
+            .await
+            .with_context(|| format!("binding metrics {}", metrics_addr))?;
+        let metrics_local = metrics_listener.local_addr()?;
+        tracing::info!(addr = %metrics_local, "mesh-server metrics listening");
+        Some(tokio::spawn(async move {
+            if let Err(e) = metrics::run_listener(metrics_listener).await {
+                tracing::error!(error = %e, "metrics listener exited");
+            }
+        }))
+    } else {
+        None
+    };
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let server_task = tokio::spawn(async move {
@@ -302,6 +321,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     }
 
     if let Some(handle) = bolt_task {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    if let Some(handle) = metrics_task {
         handle.abort();
         let _ = handle.await;
     }

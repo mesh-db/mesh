@@ -198,6 +198,8 @@ where
 
             // -- Ready phase -------------------------------------------
             (Phase::Ready, BoltMessage::Run { query, params, .. }) => {
+                let run_span =
+                    tracing::info_span!("bolt_run", query_len = query.len(), auto_commit = true);
                 let param_map = match bolt_params_to_param_map(&params) {
                     Ok(m) => m,
                     Err(e) => {
@@ -212,8 +214,15 @@ where
                 };
                 // Auto-commit path: execute_cypher_local already
                 // dispatches buffered writes through the active backend
-                // before returning rows.
-                match service.execute_cypher_local(query, param_map).await {
+                // before returning rows. Instrument the call so any
+                // tracing events emitted by the executor inherit the
+                // bolt_run span.
+                use tracing::Instrument;
+                match service
+                    .execute_cypher_local(query, param_map)
+                    .instrument(run_span)
+                    .await
+                {
                     Ok(rows) => {
                         let fields = field_names_from_rows(&rows);
                         send(&mut writer, &fields_success(&fields)).await?;
@@ -271,6 +280,8 @@ where
 
             // -- InTxReady phase (between RUNs in an explicit tx) ------
             (Phase::InTxReady { .. }, BoltMessage::Run { query, params, .. }) => {
+                let run_span =
+                    tracing::info_span!("bolt_run", query_len = query.len(), auto_commit = false);
                 let param_map = match bolt_params_to_param_map(&params) {
                     Ok(m) => m,
                     Err(e) => {
@@ -294,8 +305,10 @@ where
                     Phase::InTxReady { buffered } => buffered,
                     _ => unreachable!(),
                 };
+                use tracing::Instrument;
                 match service
                     .execute_cypher_in_tx(query, param_map, buffered.clone())
+                    .instrument(run_span)
                     .await
                 {
                     Ok((rows, mut commands)) => {

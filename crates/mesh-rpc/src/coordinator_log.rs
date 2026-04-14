@@ -275,6 +275,13 @@ impl CoordinatorLog {
                         tracing::warn!(error = %e, "coordinator log compaction failed");
                     }
                 }
+                // Re-read the on-disk entry count so the gauge
+                // reflects the post-compaction size. Cheap relative
+                // to the rotation cadence and keeps the gauge in
+                // sync without instrumenting every append.
+                if let Ok(entries) = self.read_all() {
+                    crate::metrics::COORDINATOR_LOG_ENTRIES.set(entries.len() as i64);
+                }
             }
         })
     }
