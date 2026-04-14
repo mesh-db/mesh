@@ -69,9 +69,7 @@ impl ClusterState {
 
     pub fn apply(&mut self, command: &ClusterCommand) -> Result<()> {
         match command {
-            ClusterCommand::AddPeer { id, address } => {
-                self.apply_add_peer(*id, address.clone())
-            }
+            ClusterCommand::AddPeer { id, address } => self.apply_add_peer(*id, address.clone()),
             ClusterCommand::RemovePeer { id } => self.apply_remove_peer(*id),
             ClusterCommand::UpdatePeerAddress { id, address } => {
                 self.apply_update_address(*id, address.clone())

@@ -174,7 +174,10 @@ fn apply_add_peer_extends_membership_without_rebalancing() {
     assert_eq!(cluster.membership().len(), 4);
     assert_eq!(cluster.peer_address(PeerId(4)), Some("127.0.0.1:7004"));
     // AddPeer doesn't touch the partition map — Rebalance is required.
-    assert_eq!(cluster.partition_map().assignments(), &before_partitions[..]);
+    assert_eq!(
+        cluster.partition_map().assignments(),
+        &before_partitions[..]
+    );
 }
 
 #[test]
@@ -458,12 +461,10 @@ async fn raft_persistent_store_reloads_state_machine_after_restart() {
         let entries = vec![
             Entry::<MeshRaftConfig> {
                 log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
-                payload: EntryPayload::Normal(MeshLogEntry::Cluster(
-                    ClusterCommand::AddPeer {
-                        id: PeerId(2),
-                        address: "127.0.0.1:7002".into(),
-                    },
-                )),
+                payload: EntryPayload::Normal(MeshLogEntry::Cluster(ClusterCommand::AddPeer {
+                    id: PeerId(2),
+                    address: "127.0.0.1:7002".into(),
+                })),
             },
             Entry::<MeshRaftConfig> {
                 log_id: LogId::new(CommittedLeaderId::new(1, 1), 2),
@@ -475,11 +476,9 @@ async fn raft_persistent_store_reloads_state_machine_after_restart() {
                 )),
             },
         ];
-        <MemStore as RaftStorage<MeshRaftConfig>>::apply_to_state_machine(
-            &mut store, &entries,
-        )
-        .await
-        .unwrap();
+        <MemStore as RaftStorage<MeshRaftConfig>>::apply_to_state_machine(&mut store, &entries)
+            .await
+            .unwrap();
         // Sanity check: in-memory state reflects both commands.
         let inner = store.inner();
         let guard = inner.read().await;
@@ -517,11 +516,9 @@ async fn raft_persistent_store_reloads_state_machine_after_restart() {
     // last_applied_state() (the function openraft calls on startup) should
     // also report the persisted last_applied — this is the actual hook
     // that lets openraft skip log replay.
-    let (la, _) = <MemStore as RaftStorage<MeshRaftConfig>>::last_applied_state(
-        &mut store,
-    )
-    .await
-    .unwrap();
+    let (la, _) = <MemStore as RaftStorage<MeshRaftConfig>>::last_applied_state(&mut store)
+        .await
+        .unwrap();
     assert_eq!(la.map(|l| l.index), Some(2));
 }
 
@@ -545,10 +542,9 @@ async fn raft_persistent_store_reloads_log_and_vote_after_restart() {
     // Bootstrap a single-node cluster against the persistent store and
     // drive a few commands through it so the log has non-trivial content.
     {
-        let cluster =
-            RaftCluster::open_persistent(1, &path, initial(), NoOpNetwork, None)
-                .await
-                .expect("open persistent raft");
+        let cluster = RaftCluster::open_persistent(1, &path, initial(), NoOpNetwork, None)
+            .await
+            .expect("open persistent raft");
         let mut members = std::collections::BTreeSet::new();
         members.insert(1u64);
         cluster
@@ -576,14 +572,11 @@ async fn raft_persistent_store_reloads_log_and_vote_after_restart() {
     // Re-open the store directly (bypassing RaftCluster, whose startup
     // would race with the NoOpNetwork-backed election loop) and confirm
     // the log and vote survived the drop.
-    let mut store = MemStore::open_persistent(&path, initial(), None)
-        .expect("reopen persistent store");
-    let entries = <MemStore as RaftLogReader<MeshRaftConfig>>::try_get_log_entries(
-        &mut store,
-        ..,
-    )
-    .await
-    .expect("read log entries");
+    let mut store =
+        MemStore::open_persistent(&path, initial(), None).expect("reopen persistent store");
+    let entries = <MemStore as RaftLogReader<MeshRaftConfig>>::try_get_log_entries(&mut store, ..)
+        .await
+        .expect("read log entries");
     assert!(
         entries.len() >= 2,
         "expected at least 2 entries (initial membership + 2 AddPeer), got {}",
@@ -707,8 +700,7 @@ fn cluster_command_roundtrips_through_serde_json() {
 fn cluster_state_roundtrips_through_serde_json() {
     use mesh_cluster::{ClusterState, Membership, PartitionMap};
     let membership = Membership::new(sample_peers());
-    let partition_map =
-        PartitionMap::round_robin(&[PeerId(1), PeerId(2), PeerId(3)], 6).unwrap();
+    let partition_map = PartitionMap::round_robin(&[PeerId(1), PeerId(2), PeerId(3)], 6).unwrap();
     let state = ClusterState::new(membership, partition_map);
 
     let json = serde_json::to_string(&state).unwrap();
@@ -723,8 +715,7 @@ fn cluster_state_serializes_membership_as_vec_of_peers() {
     // the custom impl, and we want to lock it in so future changes are caught.
     use mesh_cluster::{ClusterState, Membership, PartitionMap};
     let membership = Membership::new(sample_peers());
-    let partition_map =
-        PartitionMap::round_robin(&[PeerId(1), PeerId(2), PeerId(3)], 3).unwrap();
+    let partition_map = PartitionMap::round_robin(&[PeerId(1), PeerId(2), PeerId(3)], 3).unwrap();
     let state = ClusterState::new(membership, partition_map);
     let json = serde_json::to_value(&state).unwrap();
     let membership_json = &json["membership"];
@@ -739,8 +730,7 @@ fn cluster_state_serializes_membership_as_vec_of_peers() {
 fn cluster_state_after_apply_still_roundtrips() {
     use mesh_cluster::{ClusterState, Membership, PartitionMap};
     let membership = Membership::new(sample_peers());
-    let partition_map =
-        PartitionMap::round_robin(&[PeerId(1), PeerId(2), PeerId(3)], 6).unwrap();
+    let partition_map = PartitionMap::round_robin(&[PeerId(1), PeerId(2), PeerId(3)], 6).unwrap();
     let mut state = ClusterState::new(membership, partition_map);
     state
         .apply(&ClusterCommand::AddPeer {

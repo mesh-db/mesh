@@ -130,11 +130,7 @@ impl Store {
             adj_key(edge.source, edge.id),
             edge.target.as_bytes(),
         );
-        batch.put_cf(
-            in_cf,
-            adj_key(edge.target, edge.id),
-            edge.source.as_bytes(),
-        );
+        batch.put_cf(in_cf, adj_key(edge.target, edge.id), edge.source.as_bytes());
         batch.put_cf(type_cf, type_index_key(&edge.edge_type, edge.id), EMPTY);
         Ok(())
     }
@@ -155,12 +151,7 @@ impl Store {
         Ok(())
     }
 
-    fn append_delete_edge(
-        &self,
-        batch: &mut WriteBatch,
-        id: EdgeId,
-        edge: &Edge,
-    ) -> Result<()> {
+    fn append_delete_edge(&self, batch: &mut WriteBatch, id: EdgeId, edge: &Edge) -> Result<()> {
         let edges_cf = self.cf(CF_EDGES)?;
         let out_cf = self.cf(CF_ADJ_OUT)?;
         let in_cf = self.cf(CF_ADJ_IN)?;
@@ -180,11 +171,7 @@ impl Store {
         Ok(())
     }
 
-    fn append_detach_delete_node(
-        &self,
-        batch: &mut WriteBatch,
-        id: NodeId,
-    ) -> Result<()> {
+    fn append_detach_delete_node(&self, batch: &mut WriteBatch, id: NodeId) -> Result<()> {
         let node = self.get_node(id)?;
         let outgoing = self.outgoing(id)?;
         let incoming = self.incoming(id)?;

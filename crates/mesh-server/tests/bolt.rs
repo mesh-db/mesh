@@ -5,8 +5,8 @@
 //! RUN (CREATE + MATCH), PULL, RECORD decoding, and GOODBYE.
 
 use mesh_bolt::{
-    perform_client_handshake, read_message, version_bytes, write_message, BoltMessage,
-    BoltValue, BOLT_4_4,
+    perform_client_handshake, read_message, version_bytes, write_message, BoltMessage, BoltValue,
+    BOLT_4_4,
 };
 use mesh_rpc::MeshService;
 use mesh_server::bolt::run_listener;
@@ -67,10 +67,7 @@ async fn connect_and_hello(addr: &str) -> TcpStream {
 
 /// Issue a RUN + PULL round-trip and return the decoded RECORD rows
 /// plus the trailing PULL SUCCESS metadata.
-async fn run_and_pull(
-    sock: &mut TcpStream,
-    query: &str,
-) -> (Vec<Vec<BoltValue>>, BoltValue) {
+async fn run_and_pull(sock: &mut TcpStream, query: &str) -> (Vec<Vec<BoltValue>>, BoltValue) {
     let run = BoltMessage::Run {
         query: query.to_string(),
         params: BoltValue::Map(vec![]),
@@ -130,11 +127,7 @@ async fn bolt_create_then_match_round_trips_records() {
     for i in 0..3 {
         let _ = run_and_pull(
             &mut sock,
-            &format!(
-                "CREATE (n:Person {{name: 'p{}', age: {}}})",
-                i,
-                20 + i * 10
-            ),
+            &format!("CREATE (n:Person {{name: 'p{}', age: {}}})", i, 20 + i * 10),
         )
         .await;
     }
@@ -154,24 +147,20 @@ async fn bolt_create_then_match_round_trips_records() {
         .iter()
         .map(|fields| {
             let age = fields[0].as_int().expect("age should be Int");
-            let name = fields[1].as_str().expect("name should be String").to_string();
+            let name = fields[1]
+                .as_str()
+                .expect("name should be String")
+                .to_string();
             (age, name)
         })
         .collect();
     assert_eq!(
         rows,
-        vec![
-            (20, "p0".into()),
-            (30, "p1".into()),
-            (40, "p2".into()),
-        ]
+        vec![(20, "p0".into()), (30, "p1".into()), (40, "p2".into()),]
     );
 
     // Trailing SUCCESS after PULL carries a type and record count.
-    assert_eq!(
-        meta.get("type").and_then(BoltValue::as_str),
-        Some("r")
-    );
+    assert_eq!(meta.get("type").and_then(BoltValue::as_str), Some("r"));
     assert_eq!(
         meta.get("record_count").and_then(BoltValue::as_int),
         Some(3)
@@ -185,11 +174,7 @@ async fn bolt_returns_full_node_struct_with_labels_and_props() {
     let (addr, _dir) = spawn_bolt_server().await;
     let mut sock = connect_and_hello(&addr).await;
 
-    let (_, _) = run_and_pull(
-        &mut sock,
-        "CREATE (n:Widget {sku: 'abc-123', weight: 4.2})",
-    )
-    .await;
+    let (_, _) = run_and_pull(&mut sock, "CREATE (n:Widget {sku: 'abc-123', weight: 4.2})").await;
 
     let (records, _) = run_and_pull(&mut sock, "MATCH (n:Widget) RETURN n").await;
     assert_eq!(records.len(), 1);
@@ -270,8 +255,7 @@ async fn bolt_reset_after_failure_returns_to_ready() {
     write_message(&mut sock, &BoltMessage::Reset.encode())
         .await
         .unwrap();
-    let reset_ack =
-        BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
+    let reset_ack = BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
     assert!(matches!(reset_ack, BoltMessage::Success { .. }));
 
     // Session is now back in Ready — a fresh RUN should succeed.

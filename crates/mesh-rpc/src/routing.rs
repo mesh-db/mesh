@@ -28,12 +28,11 @@ impl Routing {
                 continue;
             }
             let uri = format!("http://{}", addr);
-            let endpoint = Endpoint::from_shared(uri).map_err(|e| {
-                RoutingError::InvalidEndpoint {
+            let endpoint =
+                Endpoint::from_shared(uri).map_err(|e| RoutingError::InvalidEndpoint {
                     peer: peer_id,
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             channels.insert(peer_id, endpoint.connect_lazy());
         }
         Ok(Self { cluster, channels })

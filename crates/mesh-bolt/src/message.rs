@@ -117,9 +117,7 @@ impl BoltMessage {
             BoltMessage::Discard { extra } => (TAG_DISCARD, vec![extra.clone()]),
             BoltMessage::Pull { extra } => (TAG_PULL, vec![extra.clone()]),
             BoltMessage::Success { metadata } => (TAG_SUCCESS, vec![metadata.clone()]),
-            BoltMessage::Record { fields } => {
-                (TAG_RECORD, vec![BoltValue::List(fields.clone())])
-            }
+            BoltMessage::Record { fields } => (TAG_RECORD, vec![BoltValue::List(fields.clone())]),
             BoltMessage::Ignored => (TAG_IGNORED, vec![]),
             BoltMessage::Failure { metadata } => (TAG_FAILURE, vec![metadata.clone()]),
         }
@@ -211,14 +209,11 @@ fn one_field(mut fields: Vec<BoltValue>, message: &'static str) -> Result<BoltVa
     Ok(fields.remove(0))
 }
 
-fn three_fields(
-    fields: Vec<BoltValue>,
-    message: &'static str,
-) -> Result<[BoltValue; 3]> {
+fn three_fields(fields: Vec<BoltValue>, message: &'static str) -> Result<[BoltValue; 3]> {
     let len = fields.len();
-    let array: [BoltValue; 3] = fields.try_into().map_err(|_| {
-        BoltError::Malformed(format!("{} expects 3 fields, got {}", message, len))
-    })?;
+    let array: [BoltValue; 3] = fields
+        .try_into()
+        .map_err(|_| BoltError::Malformed(format!("{} expects 3 fields, got {}", message, len)))?;
     Ok(array)
 }
 

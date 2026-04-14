@@ -116,13 +116,9 @@ impl<'a> TxCoordinator<'a> {
     ///   peer — we don't know which peers hold ghost copies, and local
     ///   apply is idempotent for missing targets.
     /// * `Batch(inner)` flattens recursively.
-    fn group_by_peer(
-        &self,
-        commands: Vec<GraphCommand>,
-    ) -> HashMap<PeerId, Vec<GraphCommand>> {
+    fn group_by_peer(&self, commands: Vec<GraphCommand>) -> HashMap<PeerId, Vec<GraphCommand>> {
         let cluster = self.routing.cluster();
-        let all_peers: Vec<PeerId> =
-            cluster.membership().peer_ids().collect();
+        let all_peers: Vec<PeerId> = cluster.membership().peer_ids().collect();
         let mut groups: HashMap<PeerId, Vec<GraphCommand>> = HashMap::new();
         self.group_into(&mut groups, &all_peers, commands);
         groups
@@ -139,7 +135,10 @@ impl<'a> TxCoordinator<'a> {
             match cmd {
                 GraphCommand::PutNode(n) => {
                     let owner = cluster.owner_of(n.id);
-                    groups.entry(owner).or_default().push(GraphCommand::PutNode(n));
+                    groups
+                        .entry(owner)
+                        .or_default()
+                        .push(GraphCommand::PutNode(n));
                 }
                 GraphCommand::PutEdge(e) => {
                     let src_owner = cluster.owner_of(e.source);
@@ -185,12 +184,7 @@ impl<'a> TxCoordinator<'a> {
         }
     }
 
-    async fn prepare(
-        &self,
-        peer: PeerId,
-        txid: &str,
-        cmds: &[GraphCommand],
-    ) -> Result<(), Status> {
+    async fn prepare(&self, peer: PeerId, txid: &str, cmds: &[GraphCommand]) -> Result<(), Status> {
         if peer == self.routing.cluster().self_id() {
             // Local shortcut: stage directly into the service's pending
             // map. Matches the remote BatchWrite(PREPARE) semantics.
@@ -223,10 +217,7 @@ impl<'a> TxCoordinator<'a> {
             let cmds = {
                 let mut pending = self.local_pending.lock().unwrap();
                 pending.remove(txid).ok_or_else(|| {
-                    Status::failed_precondition(format!(
-                        "txid {} not prepared locally",
-                        txid
-                    ))
+                    Status::failed_precondition(format!("txid {} not prepared locally", txid))
                 })?
             };
             crate::server::apply_prepared_batch(self.local_store, &cmds)
@@ -262,8 +253,8 @@ impl<'a> TxCoordinator<'a> {
     }
 
     fn write_client(&self, peer: PeerId) -> Result<MeshWriteClient<Channel>, Status> {
-        self.routing.write_client(peer).ok_or_else(|| {
-            Status::internal(format!("no client registered for peer {}", peer))
-        })
+        self.routing
+            .write_client(peer)
+            .ok_or_else(|| Status::internal(format!("no client registered for peer {}", peer)))
     }
 }

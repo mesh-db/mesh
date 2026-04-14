@@ -313,11 +313,11 @@ impl MemStore {
 
         let snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, Vec<u8>)> =
             match (db.get(SNAPSHOT_META_KEY)?, db.get(SNAPSHOT_DATA_KEY)?) {
-                (Some(meta_bytes), Some(data)) => serde_json::from_slice::<
-                    SnapshotMeta<NodeId, BasicNode>,
-                >(&meta_bytes)
-                .ok()
-                .map(|meta| (meta, data)),
+                (Some(meta_bytes), Some(data)) => {
+                    serde_json::from_slice::<SnapshotMeta<NodeId, BasicNode>>(&meta_bytes)
+                        .ok()
+                        .map(|meta| (meta, data))
+                }
                 _ => None,
             };
 
@@ -448,15 +448,10 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         let mut inner = self.inner.write().await;
         if let Some(db) = inner.persistent.as_ref() {
             let mut batch = WriteBatch::default();
-            for idx in inner
-                .log
-                .range(..=log_id.index)
-                .map(|(k, _)| *k)
-            {
+            for idx in inner.log.range(..=log_id.index).map(|(k, _)| *k) {
                 batch.delete(log_key(idx));
             }
-            let last_purged_bytes =
-                serde_json::to_vec(&log_id).map_err(write_logs_err)?;
+            let last_purged_bytes = serde_json::to_vec(&log_id).map_err(write_logs_err)?;
             batch.put(LAST_PURGED_KEY, last_purged_bytes);
             db.write_opt(batch, &synced_writes())
                 .map_err(write_logs_err)?;
@@ -506,8 +501,7 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
                     },
                 },
                 EntryPayload::Membership(m) => {
-                    inner.stored_membership =
-                        StoredMembership::new(Some(entry.log_id), m.clone());
+                    inner.stored_membership = StoredMembership::new(Some(entry.log_id), m.clone());
                     ApplyResponse::ok()
                 }
             };
@@ -564,13 +558,9 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> std::result::Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let payload: PersistedSnapshot =
-            serde_json::from_slice(&data).map_err(|e| {
-                StorageError::from(StorageIOError::read_snapshot(
-                    Some(meta.signature()),
-                    &e,
-                ))
-            })?;
+        let payload: PersistedSnapshot = serde_json::from_slice(&data).map_err(|e| {
+            StorageError::from(StorageIOError::read_snapshot(Some(meta.signature()), &e))
+        })?;
         let mut inner = self.inner.write().await;
         inner.state = payload.cluster;
         inner.last_applied = meta.last_log_id;
@@ -658,9 +648,8 @@ impl RaftSnapshotBuilder<MeshRaftConfig> for MemSnapshotBuilder {
             cluster: inner.state.clone(),
             graph,
         };
-        let data = serde_json::to_vec(&payload).map_err(|e| {
-            StorageError::from(StorageIOError::read_state_machine(&e))
-        })?;
+        let data = serde_json::to_vec(&payload)
+            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
         let meta = SnapshotMeta {
             last_log_id: inner.last_applied,
             last_membership: inner.stored_membership.clone(),
@@ -749,10 +738,8 @@ impl RaftNetwork<MeshRaftConfig> for NoOpNetworkClient {
         &mut self,
         _rpc: VoteRequest<NodeId>,
         _option: RPCOption,
-    ) -> std::result::Result<
-        VoteResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId>>,
-    > {
+    ) -> std::result::Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
+    {
         Err(unreachable())
     }
 }
@@ -771,11 +758,7 @@ impl RaftCluster {
     /// Create a Raft instance with the given network factory. Does **not**
     /// call `initialize` — the caller is responsible for bootstrapping the
     /// cluster exactly once on the designated seed peer via [`initialize`].
-    pub async fn new<N>(
-        id: NodeId,
-        initial_state: ClusterState,
-        network: N,
-    ) -> Result<Self>
+    pub async fn new<N>(id: NodeId, initial_state: ClusterState, network: N) -> Result<Self>
     where
         N: RaftNetworkFactory<MeshRaftConfig>,
     {
@@ -881,13 +864,11 @@ impl RaftCluster {
                 Some(err) => Err(Error::Apply(err)),
                 None => Ok(response.data),
             },
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(
-                ForwardToLeader {
-                    leader_id,
-                    leader_node,
-                    ..
-                },
-            ))) => Err(Error::ForwardToLeader {
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                leader_id,
+                leader_node,
+                ..
+            }))) => Err(Error::ForwardToLeader {
                 leader_id: leader_id.map(crate::PeerId),
                 leader_address: leader_node.map(|n| n.addr),
             }),

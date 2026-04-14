@@ -38,10 +38,7 @@ enum Phase {
     Ready,
     /// A `RUN` succeeded; we're holding its rows + field names and
     /// waiting for `PULL` or `DISCARD` to hand them out.
-    Streaming {
-        rows: Vec<Row>,
-        fields: Vec<String>,
-    },
+    Streaming { rows: Vec<Row>, fields: Vec<String> },
     /// A prior message produced a FAILURE. Every subsequent message
     /// except `RESET` / `GOODBYE` gets `IGNORED` until the client
     /// resets the session.
@@ -51,10 +48,7 @@ enum Phase {
 /// Accept Bolt connections on `listener` forever, spawning a new tokio
 /// task per connection that runs [`serve_connection`]. The function
 /// itself returns only if the listener errors.
-pub async fn run_listener(
-    listener: TcpListener,
-    service: Arc<MeshService>,
-) -> anyhow::Result<()> {
+pub async fn run_listener(listener: TcpListener, service: Arc<MeshService>) -> anyhow::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         tracing::debug!(%peer, "bolt connection accepted");
@@ -71,10 +65,7 @@ pub async fn run_listener(
 
 /// Run the full Bolt lifecycle on a single socket: handshake, HELLO,
 /// then a request/response loop until GOODBYE or a socket error.
-pub async fn serve_connection<S>(
-    socket: S,
-    service: Arc<MeshService>,
-) -> anyhow::Result<()>
+pub async fn serve_connection<S>(socket: S, service: Arc<MeshService>) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -215,19 +206,14 @@ where
             (Phase::Streaming { .. }, BoltMessage::Pull { .. }) => {
                 // Consume the streaming state by value; we'll return
                 // to Ready once all records have been sent.
-                let (rows, fields) =
-                    match std::mem::replace(&mut phase, Phase::Ready) {
-                        Phase::Streaming { rows, fields } => (rows, fields),
-                        _ => unreachable!(),
-                    };
+                let (rows, fields) = match std::mem::replace(&mut phase, Phase::Ready) {
+                    Phase::Streaming { rows, fields } => (rows, fields),
+                    _ => unreachable!(),
+                };
                 let rows_len = rows.len();
                 for row in &rows {
                     let values = row_to_bolt_fields(row, &fields);
-                    send(
-                        &mut writer,
-                        &BoltMessage::Record { fields: values },
-                    )
-                    .await?;
+                    send(&mut writer, &BoltMessage::Record { fields: values }).await?;
                 }
                 // Trailing SUCCESS metadata is what drivers look at for
                 // `result_consumed_after`, `type`, etc. Keep it minimal.

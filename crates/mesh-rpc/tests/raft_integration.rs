@@ -80,13 +80,7 @@ async fn two_peer_raft_replicates_commands() {
     )
     .await;
     // Peer B: network has only A.
-    let peer_b = spawn_peer(
-        2,
-        listener_b,
-        vec![(1u64, addr_a.to_string())],
-        initial,
-    )
-    .await;
+    let peer_b = spawn_peer(2, listener_b, vec![(1u64, addr_a.to_string())], initial).await;
 
     // Only peer A calls initialize — B joins via replication.
     let mut members: BTreeMap<u64, BasicNode> = BTreeMap::new();
@@ -121,10 +115,7 @@ async fn two_peer_raft_replicates_commands() {
     // Peer A's state machine applied the command.
     let state_a = peer_a.cluster.current_state().await;
     assert!(state_a.membership.contains(PeerId(3)));
-    assert_eq!(
-        state_a.membership.address(PeerId(3)),
-        Some("10.0.0.3:7003")
-    );
+    assert_eq!(state_a.membership.address(PeerId(3)), Some("10.0.0.3:7003"));
 
     // Peer B should eventually see the same state via log replication.
     let mut replicated = false;
@@ -132,10 +123,7 @@ async fn two_peer_raft_replicates_commands() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let state_b = peer_b.cluster.current_state().await;
         if state_b.membership.contains(PeerId(3)) {
-            assert_eq!(
-                state_b.membership.address(PeerId(3)),
-                Some("10.0.0.3:7003")
-            );
+            assert_eq!(state_b.membership.address(PeerId(3)), Some("10.0.0.3:7003"));
             replicated = true;
             break;
         }

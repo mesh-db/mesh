@@ -8,13 +8,11 @@
 use crate::proto::mesh_raft_client::MeshRaftClient;
 use crate::proto::{RaftRpcRequest, RaftRpcResponse};
 use mesh_cluster::raft::{MeshRaftConfig, NodeId};
-use openraft::error::{
-    InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError,
-};
+use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
 use openraft::BasicNode;
 use std::collections::HashMap;
@@ -36,12 +34,11 @@ impl GrpcNetwork {
         let mut channels = HashMap::new();
         for (id, addr) in peers {
             let uri = format!("http://{}", addr);
-            let endpoint = Endpoint::from_shared(uri).map_err(|e| {
-                GrpcNetworkError::InvalidEndpoint {
+            let endpoint =
+                Endpoint::from_shared(uri).map_err(|e| GrpcNetworkError::InvalidEndpoint {
                     id,
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             channels.insert(id, endpoint.connect_lazy());
         }
         Ok(Self {
@@ -90,12 +87,9 @@ impl RaftNetwork<MeshRaftConfig> for GrpcNetworkClient {
         &mut self,
         rpc: AppendEntriesRequest<MeshRaftConfig>,
         _option: RPCOption,
-    ) -> Result<
-        AppendEntriesResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId>>,
-    > {
-        let payload = serde_json::to_vec(&rpc)
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        let payload =
+            serde_json::to_vec(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let mut client = self.client().map_err(RPCError::Network)?;
         let resp = client
             .append_entries(RaftRpcRequest { payload })
@@ -120,8 +114,8 @@ impl RaftNetwork<MeshRaftConfig> for GrpcNetworkClient {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let payload = serde_json::to_vec(&rpc)
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let payload =
+            serde_json::to_vec(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let mut client = self.client().map_err(RPCError::Network)?;
         let resp = client
             .install_snapshot(RaftRpcRequest { payload })
@@ -144,20 +138,16 @@ impl RaftNetwork<MeshRaftConfig> for GrpcNetworkClient {
         &mut self,
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
-    {
-        let payload = serde_json::to_vec(&rpc)
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        let payload =
+            serde_json::to_vec(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let mut client = self.client().map_err(RPCError::Network)?;
-        let resp = client
-            .vote(RaftRpcRequest { payload })
-            .await
-            .map_err(|s| {
-                RPCError::Network(NetworkError::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    s.message().to_string(),
-                )))
-            })?;
+        let resp = client.vote(RaftRpcRequest { payload }).await.map_err(|s| {
+            RPCError::Network(NetworkError::new(&std::io::Error::new(
+                std::io::ErrorKind::Other,
+                s.message().to_string(),
+            )))
+        })?;
         let result: Result<VoteResponse<NodeId>, RaftError<NodeId>> =
             serde_json::from_slice(&resp.into_inner().payload)
                 .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;

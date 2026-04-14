@@ -32,9 +32,8 @@ pub struct ServerComponents {
 /// Kept as a sync entry point for legacy callers; multi-peer deployments
 /// should go through [`build_components`] instead.
 pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
-    std::fs::create_dir_all(&config.data_dir).with_context(|| {
-        format!("creating data dir {}", config.data_dir.display())
-    })?;
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
     let store = Arc::new(
         Store::open(&config.data_dir)
             .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
@@ -65,9 +64,8 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
 /// for incoming Raft RPCs. Single-node configs return a local-only service
 /// with `raft: None`.
 pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents> {
-    std::fs::create_dir_all(&config.data_dir).with_context(|| {
-        format!("creating data dir {}", config.data_dir.display())
-    })?;
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
     let store = Arc::new(
         Store::open(&config.data_dir)
             .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
@@ -105,8 +103,7 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
     // The graph applier translates committed GraphCommand entries into
     // local store writes — this is what makes the Raft replication actually
     // affect the database.
-    let applier: Arc<dyn GraphStateMachine> =
-        Arc::new(StoreGraphApplier::new(store.clone()));
+    let applier: Arc<dyn GraphStateMachine> = Arc::new(StoreGraphApplier::new(store.clone()));
 
     let raft_dir = config.data_dir.join("raft");
     std::fs::create_dir_all(&raft_dir)
@@ -220,10 +217,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             // failures during initial replication eventually resolve.
             tracing::warn!("raft bootstrap failed: {e:#}");
         } else if config.bootstrap {
-            tracing::info!(
-                peers = config.peers.len(),
-                "raft cluster bootstrapped"
-            );
+            tracing::info!(peers = config.peers.len(), "raft cluster bootstrapped");
         }
     }
 

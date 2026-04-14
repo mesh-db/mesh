@@ -121,9 +121,15 @@ fn detach_delete_removes_incident_edges_on_both_ends() {
 #[test]
 fn nodes_by_label_finds_all_matching_nodes() {
     let (store, _dir) = tmp_store();
-    let ada = Node::new().with_label("Person").with_property("name", "Ada");
-    let alan = Node::new().with_label("Person").with_property("name", "Alan");
-    let py = Node::new().with_label("Language").with_property("name", "Python");
+    let ada = Node::new()
+        .with_label("Person")
+        .with_property("name", "Ada");
+    let alan = Node::new()
+        .with_label("Person")
+        .with_property("name", "Alan");
+    let py = Node::new()
+        .with_label("Language")
+        .with_property("name", "Python");
     store.put_node(&ada).unwrap();
     store.put_node(&alan).unwrap();
     store.put_node(&py).unwrap();
@@ -240,7 +246,9 @@ fn indexes_share_no_state_across_similar_prefixes() {
 #[test]
 fn apply_batch_commits_multi_op_atomically() {
     let (store, _dir) = tmp_store();
-    let a = Node::new().with_label("Person").with_property("name", "Ada");
+    let a = Node::new()
+        .with_label("Person")
+        .with_property("name", "Ada");
     let b = Node::new()
         .with_label("Person")
         .with_property("name", "Grace");

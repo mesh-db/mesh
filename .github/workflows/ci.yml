@@ -36,12 +36,19 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Cache cargo artifacts
         # Caches ~/.cargo/{registry,git} and target/ keyed on the
         # Cargo.toml + Cargo.lock hashes. Cuts cold-build time from
         # minutes to seconds on subsequent runs.
         uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        # Runs in seconds and doesn't need the cargo cache, so we put it
+        # before the build to fail fast on a stray unformatted change.
+        run: cargo fmt --all -- --check
 
       - name: Build workspace (including tests)
         run: cargo build --workspace --all-targets

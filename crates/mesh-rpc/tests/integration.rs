@@ -97,7 +97,13 @@ async fn get_node_missing_returns_not_found() {
 
     // Random 16-byte id that doesn't exist.
     let fake = uuid_to_proto(mesh_core::NodeId::new().as_uuid());
-    let resp = c.get_node(GetNodeRequest { id: Some(fake), local_only: false }).await.unwrap();
+    let resp = c
+        .get_node(GetNodeRequest {
+            id: Some(fake),
+            local_only: false,
+        })
+        .await
+        .unwrap();
     let inner = resp.into_inner();
     assert!(!inner.found);
     assert!(inner.node.is_none());
@@ -106,9 +112,15 @@ async fn get_node_missing_returns_not_found() {
 #[tokio::test]
 async fn nodes_by_label_returns_all_ids_for_label() {
     let harness = spawn_server().await;
-    let a = Node::new().with_label("Person").with_property("name", "Ada");
-    let b = Node::new().with_label("Person").with_property("name", "Alan");
-    let c_node = Node::new().with_label("Company").with_property("name", "Acme");
+    let a = Node::new()
+        .with_label("Person")
+        .with_property("name", "Ada");
+    let b = Node::new()
+        .with_label("Person")
+        .with_property("name", "Alan");
+    let c_node = Node::new()
+        .with_label("Company")
+        .with_property("name", "Acme");
     harness.store.put_node(&a).unwrap();
     harness.store.put_node(&b).unwrap();
     harness.store.put_node(&c_node).unwrap();
@@ -276,7 +288,9 @@ fn put_node_on_owner(node: &Node, h: &TwoPeer) -> PeerId {
 async fn routed_get_node_crosses_peers() {
     let h = spawn_two_peer().await;
 
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
 
     let mut local_hits = 0;
     let mut remote_hits = 0;
@@ -323,7 +337,9 @@ async fn nodes_by_label_scatter_gathers_across_peers() {
         put_node_on_owner(&n, &h);
     }
 
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
     let resp = client
         .nodes_by_label(NodesByLabelRequest {
             label: "Worker".into(),
@@ -340,9 +356,7 @@ async fn nodes_by_label_local_only_skips_remote() {
 
     let mut owned_by_a = 0;
     for i in 0..30 {
-        let n = Node::new()
-            .with_label("Flag")
-            .with_property("i", i as i64);
+        let n = Node::new().with_label("Flag").with_property("i", i as i64);
         let owner = put_node_on_owner(&n, &h);
         if owner == PeerId(1) {
             owned_by_a += 1;
@@ -351,7 +365,9 @@ async fn nodes_by_label_local_only_skips_remote() {
     assert!(owned_by_a > 0, "expected some local-to-A entries");
     assert!(owned_by_a < 30, "expected some remote entries too");
 
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
     let resp = client
         .nodes_by_label(NodesByLabelRequest {
             label: "Flag".into(),
@@ -382,7 +398,9 @@ async fn routed_outgoing_forwards_to_source_owner() {
     let edge = Edge::new("KNOWS", src.id, dst.id);
     h.store_b.put_edge(&edge).unwrap();
 
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
     let resp = client
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(src.id.as_uuid())),
@@ -424,7 +442,9 @@ async fn cypher_match_scatter_gathers_across_partitions() {
     assert!(owned_by_a > 0 && owned_by_b > 0);
     assert_eq!(owned_by_a + owned_by_b, 40);
 
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
     let resp = client
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (n:Worker) RETURN n.i AS i".to_string(),
@@ -466,11 +486,12 @@ async fn cypher_match_with_filter_scatter_gathers() {
         put_node_on_owner(&n, &h);
     }
 
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
     let resp = client
         .execute_cypher(ExecuteCypherRequest {
-            query: "MATCH (n:Box) WHERE n.size > 14 RETURN n.size AS s ORDER BY s"
-                .to_string(),
+            query: "MATCH (n:Box) WHERE n.size > 14 RETURN n.size AS s ORDER BY s".to_string(),
         })
         .await
         .unwrap();
@@ -494,7 +515,9 @@ async fn cypher_create_routes_writes_by_partition() {
     // running.
     let h = spawn_two_peer().await;
 
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
     for i in 0..40 {
         client
             .execute_cypher(ExecuteCypherRequest {
@@ -555,7 +578,9 @@ async fn cypher_create_edge_lands_on_both_owners() {
     // query and later check that every KNOWS edge exists on both the
     // source owner's store and the target owner's store.
     let h = spawn_two_peer().await;
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
 
     // Create 15 disconnected pairs — with a 4-partition / 2-peer layout
     // and a hash partitioner, most pairs will straddle the two peers.
@@ -767,17 +792,18 @@ async fn cypher_multi_op_query_atomic_across_peers() {
     // rollback branch, so this test just pins the happy-path atomic
     // shape and asserts the exact shard split matches the partitioner.
     let h = spawn_two_peer().await;
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
 
     // One Cypher query that creates eight nodes — the partitioner will
     // almost certainly split them across both peers on a hash layout,
     // so the coordinator runs PREPARE+COMMIT on both.
     client
         .execute_cypher(ExecuteCypherRequest {
-            query:
-                "CREATE (a:Batch {i:0}), (b:Batch {i:1}), (c:Batch {i:2}), (d:Batch {i:3}),
+            query: "CREATE (a:Batch {i:0}), (b:Batch {i:1}), (c:Batch {i:2}), (d:Batch {i:3}),
                         (e:Batch {i:4}), (f:Batch {i:5}), (g:Batch {i:6}), (h:Batch {i:7})"
-                    .to_string(),
+                .to_string(),
         })
         .await
         .unwrap();
@@ -827,7 +853,9 @@ async fn cypher_reverse_traversal_via_ghost_edges() {
     // entry for every edge pointing at one of its nodes. This test
     // pins that invariant by driving a reverse-direction MATCH.
     let h = spawn_two_peer().await;
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
 
     // Create 15 (a)-[:KNOWS]->(b) pairs. With a 4-partition hash
     // layout the hash partitioner will straddle some pairs across
@@ -852,9 +880,9 @@ async fn cypher_reverse_traversal_via_ghost_edges() {
         .into_iter()
         .chain(h.store_b.all_edges().unwrap().into_iter())
         .collect();
-    let cross_partition_exists = all_edges.iter().any(|e| {
-        h.cluster_a.owner_of(e.source) != h.cluster_a.owner_of(e.target)
-    });
+    let cross_partition_exists = all_edges
+        .iter()
+        .any(|e| h.cluster_a.owner_of(e.source) != h.cluster_a.owner_of(e.target));
     assert!(
         cross_partition_exists,
         "need at least one cross-partition edge to exercise ghost-edge reverse traversal"
@@ -888,8 +916,9 @@ async fn cypher_reverse_traversal_via_ghost_edges() {
             )
         })
         .collect();
-    let expected: std::collections::BTreeSet<(String, String)> =
-        (0..15).map(|i| (format!("a{i}"), format!("b{i}"))).collect();
+    let expected: std::collections::BTreeSet<(String, String)> = (0..15)
+        .map(|i| (format!("a{i}"), format!("b{i}")))
+        .collect();
     assert_eq!(pairs, expected);
 }
 
@@ -928,7 +957,10 @@ async fn cypher_traversal_crosses_partitions() {
             other_side_targets += 1;
         }
     }
-    assert!(other_side_targets > 0, "expected at least one cross-peer target");
+    assert!(
+        other_side_targets > 0,
+        "expected at least one cross-peer target"
+    );
     assert!(a_side_targets < 20, "expected some local-to-a targets too");
 
     // Edges are stored on A's owner's local store — that's where the
@@ -942,12 +974,13 @@ async fn cypher_traversal_crosses_partitions() {
         }
     }
 
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
     let resp = client
         .execute_cypher(ExecuteCypherRequest {
-            query:
-                "MATCH (a:Person {name: 'A'})-[:KNOWS]->(b:Person) RETURN b.name AS name"
-                    .to_string(),
+            query: "MATCH (a:Person {name: 'A'})-[:KNOWS]->(b:Person) RETURN b.name AS name"
+                .to_string(),
         })
         .await
         .unwrap();
@@ -963,15 +996,16 @@ async fn cypher_traversal_crosses_partitions() {
         .iter()
         .map(|r| r["name"]["Property"]["value"].as_str().unwrap().to_string())
         .collect();
-    let expected: std::collections::BTreeSet<String> =
-        (0..20).map(|i| format!("B{}", i)).collect();
+    let expected: std::collections::BTreeSet<String> = (0..20).map(|i| format!("B{}", i)).collect();
     assert_eq!(names, expected);
 }
 
 #[tokio::test]
 async fn routed_get_node_missing_returns_not_found_on_either_peer() {
     let h = spawn_two_peer().await;
-    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
     // A random id that doesn't exist anywhere.
     let resp = client
         .get_node(GetNodeRequest {
@@ -1278,7 +1312,10 @@ async fn invalid_uuid_length_returns_invalid_argument() {
         value: vec![0, 1, 2, 3], // too short
     };
     let err = c
-        .get_node(GetNodeRequest { id: Some(bad), local_only: false })
+        .get_node(GetNodeRequest {
+            id: Some(bad),
+            local_only: false,
+        })
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);

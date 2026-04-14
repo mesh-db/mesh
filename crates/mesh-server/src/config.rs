@@ -58,11 +58,9 @@ impl ServerConfig {
     }
 
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
-        let contents = std::fs::read_to_string(path).map_err(|e| {
-            anyhow::anyhow!("reading config file {}: {}", path.display(), e)
-        })?;
-        Self::from_toml_str(&contents).map_err(|e| {
-            anyhow::anyhow!("parsing config file {}: {}", path.display(), e)
-        })
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading config file {}: {}", path.display(), e))?;
+        Self::from_toml_str(&contents)
+            .map_err(|e| anyhow::anyhow!("parsing config file {}: {}", path.display(), e))
     }
 }

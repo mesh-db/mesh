@@ -240,13 +240,7 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
     let no_bindings: HashSet<String> = HashSet::new();
 
     for pattern in &stmt.patterns {
-        build_create_pattern(
-            pattern,
-            &mut nodes,
-            &mut edges,
-            &mut var_idx,
-            &no_bindings,
-        )?;
+        build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &no_bindings)?;
     }
 
     let plan = LogicalPlan::CreatePath {
@@ -491,9 +485,8 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
         };
     }
 
-    let has_mutation = stmt.delete.is_some()
-        || !stmt.set_items.is_empty()
-        || !stmt.create_patterns.is_empty();
+    let has_mutation =
+        stmt.delete.is_some() || !stmt.set_items.is_empty() || !stmt.create_patterns.is_empty();
 
     if !stmt.return_items.is_empty() {
         plan = apply_return_pipeline(
@@ -566,9 +559,7 @@ fn apply_return_pipeline(
     Ok(plan)
 }
 
-fn classify_return_items(
-    items: &[ReturnItem],
-) -> Result<(Vec<ReturnItem>, Vec<AggregateSpec>)> {
+fn classify_return_items(items: &[ReturnItem]) -> Result<(Vec<ReturnItem>, Vec<AggregateSpec>)> {
     let mut group_keys: Vec<ReturnItem> = Vec::new();
     let mut aggregates: Vec<AggregateSpec> = Vec::new();
     for (idx, item) in items.iter().enumerate() {
@@ -584,18 +575,13 @@ fn classify_return_items(
             let agg_arg = match args {
                 CallArgs::Star => {
                     if !matches!(func, AggregateFn::Count) {
-                        return Err(Error::Plan(
-                            "only count(*) accepts a star argument".into(),
-                        ));
+                        return Err(Error::Plan("only count(*) accepts a star argument".into()));
                     }
                     AggregateArg::Star
                 }
                 CallArgs::Exprs(es) if es.len() == 1 => AggregateArg::Expr(es[0].clone()),
                 CallArgs::Exprs(_) => {
-                    return Err(Error::Plan(format!(
-                        "{} takes exactly one argument",
-                        name
-                    )))
+                    return Err(Error::Plan(format!("{} takes exactly one argument", name)))
                 }
                 CallArgs::DistinctExprs(es) if es.len() == 1 => {
                     AggregateArg::DistinctExpr(es[0].clone())
@@ -633,13 +619,15 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some() => true,
         Expr::Not(inner) => contains_aggregate(inner),
         Expr::And(a, b) | Expr::Or(a, b) => contains_aggregate(a) || contains_aggregate(b),
-        Expr::Compare { left, right, .. } => {
-            contains_aggregate(left) || contains_aggregate(right)
+        Expr::Compare { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::Call {
+            args: CallArgs::Exprs(es),
+            ..
         }
-        Expr::Call { args: CallArgs::Exprs(es), .. }
-        | Expr::Call { args: CallArgs::DistinctExprs(es), .. } => {
-            es.iter().any(contains_aggregate)
-        }
+        | Expr::Call {
+            args: CallArgs::DistinctExprs(es),
+            ..
+        } => es.iter().any(contains_aggregate),
         Expr::Case {
             scrutinee,
             branches,

@@ -2,16 +2,14 @@ use mesh_cluster::raft::RaftCluster;
 use mesh_cluster::ClusterCommand;
 use mesh_cluster::PeerId;
 use mesh_core::Node;
-use std::sync::Arc;
 use mesh_rpc::convert::{node_to_proto, uuid_to_proto};
 use mesh_rpc::proto::mesh_query_client::MeshQueryClient;
 use mesh_rpc::proto::mesh_write_client::MeshWriteClient;
-use mesh_rpc::proto::{
-    ExecuteCypherRequest, GetNodeRequest, HealthRequest, PutNodeRequest,
-};
+use mesh_rpc::proto::{ExecuteCypherRequest, GetNodeRequest, HealthRequest, PutNodeRequest};
 use mesh_server::config::{PeerConfig, ServerConfig};
 use mesh_server::ServerComponents;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -100,7 +98,7 @@ async fn spawn_single_node_server() -> Harness {
         num_partitions: 4,
         peers: vec![],
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let service = mesh_server::build_service(&config).unwrap();
@@ -151,7 +149,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -160,7 +158,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let service_a = mesh_server::build_service(&config_a).unwrap();
@@ -314,7 +312,7 @@ async fn build_components_single_node_has_no_raft() {
         num_partitions: 4,
         peers: vec![],
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
     let components = mesh_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_none());
@@ -381,7 +379,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: true,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -390,7 +388,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -536,7 +534,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: true,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -545,7 +543,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -684,10 +682,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
                 .add_service(service.clone().into_query_server())
                 .add_service(service.into_write_server())
                 .add_service(raft_service.into_server())
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(listener),
-                    shutdown,
-                )
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
                 .await
                 .unwrap();
         });
@@ -741,7 +736,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: true,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -750,7 +745,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -779,9 +774,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
     let mut writer = MeshWriteClient::connect(format!("http://{}", addr_a))
         .await
         .unwrap();
-    let node_x = Node::new()
-        .with_label("Person")
-        .with_property("name", "X");
+    let node_x = Node::new().with_label("Person").with_property("name", "X");
     let x_id = node_x.id;
     writer
         .put_node(PutNodeRequest {
@@ -824,9 +817,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
     // Post-restart: write node Y on the leader. With 2 peers and quorum = 2,
     // this only commits once the restarted B is back in the replication set,
     // so success here proves B is a functioning follower again.
-    let node_y = Node::new()
-        .with_label("Person")
-        .with_property("name", "Y");
+    let node_y = Node::new().with_label("Person").with_property("name", "Y");
     let y_id = node_y.id;
     writer
         .put_node(PutNodeRequest {
@@ -884,7 +875,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: true,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -893,7 +884,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -970,8 +961,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
             })
             .await
             .unwrap();
-        let rows: serde_json::Value =
-            serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
         if rows.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
             matched_rows = Some(rows);
             break;
@@ -1023,10 +1013,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
                 .add_service(service.clone().into_query_server())
                 .add_service(service.into_write_server())
                 .add_service(raft_service.into_server())
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(listener),
-                    shutdown,
-                )
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
                 .await
                 .unwrap();
         });
@@ -1060,7 +1047,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: true,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b1 = ServerConfig {
         self_id: 2,
@@ -1069,7 +1056,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -1160,7 +1147,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let listener_b2 = TcpListener::bind(addr_b).await.unwrap();
@@ -1220,8 +1207,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         })
         .await
         .unwrap();
-    let rows: serde_json::Value =
-        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    let rows: serde_json::Value = serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
     let count = rows.as_array().map(|a| a.len()).unwrap_or(0);
     assert!(
         count >= 20,
@@ -1254,10 +1240,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
                 .add_service(service.clone().into_query_server())
                 .add_service(service.into_write_server())
                 .add_service(raft_service.into_server())
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(listener),
-                    shutdown,
-                )
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
                 .await
                 .unwrap();
         });
@@ -1301,7 +1284,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: true,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1310,7 +1293,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -1339,9 +1322,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
     for i in 0..20 {
         query_a
             .execute_cypher(ExecuteCypherRequest {
-                query: format!(
-                    "CREATE (n:Person {{idx: {i}}}) RETURN n"
-                ),
+                query: format!("CREATE (n:Person {{idx: {i}}}) RETURN n"),
             })
             .await
             .unwrap();
@@ -1358,8 +1339,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
             break;
         }
     }
-    let snap_meta = snapshot_seen
-        .expect("leader should have built a snapshot after 20 commits");
+    let snap_meta = snapshot_seen.expect("leader should have built a snapshot after 20 commits");
     // openraft fires a snapshot once enough entries have accumulated since
     // the previous one; the threshold is approximate. We just need the
     // auto-snapshot path to have run at all.
@@ -1372,7 +1352,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
     // raft store directly. The PersistedSnapshot blob should contain BOTH
     // a non-empty graph payload and the cluster state.
     use mesh_cluster::raft::{MemStore, PersistedSnapshot};
-    use mesh_cluster::{ClusterState, Membership, Peer, PartitionMap};
+    use mesh_cluster::{ClusterState, Membership, PartitionMap, Peer};
 
     // Stop A's raft cleanly so we can reopen the rocksdb handle. Order:
     // shut openraft's internal task, then stop the gRPC server (which
@@ -1413,8 +1393,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
 
     // Decode the graph blob shape — it's the StoreGraphApplier's
     // GraphSnapshot { nodes, edges } JSON. We only care that nodes are present.
-    let graph_value: serde_json::Value =
-        serde_json::from_slice(&payload.graph).unwrap();
+    let graph_value: serde_json::Value = serde_json::from_slice(&payload.graph).unwrap();
     let nodes = graph_value["nodes"].as_array().unwrap();
     // The snapshot may have fired before every CREATE was applied — what
     // matters is that the graph payload carries *some* of the data, not
@@ -1458,7 +1437,7 @@ async fn cypher_merge_replicates_through_raft() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: true,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1467,7 +1446,7 @@ async fn cypher_merge_replicates_through_raft() {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -1529,8 +1508,7 @@ async fn cypher_merge_replicates_through_raft() {
         })
         .await
         .unwrap();
-    let rows: serde_json::Value =
-        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    let rows: serde_json::Value = serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 1);
     assert_eq!(
         rows[0]["name"]["Property"]["value"].as_str().unwrap(),
@@ -1558,8 +1536,7 @@ async fn cypher_merge_replicates_through_raft() {
             })
             .await
             .unwrap();
-        let rows: serde_json::Value =
-            serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
         count = rows.as_array().map(|a| a.len()).unwrap_or(0);
         if count == 1 {
             break;
@@ -1603,7 +1580,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: true,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1612,7 +1589,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -1663,12 +1640,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         }
     }
 
-    let last_log_before = raft_a
-        .raft
-        .metrics()
-        .borrow()
-        .last_log_index
-        .unwrap_or(0);
+    let last_log_before = raft_a.raft.metrics().borrow().last_log_index.unwrap_or(0);
 
     // Multi-write Cypher query: 2 PutNode + 1 PutEdge under the old
     // one-entry-per-call model. With buffering this becomes 1 batch entry.
@@ -1677,17 +1649,14 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         .unwrap();
     query_a
         .execute_cypher(ExecuteCypherRequest {
-            query: "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Grace'}) RETURN a, b".into(),
+            query:
+                "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Grace'}) RETURN a, b"
+                    .into(),
         })
         .await
         .expect("multi-write CREATE should commit");
 
-    let last_log_after = raft_a
-        .raft
-        .metrics()
-        .borrow()
-        .last_log_index
-        .unwrap_or(0);
+    let last_log_after = raft_a.raft.metrics().borrow().last_log_index.unwrap_or(0);
     assert_eq!(
         last_log_after - last_log_before,
         1,
@@ -1710,8 +1679,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
             })
             .await
             .unwrap();
-        let rows: serde_json::Value =
-            serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
         let arr = rows.as_array().unwrap();
         if arr.len() == 1 {
             let row = &arr[0];
@@ -1759,7 +1727,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         num_partitions: 4,
         peers: peers.clone(),
         bootstrap: true,
-                bolt_address: None,
+        bolt_address: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1768,7 +1736,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         num_partitions: 4,
         peers,
         bootstrap: false,
-                bolt_address: None,
+        bolt_address: None,
     };
 
     // Build components for both peers.
@@ -1851,10 +1819,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let state_b = raft_b.current_state().await;
         if state_b.membership.contains(PeerId(3)) {
-            assert_eq!(
-                state_b.membership.address(PeerId(3)),
-                Some("10.0.0.3:7003")
-            );
+            assert_eq!(state_b.membership.address(PeerId(3)), Some("10.0.0.3:7003"));
             replicated = true;
             break;
         }

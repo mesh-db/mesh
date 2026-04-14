@@ -135,7 +135,10 @@ pub struct ReturnItem {
 pub enum Expr {
     Literal(Literal),
     Identifier(String),
-    Property { var: String, key: String },
+    Property {
+        var: String,
+        key: String,
+    },
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),

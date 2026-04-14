@@ -1,9 +1,7 @@
 use mesh_core::NodeId;
 use serde::{Deserialize, Serialize};
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PartitionId(pub u32);
 
 impl std::fmt::Display for PartitionId {

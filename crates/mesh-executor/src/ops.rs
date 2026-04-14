@@ -26,11 +26,7 @@ pub trait Operator {
 /// Execute a plan using the given store for both reads and writes.
 /// Equivalent to [`execute_with_reader`] with the store acting as both.
 pub fn execute(plan: &LogicalPlan, store: &Store) -> Result<Vec<Row>> {
-    execute_with_reader(
-        plan,
-        store as &dyn GraphReader,
-        store as &dyn GraphWriter,
-    )
+    execute_with_reader(plan, store as &dyn GraphReader, store as &dyn GraphWriter)
 }
 
 /// Execute a plan against a local [`Store`] for reads, sending mutations to
@@ -75,19 +71,17 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             nodes.clone(),
             edges.clone(),
         )),
-        LogicalPlan::CartesianProduct { left, right } => Box::new(CartesianProductOp::new(
-            build_op(left),
-            (**right).clone(),
-        )),
+        LogicalPlan::CartesianProduct { left, right } => {
+            Box::new(CartesianProductOp::new(build_op(left), (**right).clone()))
+        }
         LogicalPlan::Delete {
             input,
             detach,
             vars,
         } => Box::new(DeleteOp::new(build_op(input), *detach, vars.clone())),
-        LogicalPlan::SetProperty { input, assignments } => Box::new(SetPropertyOp::new(
-            build_op(input),
-            assignments.clone(),
-        )),
+        LogicalPlan::SetProperty { input, assignments } => {
+            Box::new(SetPropertyOp::new(build_op(input), assignments.clone()))
+        }
         LogicalPlan::NodeScanAll { var } => Box::new(NodeScanAllOp::new(var.clone())),
         LogicalPlan::NodeScanByLabels { var, labels } => {
             Box::new(NodeScanByLabelsOp::new(var.clone(), labels.clone()))
@@ -160,9 +154,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             labels.clone(),
             properties.clone(),
         )),
-        LogicalPlan::Unwind { var, expr } => {
-            Box::new(UnwindOp::new(var.clone(), expr.clone()))
-        }
+        LogicalPlan::Unwind { var, expr } => Box::new(UnwindOp::new(var.clone(), expr.clone())),
     }
 }
 
@@ -431,10 +423,23 @@ impl Operator for SetPropertyOp {
             Some(mut row) => {
                 // Phase 1: evaluate any RHSes against the original row bindings.
                 enum Action {
-                    SetKey { var: String, key: String, prop: Property },
-                    AddLabels { var: String, labels: Vec<String> },
-                    Replace { var: String, props: Vec<(String, Property)> },
-                    Merge { var: String, props: Vec<(String, Property)> },
+                    SetKey {
+                        var: String,
+                        key: String,
+                        prop: Property,
+                    },
+                    AddLabels {
+                        var: String,
+                        labels: Vec<String>,
+                    },
+                    Replace {
+                        var: String,
+                        props: Vec<(String, Property)>,
+                    },
+                    Merge {
+                        var: String,
+                        props: Vec<(String, Property)>,
+                    },
                 }
                 let mut actions: Vec<Action> = Vec::with_capacity(self.assignments.len());
                 for a in &self.assignments {
@@ -879,16 +884,19 @@ impl VarLengthExpandOp {
         }
     }
 
-    fn enumerate(
-        &self,
-        ctx: &ExecCtx,
-        start: NodeId,
-    ) -> Result<(Vec<Vec<Edge>>, Vec<NodeId>)> {
+    fn enumerate(&self, ctx: &ExecCtx, start: NodeId) -> Result<(Vec<Vec<Edge>>, Vec<NodeId>)> {
         let mut paths: Vec<Vec<Edge>> = Vec::new();
         let mut targets: Vec<NodeId> = Vec::new();
         let mut current: Vec<Edge> = Vec::new();
         let mut used: HashSet<EdgeId> = HashSet::new();
-        self.dfs(ctx, start, &mut current, &mut used, &mut paths, &mut targets)?;
+        self.dfs(
+            ctx,
+            start,
+            &mut current,
+            &mut used,
+            &mut paths,
+            &mut targets,
+        )?;
         Ok((paths, targets))
     }
 
@@ -1206,9 +1214,7 @@ impl AggregateOp {
                         continue;
                     }
                     let key = value_key(&v);
-                    let seen = entry
-                        .distinct_seen[i]
-                        .get_or_insert_with(HashSet::new);
+                    let seen = entry.distinct_seen[i].get_or_insert_with(HashSet::new);
                     if !seen.insert(key) {
                         continue;
                     }
@@ -1222,7 +1228,10 @@ impl AggregateOp {
             // Empty group, single aggregate row
             let mut row = Row::new();
             for spec in &self.aggregates {
-                row.insert(spec.alias.clone(), AggState::initial(spec.function).finalize());
+                row.insert(
+                    spec.alias.clone(),
+                    AggState::initial(spec.function).finalize(),
+                );
             }
             out.push(row);
         } else {

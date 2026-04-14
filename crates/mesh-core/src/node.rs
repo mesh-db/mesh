@@ -47,7 +47,10 @@ mod tests {
             .with_property("age", 37_i64);
 
         assert_eq!(n.labels, vec!["Person"]);
-        assert_eq!(n.properties.get("name"), Some(&Property::String("Ada".into())));
+        assert_eq!(
+            n.properties.get("name"),
+            Some(&Property::String("Ada".into()))
+        );
         assert_eq!(n.properties.get("age"), Some(&Property::Int64(37)));
     }
 }

@@ -41,12 +41,8 @@ impl StoreGraphApplier {
 impl GraphStateMachine for StoreGraphApplier {
     fn apply(&self, command: &GraphCommand) -> Result<(), String> {
         match command {
-            GraphCommand::PutNode(node) => {
-                self.store.put_node(node).map_err(|e| e.to_string())
-            }
-            GraphCommand::PutEdge(edge) => {
-                self.store.put_edge(edge).map_err(|e| e.to_string())
-            }
+            GraphCommand::PutNode(node) => self.store.put_node(node).map_err(|e| e.to_string()),
+            GraphCommand::PutEdge(edge) => self.store.put_edge(edge).map_err(|e| e.to_string()),
             GraphCommand::DeleteEdge(id) => {
                 // Idempotent: a redundant Raft replay shouldn't error.
                 if self
@@ -90,8 +86,7 @@ impl GraphStateMachine for StoreGraphApplier {
         if snapshot.is_empty() {
             return Ok(());
         }
-        let parsed: GraphSnapshot =
-            serde_json::from_slice(snapshot).map_err(|e| e.to_string())?;
+        let parsed: GraphSnapshot = serde_json::from_slice(snapshot).map_err(|e| e.to_string())?;
 
         // Replace the local store contents wholesale: clear, then apply
         // the snapshot's nodes + edges as one atomic batch so a crash
@@ -112,18 +107,13 @@ impl GraphStateMachine for StoreGraphApplier {
     }
 }
 
-fn flatten_into(
-    cmds: &[GraphCommand],
-    out: &mut Vec<StoreMutation>,
-) -> Result<(), String> {
+fn flatten_into(cmds: &[GraphCommand], out: &mut Vec<StoreMutation>) -> Result<(), String> {
     for cmd in cmds {
         match cmd {
             GraphCommand::PutNode(n) => out.push(StoreMutation::PutNode(n.clone())),
             GraphCommand::PutEdge(e) => out.push(StoreMutation::PutEdge(e.clone())),
             GraphCommand::DeleteEdge(id) => out.push(StoreMutation::DeleteEdge(*id)),
-            GraphCommand::DetachDeleteNode(id) => {
-                out.push(StoreMutation::DetachDeleteNode(*id))
-            }
+            GraphCommand::DetachDeleteNode(id) => out.push(StoreMutation::DetachDeleteNode(*id)),
             GraphCommand::Batch(inner) => flatten_into(inner, out)?,
         }
     }

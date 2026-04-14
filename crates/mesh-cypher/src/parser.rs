@@ -73,18 +73,12 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
                 )?;
             }
             Rule::kw_as => {}
-            r => {
-                return Err(Error::Parse(format!(
-                    "unexpected rule in unwind: {:?}",
-                    r
-                )))
-            }
+            r => return Err(Error::Parse(format!("unexpected rule in unwind: {:?}", r))),
         }
     }
 
     let expr = expr.ok_or_else(|| Error::Parse("UNWIND requires a source expression".into()))?;
-    let alias =
-        alias.ok_or_else(|| Error::Parse("UNWIND requires an AS alias".into()))?;
+    let alias = alias.ok_or_else(|| Error::Parse("UNWIND requires an AS alias".into()))?;
     if return_items.is_empty() {
         return Err(Error::Parse("UNWIND requires a RETURN clause".into()));
     }
@@ -121,12 +115,7 @@ fn build_merge(pair: Pair<Rule>) -> Result<MergeStmt> {
                     &mut limit,
                 )?;
             }
-            r => {
-                return Err(Error::Parse(format!(
-                    "unexpected rule in merge: {:?}",
-                    r
-                )))
-            }
+            r => return Err(Error::Parse(format!("unexpected rule in merge: {:?}", r))),
         }
     }
 
@@ -162,12 +151,7 @@ fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
                     &mut limit,
                 )?;
             }
-            r => {
-                return Err(Error::Parse(format!(
-                    "unexpected rule in create: {:?}",
-                    r
-                )))
-            }
+            r => return Err(Error::Parse(format!("unexpected rule in create: {:?}", r))),
         }
     }
 
@@ -307,12 +291,7 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                 }
                 delete = Some(DeleteClause { detach, vars });
             }
-            r => {
-                return Err(Error::Parse(format!(
-                    "unexpected rule in match: {:?}",
-                    r
-                )))
-            }
+            r => return Err(Error::Parse(format!("unexpected rule in match: {:?}", r))),
         }
     }
 
@@ -422,12 +401,7 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
                     Rule::var_length => {
                         var_length = Some(build_var_length(d)?);
                     }
-                    r => {
-                        return Err(Error::Parse(format!(
-                            "unexpected rel detail rule: {:?}",
-                            r
-                        )))
-                    }
+                    r => return Err(Error::Parse(format!("unexpected rel detail rule: {:?}", r))),
                 }
             }
         }
@@ -656,9 +630,7 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 .ok_or_else(|| Error::Parse("empty expression".into()))?,
         ),
         Rule::or_expr => {
-            let mut inner = pair
-                .into_inner()
-                .filter(|p| p.as_rule() != Rule::kw_or);
+            let mut inner = pair.into_inner().filter(|p| p.as_rule() != Rule::kw_or);
             let mut left = build_expression(
                 inner
                     .next()
@@ -671,9 +643,7 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             Ok(left)
         }
         Rule::and_expr => {
-            let mut inner = pair
-                .into_inner()
-                .filter(|p| p.as_rule() != Rule::kw_and);
+            let mut inner = pair.into_inner().filter(|p| p.as_rule() != Rule::kw_and);
             let mut left = build_expression(
                 inner
                     .next()
@@ -761,10 +731,7 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                             }
                         }
                         r => {
-                            return Err(Error::Parse(format!(
-                                "unexpected fn args inner: {:?}",
-                                r
-                            )))
+                            return Err(Error::Parse(format!("unexpected fn args inner: {:?}", r)))
                         }
                     }
                 }
@@ -795,7 +762,10 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             Ok(Expr::List(items))
         }
         Rule::list_comp => build_list_comp(pair),
-        r => Err(Error::Parse(format!("unexpected rule in expression: {:?}", r))),
+        r => Err(Error::Parse(format!(
+            "unexpected rule in expression: {:?}",
+            r
+        ))),
     }
 }
 
@@ -846,7 +816,9 @@ fn build_case_expr(pair: Pair<Rule>) -> Result<Expr> {
     }
 
     if branches.is_empty() {
-        return Err(Error::Parse("CASE requires at least one WHEN branch".into()));
+        return Err(Error::Parse(
+            "CASE requires at least one WHEN branch".into(),
+        ));
     }
     Ok(Expr::Case {
         scrutinee,
@@ -914,12 +886,11 @@ fn build_literal(pair: Pair<Rule>) -> Result<Literal> {
     };
     match lit_pair.as_rule() {
         Rule::integer => Ok(Literal::Integer(parse_integer(lit_pair.as_str())?)),
-        Rule::float => Ok(Literal::Float(
-            lit_pair
-                .as_str()
-                .parse()
-                .map_err(|_| Error::InvalidNumber(lit_pair.as_str().into()))?,
-        )),
+        Rule::float => {
+            Ok(Literal::Float(lit_pair.as_str().parse().map_err(|_| {
+                Error::InvalidNumber(lit_pair.as_str().into())
+            })?))
+        }
         Rule::string => {
             let inner = lit_pair
                 .into_inner()
@@ -927,7 +898,9 @@ fn build_literal(pair: Pair<Rule>) -> Result<Literal> {
                 .ok_or_else(|| Error::Parse("empty string literal".into()))?;
             Ok(Literal::String(inner.as_str().to_string()))
         }
-        Rule::boolean_lit => Ok(Literal::Boolean(lit_pair.as_str().eq_ignore_ascii_case("true"))),
+        Rule::boolean_lit => Ok(Literal::Boolean(
+            lit_pair.as_str().eq_ignore_ascii_case("true"),
+        )),
         Rule::null_lit => Ok(Literal::Null),
         r => Err(Error::Parse(format!("unexpected literal rule: {:?}", r))),
     }

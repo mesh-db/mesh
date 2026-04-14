@@ -12,9 +12,7 @@ pub enum Error {
     #[error("unknown peer: {0:?}")]
     UnknownPeer(PeerId),
 
-    #[error(
-        "partition map length {map_len} does not match partition count {expected}"
-    )]
+    #[error("partition map length {map_len} does not match partition count {expected}")]
     PartitionMapLengthMismatch { map_len: usize, expected: u32 },
 
     #[error("peer already exists: {0}")]
@@ -29,9 +27,7 @@ pub enum Error {
     #[error("apply rejected by state machine: {0}")]
     Apply(String),
 
-    #[error(
-        "not the raft leader; forward to peer {leader_id:?} at {leader_address:?}"
-    )]
+    #[error("not the raft leader; forward to peer {leader_id:?} at {leader_address:?}")]
     ForwardToLeader {
         leader_id: Option<PeerId>,
         leader_address: Option<String>,

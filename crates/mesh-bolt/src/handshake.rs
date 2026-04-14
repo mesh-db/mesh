@@ -137,9 +137,7 @@ mod tests {
     async fn client_and_server_agree_on_4_4() {
         let (mut client, mut server) = duplex(64);
 
-        let server_task = tokio::spawn(async move {
-            perform_server_handshake(&mut server).await
-        });
+        let server_task = tokio::spawn(async move { perform_server_handshake(&mut server).await });
 
         let preferences = [BOLT_4_4, [0; 4], [0; 4], [0; 4]];
         let agreed = perform_client_handshake(&mut client, &preferences)
@@ -153,9 +151,7 @@ mod tests {
     async fn server_rejects_unsupported_versions() {
         let (mut client, mut server) = duplex(64);
 
-        let server_task = tokio::spawn(async move {
-            perform_server_handshake(&mut server).await
-        });
+        let server_task = tokio::spawn(async move { perform_server_handshake(&mut server).await });
 
         // Bolt 5.0 only — not supported yet.
         let preferences = [version_bytes(5, 0, 0), [0; 4], [0; 4], [0; 4]];
@@ -172,9 +168,7 @@ mod tests {
     async fn range_negotiation_picks_nearest_supported() {
         let (mut client, mut server) = duplex(64);
 
-        let server_task = tokio::spawn(async move {
-            perform_server_handshake(&mut server).await
-        });
+        let server_task = tokio::spawn(async move { perform_server_handshake(&mut server).await });
 
         // "Bolt 4.6 with range 2" → 4.6 / 4.5 / 4.4 accepted. We only
         // support 4.4, which the server should choose.
@@ -189,9 +183,7 @@ mod tests {
     #[tokio::test]
     async fn bad_preamble_rejected() {
         let (mut client, mut server) = duplex(64);
-        let server_task = tokio::spawn(async move {
-            perform_server_handshake(&mut server).await
-        });
+        let server_task = tokio::spawn(async move { perform_server_handshake(&mut server).await });
         client.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).await.unwrap();
         // Still send version slots so the server's read_exact for
         // slots doesn't block forever on a closed half.

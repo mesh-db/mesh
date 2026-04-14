@@ -157,8 +157,7 @@ impl GraphReader for PartitionedGraphReader {
     }
 
     fn nodes_by_label(&self, label: &str) -> ExecResult<Vec<NodeId>> {
-        let mut seen: HashSet<NodeId> =
-            self.local.nodes_by_label(label)?.into_iter().collect();
+        let mut seen: HashSet<NodeId> = self.local.nodes_by_label(label)?.into_iter().collect();
         let label = label.to_string();
         let routing = self.routing.clone();
         let remote: ExecResult<Vec<NodeId>> = self.block(async move {

@@ -145,9 +145,7 @@ fn case_equals(a: &Value, b: &Value) -> bool {
 
 fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
     let arg_exprs = match args {
-        CallArgs::Star => {
-            return Err(Error::UnknownScalarFunction(format!("{}(*)", name)))
-        }
+        CallArgs::Star => return Err(Error::UnknownScalarFunction(format!("{}(*)", name))),
         CallArgs::Exprs(e) => e.as_slice(),
         CallArgs::DistinctExprs(_) => {
             return Err(Error::UnknownScalarFunction(format!(
@@ -161,9 +159,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             let v = single_arg(name, arg_exprs, row)?;
             match v {
                 Value::Null => Ok(Value::Null),
-                Value::List(items) => {
-                    Ok(Value::Property(Property::Int64(items.len() as i64)))
-                }
+                Value::List(items) => Ok(Value::Property(Property::Int64(items.len() as i64))),
                 Value::Property(Property::List(items)) => {
                     Ok(Value::Property(Property::Int64(items.len() as i64)))
                 }
@@ -247,9 +243,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             let v = single_arg(name, arg_exprs, row)?;
             match v {
                 Value::Null => Ok(Value::Null),
-                Value::Property(Property::Int64(i)) => {
-                    Ok(Value::Property(Property::Int64(i)))
-                }
+                Value::Property(Property::Int64(i)) => Ok(Value::Property(Property::Int64(i))),
                 Value::Property(Property::Float64(f)) => {
                     Ok(Value::Property(Property::Int64(f as i64)))
                 }
@@ -271,10 +265,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             }
             for e in arg_exprs {
                 let v = eval_expr(e, row)?;
-                let is_null = matches!(
-                    v,
-                    Value::Null | Value::Property(Property::Null)
-                );
+                let is_null = matches!(v, Value::Null | Value::Property(Property::Null));
                 if !is_null {
                     return Ok(v);
                 }
@@ -300,15 +291,9 @@ fn value_to_string(v: Value) -> Value {
     match v {
         Value::Null => Value::Null,
         Value::Property(Property::String(s)) => Value::Property(Property::String(s)),
-        Value::Property(Property::Int64(i)) => {
-            Value::Property(Property::String(i.to_string()))
-        }
-        Value::Property(Property::Float64(f)) => {
-            Value::Property(Property::String(f.to_string()))
-        }
-        Value::Property(Property::Bool(b)) => {
-            Value::Property(Property::String(b.to_string()))
-        }
+        Value::Property(Property::Int64(i)) => Value::Property(Property::String(i.to_string())),
+        Value::Property(Property::Float64(f)) => Value::Property(Property::String(f.to_string())),
+        Value::Property(Property::Bool(b)) => Value::Property(Property::String(b.to_string())),
         Value::Property(Property::Null) => Value::Null,
         other => Value::Property(Property::String(format!("{:?}", other))),
     }
@@ -329,15 +314,13 @@ fn compare_props(a: &Property, b: &Property) -> Ordering {
         (Property::Int64(a), Property::Int64(b)) => a.cmp(b),
         (Property::String(a), Property::String(b)) => a.cmp(b),
         (Property::Bool(a), Property::Bool(b)) => a.cmp(b),
-        (Property::Float64(a), Property::Float64(b)) => {
-            a.partial_cmp(b).unwrap_or(Ordering::Equal)
+        (Property::Float64(a), Property::Float64(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Property::Int64(a), Property::Float64(b)) => {
+            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
         }
-        (Property::Int64(a), Property::Float64(b)) => (*a as f64)
-            .partial_cmp(b)
-            .unwrap_or(Ordering::Equal),
-        (Property::Float64(a), Property::Int64(b)) => a
-            .partial_cmp(&(*b as f64))
-            .unwrap_or(Ordering::Equal),
+        (Property::Float64(a), Property::Int64(b)) => {
+            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
+        }
         _ => Ordering::Equal,
     }
 }

@@ -6,9 +6,7 @@
 //! in **peer B's `Store`** via the Raft `apply_to_state_machine` pipeline.
 
 use mesh_cluster::raft::{GraphStateMachine, RaftCluster};
-use mesh_cluster::{
-    ClusterState, GraphCommand, Membership, PartitionMap, Peer, PeerId,
-};
+use mesh_cluster::{ClusterState, GraphCommand, Membership, PartitionMap, Peer, PeerId};
 use mesh_core::{Edge, Node};
 use mesh_rpc::{GrpcNetwork, MeshRaftService, StoreGraphApplier};
 use mesh_storage::Store;
@@ -34,8 +32,7 @@ async fn spawn_graph_peer(
     peer_endpoints: Vec<(u64, String)>,
     initial: ClusterState,
 ) -> GraphPeer {
-    let applier: Arc<dyn GraphStateMachine> =
-        Arc::new(StoreGraphApplier::new(store.clone()));
+    let applier: Arc<dyn GraphStateMachine> = Arc::new(StoreGraphApplier::new(store.clone()));
     let network = GrpcNetwork::new(peer_endpoints).expect("valid endpoints");
     let cluster = RaftCluster::new_with_applier(id, initial, network, Some(applier))
         .await

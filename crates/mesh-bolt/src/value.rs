@@ -32,9 +32,7 @@ impl BoltValue {
     /// keys; never panics.
     pub fn get(&self, key: &str) -> Option<&BoltValue> {
         match self {
-            BoltValue::Map(entries) => {
-                entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-            }
+            BoltValue::Map(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }

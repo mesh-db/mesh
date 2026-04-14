@@ -116,10 +116,7 @@ fn where_with_not() {
     run(&store, "CREATE (n:Flag {active: true})");
     run(&store, "CREATE (n:Flag {active: false})");
 
-    let rows = run(
-        &store,
-        "MATCH (n:Flag) WHERE NOT n.active = true RETURN n",
-    );
+    let rows = run(&store, "MATCH (n:Flag) WHERE NOT n.active = true RETURN n");
     assert_eq!(rows.len(), 1);
 }
 
@@ -384,10 +381,7 @@ fn multi_label_node_pattern_matches_intersection() {
         .with_property("name", "Alan");
     store.put_node(&employee).unwrap();
 
-    let rows = run(
-        &store,
-        "MATCH (n:Person:Employee) RETURN n.name AS name",
-    );
+    let rows = run(&store, "MATCH (n:Person:Employee) RETURN n.name AS name");
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "name"), "Alan");
 }
@@ -419,14 +413,8 @@ fn multi_label_expand_target() {
 #[test]
 fn create_with_multi_label() {
     let (store, _d) = open_store();
-    run(
-        &store,
-        "CREATE (n:Person:Employee {name: 'Alan'})",
-    );
-    let rows = run(
-        &store,
-        "MATCH (n:Person:Employee) RETURN labels(n) AS ls",
-    );
+    run(&store, "CREATE (n:Person:Employee {name: 'Alan'})");
+    let rows = run(&store, "MATCH (n:Person:Employee) RETURN labels(n) AS ls");
     match rows[0].get("ls") {
         Some(Value::List(items)) => {
             let mut names: Vec<String> = items
@@ -463,10 +451,7 @@ fn set_label_multiple_at_once() {
     run(&store, "CREATE (n:Person {name: 'Ada'})");
     run(&store, "MATCH (n:Person) SET n:Active:VIP");
 
-    let rows = run(
-        &store,
-        "MATCH (n:Person:Active:VIP) RETURN n.name AS name",
-    );
+    let rows = run(&store, "MATCH (n:Person:Active:VIP) RETURN n.name AS name");
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "name"), "Ada");
 }
@@ -478,10 +463,7 @@ fn set_merge_map_overlays_properties() {
 
     run(&store, "MATCH (n:X) SET n += {b: 20, c: 30}");
 
-    let rows = run(
-        &store,
-        "MATCH (n:X) RETURN n.a AS a, n.b AS b, n.c AS c",
-    );
+    let rows = run(&store, "MATCH (n:X) RETURN n.a AS a, n.b AS b, n.c AS c");
     assert_eq!(int_prop(&rows[0], "a"), 1);
     assert_eq!(int_prop(&rows[0], "b"), 20);
     assert_eq!(int_prop(&rows[0], "c"), 30);
@@ -494,10 +476,7 @@ fn set_replace_map_clears_other_properties() {
 
     run(&store, "MATCH (n:X) SET n = {c: 3}");
 
-    let rows = run(
-        &store,
-        "MATCH (n:X) RETURN n.a AS a, n.b AS b, n.c AS c",
-    );
+    let rows = run(&store, "MATCH (n:X) RETURN n.a AS a, n.b AS b, n.c AS c");
     assert_eq!(rows[0].get("a"), Some(&Value::Null));
     assert_eq!(rows[0].get("b"), Some(&Value::Null));
     assert_eq!(int_prop(&rows[0], "c"), 3);
@@ -584,10 +563,7 @@ fn scalar_coalesce_all_null_returns_null() {
 fn scalar_size_on_string_and_list() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:X {name: 'hello'})");
-    let rows = run(
-        &store,
-        "MATCH (n:X) RETURN size(n.name) AS len",
-    );
+    let rows = run(&store, "MATCH (n:X) RETURN size(n.name) AS len");
     assert_eq!(int_prop(&rows[0], "len"), 5);
 }
 
@@ -601,10 +577,7 @@ fn scalar_labels_returns_list_of_strings() {
         .with_property("name", "Ada");
     store.put_node(&n).unwrap();
 
-    let rows = run(
-        &store,
-        "MATCH (n:Person) RETURN labels(n) AS ls",
-    );
+    let rows = run(&store, "MATCH (n:Person) RETURN labels(n) AS ls");
     match rows[0].get("ls") {
         Some(Value::List(items)) => {
             let mut names: Vec<String> = items
@@ -644,14 +617,8 @@ fn scalar_keys_returns_sorted_list() {
 #[test]
 fn scalar_type_on_edge() {
     let (store, _d) = open_store();
-    run(
-        &store,
-        "CREATE (a:Person)-[:KNOWS]->(b:Person)",
-    );
-    let rows = run(
-        &store,
-        "MATCH (a)-[r]->(b) RETURN type(r) AS t",
-    );
+    run(&store, "CREATE (a:Person)-[:KNOWS]->(b:Person)");
+    let rows = run(&store, "MATCH (a)-[r]->(b) RETURN type(r) AS t");
     assert_eq!(str_prop(&rows[0], "t"), "KNOWS");
 }
 
@@ -738,7 +705,10 @@ fn match_create_with_return_yields_linked_pair() {
 #[test]
 fn match_detach_delete_with_return_sees_pre_delete_row() {
     let (store, _d) = open_store();
-    run(&store, "CREATE (n:Person {name: 'Ada'})-[:KNOWS]->(m:Person {name: 'Alan'})");
+    run(
+        &store,
+        "CREATE (n:Person {name: 'Ada'})-[:KNOWS]->(m:Person {name: 'Alan'})",
+    );
 
     let rows = run(
         &store,
@@ -905,17 +875,32 @@ fn match_create_self_loop_via_same_var() {
 
     run(&store, "MATCH (n:Node) CREATE (n)-[:LOOP]->(n)");
 
-    let rows = run(&store, "MATCH (a)-[:LOOP]->(b) RETURN a.name AS a, b.name AS b");
+    let rows = run(
+        &store,
+        "MATCH (a)-[:LOOP]->(b) RETURN a.name AS a, b.name AS b",
+    );
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "a"), "self");
     assert_eq!(str_prop(&rows[0], "b"), "self");
 }
 
 fn seed_people(store: &Store) {
-    run(store, "CREATE (n:Person {name: 'Ada', age: 37, dept: 'eng'})");
-    run(store, "CREATE (n:Person {name: 'Alan', age: 41, dept: 'eng'})");
-    run(store, "CREATE (n:Person {name: 'Grace', age: 85, dept: 'ops'})");
-    run(store, "CREATE (n:Person {name: 'Ada', age: 29, dept: 'ops'})");
+    run(
+        store,
+        "CREATE (n:Person {name: 'Ada', age: 37, dept: 'eng'})",
+    );
+    run(
+        store,
+        "CREATE (n:Person {name: 'Alan', age: 41, dept: 'eng'})",
+    );
+    run(
+        store,
+        "CREATE (n:Person {name: 'Grace', age: 85, dept: 'ops'})",
+    );
+    run(
+        store,
+        "CREATE (n:Person {name: 'Ada', age: 29, dept: 'ops'})",
+    );
 }
 
 #[test]
@@ -987,10 +972,7 @@ fn distinct_dedupes_identical_projected_rows() {
     let (store, _d) = open_store();
     seed_people(&store);
 
-    let rows = run(
-        &store,
-        "MATCH (p:Person) RETURN DISTINCT p.dept AS dept",
-    );
+    let rows = run(&store, "MATCH (p:Person) RETURN DISTINCT p.dept AS dept");
     let mut depts: Vec<String> = rows.iter().map(|r| str_prop(r, "dept")).collect();
     depts.sort();
     assert_eq!(depts, vec!["eng", "ops"]);
@@ -1014,10 +996,7 @@ fn count_star_over_label() {
     let (store, _d) = open_store();
     seed_people(&store);
 
-    let rows = run(
-        &store,
-        "MATCH (p:Person) RETURN count(*) AS total",
-    );
+    let rows = run(&store, "MATCH (p:Person) RETURN count(*) AS total");
     assert_eq!(rows.len(), 1);
     assert_eq!(int_prop(&rows[0], "total"), 4);
 }
@@ -1025,10 +1004,7 @@ fn count_star_over_label() {
 #[test]
 fn count_empty_match_returns_zero() {
     let (store, _d) = open_store();
-    let rows = run(
-        &store,
-        "MATCH (p:NoSuchLabel) RETURN count(*) AS total",
-    );
+    let rows = run(&store, "MATCH (p:NoSuchLabel) RETURN count(*) AS total");
     assert_eq!(rows.len(), 1);
     assert_eq!(int_prop(&rows[0], "total"), 0);
 }
@@ -1039,10 +1015,7 @@ fn count_expr_skips_null() {
     run(&store, "CREATE (n:Person {name: 'with_age', age: 30})");
     run(&store, "CREATE (n:Person {name: 'no_age'})");
 
-    let rows = run(
-        &store,
-        "MATCH (p:Person) RETURN count(p.age) AS c",
-    );
+    let rows = run(&store, "MATCH (p:Person) RETURN count(p.age) AS c");
     assert_eq!(int_prop(&rows[0], "c"), 1);
 }
 
@@ -1083,10 +1056,7 @@ fn collect_returns_list_of_names() {
     let (store, _d) = open_store();
     seed_people(&store);
 
-    let rows = run(
-        &store,
-        "MATCH (p:Person) RETURN collect(p.name) AS names",
-    );
+    let rows = run(&store, "MATCH (p:Person) RETURN collect(p.name) AS names");
     match rows[0].get("names") {
         Some(Value::List(items)) => {
             assert_eq!(items.len(), 4);
@@ -1157,7 +1127,10 @@ fn unknown_scalar_function_rejected_at_exec_time() {
     let stmt = parse("MATCH (n:X) RETURN unknownfn(n) AS v").unwrap();
     let plan_tree = plan(&stmt).unwrap();
     let err = execute(&plan_tree, &store).unwrap_err();
-    assert!(matches!(err, mesh_executor::Error::UnknownScalarFunction(_)));
+    assert!(matches!(
+        err,
+        mesh_executor::Error::UnknownScalarFunction(_)
+    ));
 }
 
 fn build_chain(store: &Store) {
@@ -1301,10 +1274,7 @@ fn var_length_edge_variable_binds_list_of_edges() {
 fn var_length_no_paths_for_isolated_source() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Loner {name: 'solo'})");
-    let rows = run(
-        &store,
-        "MATCH (a:Loner)-[:N*1..5]->(b) RETURN b",
-    );
+    let rows = run(&store, "MATCH (a:Loner)-[:N*1..5]->(b) RETURN b");
     assert!(rows.is_empty());
 }
 
@@ -1394,7 +1364,10 @@ fn detach_delete_removes_node_and_edges() {
     let (store, _d) = open_store();
     let _g = build_social_graph(&store);
 
-    run(&store, "MATCH (n:Person) WHERE n.name = 'Alan' DETACH DELETE n");
+    run(
+        &store,
+        "MATCH (n:Person) WHERE n.name = 'Alan' DETACH DELETE n",
+    );
 
     let alans = run(&store, "MATCH (n:Person) WHERE n.name = 'Alan' RETURN n");
     assert!(alans.is_empty());
@@ -1458,7 +1431,10 @@ fn set_property_on_node() {
         "MATCH (n:Person) WHERE n.name = 'Ada' SET n.age = 37",
     );
 
-    let rows = run(&store, "MATCH (n:Person) RETURN n.name AS name, n.age AS age");
+    let rows = run(
+        &store,
+        "MATCH (n:Person) RETURN n.name AS name, n.age AS age",
+    );
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "name"), "Ada");
     assert_eq!(int_prop(&rows[0], "age"), 37);
@@ -1539,10 +1515,7 @@ fn merge_binds_existing_node_without_creating() {
     // Second MERGE on the same key should be a no-op write-wise. Verify
     // both that the rows reflect the existing entity and that the store
     // still only has one Person.
-    let rows = run(
-        &store,
-        "MERGE (n:Person {name: 'Ada'}) RETURN n.age AS age",
-    );
+    let rows = run(&store, "MERGE (n:Person {name: 'Ada'}) RETURN n.age AS age");
     assert_eq!(rows.len(), 1);
     match rows[0].get("age") {
         Some(Value::Property(Property::Int64(36))) => {}
@@ -1685,10 +1658,7 @@ fn list_literal_returned_as_list_value() {
     match rows[0].get("xs") {
         Some(Value::List(items)) => {
             assert_eq!(items.len(), 3);
-            assert!(matches!(
-                items[0],
-                Value::Property(Property::Int64(1))
-            ));
+            assert!(matches!(items[0], Value::Property(Property::Int64(1))));
         }
         other => panic!("expected List, got {:?}", other),
     }
@@ -1784,10 +1754,7 @@ fn float_comparison_works() {
     run(&store, "CREATE (n:Meas {val: 3.14})");
     run(&store, "CREATE (n:Meas {val: 2.71})");
 
-    let rows = run(
-        &store,
-        "MATCH (n:Meas) WHERE n.val > 3.0 RETURN n.val AS v",
-    );
+    let rows = run(&store, "MATCH (n:Meas) WHERE n.val > 3.0 RETURN n.val AS v");
     assert_eq!(rows.len(), 1);
     match rows[0].get("v") {
         Some(Value::Property(Property::Float64(f))) => assert!((*f - 3.14).abs() < 1e-9),

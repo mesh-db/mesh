@@ -10,8 +10,8 @@ use crate::proto::{RaftRpcRequest, RaftRpcResponse};
 use mesh_cluster::raft::{MeshRaftConfig, NodeId};
 use openraft::error::{InstallSnapshotError, RaftError};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
 use openraft::Raft;
 use tonic::{Request, Response, Status};
@@ -36,8 +36,7 @@ fn decode_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, S
 }
 
 fn encode_payload<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Status> {
-    serde_json::to_vec(value)
-        .map_err(|e| Status::internal(format!("encoding raft response: {e}")))
+    serde_json::to_vec(value).map_err(|e| Status::internal(format!("encoding raft response: {e}")))
 }
 
 #[tonic::async_trait]
@@ -59,8 +58,7 @@ impl MeshRaft for MeshRaftService {
         request: Request<RaftRpcRequest>,
     ) -> Result<Response<RaftRpcResponse>, Status> {
         let rpc: VoteRequest<NodeId> = decode_payload(&request.into_inner().payload)?;
-        let result: Result<VoteResponse<NodeId>, RaftError<NodeId>> =
-            self.raft.vote(rpc).await;
+        let result: Result<VoteResponse<NodeId>, RaftError<NodeId>> = self.raft.vote(rpc).await;
         let payload = encode_payload(&result)?;
         Ok(Response::new(RaftRpcResponse { payload }))
     }

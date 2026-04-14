@@ -26,7 +26,10 @@ fn empty_node_creation() {
 fn labeled_node_creation() {
     let c = unwrap_create(parse("CREATE (n:Person)").unwrap());
     assert_eq!(c.patterns[0].start.var.as_deref(), Some("n"));
-    assert_eq!(c.patterns[0].start.labels.first().map(String::as_str), Some("Person"));
+    assert_eq!(
+        c.patterns[0].start.labels.first().map(String::as_str),
+        Some("Person")
+    );
 }
 
 #[test]
@@ -45,14 +48,20 @@ fn labeled_node_with_properties() {
 fn anonymous_labeled_node() {
     let c = unwrap_create(parse("CREATE (:Tag)").unwrap());
     assert!(c.patterns[0].start.var.is_none());
-    assert_eq!(c.patterns[0].start.labels.first().map(String::as_str), Some("Tag"));
+    assert_eq!(
+        c.patterns[0].start.labels.first().map(String::as_str),
+        Some("Tag")
+    );
 }
 
 #[test]
 fn simple_match_return() {
     let m = unwrap_match(parse("MATCH (n:Person) RETURN n").unwrap());
     assert_eq!(m.patterns[0].start.var.as_deref(), Some("n"));
-    assert_eq!(m.patterns[0].start.labels.first().map(String::as_str), Some("Person"));
+    assert_eq!(
+        m.patterns[0].start.labels.first().map(String::as_str),
+        Some("Person")
+    );
     assert!(m.patterns[0].hops.is_empty());
     assert_eq!(m.return_items.len(), 1);
     assert_eq!(m.return_items[0].expr, Expr::Identifier("n".into()));
@@ -61,16 +70,17 @@ fn simple_match_return() {
 
 #[test]
 fn single_hop_directed() {
-    let m = unwrap_match(
-        parse("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b").unwrap());
     assert_eq!(m.patterns[0].hops.len(), 1);
     let hop = &m.patterns[0].hops[0];
     assert_eq!(hop.rel.direction, Direction::Outgoing);
     assert_eq!(hop.rel.var.as_deref(), Some("r"));
     assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
     assert_eq!(hop.target.var.as_deref(), Some("b"));
-    assert_eq!(hop.target.labels.first().map(String::as_str), Some("Person"));
+    assert_eq!(
+        hop.target.labels.first().map(String::as_str),
+        Some("Person")
+    );
 }
 
 #[test]
@@ -110,9 +120,7 @@ fn single_hop_undirected() {
 
 #[test]
 fn match_set_with_return_parses() {
-    let m = unwrap_match(
-        parse("MATCH (n:Person) SET n.age = 37 RETURN n").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (n:Person) SET n.age = 37 RETURN n").unwrap());
     assert_eq!(m.set_items.len(), 1);
     assert_eq!(m.return_items.len(), 1);
     assert_eq!(m.return_items[0].expr, Expr::Identifier("n".into()));
@@ -129,9 +137,7 @@ fn match_create_with_return_parses() {
 
 #[test]
 fn match_delete_with_return_parses() {
-    let m = unwrap_match(
-        parse("MATCH (n:Person) DETACH DELETE n RETURN n.name").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (n:Person) DETACH DELETE n RETURN n.name").unwrap());
     assert!(m.delete.is_some());
     assert_eq!(m.return_items.len(), 1);
 }
@@ -147,7 +153,10 @@ fn pure_create_with_return_parses() {
 fn scalar_call_labels_parses() {
     let m = unwrap_match(parse("MATCH (n) RETURN labels(n) AS ls").unwrap());
     match &m.return_items[0].expr {
-        Expr::Call { name, args: CallArgs::Exprs(es) } => {
+        Expr::Call {
+            name,
+            args: CallArgs::Exprs(es),
+        } => {
             assert_eq!(name.to_lowercase(), "labels");
             assert_eq!(es.len(), 1);
         }
@@ -164,8 +173,14 @@ fn match_requires_tail() {
 fn multi_pattern_match_parses() {
     let m = unwrap_match(parse("MATCH (a:Person), (b:Company) RETURN a, b").unwrap());
     assert_eq!(m.patterns.len(), 2);
-    assert_eq!(m.patterns[0].start.labels.first().map(String::as_str), Some("Person"));
-    assert_eq!(m.patterns[1].start.labels.first().map(String::as_str), Some("Company"));
+    assert_eq!(
+        m.patterns[0].start.labels.first().map(String::as_str),
+        Some("Person")
+    );
+    assert_eq!(
+        m.patterns[1].start.labels.first().map(String::as_str),
+        Some("Company")
+    );
 }
 
 #[test]
@@ -176,9 +191,7 @@ fn multi_pattern_create_parses() {
 
 #[test]
 fn match_create_tail_parses() {
-    let m = unwrap_match(
-        parse("MATCH (a:Person), (b:Person) CREATE (a)-[:KNOWS]->(b)").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (a:Person), (b:Person) CREATE (a)-[:KNOWS]->(b)").unwrap());
     assert_eq!(m.patterns.len(), 2);
     assert_eq!(m.create_patterns.len(), 1);
     assert_eq!(m.create_patterns[0].hops.len(), 1);
@@ -203,9 +216,7 @@ fn order_by_desc() {
 
 #[test]
 fn order_by_multi_key() {
-    let m = unwrap_match(
-        parse("MATCH (n) RETURN n ORDER BY n.dept ASC, n.age DESC").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (n) RETURN n ORDER BY n.dept ASC, n.age DESC").unwrap());
     assert_eq!(m.order_by.len(), 2);
     assert!(!m.order_by[0].descending);
     assert!(m.order_by[1].descending);
@@ -231,11 +242,12 @@ fn count_star_call_parsed() {
 
 #[test]
 fn aggregate_call_with_expr_arg() {
-    let m = unwrap_match(
-        parse("MATCH (n:Person) RETURN avg(n.age) AS mean").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (n:Person) RETURN avg(n.age) AS mean").unwrap());
     match &m.return_items[0].expr {
-        Expr::Call { name, args: CallArgs::Exprs(es) } => {
+        Expr::Call {
+            name,
+            args: CallArgs::Exprs(es),
+        } => {
             assert_eq!(name.to_lowercase(), "avg");
             assert_eq!(es.len(), 1);
         }
@@ -246,9 +258,7 @@ fn aggregate_call_with_expr_arg() {
 
 #[test]
 fn distinct_and_order_by_combined() {
-    let m = unwrap_match(
-        parse("MATCH (n) RETURN DISTINCT n.dept AS d ORDER BY d").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (n) RETURN DISTINCT n.dept AS d ORDER BY d").unwrap());
     assert!(m.distinct);
     assert_eq!(m.order_by.len(), 1);
 }
@@ -295,9 +305,7 @@ fn var_length_unbounded_star() {
 
 #[test]
 fn var_length_with_var_and_type() {
-    let m = unwrap_match(
-        parse("MATCH (a)-[r:KNOWS*1..3]->(b) RETURN r").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (a)-[r:KNOWS*1..3]->(b) RETURN r").unwrap());
     let rel = &m.patterns[0].hops[0].rel;
     assert_eq!(rel.var.as_deref(), Some("r"));
     assert_eq!(rel.edge_type.as_deref(), Some("KNOWS"));
@@ -316,9 +324,22 @@ fn single_hop_has_no_var_length() {
 fn create_path_with_relationship() {
     let c = unwrap_create(parse("CREATE (a:Person)-[:KNOWS]->(b:Person)").unwrap());
     assert_eq!(c.patterns[0].hops.len(), 1);
-    assert_eq!(c.patterns[0].start.labels.first().map(String::as_str), Some("Person"));
-    assert_eq!(c.patterns[0].hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
-    assert_eq!(c.patterns[0].hops[0].target.labels.first().map(String::as_str), Some("Person"));
+    assert_eq!(
+        c.patterns[0].start.labels.first().map(String::as_str),
+        Some("Person")
+    );
+    assert_eq!(
+        c.patterns[0].hops[0].rel.edge_type.as_deref(),
+        Some("KNOWS")
+    );
+    assert_eq!(
+        c.patterns[0].hops[0]
+            .target
+            .labels
+            .first()
+            .map(String::as_str),
+        Some("Person")
+    );
 }
 
 #[test]
@@ -342,7 +363,10 @@ fn match_detach_delete() {
 fn match_delete_multiple_vars() {
     let m = unwrap_match(parse("MATCH (a)-[r]->(b) DELETE r, a, b").unwrap());
     let d = m.delete.unwrap();
-    assert_eq!(d.vars, vec!["r".to_string(), "a".to_string(), "b".to_string()]);
+    assert_eq!(
+        d.vars,
+        vec!["r".to_string(), "a".to_string(), "b".to_string()]
+    );
 }
 
 #[test]
@@ -361,9 +385,7 @@ fn match_set_single() {
 
 #[test]
 fn match_set_multiple() {
-    let m = unwrap_match(
-        parse("MATCH (n:Person) SET n.name = 'Ada', n.age = 37").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (n:Person) SET n.name = 'Ada', n.age = 37").unwrap());
     assert_eq!(m.set_items.len(), 2);
     match &m.set_items[1] {
         SetItem::Property { key, value, .. } => {
@@ -423,13 +445,17 @@ fn match_set_replace_map() {
 
 #[test]
 fn multi_hop_chain() {
-    let m = unwrap_match(
-        parse("MATCH (a)-[:KNOWS]->(b)-[:WORKS_AT]->(c) RETURN a, c").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (a)-[:KNOWS]->(b)-[:WORKS_AT]->(c) RETURN a, c").unwrap());
     assert_eq!(m.patterns[0].hops.len(), 2);
-    assert_eq!(m.patterns[0].hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(
+        m.patterns[0].hops[0].rel.edge_type.as_deref(),
+        Some("KNOWS")
+    );
     assert_eq!(m.patterns[0].hops[0].target.var.as_deref(), Some("b"));
-    assert_eq!(m.patterns[0].hops[1].rel.edge_type.as_deref(), Some("WORKS_AT"));
+    assert_eq!(
+        m.patterns[0].hops[1].rel.edge_type.as_deref(),
+        Some("WORKS_AT")
+    );
     assert_eq!(m.patterns[0].hops[1].target.var.as_deref(), Some("c"));
 }
 
@@ -478,9 +504,8 @@ fn where_comparison() {
 
 #[test]
 fn where_and_combination() {
-    let m = unwrap_match(
-        parse(r#"MATCH (n) WHERE n.age > 30 AND n.name = "Ada" RETURN n"#).unwrap(),
-    );
+    let m =
+        unwrap_match(parse(r#"MATCH (n) WHERE n.age > 30 AND n.name = "Ada" RETURN n"#).unwrap());
     assert!(matches!(m.where_clause.unwrap(), Expr::And(_, _)));
 }
 
@@ -585,10 +610,8 @@ fn unwrap_unwind(s: Statement) -> UnwindStmt {
 #[test]
 fn case_generic_form_parses() {
     let m = unwrap_match(
-        parse(
-            "MATCH (n) RETURN CASE WHEN n.age > 30 THEN 'old' ELSE 'young' END AS bucket",
-        )
-        .unwrap(),
+        parse("MATCH (n) RETURN CASE WHEN n.age > 30 THEN 'old' ELSE 'young' END AS bucket")
+            .unwrap(),
     );
     assert_eq!(m.return_items.len(), 1);
     match &m.return_items[0].expr {
@@ -645,9 +668,7 @@ fn empty_list_literal_parses() {
 
 #[test]
 fn list_comprehension_full_form() {
-    let m = unwrap_match(
-        parse("MATCH (n) RETURN [x IN [1, 2, 3] WHERE x > 1 | x] AS ys").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (n) RETURN [x IN [1, 2, 3] WHERE x > 1 | x] AS ys").unwrap());
     match &m.return_items[0].expr {
         Expr::ListComprehension {
             var,
@@ -665,9 +686,7 @@ fn list_comprehension_full_form() {
 
 #[test]
 fn list_comprehension_filter_only() {
-    let m = unwrap_match(
-        parse("MATCH (n) RETURN [x IN [1, 2, 3] WHERE x > 1] AS ys").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (n) RETURN [x IN [1, 2, 3] WHERE x > 1] AS ys").unwrap());
     match &m.return_items[0].expr {
         Expr::ListComprehension {
             predicate,
@@ -683,9 +702,7 @@ fn list_comprehension_filter_only() {
 
 #[test]
 fn list_comprehension_project_only() {
-    let m = unwrap_match(
-        parse("MATCH (n) RETURN [x IN [1, 2, 3] | x] AS ys").unwrap(),
-    );
+    let m = unwrap_match(parse("MATCH (n) RETURN [x IN [1, 2, 3] | x] AS ys").unwrap());
     match &m.return_items[0].expr {
         Expr::ListComprehension {
             predicate,
@@ -709,9 +726,8 @@ fn unwind_parses() {
 
 #[test]
 fn unwind_with_where_and_order() {
-    let u = unwrap_unwind(
-        parse("UNWIND [3, 1, 2] AS x WHERE x > 1 RETURN x ORDER BY x DESC").unwrap(),
-    );
+    let u =
+        unwrap_unwind(parse("UNWIND [3, 1, 2] AS x WHERE x > 1 RETURN x ORDER BY x DESC").unwrap());
     assert!(u.where_clause.is_some());
     assert_eq!(u.order_by.len(), 1);
     assert!(u.order_by[0].descending);
@@ -719,9 +735,8 @@ fn unwind_with_where_and_order() {
 
 #[test]
 fn parenthesized_expression() {
-    let m = unwrap_match(
-        parse("MATCH (n) WHERE (n.a = 1 OR n.b = 2) AND n.c = 3 RETURN n").unwrap(),
-    );
+    let m =
+        unwrap_match(parse("MATCH (n) WHERE (n.a = 1 OR n.b = 2) AND n.c = 3 RETURN n").unwrap());
     match m.where_clause.unwrap() {
         Expr::And(left, _) => {
             assert!(matches!(*left, Expr::Or(_, _)));

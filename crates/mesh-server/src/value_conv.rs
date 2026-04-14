@@ -52,9 +52,7 @@ fn value_to_bolt(value: &Value) -> BoltValue {
     match value {
         Value::Null => BoltValue::Null,
         Value::Property(p) => property_to_bolt(p),
-        Value::List(items) => {
-            BoltValue::List(items.iter().map(value_to_bolt).collect())
-        }
+        Value::List(items) => BoltValue::List(items.iter().map(value_to_bolt).collect()),
         Value::Node(n) => node_to_bolt(n),
         Value::Edge(e) => edge_to_bolt(e),
     }
@@ -67,9 +65,7 @@ fn property_to_bolt(p: &Property) -> BoltValue {
         Property::Int64(i) => BoltValue::Int(*i),
         Property::Float64(f) => BoltValue::Float(*f),
         Property::String(s) => BoltValue::String(s.clone()),
-        Property::List(items) => {
-            BoltValue::List(items.iter().map(property_to_bolt).collect())
-        }
+        Property::List(items) => BoltValue::List(items.iter().map(property_to_bolt).collect()),
         Property::Map(entries) => {
             // Maps in Property use a BTreeMap-like structure, sorted
             // to keep the Bolt representation deterministic.
@@ -144,7 +140,6 @@ fn edge_uuid_to_bolt_id(id: mesh_core::EdgeId) -> i64 {
 
 fn fold_bytes(bytes: &[u8; 16]) -> i64 {
     i64::from_be_bytes([
-        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
-        bytes[15],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
     ])
 }

@@ -4,19 +4,19 @@ use crate::convert::{
 };
 use crate::executor_writer::BufferingGraphWriter;
 use crate::partitioned_reader::PartitionedGraphReader;
-use crate::tx_coordinator::TxCoordinator;
 use crate::proto::mesh_query_server::{MeshQuery, MeshQueryServer};
 use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
     AllNodeIdsRequest, AllNodeIdsResponse, BatchPhase, BatchWriteRequest, BatchWriteResponse,
     DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest, DetachDeleteNodeResponse,
-    ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse,
-    GetNodeRequest, GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo,
-    NeighborRequest, NeighborResponse, NodesByLabelRequest, NodesByLabelResponse,
-    PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
+    ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse, GetNodeRequest,
+    GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo, NeighborRequest,
+    NeighborResponse, NodesByLabelRequest, NodesByLabelResponse, PutEdgeRequest, PutEdgeResponse,
+    PutNodeRequest, PutNodeResponse,
 };
 use crate::routing::Routing;
+use crate::tx_coordinator::TxCoordinator;
 use mesh_cluster::raft::RaftCluster;
 use mesh_cluster::{Error as ClusterError, GraphCommand, PeerId};
 use mesh_executor::{execute_with_reader, execute_with_writer, GraphReader, GraphWriter};
@@ -161,8 +161,7 @@ impl MeshService {
         // across every participating peer (or not at all).
         if let (Some(routing), Some(commands)) = (&self.routing, routing_batch) {
             if !commands.is_empty() {
-                let coordinator =
-                    TxCoordinator::new(&self.store, &self.pending_batches, routing);
+                let coordinator = TxCoordinator::new(&self.store, &self.pending_batches, routing);
                 coordinator.run(commands).await?;
             }
         }
@@ -186,26 +185,20 @@ impl MeshService {
                         // only safe option, because our buffered
                         // GraphCommands carry fresh ids that would clash
                         // with anything the leader minted for itself.
-                        let endpoint = Endpoint::from_shared(format!("http://{}", addr))
-                            .map_err(|e| {
-                                Status::internal(format!(
-                                    "invalid leader address {addr}: {e}"
-                                ))
+                        let endpoint =
+                            Endpoint::from_shared(format!("http://{}", addr)).map_err(|e| {
+                                Status::internal(format!("invalid leader address {addr}: {e}"))
                             })?;
-                        let mut client =
-                            crate::proto::mesh_query_client::MeshQueryClient::new(
-                                endpoint.connect_lazy(),
-                            );
+                        let mut client = crate::proto::mesh_query_client::MeshQueryClient::new(
+                            endpoint.connect_lazy(),
+                        );
                         let resp = client
                             .execute_cypher(ExecuteCypherRequest { query })
                             .await?;
                         let forwarded: Vec<mesh_executor::Row> =
-                            serde_json::from_slice(&resp.into_inner().rows_json)
-                                .map_err(|e| {
-                                    Status::internal(format!(
-                                        "decoding forwarded rows: {e}"
-                                    ))
-                                })?;
+                            serde_json::from_slice(&resp.into_inner().rows_json).map_err(|e| {
+                                Status::internal(format!("decoding forwarded rows: {e}"))
+                            })?;
                         return Ok(forwarded);
                     }
                     Err(e) => return Err(raft_propose_failed(e)),
@@ -220,19 +213,14 @@ impl MeshService {
 /// Flatten a tree of [`GraphCommand`] (which may nest `Batch` variants)
 /// into a flat `Vec<StoreMutation>` so `Store::apply_batch` can commit
 /// them as one rocksdb `WriteBatch`.
-pub(crate) fn flatten_commands(
-    cmds: &[GraphCommand],
-    out: &mut Vec<mesh_storage::StoreMutation>,
-) {
+pub(crate) fn flatten_commands(cmds: &[GraphCommand], out: &mut Vec<mesh_storage::StoreMutation>) {
     use mesh_storage::StoreMutation;
     for cmd in cmds {
         match cmd {
             GraphCommand::PutNode(n) => out.push(StoreMutation::PutNode(n.clone())),
             GraphCommand::PutEdge(e) => out.push(StoreMutation::PutEdge(e.clone())),
             GraphCommand::DeleteEdge(id) => out.push(StoreMutation::DeleteEdge(*id)),
-            GraphCommand::DetachDeleteNode(id) => {
-                out.push(StoreMutation::DetachDeleteNode(*id))
-            }
+            GraphCommand::DetachDeleteNode(id) => out.push(StoreMutation::DetachDeleteNode(*id)),
             GraphCommand::Batch(inner) => flatten_commands(inner, out),
         }
     }
@@ -292,8 +280,9 @@ impl MeshQuery for MeshService {
             if let Some(routing) = &self.routing {
                 if !routing.cluster().is_local(id) {
                     let owner = routing.cluster().owner_of(id);
-                    let mut client =
-                        routing.query_client(owner).ok_or_else(|| no_client(owner))?;
+                    let mut client = routing
+                        .query_client(owner)
+                        .ok_or_else(|| no_client(owner))?;
                     return client
                         .get_node(GetNodeRequest {
                             id: Some(id_proto),
@@ -342,8 +331,9 @@ impl MeshQuery for MeshService {
                     if peer_id == self_id {
                         continue;
                     }
-                    let mut client =
-                        routing.query_client(peer_id).ok_or_else(|| no_client(peer_id))?;
+                    let mut client = routing
+                        .query_client(peer_id)
+                        .ok_or_else(|| no_client(peer_id))?;
                     let resp = client
                         .get_edge(GetEdgeRequest {
                             id: Some(id_proto.clone()),
@@ -388,8 +378,9 @@ impl MeshQuery for MeshService {
                     if peer_id == self_id {
                         continue;
                     }
-                    let mut client =
-                        routing.query_client(peer_id).ok_or_else(|| no_client(peer_id))?;
+                    let mut client = routing
+                        .query_client(peer_id)
+                        .ok_or_else(|| no_client(peer_id))?;
                     let resp = client
                         .nodes_by_label(NodesByLabelRequest {
                             label: label.clone(),
@@ -420,8 +411,9 @@ impl MeshQuery for MeshService {
             if let Some(routing) = &self.routing {
                 if !routing.cluster().is_local(id) {
                     let owner = routing.cluster().owner_of(id);
-                    let mut client =
-                        routing.query_client(owner).ok_or_else(|| no_client(owner))?;
+                    let mut client = routing
+                        .query_client(owner)
+                        .ok_or_else(|| no_client(owner))?;
                     return client
                         .outgoing(NeighborRequest {
                             node_id: Some(id_proto),
@@ -459,8 +451,9 @@ impl MeshQuery for MeshService {
             if let Some(routing) = &self.routing {
                 if !routing.cluster().is_local(id) {
                     let owner = routing.cluster().owner_of(id);
-                    let mut client =
-                        routing.query_client(owner).ok_or_else(|| no_client(owner))?;
+                    let mut client = routing
+                        .query_client(owner)
+                        .ok_or_else(|| no_client(owner))?;
                     return client
                         .incoming(NeighborRequest {
                             node_id: Some(id_proto),
@@ -504,8 +497,9 @@ impl MeshQuery for MeshService {
                     if peer_id == self_id {
                         continue;
                     }
-                    let mut client =
-                        routing.query_client(peer_id).ok_or_else(|| no_client(peer_id))?;
+                    let mut client = routing
+                        .query_client(peer_id)
+                        .ok_or_else(|| no_client(peer_id))?;
                     let resp = client
                         .all_node_ids(AllNodeIdsRequest { local_only: true })
                         .await?;
@@ -643,8 +637,9 @@ impl MeshWrite for MeshService {
 
             if !local_only {
                 for owner in targets {
-                    let mut client =
-                        routing.write_client(owner).ok_or_else(|| no_client(owner))?;
+                    let mut client = routing
+                        .write_client(owner)
+                        .ok_or_else(|| no_client(owner))?;
                     client
                         .put_edge(PutEdgeRequest {
                             edge: Some(proto_edge.clone()),

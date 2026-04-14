@@ -1,6 +1,6 @@
 use crate::{
-    ClusterCommand, ClusterState, Error, Membership, PartitionId, PartitionMap, Partitioner,
-    Peer, PeerId, Result,
+    ClusterCommand, ClusterState, Error, Membership, PartitionId, PartitionMap, Partitioner, Peer,
+    PeerId, Result,
 };
 use mesh_core::NodeId;
 

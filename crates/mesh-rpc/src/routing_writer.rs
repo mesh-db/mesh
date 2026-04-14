@@ -1,7 +1,5 @@
 use crate::convert::{edge_to_proto, node_to_proto, uuid_to_proto};
-use crate::proto::{
-    DeleteEdgeRequest, DetachDeleteNodeRequest, PutEdgeRequest, PutNodeRequest,
-};
+use crate::proto::{DeleteEdgeRequest, DetachDeleteNodeRequest, PutEdgeRequest, PutNodeRequest};
 use crate::routing::Routing;
 use mesh_core::{Edge, EdgeId, Node, NodeId};
 use mesh_executor::{Error as ExecError, GraphWriter, Result as ExecResult};
@@ -60,8 +58,7 @@ impl GraphWriter for RoutingGraphWriter {
             return Ok(());
         }
         let owner = cluster.owner_of(node.id);
-        let proto_node =
-            node_to_proto(node).map_err(|e| ExecError::Write(e.to_string()))?;
+        let proto_node = node_to_proto(node).map_err(|e| ExecError::Write(e.to_string()))?;
         let routing = self.routing.clone();
         self.block(async move {
             let mut client = routing.write_client(owner).ok_or_else(|| {
@@ -94,8 +91,7 @@ impl GraphWriter for RoutingGraphWriter {
             return Ok(());
         }
 
-        let proto_edge =
-            edge_to_proto(edge).map_err(|e| ExecError::Write(e.to_string()))?;
+        let proto_edge = edge_to_proto(edge).map_err(|e| ExecError::Write(e.to_string()))?;
         let routing = self.routing.clone();
         self.block(async move {
             for owner in targets {
