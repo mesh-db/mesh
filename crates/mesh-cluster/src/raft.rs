@@ -33,13 +33,23 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // Persistent-storage key schema — a single rocksdb namespace is enough for
-// the handful of things Raft needs durable:
-//   "vote"        → Vote<NodeId>                (JSON)
-//   "last_purged" → LogId<NodeId>               (JSON)
-//   "log/<be64>"  → Entry<MeshRaftConfig>       (JSON)
+// everything Raft needs durable:
+//   "vote"              → Vote<NodeId>                              (JSON)
+//   "last_purged"       → LogId<NodeId>                             (JSON)
+//   "log/<be64>"        → Entry<MeshRaftConfig>                     (JSON)
+//   "cluster_state"     → ClusterState                              (JSON)
+//   "last_applied"      → LogId<NodeId>                             (JSON)
+//   "stored_membership" → StoredMembership<NodeId, BasicNode>       (JSON)
+//   "snapshot_meta"     → SnapshotMeta<NodeId, BasicNode>           (JSON)
+//   "snapshot_data"     → raw snapshot bytes
 const VOTE_KEY: &[u8] = b"vote";
 const LAST_PURGED_KEY: &[u8] = b"last_purged";
 const LOG_PREFIX: &[u8] = b"log/";
+const CLUSTER_STATE_KEY: &[u8] = b"cluster_state";
+const LAST_APPLIED_KEY: &[u8] = b"last_applied";
+const STORED_MEMBERSHIP_KEY: &[u8] = b"stored_membership";
+const SNAPSHOT_META_KEY: &[u8] = b"snapshot_meta";
+const SNAPSHOT_DATA_KEY: &[u8] = b"snapshot_data";
 
 fn log_key(index: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(LOG_PREFIX.len() + 8);
@@ -60,6 +70,10 @@ fn write_logs_err<E: std::error::Error + 'static>(e: E) -> StorageError<NodeId> 
 
 fn write_vote_err<E: std::error::Error + 'static>(e: E) -> StorageError<NodeId> {
     StorageIOError::write_vote(&e).into()
+}
+
+fn write_sm_err<E: std::error::Error + 'static>(e: E) -> StorageError<NodeId> {
+    StorageIOError::write_state_machine(&e).into()
 }
 
 /// Cluster-wide peer identifier as seen by openraft.
@@ -185,9 +199,13 @@ impl MemStore {
     }
 
     /// Open a [`MemStore`] backed by a rocksdb instance at `path`. On
-    /// restart this hydrates the vote, log entries, and last-purged pointer
-    /// from disk; the state machine itself starts from `initial_state` and
-    /// is rebuilt as openraft re-applies committed log entries.
+    /// restart this hydrates the vote, log entries, last-purged pointer,
+    /// state-machine state (cluster state + last_applied + stored
+    /// membership), and the most recent snapshot from disk. openraft can
+    /// then resume without re-applying committed log entries.
+    ///
+    /// `initial_state` is only used as the fallback for the very first
+    /// open against a fresh data directory.
     ///
     /// The rocksdb handle is opened with `create_if_missing = true`, so a
     /// fresh data directory also works — it'll simply start empty.
@@ -224,16 +242,40 @@ impl MemStore {
             }
         }
 
+        let state: ClusterState = db
+            .get(CLUSTER_STATE_KEY)?
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(initial_state);
+
+        let last_applied: Option<LogId<NodeId>> = db
+            .get(LAST_APPLIED_KEY)?
+            .and_then(|b| serde_json::from_slice(&b).ok());
+
+        let stored_membership: StoredMembership<NodeId, BasicNode> = db
+            .get(STORED_MEMBERSHIP_KEY)?
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+
+        let snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, Vec<u8>)> =
+            match (db.get(SNAPSHOT_META_KEY)?, db.get(SNAPSHOT_DATA_KEY)?) {
+                (Some(meta_bytes), Some(data)) => serde_json::from_slice::<
+                    SnapshotMeta<NodeId, BasicNode>,
+                >(&meta_bytes)
+                .ok()
+                .map(|meta| (meta, data)),
+                _ => None,
+            };
+
         Ok(Self {
             inner: Arc::new(RwLock::new(MemStoreInner {
                 log,
                 last_purged,
                 vote,
-                state: initial_state,
-                last_applied: None,
-                stored_membership: StoredMembership::default(),
+                state,
+                last_applied,
+                stored_membership,
                 graph_applier,
-                snapshot: None,
+                snapshot,
                 snapshot_counter: 0,
                 persistent: Some(db),
             })),
@@ -409,6 +451,29 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
             }
             results.push(ApplyResponse);
         }
+        // Flush state-machine state in one synced rocksdb batch. Persisting
+        // last_applied + cluster_state + stored_membership together means a
+        // restart can pick up exactly where we left off, instead of
+        // re-applying every committed log entry from the beginning.
+        if let Some(db) = inner.persistent.as_ref() {
+            let mut batch = WriteBatch::default();
+            batch.put(
+                CLUSTER_STATE_KEY,
+                serde_json::to_vec(&inner.state).map_err(write_sm_err)?,
+            );
+            if let Some(la) = inner.last_applied.as_ref() {
+                batch.put(
+                    LAST_APPLIED_KEY,
+                    serde_json::to_vec(la).map_err(write_sm_err)?,
+                );
+            }
+            batch.put(
+                STORED_MEMBERSHIP_KEY,
+                serde_json::to_vec(&inner.stored_membership).map_err(write_sm_err)?,
+            );
+            db.write_opt(batch, &synced_writes())
+                .map_err(write_sm_err)?;
+        }
         Ok(results)
     }
 
@@ -437,7 +502,32 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         inner.state = state;
         inner.last_applied = meta.last_log_id;
         inner.stored_membership = meta.last_membership.clone();
-        inner.snapshot = Some((meta.clone(), data));
+        inner.snapshot = Some((meta.clone(), data.clone()));
+
+        if let Some(db) = inner.persistent.as_ref() {
+            let mut batch = WriteBatch::default();
+            batch.put(
+                CLUSTER_STATE_KEY,
+                serde_json::to_vec(&inner.state).map_err(write_sm_err)?,
+            );
+            if let Some(la) = inner.last_applied.as_ref() {
+                batch.put(
+                    LAST_APPLIED_KEY,
+                    serde_json::to_vec(la).map_err(write_sm_err)?,
+                );
+            }
+            batch.put(
+                STORED_MEMBERSHIP_KEY,
+                serde_json::to_vec(&inner.stored_membership).map_err(write_sm_err)?,
+            );
+            batch.put(
+                SNAPSHOT_META_KEY,
+                serde_json::to_vec(meta).map_err(write_sm_err)?,
+            );
+            batch.put(SNAPSHOT_DATA_KEY, &data);
+            db.write_opt(batch, &synced_writes())
+                .map_err(write_sm_err)?;
+        }
         Ok(())
     }
 
@@ -471,6 +561,18 @@ impl RaftSnapshotBuilder<MeshRaftConfig> for MemSnapshotBuilder {
             snapshot_id: format!("mesh-snapshot-{}", inner.snapshot_counter),
         };
         inner.snapshot = Some((meta.clone(), data.clone()));
+
+        if let Some(db) = inner.persistent.as_ref() {
+            let mut batch = WriteBatch::default();
+            batch.put(
+                SNAPSHOT_META_KEY,
+                serde_json::to_vec(&meta).map_err(write_sm_err)?,
+            );
+            batch.put(SNAPSHOT_DATA_KEY, &data);
+            db.write_opt(batch, &synced_writes())
+                .map_err(write_sm_err)?;
+        }
+
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(data)),

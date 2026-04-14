@@ -376,6 +376,104 @@ async fn raft_single_node_bootstraps_and_applies_commands() {
 }
 
 #[tokio::test]
+async fn raft_persistent_store_reloads_state_machine_after_restart() {
+    // The persistent state-machine payoff: if last_applied / cluster_state /
+    // stored_membership survive process restart, openraft can resume
+    // without re-applying every committed log entry from scratch. Verifies
+    // by driving apply_to_state_machine directly, dropping the store, and
+    // reopening to assert the in-memory snapshot mirrors what was persisted.
+
+    use mesh_cluster::raft::{MemStore, MeshRaftConfig};
+    use mesh_cluster::{ClusterState, Membership, MeshLogEntry, PartitionMap};
+    use openraft::storage::RaftStorage;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("raft");
+
+    let initial = || {
+        ClusterState::new(
+            Membership::new(vec![Peer::new(PeerId(1), "127.0.0.1:7001")]),
+            PartitionMap::round_robin(&[PeerId(1)], 1).unwrap(),
+        )
+    };
+
+    {
+        let mut store = MemStore::open_persistent(&path, initial(), None).unwrap();
+        // Two synthetic apply-to-state-machine entries that mutate
+        // ClusterState. Real openraft would feed these through the Raft
+        // pipeline; we bypass it to keep the test focused on persistence.
+        let entries = vec![
+            Entry::<MeshRaftConfig> {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                payload: EntryPayload::Normal(MeshLogEntry::Cluster(
+                    ClusterCommand::AddPeer {
+                        id: PeerId(2),
+                        address: "127.0.0.1:7002".into(),
+                    },
+                )),
+            },
+            Entry::<MeshRaftConfig> {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 2),
+                payload: EntryPayload::Normal(MeshLogEntry::Cluster(
+                    ClusterCommand::UpdatePeerAddress {
+                        id: PeerId(2),
+                        address: "10.0.0.2:9999".into(),
+                    },
+                )),
+            },
+        ];
+        <MemStore as RaftStorage<MeshRaftConfig>>::apply_to_state_machine(
+            &mut store, &entries,
+        )
+        .await
+        .unwrap();
+        // Sanity check: in-memory state reflects both commands.
+        let inner = store.inner();
+        let guard = inner.read().await;
+        assert_eq!(guard.state.membership.len(), 2);
+        assert_eq!(
+            guard.state.membership.address(PeerId(2)),
+            Some("10.0.0.2:9999")
+        );
+        assert_eq!(guard.last_applied.unwrap().index, 2);
+    }
+
+    // Reopen against the same path. The stale `initial()` here would lose
+    // peer 2 if hydration didn't override it — the assertions verify the
+    // persisted state machine wins.
+    let mut store = MemStore::open_persistent(&path, initial(), None).unwrap();
+    let inner = store.inner();
+    let guard = inner.read().await;
+    assert_eq!(
+        guard.state.membership.len(),
+        2,
+        "cluster_state should rehydrate to post-apply value, not initial"
+    );
+    assert_eq!(
+        guard.state.membership.address(PeerId(2)),
+        Some("10.0.0.2:9999"),
+        "second AddPeer + UpdateAddress must round-trip"
+    );
+    assert_eq!(
+        guard.last_applied.map(|l| l.index),
+        Some(2),
+        "last_applied index should rehydrate"
+    );
+    drop(guard);
+
+    // last_applied_state() (the function openraft calls on startup) should
+    // also report the persisted last_applied — this is the actual hook
+    // that lets openraft skip log replay.
+    let (la, _) = <MemStore as RaftStorage<MeshRaftConfig>>::last_applied_state(
+        &mut store,
+    )
+    .await
+    .unwrap();
+    assert_eq!(la.map(|l| l.index), Some(2));
+}
+
+#[tokio::test]
 async fn raft_persistent_store_reloads_log_and_vote_after_restart() {
     use mesh_cluster::raft::{MemStore, MeshRaftConfig, NoOpNetwork, RaftCluster};
     use mesh_cluster::{ClusterState, Membership, PartitionMap};
