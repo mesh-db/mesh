@@ -485,6 +485,137 @@ async fn cypher_match_with_filter_scatter_gathers() {
 }
 
 #[tokio::test]
+async fn cypher_create_routes_writes_by_partition() {
+    // Routing mode sharding invariant: each node must live on the peer
+    // whose partition owns its id. With the RoutingGraphWriter wired in,
+    // a Cypher CREATE issued on peer A for a node whose id hashes to
+    // peer B must travel through MeshWrite::PutNode (local_only=true) to
+    // peer B's local store — NOT land on peer A where the executor is
+    // running.
+    let h = spawn_two_peer().await;
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    for i in 0..40 {
+        client
+            .execute_cypher(ExecuteCypherRequest {
+                query: format!("CREATE (n:Worker {{i: {}}})", i),
+            })
+            .await
+            .unwrap();
+    }
+
+    let a_ids = h.store_a.all_node_ids().unwrap();
+    let b_ids = h.store_b.all_node_ids().unwrap();
+    assert_eq!(
+        a_ids.len() + b_ids.len(),
+        40,
+        "total nodes across both shards should be exactly 40"
+    );
+    assert!(
+        !a_ids.is_empty() && !b_ids.is_empty(),
+        "hash partitioner should spread 40 nodes across both peers (got a={}, b={})",
+        a_ids.len(),
+        b_ids.len()
+    );
+    // Every node's host shard must match the partition owner for its id.
+    for id in &a_ids {
+        assert_eq!(h.cluster_a.owner_of(*id), PeerId(1));
+    }
+    for id in &b_ids {
+        assert_eq!(h.cluster_a.owner_of(*id), PeerId(2));
+    }
+
+    // Round-trip via scatter-gather MATCH to confirm the full graph is
+    // reachable from peer A even though half the data lives on B.
+    let resp = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:Worker) RETURN n.i AS i".to_string(),
+        })
+        .await
+        .unwrap();
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    assert_eq!(rows.len(), 40);
+    let seen: std::collections::BTreeSet<i64> = rows
+        .iter()
+        .map(|r| r["i"]["Property"]["value"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seen, (0..40).collect());
+}
+
+#[tokio::test]
+async fn cypher_create_edge_lands_on_both_owners() {
+    // Cypher CREATE (a)-[:KNOWS]->(b) must place the edge on both a's
+    // owner and b's owner. Force the two endpoints onto different peers
+    // by generating candidates until the hash partitioner splits them,
+    // then drive the CREATE through the routing writer.
+    //
+    // Since we can't pre-compute ids for nodes that CREATE will mint
+    // itself, we fan out 20 create-pair attempts via a single Cypher
+    // query and later check that every KNOWS edge exists on both the
+    // source owner's store and the target owner's store.
+    let h = spawn_two_peer().await;
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+
+    // Create 15 disconnected pairs — with a 4-partition / 2-peer layout
+    // and a hash partitioner, most pairs will straddle the two peers.
+    for i in 0..15 {
+        client
+            .execute_cypher(ExecuteCypherRequest {
+                query: format!(
+                    "CREATE (a:Link {{name: 'a{}'}})-[:KNOWS]->(b:Link {{name: 'b{}'}})",
+                    i, i
+                ),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Every edge must appear on both endpoint owners' local stores.
+    let edges_a = h.store_a.all_edges().unwrap();
+    let edges_b = h.store_b.all_edges().unwrap();
+
+    let mut cross_partition = 0;
+    for edge in edges_a.iter().chain(edges_b.iter()) {
+        let src_owner = h.cluster_a.owner_of(edge.source);
+        let dst_owner = h.cluster_a.owner_of(edge.target);
+
+        if src_owner != dst_owner {
+            cross_partition += 1;
+            // Cross-partition edge: must live on BOTH stores.
+            assert!(
+                h.store_a.get_edge(edge.id).unwrap().is_some(),
+                "cross-partition edge missing from store_a"
+            );
+            assert!(
+                h.store_b.get_edge(edge.id).unwrap().is_some(),
+                "cross-partition edge missing from store_b"
+            );
+        }
+    }
+    // Each cross-partition edge gets counted twice (once per store), so
+    // divide. Require at least one genuine cross-partition edge so we
+    // know the test is actually exercising the two-writer path.
+    assert!(
+        cross_partition / 2 >= 1,
+        "expected at least one cross-partition edge, got {}",
+        cross_partition / 2
+    );
+
+    // MATCH round-trip from peer A reaches every edge.
+    let resp = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (a:Link)-[:KNOWS]->(b:Link) RETURN a.name AS an, b.name AS bn"
+                .to_string(),
+        })
+        .await
+        .unwrap();
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    assert_eq!(rows.len(), 15);
+}
+
+#[tokio::test]
 async fn cypher_traversal_crosses_partitions() {
     // Seed a KNOWS chain whose source and destination are likely on
     // different peers; the partitioned reader must route the outgoing()

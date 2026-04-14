@@ -4,6 +4,7 @@ use crate::convert::{
 };
 use crate::executor_writer::BufferingGraphWriter;
 use crate::partitioned_reader::PartitionedGraphReader;
+use crate::routing_writer::RoutingGraphWriter;
 use crate::proto::mesh_query_server::{MeshQuery, MeshQueryServer};
 use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
@@ -385,17 +386,18 @@ impl MeshQuery for MeshService {
                     Ok((rows, Some(writer.into_commands())))
                 } else if let Some(r) = routing.as_ref() {
                     // Routing mode: nodes are sharded across peers by hash
-                    // partition, so a MATCH on any single peer would see
-                    // only a fragment of the graph. Drive reads through a
-                    // partitioned reader that routes point lookups to
-                    // owners and scatter-gathers bulk scans across peers.
-                    // Writes still hit the local store — Cypher writes
-                    // routing across partitions is a separate task.
+                    // partition. Reads go through a partitioned reader that
+                    // routes point lookups to owners and scatter-gathers
+                    // bulk scans; writes go through a routing writer that
+                    // sends each mutation to the partition owner (or both
+                    // owners for edges). Together these make Cypher queries
+                    // behave correctly over a sharded graph.
                     let reader = PartitionedGraphReader::new(store.clone(), r.clone());
+                    let writer = RoutingGraphWriter::new(store.clone(), r.clone());
                     let rows = execute_with_reader(
                         &plan,
                         &reader as &dyn GraphReader,
-                        store_ref as &dyn GraphWriter,
+                        &writer as &dyn GraphWriter,
                     )?;
                     Ok((rows, None))
                 } else {
