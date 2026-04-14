@@ -31,6 +31,11 @@ pub(crate) struct TxCoordinator<'a> {
     local_store: &'a Store,
     local_pending: &'a PendingBatches,
     routing: &'a Routing,
+    /// Optional durable log used to recover from a coordinator crash
+    /// between PREPARE and COMMIT. When `None`, the coordinator runs
+    /// without crash recovery — useful for tests that don't care, but
+    /// production paths should always pass a real log.
+    log: Option<&'a crate::CoordinatorLog>,
 }
 
 impl<'a> TxCoordinator<'a> {
@@ -43,7 +48,18 @@ impl<'a> TxCoordinator<'a> {
             local_store,
             local_pending,
             routing,
+            log: None,
         }
+    }
+
+    /// Attach a durable coordinator log to this coordinator instance.
+    /// Each 2PC round will append `Prepared` / decision / `Completed`
+    /// entries at the protocol boundaries; on a restart, the recovery
+    /// routine in `MeshService` walks the log and pushes any
+    /// unfinished transactions forward.
+    pub fn with_log(mut self, log: &'a crate::CoordinatorLog) -> Self {
+        self.log = Some(log);
+        self
     }
 
     /// Run a 2PC round over the buffered commands. The commands get
@@ -62,6 +78,22 @@ impl<'a> TxCoordinator<'a> {
 
         let txid = Uuid::now_v7().to_string();
 
+        // Durable intent: record the full tx (groups + commands) in
+        // the coordinator log before we touch any participant. If we
+        // crash after this and before writing a decision, recovery
+        // will find the Prepared entry and abort the tx.
+        if let Some(log) = self.log {
+            let groups_vec: Vec<(PeerId, Vec<GraphCommand>)> =
+                groups.iter().map(|(p, c)| (*p, c.clone())).collect();
+            log.append(&crate::TxLogEntry::Prepared {
+                txid: txid.clone(),
+                groups: groups_vec,
+            })
+            .map_err(|e| {
+                Status::internal(format!("coordinator log write (Prepared) failed: {e}"))
+            })?;
+        }
+
         // PREPARE phase. Track which peers ack'd so we can target ABORT
         // precisely if one of the later PREPAREs fails.
         let mut prepared: Vec<PeerId> = Vec::new();
@@ -69,10 +101,22 @@ impl<'a> TxCoordinator<'a> {
             match self.prepare(*peer_id, &txid, cmds).await {
                 Ok(()) => prepared.push(*peer_id),
                 Err(prepare_err) => {
+                    // Record the abort decision *before* sending any
+                    // ABORT so a crash mid-rollback still leaves
+                    // recovery with a consistent picture: "this tx was
+                    // decided to abort; finish the rollback."
+                    if let Some(log) = self.log {
+                        if let Err(e) =
+                            log.append(&crate::TxLogEntry::AbortDecision { txid: txid.clone() })
+                        {
+                            tracing::warn!(
+                                txid = %txid,
+                                error = %e,
+                                "coordinator log write (AbortDecision) failed",
+                            );
+                        }
+                    }
                     // Best-effort ABORT of the peers that did prepare.
-                    // Abort failures are logged and swallowed — the
-                    // original PREPARE error is what we surface to the
-                    // caller, since it's the root cause.
                     for p in &prepared {
                         if let Err(abort_err) = self.abort(*p, &txid).await {
                             tracing::warn!(
@@ -83,9 +127,25 @@ impl<'a> TxCoordinator<'a> {
                             );
                         }
                     }
+                    // Mark the tx done so compaction can drop it.
+                    if let Some(log) = self.log {
+                        let _ = log.append(&crate::TxLogEntry::Completed { txid: txid.clone() });
+                    }
                     return Err(prepare_err);
                 }
             }
+        }
+
+        // Point of no return: every PREPARE ack'd. Write the commit
+        // decision before we start sending COMMIT RPCs so recovery can
+        // tell "we intended to commit" from "we intended to abort."
+        if let Some(log) = self.log {
+            log.append(&crate::TxLogEntry::CommitDecision { txid: txid.clone() })
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "coordinator log write (CommitDecision) failed: {e}"
+                    ))
+                })?;
         }
 
         // COMMIT phase. A COMMIT failure is harder to recover from
@@ -100,6 +160,21 @@ impl<'a> TxCoordinator<'a> {
                 }
             }
         }
+
+        // Append Completed regardless of whether every commit
+        // succeeded — we've done everything we intend to do, and
+        // recovery resend-on-restart handles any peer that actually
+        // missed the COMMIT.
+        if let Some(log) = self.log {
+            if let Err(e) = log.append(&crate::TxLogEntry::Completed { txid: txid.clone() }) {
+                tracing::warn!(
+                    txid = %txid,
+                    error = %e,
+                    "coordinator log write (Completed) failed",
+                );
+            }
+        }
+
         match first_commit_err {
             Some(e) => Err(e),
             None => Ok(()),

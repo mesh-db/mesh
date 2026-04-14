@@ -6,7 +6,9 @@ use anyhow::{anyhow, Context, Result};
 use config::ServerConfig;
 use mesh_cluster::raft::{BasicNode, GraphStateMachine, RaftCluster};
 use mesh_cluster::{Cluster, ClusterState, Membership, PartitionMap, Peer, PeerId};
-use mesh_rpc::{GrpcNetwork, MeshRaftService, MeshService, Routing, StoreGraphApplier};
+use mesh_rpc::{
+    CoordinatorLog, GrpcNetwork, MeshRaftService, MeshService, Routing, StoreGraphApplier,
+};
 use mesh_storage::Store;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -54,7 +56,19 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
             .context("building cluster")?,
     );
     let routing = Arc::new(Routing::new(cluster).context("building routing")?);
-    Ok(MeshService::with_routing(store, routing))
+    // Routing mode owns a durable 2PC log for crash recovery.
+    let log = Arc::new(
+        CoordinatorLog::open(coordinator_log_path(&config.data_dir))
+            .context("opening coordinator log")?,
+    );
+    Ok(MeshService::with_routing_and_log(store, routing, Some(log)))
+}
+
+/// Path of the coordinator recovery log inside the configured data
+/// directory. Kept in a helper so the mesh-rpc test harness can point
+/// at the same file during integration tests.
+pub fn coordinator_log_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("coordinator-log.jsonl")
 }
 
 /// Build the full [`ServerComponents`] bundle. For multi-peer configs this
@@ -166,6 +180,18 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         raft: _,
         raft_service,
     } = components;
+
+    // Reconcile any transactions left unfinished by a prior crash
+    // before we start accepting new traffic. In single-node and Raft
+    // modes this is a no-op (no coordinator log). In routing mode,
+    // recovery drains the persisted log by pushing committed
+    // transactions forward to completion on every peer and rolling
+    // back un-decided ones; failures talking to unreachable peers
+    // are logged and skipped so a partial cluster restart can still
+    // make progress.
+    if let Err(e) = service.recover_pending_transactions().await {
+        tracing::warn!(error = %e, "coordinator recovery failed; continuing");
+    }
 
     // Optional Bolt listener. Binds before we start the gRPC server so
     // that a port-in-use error at startup is immediately fatal rather

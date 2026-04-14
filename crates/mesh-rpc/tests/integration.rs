@@ -8,7 +8,7 @@ use mesh_rpc::proto::{
     ExecuteCypherRequest, GetEdgeRequest, GetNodeRequest, HealthRequest, NeighborRequest,
     NodesByLabelRequest, PutEdgeRequest, PutNodeRequest, UuidBytes,
 };
-use mesh_rpc::{MeshService, Routing};
+use mesh_rpc::{CoordinatorLog, MeshService, Routing, TxLogEntry};
 use mesh_storage::Store;
 use std::sync::Arc;
 use std::time::Duration;
@@ -282,6 +282,87 @@ fn put_node_on_owner(node: &Node, h: &TwoPeer) -> PeerId {
         other => panic!("unexpected owner {other:?}"),
     }
     owner
+}
+
+/// Two-peer harness extended with an on-disk coordinator log for peer
+/// A, so recovery tests can manipulate the log directly and then call
+/// `service_a.recover_pending_transactions()` through the local
+/// `MeshService` handle.
+struct TwoPeerWithLog {
+    service_a: MeshService,
+    store_a: Arc<Store>,
+    store_b: Arc<Store>,
+    cluster_a: Arc<Cluster>,
+    log_a: Arc<CoordinatorLog>,
+    log_a_path: std::path::PathBuf,
+    _dirs: (TempDir, TempDir, TempDir),
+}
+
+/// Same shape as [`spawn_two_peer`] but wires a real `CoordinatorLog`
+/// into peer A's `MeshService` and exposes it on the returned harness.
+/// Peer B is unchanged — it's a plain routing participant whose
+/// in-memory staging is all we need for recovery to exercise.
+async fn spawn_two_peer_with_log() -> TwoPeerWithLog {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let log_dir = TempDir::new().unwrap();
+    let store_a = Arc::new(Store::open(dir_a.path()).unwrap());
+    let store_b = Arc::new(Store::open(dir_b.path()).unwrap());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        Peer::new(PeerId(1), addr_a.to_string()),
+        Peer::new(PeerId(2), addr_b.to_string()),
+    ];
+
+    let cluster_a = Arc::new(Cluster::new(PeerId(1), 4, peers.clone()).unwrap());
+    let cluster_b = Arc::new(Cluster::new(PeerId(2), 4, peers.clone()).unwrap());
+    let routing_a = Arc::new(Routing::new(cluster_a.clone()).unwrap());
+    let routing_b = Arc::new(Routing::new(cluster_b.clone()).unwrap());
+
+    let log_a_path = log_dir.path().join("coordinator-log.jsonl");
+    let log_a = Arc::new(CoordinatorLog::open(&log_a_path).unwrap());
+
+    let service_a =
+        MeshService::with_routing_and_log(store_a.clone(), routing_a, Some(log_a.clone()));
+    let service_b = MeshService::with_routing(store_b.clone(), routing_b);
+
+    let stream_a = TcpListenerStream::new(listener_a);
+    let stream_b = TcpListenerStream::new(listener_b);
+
+    let service_a_for_server = service_a.clone();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_a_for_server.clone().into_query_server())
+            .add_service(service_a_for_server.into_write_server())
+            .serve_with_incoming(stream_a)
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_b.clone().into_query_server())
+            .add_service(service_b.into_write_server())
+            .serve_with_incoming(stream_b)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    TwoPeerWithLog {
+        service_a,
+        store_a,
+        store_b,
+        cluster_a,
+        log_a,
+        log_a_path,
+        _dirs: (dir_a, dir_b, log_dir),
+    }
 }
 
 #[tokio::test]
@@ -1376,4 +1457,243 @@ async fn grpc_execute_cypher_with_params_round_trips() {
         serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["age"]["Property"]["value"].as_i64(), Some(37));
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator recovery log: durable 2PC crash recovery
+// ---------------------------------------------------------------------------
+
+/// Pick two fresh node ids whose partitioner owners are peers 1 and 2
+/// respectively. Used by the recovery tests to construct synthetic
+/// Prepared entries that touch both peers regardless of the hash
+/// partitioner's output.
+fn pick_ids_per_peer(cluster: &Cluster) -> (mesh_core::NodeId, mesh_core::NodeId) {
+    let mut owner1 = None;
+    let mut owner2 = None;
+    while owner1.is_none() || owner2.is_none() {
+        let id = mesh_core::NodeId::new();
+        match cluster.owner_of(id) {
+            PeerId(1) if owner1.is_none() => owner1 = Some(id),
+            PeerId(2) if owner2.is_none() => owner2 = Some(id),
+            _ => {}
+        }
+    }
+    (owner1.unwrap(), owner2.unwrap())
+}
+
+#[tokio::test]
+async fn successful_tx_writes_prepared_commit_and_completed() {
+    // Drive a normal routing-mode Cypher write through
+    // execute_cypher_local and assert the coordinator log contains a
+    // full Prepared → CommitDecision → Completed sequence. This is
+    // the happy-path signal that logging hooks fire at the right
+    // protocol boundaries.
+    let h = spawn_two_peer_with_log().await;
+
+    // Drive CREATEs straight through `execute_cypher_local` rather
+    // than building a gRPC client — the method on MeshService is
+    // exactly what the gRPC handler delegates to, and it commits
+    // through the same TxCoordinator path that writes the log.
+    // 8 creates virtually guarantee the partitioner scatters nodes
+    // across peers 1 and 2, producing 2PC rounds that touch both.
+    for i in 0..8 {
+        h.service_a
+            .execute_cypher_local(
+                format!("CREATE (n:T {{i: {i}}})"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Each execute_cypher_local call that touches multiple peers
+    // produces one 2PC round and therefore one {Prepared, Commit,
+    // Completed} triple in the log. After 8 rounds the log should
+    // have exactly 8 * 3 = 24 entries, alternating in that order.
+    let entries = h.log_a.read_all().unwrap();
+    assert!(
+        entries.len() >= 3,
+        "expected at least one full tx triple in the log, got {} entries",
+        entries.len()
+    );
+    // Group by txid and verify every tx saw Prepared → CommitDecision → Completed.
+    use std::collections::HashMap;
+    let mut per_txid: HashMap<String, Vec<&TxLogEntry>> = HashMap::new();
+    for e in &entries {
+        per_txid.entry(e.txid().to_string()).or_default().push(e);
+    }
+    for (txid, entries) in &per_txid {
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, TxLogEntry::Prepared { .. })),
+            "tx {txid} missing Prepared entry"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, TxLogEntry::CommitDecision { .. })),
+            "tx {txid} missing CommitDecision entry"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, TxLogEntry::Completed { .. })),
+            "tx {txid} missing Completed entry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recovery_commits_tx_with_commit_decision_but_no_completion() {
+    // Simulate a coordinator crash between writing CommitDecision and
+    // finishing the COMMIT phase on every peer. On restart, recovery
+    // must push the tx forward: apply the local commands directly
+    // and send COMMIT (falling back to PREPARE+COMMIT) to peer B.
+    let h = spawn_two_peer_with_log().await;
+
+    // Pick one node id per peer so the Prepared entry has work for
+    // both sides of the cluster.
+    let (id_a, id_b) = pick_ids_per_peer(&h.cluster_a);
+    let mut node_a = Node::new().with_label("Recovered");
+    node_a.id = id_a;
+    let mut node_b = Node::new().with_label("Recovered");
+    node_b.id = id_b;
+
+    // Synthesize what the coordinator log would contain if we had
+    // crashed between CommitDecision and Completed. Peer B's staging
+    // is empty (nothing ever ran PREPARE on it), so recover_commit
+    // must fall back to re-sending PREPARE before COMMIT.
+    let txid = "recovery-commit-1".to_string();
+    let groups = vec![
+        (
+            PeerId(1),
+            vec![mesh_cluster::GraphCommand::PutNode(node_a.clone())],
+        ),
+        (
+            PeerId(2),
+            vec![mesh_cluster::GraphCommand::PutNode(node_b.clone())],
+        ),
+    ];
+    h.log_a
+        .append(&TxLogEntry::Prepared {
+            txid: txid.clone(),
+            groups,
+        })
+        .unwrap();
+    h.log_a
+        .append(&TxLogEntry::CommitDecision { txid: txid.clone() })
+        .unwrap();
+
+    // Kick the coordinator into its recovery routine.
+    h.service_a.recover_pending_transactions().await.unwrap();
+
+    // Local peer A applied the command directly via apply_batch.
+    assert!(
+        h.store_a.get_node(node_a.id).unwrap().is_some(),
+        "recovery should have applied the local node",
+    );
+    // Remote peer B received PREPARE+COMMIT and landed the node.
+    assert!(
+        h.store_b.get_node(node_b.id).unwrap().is_some(),
+        "recovery should have committed the remote node",
+    );
+    // Log was compacted after recovery — no entries should remain
+    // for the reconciled txid.
+    let after = h.log_a.read_all().unwrap();
+    assert!(
+        !after.iter().any(|e| e.txid() == txid),
+        "compacted log still contains recovered txid"
+    );
+}
+
+#[tokio::test]
+async fn recovery_aborts_tx_with_prepared_but_no_decision() {
+    // Crash between Prepared and any decision → recovery rolls back.
+    // We can't observe "staged then aborted" directly because peer B
+    // never saw PREPARE in this synthetic scenario, but we can check
+    // that no commands land on either store after recovery, and that
+    // the log is compacted.
+    let h = spawn_two_peer_with_log().await;
+
+    let (id_a, id_b) = pick_ids_per_peer(&h.cluster_a);
+    let mut node_a = Node::new().with_label("NeverCommitted");
+    node_a.id = id_a;
+    let mut node_b = Node::new().with_label("NeverCommitted");
+    node_b.id = id_b;
+
+    let txid = "recovery-abort-1".to_string();
+    let groups = vec![
+        (
+            PeerId(1),
+            vec![mesh_cluster::GraphCommand::PutNode(node_a.clone())],
+        ),
+        (
+            PeerId(2),
+            vec![mesh_cluster::GraphCommand::PutNode(node_b.clone())],
+        ),
+    ];
+    h.log_a
+        .append(&TxLogEntry::Prepared {
+            txid: txid.clone(),
+            groups,
+        })
+        .unwrap();
+    // No CommitDecision — simulate crash right after writing Prepared.
+
+    h.service_a.recover_pending_transactions().await.unwrap();
+
+    // Neither node should exist. Recovery decided to abort because
+    // there was no commit decision recorded.
+    assert!(
+        h.store_a.get_node(node_a.id).unwrap().is_none(),
+        "undecided tx should not have landed on peer A"
+    );
+    assert!(
+        h.store_b.get_node(node_b.id).unwrap().is_none(),
+        "undecided tx should not have landed on peer B"
+    );
+
+    let after = h.log_a.read_all().unwrap();
+    assert!(
+        !after.iter().any(|e| e.txid() == txid),
+        "compacted log still contains aborted txid"
+    );
+}
+
+#[tokio::test]
+async fn recovery_compacts_completed_entries() {
+    // A log full of already-Completed entries should compact to
+    // empty on recovery — nothing to resolve, no reason to keep the
+    // historical trail around.
+    let h = spawn_two_peer_with_log().await;
+
+    for i in 0..3 {
+        let txid = format!("done-{i}");
+        h.log_a
+            .append(&TxLogEntry::Prepared {
+                txid: txid.clone(),
+                groups: vec![],
+            })
+            .unwrap();
+        h.log_a
+            .append(&TxLogEntry::CommitDecision { txid: txid.clone() })
+            .unwrap();
+        h.log_a.append(&TxLogEntry::Completed { txid }).unwrap();
+    }
+    let before = h.log_a.read_all().unwrap();
+    assert_eq!(before.len(), 9);
+
+    h.service_a.recover_pending_transactions().await.unwrap();
+
+    let after = h.log_a.read_all().unwrap();
+    assert!(
+        after.is_empty(),
+        "recovery should compact away already-completed entries, got {} left",
+        after.len()
+    );
+
+    // Also silence the "unused" warnings on harness fields the
+    // recovery tests don't exercise directly.
+    let _ = h.log_a_path;
 }

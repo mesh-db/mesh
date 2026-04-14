@@ -3,6 +3,7 @@ pub mod proto {
 }
 
 pub mod convert;
+mod coordinator_log;
 mod error;
 mod executor_writer;
 mod partitioned_reader;
@@ -14,6 +15,7 @@ mod routing_writer;
 mod server;
 mod tx_coordinator;
 
+pub use coordinator_log::{CoordinatorLog, TxDecision, TxLogEntry, TxState};
 pub use error::ConvertError;
 pub use executor_writer::{BufferingGraphWriter, RaftGraphWriter};
 pub use partitioned_reader::PartitionedGraphReader;

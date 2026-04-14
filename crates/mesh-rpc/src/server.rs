@@ -40,6 +40,9 @@ pub struct MeshService {
     routing: Option<Arc<Routing>>,
     raft: Option<Arc<RaftCluster>>,
     pending_batches: PendingBatches,
+    /// Durable 2PC coordinator log. Only populated in routing mode,
+    /// where multi-peer transactions need a crash-recovery record.
+    coordinator_log: Option<Arc<crate::CoordinatorLog>>,
 }
 
 impl MeshService {
@@ -50,17 +53,31 @@ impl MeshService {
             routing: None,
             raft: None,
             pending_batches: Arc::new(Mutex::new(HashMap::new())),
+            coordinator_log: None,
         }
     }
 
-    /// Routed service: point queries go to the partition owner; scan
-    /// queries scatter-gather across all known peers. No Raft.
+    /// Routed service without a durable coordinator log. Equivalent
+    /// to [`with_routing_and_log`] passing `None`.
     pub fn with_routing(store: Arc<Store>, routing: Arc<Routing>) -> Self {
+        Self::with_routing_and_log(store, routing, None)
+    }
+
+    /// Routed service with an optional durable coordinator log. The
+    /// log records 2PC progress so a coordinator crash between PREPARE
+    /// and COMMIT can be recovered via
+    /// [`recover_pending_transactions`] at startup.
+    pub fn with_routing_and_log(
+        store: Arc<Store>,
+        routing: Arc<Routing>,
+        coordinator_log: Option<Arc<crate::CoordinatorLog>>,
+    ) -> Self {
         Self {
             store,
             routing: Some(routing),
             raft: None,
             pending_batches: Arc::new(Mutex::new(HashMap::new())),
+            coordinator_log,
         }
     }
 
@@ -74,6 +91,7 @@ impl MeshService {
             routing: None,
             raft: Some(raft),
             pending_batches: Arc::new(Mutex::new(HashMap::new())),
+            coordinator_log: None,
         }
     }
 
@@ -201,7 +219,10 @@ impl MeshService {
             return Ok(());
         }
         if let Some(routing) = &self.routing {
-            let coordinator = TxCoordinator::new(&self.store, &self.pending_batches, routing);
+            let mut coordinator = TxCoordinator::new(&self.store, &self.pending_batches, routing);
+            if let Some(log) = self.coordinator_log.as_deref() {
+                coordinator = coordinator.with_log(log);
+            }
             coordinator.run(commands).await?;
             return Ok(());
         }
@@ -228,6 +249,169 @@ impl MeshService {
         Ok(())
     }
 
+    /// Walk the coordinator log and push every unfinished transaction
+    /// forward to its recorded decision — or, if no decision was ever
+    /// recorded, roll it back. Call this once at startup, before the
+    /// service begins accepting new traffic, so participants aren't
+    /// left holding stuck staged batches from a previous run.
+    ///
+    /// Recovery decisions:
+    ///
+    /// - **Completed**: skip. Tx is already done; compaction will drop
+    ///   the entries.
+    /// - **CommitDecision present**: resend COMMIT to every peer in
+    ///   the prepared groups. If a peer replies "not prepared" (its
+    ///   own staging was lost to a crash), resend PREPARE with the
+    ///   original commands and then COMMIT.
+    /// - **AbortDecision present**: resend ABORT to every peer.
+    ///   Idempotent on the participant side.
+    /// - **No decision** (only Prepared): treat as abort. The original
+    ///   client never saw a commit success, so rolling back is safe.
+    ///
+    /// After reconciling, append a `Completed` entry for each tx we
+    /// touched and compact the log so future recovery runs stay
+    /// short.
+    ///
+    /// Failures talking to individual peers are logged and swallowed
+    /// — the tx is marked completed anyway, because a stuck staging
+    /// entry on an unreachable peer is the participant's problem to
+    /// resolve on *its* restart (the staging is in-memory and dies
+    /// with the process).
+    pub async fn recover_pending_transactions(&self) -> std::result::Result<(), Status> {
+        let Some(log) = self.coordinator_log.clone() else {
+            return Ok(());
+        };
+        let Some(routing) = self.routing.clone() else {
+            // Only routing mode uses the coordinator log.
+            return Ok(());
+        };
+
+        let entries = log
+            .read_all()
+            .map_err(|e| Status::internal(format!("reading coordinator log: {e}")))?;
+        let state = crate::coordinator_log::reconstruct_state(&entries);
+
+        let unfinished: Vec<_> = state.values().filter(|s| !s.completed).cloned().collect();
+        if unfinished.is_empty() {
+            // Still compact: drop completed entries that accumulated
+            // from previous runs.
+            let keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let _ = log.compact(&keep);
+            return Ok(());
+        }
+
+        tracing::info!(
+            count = unfinished.len(),
+            "recovering unfinished coordinator transactions",
+        );
+
+        for tx in &unfinished {
+            match tx.decision {
+                Some(crate::TxDecision::Commit) => {
+                    self.recover_commit(&routing, &log, tx).await;
+                }
+                Some(crate::TxDecision::Abort) | None => {
+                    // No decision → safe to abort. The original client
+                    // hadn't received a commit ack, so nothing depends
+                    // on this tx having committed.
+                    self.recover_abort(&routing, &log, tx).await;
+                }
+            }
+        }
+
+        // All unfinished txids are now either committed or aborted.
+        // Compact the log to drop every entry — the recovered txids
+        // all have a Completed marker now.
+        let keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Err(e) = log.compact(&keep) {
+            tracing::warn!(error = %e, "compacting coordinator log after recovery");
+        }
+        Ok(())
+    }
+
+    /// Push a committed-but-unfinished tx forward on each peer. For
+    /// each (peer, commands) pair: try COMMIT; if the peer lost its
+    /// staging, resend PREPARE with the original commands and retry
+    /// COMMIT. Errors on individual peers are logged and moved past.
+    async fn recover_commit(
+        &self,
+        routing: &Arc<Routing>,
+        log: &crate::CoordinatorLog,
+        tx: &crate::TxState,
+    ) {
+        let txid = &tx.txid;
+        let self_id = routing.cluster().self_id();
+        for (peer_id, cmds) in &tx.groups {
+            if *peer_id == self_id {
+                // Local: the in-process pending_batches map was lost
+                // to the crash, so just apply the commands directly.
+                // This bypasses the prepare-commit dance but reaches
+                // the same end state — an atomic apply_batch.
+                if let Err(e) = apply_prepared_batch(&self.store, cmds) {
+                    tracing::warn!(
+                        txid = %txid,
+                        error = %e,
+                        "local recovery apply_batch failed",
+                    );
+                }
+                continue;
+            }
+            if let Err(e) = recover_commit_remote(routing, *peer_id, txid, cmds).await {
+                tracing::warn!(
+                    peer = %peer_id,
+                    txid = %txid,
+                    error = %e,
+                    "remote recovery commit failed; skipping",
+                );
+            }
+        }
+        if let Err(e) = log.append(&crate::TxLogEntry::Completed { txid: txid.clone() }) {
+            tracing::warn!(
+                txid = %txid,
+                error = %e,
+                "coordinator log write (Completed during recovery) failed",
+            );
+        }
+    }
+
+    /// Push an aborted-or-undecided tx forward on each peer by
+    /// resending ABORT. Idempotent on the participant side so this is
+    /// safe to retry after crashes.
+    async fn recover_abort(
+        &self,
+        routing: &Arc<Routing>,
+        log: &crate::CoordinatorLog,
+        tx: &crate::TxState,
+    ) {
+        let txid = &tx.txid;
+        let self_id = routing.cluster().self_id();
+        for peer_id in tx.groups.keys() {
+            if *peer_id == self_id {
+                // Local abort: drop any stale staging entry. The
+                // pending_batches map is fresh after restart, so this
+                // is a no-op in practice — kept for completeness and
+                // in case we ever persist participant staging.
+                let _ = self.pending_batches.lock().unwrap().remove(txid);
+                continue;
+            }
+            if let Err(e) = send_abort_remote(routing, *peer_id, txid).await {
+                tracing::warn!(
+                    peer = %peer_id,
+                    txid = %txid,
+                    error = %e,
+                    "remote recovery abort failed; skipping",
+                );
+            }
+        }
+        if let Err(e) = log.append(&crate::TxLogEntry::Completed { txid: txid.clone() }) {
+            tracing::warn!(
+                txid = %txid,
+                error = %e,
+                "coordinator log write (Completed during recovery) failed",
+            );
+        }
+    }
+
     /// Re-issue an `execute_cypher` gRPC call to the Raft leader and
     /// return the leader's rows. Used by [`execute_cypher_local`] when
     /// `commit_buffered_commands` reports a leader-redirect, and only
@@ -251,6 +435,65 @@ impl MeshService {
         serde_json::from_slice(&resp.into_inner().rows_json)
             .map_err(|e| Status::internal(format!("decoding forwarded rows: {e}")))
     }
+}
+
+/// Recovery helper: try to COMMIT an in-flight tx on a remote peer.
+/// If the peer's staging is gone (FailedPrecondition / "not
+/// prepared"), resend PREPARE with the original commands and retry
+/// COMMIT. Other error codes surface as-is so the caller can log them.
+async fn recover_commit_remote(
+    routing: &Arc<Routing>,
+    peer: PeerId,
+    txid: &str,
+    cmds: &[GraphCommand],
+) -> Result<(), Status> {
+    let mut client = routing.write_client(peer).ok_or_else(|| no_client(peer))?;
+    let commit_res = client
+        .batch_write(crate::proto::BatchWriteRequest {
+            txid: txid.to_string(),
+            phase: crate::proto::BatchPhase::Commit as i32,
+            commands_json: Vec::new(),
+        })
+        .await;
+    match commit_res {
+        Ok(_) => Ok(()),
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            // Peer forgot the staging — re-prepare and retry.
+            let payload = serde_json::to_vec(&cmds.to_vec())
+                .map_err(|e| Status::internal(format!("re-encoding PREPARE payload: {e}")))?;
+            client
+                .batch_write(crate::proto::BatchWriteRequest {
+                    txid: txid.to_string(),
+                    phase: crate::proto::BatchPhase::Prepare as i32,
+                    commands_json: payload,
+                })
+                .await?;
+            client
+                .batch_write(crate::proto::BatchWriteRequest {
+                    txid: txid.to_string(),
+                    phase: crate::proto::BatchPhase::Commit as i32,
+                    commands_json: Vec::new(),
+                })
+                .await?;
+            Ok(())
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// Recovery helper: send ABORT for `txid` to a remote peer.
+/// Idempotent — the peer drops any staging entry whether or not one
+/// exists.
+async fn send_abort_remote(routing: &Arc<Routing>, peer: PeerId, txid: &str) -> Result<(), Status> {
+    let mut client = routing.write_client(peer).ok_or_else(|| no_client(peer))?;
+    client
+        .batch_write(crate::proto::BatchWriteRequest {
+            txid: txid.to_string(),
+            phase: crate::proto::BatchPhase::Abort as i32,
+            commands_json: Vec::new(),
+        })
+        .await?;
+    Ok(())
 }
 
 /// Sniff a `Status` produced by `commit_buffered_commands` for the
