@@ -11,7 +11,8 @@ use crate::proto::{
     NodesByLabelResponse, PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
 };
 use crate::routing::Routing;
-use mesh_cluster::PeerId;
+use mesh_cluster::raft::RaftCluster;
+use mesh_cluster::{GraphCommand, PeerId};
 use mesh_storage::Store;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tonic::{Request, Response, Status};
 pub struct MeshService {
     store: Arc<Store>,
     routing: Option<Arc<Routing>>,
+    raft: Option<Arc<RaftCluster>>,
 }
 
 impl MeshService {
@@ -29,15 +31,29 @@ impl MeshService {
         Self {
             store,
             routing: None,
+            raft: None,
         }
     }
 
     /// Routed service: point queries go to the partition owner; scan
-    /// queries scatter-gather across all known peers.
+    /// queries scatter-gather across all known peers. No Raft.
     pub fn with_routing(store: Arc<Store>, routing: Arc<Routing>) -> Self {
         Self {
             store,
             routing: Some(routing),
+            raft: None,
+        }
+    }
+
+    /// Raft-backed service: writes go through `RaftCluster::propose_graph`
+    /// so every replica's local store ends up with the same data via the
+    /// state machine's apply path. Reads go straight to the local store
+    /// (every peer holds the full graph in this single-Raft-group model).
+    pub fn with_raft(store: Arc<Store>, raft: Arc<RaftCluster>) -> Self {
+        Self {
+            store,
+            routing: None,
+            raft: Some(raft),
         }
     }
 
@@ -48,6 +64,10 @@ impl MeshService {
     pub fn into_write_server(self) -> MeshWriteServer<Self> {
         MeshWriteServer::new(self)
     }
+}
+
+fn raft_propose_failed<E: std::fmt::Display>(e: E) -> Status {
+    Status::internal(format!("raft propose failed: {e}"))
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> Status {
@@ -271,6 +291,15 @@ impl MeshWrite for MeshService {
         let node = node_from_proto(proto_node.clone()).map_err(bad_request)?;
         let id = node.id;
 
+        // Raft mode: propose through consensus. Every replica's state
+        // machine applies the same write via StoreGraphApplier.
+        if let Some(raft) = &self.raft {
+            raft.propose_graph(GraphCommand::PutNode(node))
+                .await
+                .map_err(raft_propose_failed)?;
+            return Ok(Response::new(PutNodeResponse {}));
+        }
+
         // Route to the owner when we aren't it.
         if let Some(routing) = &self.routing {
             if !routing.cluster().is_local(id) && !local_only {
@@ -302,6 +331,13 @@ impl MeshWrite for MeshService {
             .edge
             .ok_or_else(|| Status::invalid_argument("missing edge"))?;
         let edge = edge_from_proto(proto_edge.clone()).map_err(bad_request)?;
+
+        if let Some(raft) = &self.raft {
+            raft.propose_graph(GraphCommand::PutEdge(edge))
+                .await
+                .map_err(raft_propose_failed)?;
+            return Ok(Response::new(PutEdgeResponse {}));
+        }
 
         if let Some(routing) = &self.routing {
             let cluster = routing.cluster();
@@ -347,6 +383,13 @@ impl MeshWrite for MeshService {
             .ok_or_else(|| Status::invalid_argument("missing edge_id"))?;
         let id = edge_id_from_proto(&id_proto).map_err(bad_request)?;
 
+        if let Some(raft) = &self.raft {
+            raft.propose_graph(GraphCommand::DeleteEdge(id))
+                .await
+                .map_err(raft_propose_failed)?;
+            return Ok(Response::new(DeleteEdgeResponse {}));
+        }
+
         // Local delete is idempotent (check-then-delete).
         if self.store.get_edge(id).map_err(internal)?.is_some() {
             self.store.delete_edge(id).map_err(internal)?;
@@ -386,6 +429,13 @@ impl MeshWrite for MeshService {
             .node_id
             .ok_or_else(|| Status::invalid_argument("missing node_id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
+
+        if let Some(raft) = &self.raft {
+            raft.propose_graph(GraphCommand::DetachDeleteNode(id))
+                .await
+                .map_err(raft_propose_failed)?;
+            return Ok(Response::new(DetachDeleteNodeResponse {}));
+        }
 
         // Local detach-delete is idempotent — no-op if the node isn't here.
         self.store.detach_delete_node(id).map_err(internal)?;

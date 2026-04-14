@@ -2,9 +2,9 @@ pub mod config;
 
 use anyhow::{anyhow, Context, Result};
 use config::ServerConfig;
-use mesh_cluster::raft::{BasicNode, RaftCluster};
+use mesh_cluster::raft::{BasicNode, GraphStateMachine, RaftCluster};
 use mesh_cluster::{Cluster, ClusterState, Membership, PartitionMap, Peer, PeerId};
-use mesh_rpc::{GrpcNetwork, MeshRaftService, MeshService, Routing};
+use mesh_rpc::{GrpcNetwork, MeshRaftService, MeshService, Routing, StoreGraphApplier};
 use mesh_storage::Store;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -57,15 +57,23 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
 }
 
 /// Build the full [`ServerComponents`] bundle. For multi-peer configs this
-/// also constructs a [`RaftCluster`] backed by a [`GrpcNetwork`] pointing at
-/// the other peers, plus a [`MeshRaftService`] handler for incoming Raft
-/// RPCs. Single-node configs return `raft: None` / `raft_service: None`.
+/// constructs a [`RaftCluster`] (with a [`StoreGraphApplier`] so graph
+/// writes replicate via the state machine), wires the [`MeshService`]'s
+/// write path through `propose_graph`, and exposes a [`MeshRaftService`]
+/// for incoming Raft RPCs. Single-node configs return a local-only service
+/// with `raft: None`.
 pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents> {
-    let service = build_service(config)?;
+    std::fs::create_dir_all(&config.data_dir).with_context(|| {
+        format!("creating data dir {}", config.data_dir.display())
+    })?;
+    let store = Arc::new(
+        Store::open(&config.data_dir)
+            .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
+    );
 
     if config.peers.is_empty() {
         return Ok(ServerComponents {
-            service,
+            service: MeshService::new(store),
             raft: None,
             raft_service: None,
         });
@@ -92,11 +100,26 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
         .collect();
     let network = GrpcNetwork::new(peer_map).context("building grpc network")?;
 
-    let raft_cluster = RaftCluster::new(config.self_id, initial_state, network)
-        .await
-        .context("building raft cluster")?;
+    // The graph applier translates committed GraphCommand entries into
+    // local store writes — this is what makes the Raft replication actually
+    // affect the database.
+    let applier: Arc<dyn GraphStateMachine> =
+        Arc::new(StoreGraphApplier::new(store.clone()));
+
+    let raft_cluster = RaftCluster::new_with_applier(
+        config.self_id,
+        initial_state,
+        network,
+        Some(applier),
+    )
+    .await
+    .context("building raft cluster")?;
     let raft_service = MeshRaftService::new(raft_cluster.raft.clone());
     let raft = Arc::new(raft_cluster);
+
+    // The MeshService routes writes through Raft so every replica's local
+    // store ends up consistent.
+    let service = MeshService::with_raft(store, raft.clone());
 
     Ok(ServerComponents {
         service,
