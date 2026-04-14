@@ -8,6 +8,8 @@ description = "gRPC services for Mesh"
 [dependencies]
 mesh-core = { path = "../mesh-core" }
 mesh-storage = { path = "../mesh-storage" }
+mesh-cypher = { path = "../mesh-cypher" }
+mesh-executor = { path = "../mesh-executor" }
 mesh-cluster = { path = "../mesh-cluster" }
 openraft = { version = "0.9", features = ["serde"] }
 serde = { workspace = true }

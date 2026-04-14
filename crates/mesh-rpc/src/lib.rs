@@ -4,6 +4,7 @@ pub mod proto {
 
 pub mod convert;
 mod error;
+mod executor_writer;
 mod raft_applier;
 mod raft_network;
 mod raft_service;
@@ -11,6 +12,7 @@ mod routing;
 mod server;
 
 pub use error::ConvertError;
+pub use executor_writer::RaftGraphWriter;
 pub use raft_applier::StoreGraphApplier;
 pub use raft_network::{GrpcNetwork, GrpcNetworkError};
 pub use raft_service::MeshRaftService;

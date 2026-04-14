@@ -31,6 +31,9 @@ pub enum Error {
 
     #[error("aggregate argument has unsupported type")]
     AggregateTypeError,
+
+    #[error("write failed: {0}")]
+    Write(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

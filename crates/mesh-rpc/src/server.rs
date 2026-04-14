@@ -2,18 +2,21 @@ use crate::convert::{
     edge_from_proto, edge_id_from_proto, edge_to_proto, node_from_proto, node_id_from_proto,
     node_to_proto, uuid_to_proto,
 };
+use crate::executor_writer::RaftGraphWriter;
 use crate::proto::mesh_query_server::{MeshQuery, MeshQueryServer};
 use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
     DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest, DetachDeleteNodeResponse,
-    GetEdgeRequest, GetEdgeResponse, GetNodeRequest, GetNodeResponse, HealthRequest,
-    HealthResponse, NeighborInfo, NeighborRequest, NeighborResponse, NodesByLabelRequest,
-    NodesByLabelResponse, PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
+    ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse, GetNodeRequest,
+    GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo, NeighborRequest,
+    NeighborResponse, NodesByLabelRequest, NodesByLabelResponse, PutEdgeRequest, PutEdgeResponse,
+    PutNodeRequest, PutNodeResponse,
 };
 use crate::routing::Routing;
 use mesh_cluster::raft::RaftCluster;
 use mesh_cluster::{Error as ClusterError, GraphCommand, PeerId};
+use mesh_executor::{execute_with_writer, GraphWriter};
 use mesh_storage::Store;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -282,6 +285,42 @@ impl MeshQuery for MeshService {
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse { serving: true }))
+    }
+
+    async fn execute_cypher(
+        &self,
+        request: Request<ExecuteCypherRequest>,
+    ) -> Result<Response<ExecuteCypherResponse>, Status> {
+        let query = request.into_inner().query;
+
+        // Parse + plan on the async task — cheap and synchronous.
+        let statement = mesh_cypher::parse(&query).map_err(bad_request)?;
+        let plan = mesh_cypher::plan(&statement).map_err(bad_request)?;
+
+        // Executor runs on a blocking worker: mutating plans may call
+        // RaftGraphWriter, which internally does `Handle::block_on` on an
+        // async Raft propose — illegal from a runtime worker thread, fine
+        // from spawn_blocking. Reads go straight to the local store; every
+        // peer holds the full graph in the single-Raft-group model.
+        let store = self.store.clone();
+        let raft = self.raft.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            let store_ref: &Store = &store;
+            let rows = if let Some(raft) = raft {
+                let writer = RaftGraphWriter::new(raft);
+                execute_with_writer(&plan, store_ref, &writer as &dyn GraphWriter)
+            } else {
+                execute_with_writer(&plan, store_ref, store_ref as &dyn GraphWriter)
+            }?;
+            Ok::<_, mesh_executor::Error>(rows)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("executor task panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("cypher execution failed: {e}")))?;
+
+        let rows_json = serde_json::to_vec(&rows)
+            .map_err(|e| Status::internal(format!("encoding rows: {e}")))?;
+        Ok(Response::new(ExecuteCypherResponse { rows_json }))
     }
 }
 

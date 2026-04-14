@@ -9,6 +9,7 @@ description = "Physical operators and query execution for Mesh"
 mesh-core = { path = "../mesh-core" }
 mesh-storage = { path = "../mesh-storage" }
 mesh-cypher = { path = "../mesh-cypher" }
+serde = { workspace = true }
 thiserror.workspace = true
 
 [dev-dependencies]

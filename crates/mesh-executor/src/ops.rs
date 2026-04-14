@@ -2,6 +2,7 @@ use crate::{
     error::{Error, Result},
     eval::{compare_values, eval_expr, literal_to_property, row_key, to_bool, value_key},
     value::{Row, Value},
+    writer::GraphWriter,
 };
 use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use mesh_cypher::{
@@ -14,15 +15,29 @@ use std::collections::{HashMap, HashSet};
 
 pub struct ExecCtx<'a> {
     pub store: &'a Store,
+    pub writer: &'a dyn GraphWriter,
 }
 
 pub trait Operator {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>>;
 }
 
+/// Execute a plan using the given store for both reads and writes.
+/// Equivalent to [`execute_with_writer`] with the store as the writer.
 pub fn execute(plan: &LogicalPlan, store: &Store) -> Result<Vec<Row>> {
+    execute_with_writer(plan, store, store)
+}
+
+/// Execute a plan, sending mutations to a separate [`GraphWriter`]. Reads
+/// always go to `store`. In cluster mode the caller supplies a writer that
+/// proposes each mutation through Raft.
+pub fn execute_with_writer(
+    plan: &LogicalPlan,
+    store: &Store,
+    writer: &dyn GraphWriter,
+) -> Result<Vec<Row>> {
     let mut op = build_op(plan);
-    let ctx = ExecCtx { store };
+    let ctx = ExecCtx { store, writer };
     let mut rows = Vec::new();
     while let Some(row) = op.next(&ctx)? {
         rows.push(row);
@@ -162,7 +177,7 @@ impl CreatePathOp {
                     for (k, v) in properties {
                         node.properties.insert(k.clone(), literal_to_property(v));
                     }
-                    ctx.store.put_node(&node)?;
+                    ctx.writer.put_node(&node)?;
                     node_ids.push(node.id);
                     if let Some(v) = var {
                         out.insert(v.clone(), Value::Node(node));
@@ -181,7 +196,7 @@ impl CreatePathOp {
             let src = node_ids[spec.src_idx];
             let dst = node_ids[spec.dst_idx];
             let edge = Edge::new(spec.edge_type.clone(), src, dst);
-            ctx.store.put_edge(&edge)?;
+            ctx.writer.put_edge(&edge)?;
             if let Some(v) = &spec.var {
                 out.insert(v.clone(), Value::Edge(edge));
             }
@@ -299,20 +314,18 @@ impl Operator for DeleteOp {
                     match row.get(var) {
                         Some(Value::Node(n)) => {
                             if self.detach {
-                                ctx.store.detach_delete_node(n.id)?;
+                                ctx.writer.detach_delete_node(n.id)?;
                             } else {
                                 let out = ctx.store.outgoing(n.id)?;
                                 let inc = ctx.store.incoming(n.id)?;
                                 if !out.is_empty() || !inc.is_empty() {
                                     return Err(Error::CannotDeleteAttachedNode);
                                 }
-                                ctx.store.detach_delete_node(n.id)?;
+                                ctx.writer.detach_delete_node(n.id)?;
                             }
                         }
                         Some(Value::Edge(e)) => {
-                            if ctx.store.get_edge(e.id)?.is_some() {
-                                ctx.store.delete_edge(e.id)?;
-                            }
+                            ctx.writer.delete_edge(e.id)?;
                         }
                         _ => return Err(Error::UnboundVariable(var.clone())),
                     }
@@ -449,15 +462,15 @@ impl Operator for SetPropertyOp {
                     }
                 }
 
-                // Phase 3: flush each mutated entity once to the store.
+                // Phase 3: flush each mutated entity once to the writer.
                 for var in &updated_nodes {
                     if let Some(Value::Node(n)) = row.get(var) {
-                        ctx.store.put_node(n)?;
+                        ctx.writer.put_node(n)?;
                     }
                 }
                 for var in &updated_edges {
                     if let Some(Value::Edge(e)) = row.get(var) {
-                        ctx.store.put_edge(e)?;
+                        ctx.writer.put_edge(e)?;
                     }
                 }
 

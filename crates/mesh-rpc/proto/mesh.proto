@@ -49,6 +49,11 @@ service MeshQuery {
   rpc Outgoing(NeighborRequest) returns (NeighborResponse);
   rpc Incoming(NeighborRequest) returns (NeighborResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
+  // Parse + plan + execute a Cypher query. Mutating clauses (CREATE, SET,
+  // DELETE) route through Raft when the server is running in cluster mode,
+  // so the executor's writes replicate to every replica via the same
+  // commit path as direct gRPC writes.
+  rpc ExecuteCypher(ExecuteCypherRequest) returns (ExecuteCypherResponse);
 }
 
 message GetNodeRequest { UuidBytes id = 1; }
@@ -81,6 +86,16 @@ message NeighborResponse { repeated NeighborInfo neighbors = 1; }
 message HealthRequest {}
 message HealthResponse {
   bool serving = 1;
+}
+
+message ExecuteCypherRequest {
+  string query = 1;
+}
+
+// Rows carried as a single JSON blob (serde-serialized Vec<mesh_executor::Row>).
+// A typed proto Value is deferred until the row shape stabilizes.
+message ExecuteCypherResponse {
+  bytes rows_json = 1;
 }
 
 // Mutations. Writes for a node are routed to the partition owner; writes for

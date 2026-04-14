@@ -6,7 +6,9 @@ use std::sync::Arc;
 use mesh_rpc::convert::{node_to_proto, uuid_to_proto};
 use mesh_rpc::proto::mesh_query_client::MeshQueryClient;
 use mesh_rpc::proto::mesh_write_client::MeshWriteClient;
-use mesh_rpc::proto::{GetNodeRequest, HealthRequest, PutNodeRequest};
+use mesh_rpc::proto::{
+    ExecuteCypherRequest, GetNodeRequest, HealthRequest, PutNodeRequest,
+};
 use mesh_server::config::{PeerConfig, ServerConfig};
 use mesh_server::ServerComponents;
 use std::path::PathBuf;
@@ -829,6 +831,144 @@ async fn peer_restart_recovers_persistent_raft_state() {
         wait_for_node(&mut reader_b2, y_id).await,
         "restarted B didn't receive post-restart node Y — not a functioning follower"
     );
+}
+
+#[tokio::test]
+async fn cypher_create_replicates_through_raft_to_follower() {
+    // End-to-end payoff: a Cypher CREATE sent to peer A's ExecuteCypher RPC
+    // lands on peer A's executor, which routes its writes through the
+    // RaftGraphWriter → propose_graph → commit → StoreGraphApplier on every
+    // replica. Peer B can then serve both a MATCH RETURN query over Cypher
+    // and a raw GetNode RPC for the created node — proving the executor's
+    // writes replicate exactly like direct MeshWrite PutNode.
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        PeerConfig {
+            id: 1,
+            address: addr_a.to_string(),
+        },
+        PeerConfig {
+            id: 2,
+            address: addr_b.to_string(),
+        },
+    ];
+    let config_a = ServerConfig {
+        self_id: 1,
+        listen_address: addr_a.to_string(),
+        data_dir: dir_a.path().to_path_buf(),
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap: true,
+    };
+    let config_b = ServerConfig {
+        self_id: 2,
+        listen_address: addr_b.to_string(),
+        data_dir: dir_b.path().to_path_buf(),
+        num_partitions: 4,
+        peers,
+        bootstrap: false,
+    };
+
+    let components_a = mesh_server::build_components(&config_a).await.unwrap();
+    let components_b = mesh_server::build_components(&config_b).await.unwrap();
+    let raft_a = components_a.raft.clone().unwrap();
+
+    let ServerComponents {
+        service: service_a,
+        raft: _,
+        raft_service: raft_service_a,
+    } = components_a;
+    let ServerComponents {
+        service: service_b,
+        raft: _,
+        raft_service: raft_service_b,
+    } = components_b;
+    let raft_service_a = raft_service_a.unwrap();
+    let raft_service_b = raft_service_b.unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_a.clone().into_query_server())
+            .add_service(service_a.into_write_server())
+            .add_service(raft_service_a.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_a))
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_b.clone().into_query_server())
+            .add_service(service_b.into_write_server())
+            .add_service(raft_service_b.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_b))
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    mesh_server::initialize_if_seed(&config_a, &raft_a)
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if raft_a.raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+
+    // CREATE via Cypher on the leader. The executor's CreatePathOp routes
+    // its single put_node through RaftGraphWriter → propose_graph → commit.
+    let mut query_a = MeshQueryClient::connect(format!("http://{}", addr_a))
+        .await
+        .unwrap();
+    query_a
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE (n:Person {name: 'Ada', age: 36}) RETURN n".into(),
+        })
+        .await
+        .expect("CREATE through Cypher should commit on leader");
+
+    // MATCH on peer B via Cypher; poll until the committed entry has been
+    // applied on B's state machine.
+    let mut query_b = MeshQueryClient::connect(format!("http://{}", addr_b))
+        .await
+        .unwrap();
+    let mut matched_rows: Option<serde_json::Value> = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let resp = query_b
+            .execute_cypher(ExecuteCypherRequest {
+                query: "MATCH (n:Person) RETURN n.name AS name, n.age AS age".into(),
+            })
+            .await
+            .unwrap();
+        let rows: serde_json::Value =
+            serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+        if rows.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            matched_rows = Some(rows);
+            break;
+        }
+    }
+    let rows = matched_rows.expect("follower didn't see Cypher-created node");
+    let row = &rows.as_array().unwrap()[0];
+    // Value is untagged serde (default: external tag), Property is
+    // internally tagged `{type, value}`. So:
+    //   Value::Property(Property::String("Ada"))
+    //     → {"Property":{"type":"String","value":"Ada"}}
+    assert_eq!(
+        row["name"]["Property"]["value"].as_str().unwrap(),
+        "Ada",
+        "row: {row}"
+    );
+    assert_eq!(row["age"]["Property"]["value"].as_i64().unwrap(), 36);
 }
 
 #[tokio::test]
