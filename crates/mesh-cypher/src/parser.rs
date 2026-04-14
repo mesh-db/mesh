@@ -31,8 +31,50 @@ fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
     match inner.as_rule() {
         Rule::create_stmt => Ok(Statement::Create(build_create(inner)?)),
         Rule::match_stmt => Ok(Statement::Match(build_match(inner)?)),
+        Rule::merge_stmt => Ok(Statement::Merge(build_merge(inner)?)),
         r => Err(Error::Parse(format!("unexpected rule: {:?}", r))),
     }
+}
+
+fn build_merge(pair: Pair<Rule>) -> Result<MergeStmt> {
+    let mut pattern: Option<NodePattern> = None;
+    let mut return_items = Vec::new();
+    let mut distinct = false;
+    let mut order_by: Vec<SortItem> = Vec::new();
+    let mut skip = None;
+    let mut limit = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::node_pattern => pattern = Some(build_node_pattern(p)?),
+            Rule::return_tail => {
+                parse_return_tail(
+                    p,
+                    &mut return_items,
+                    &mut distinct,
+                    &mut order_by,
+                    &mut skip,
+                    &mut limit,
+                )?;
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in merge: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+
+    let pattern = pattern.ok_or_else(|| Error::Parse("MERGE requires a node pattern".into()))?;
+    Ok(MergeStmt {
+        pattern,
+        return_items,
+        distinct,
+        order_by,
+        skip,
+        limit,
+    })
 }
 
 fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {

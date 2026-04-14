@@ -2,9 +2,10 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
 query = { SOI ~ statement ~ EOI }
 
-statement = { create_stmt | match_stmt }
+statement = { merge_stmt | create_stmt | match_stmt }
 
 create_stmt = { kw_create ~ pattern_list ~ return_tail? }
+merge_stmt  = { kw_merge ~ node_pattern ~ return_tail? }
 
 match_stmt = {
     kw_match ~ pattern_list ~
@@ -109,7 +110,7 @@ identifier = @{ !reserved ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 id_cont = _{ ASCII_ALPHANUMERIC | "_" }
 
 reserved = @{
-    (^"create" | ^"match" | ^"where" | ^"return" | ^"skip" | ^"limit" |
+    (^"create" | ^"merge" | ^"match" | ^"where" | ^"return" | ^"skip" | ^"limit" |
      ^"as" | ^"or" | ^"and" | ^"not" | ^"true" | ^"false" | ^"null" |
      ^"set" | ^"delete" | ^"detach" |
      ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc")
@@ -117,6 +118,7 @@ reserved = @{
 }
 
 kw_create = _{ ^"create" }
+kw_merge  = _{ ^"merge" }
 kw_match = _{ ^"match" }
 kw_where = _{ ^"where" }
 kw_return = _{ ^"return" }

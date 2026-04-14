@@ -7,7 +7,7 @@ use crate::{
 use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use mesh_cypher::{
     AggregateArg, AggregateFn, AggregateSpec, CreateEdgeSpec, CreateNodeSpec, Direction, Expr,
-    LogicalPlan, ReturnItem, SetAssignment, SortItem,
+    Literal, LogicalPlan, ReturnItem, SetAssignment, SortItem,
 };
 use mesh_storage::Store;
 use std::cmp::Ordering;
@@ -132,6 +132,15 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
         }
         LogicalPlan::Skip { input, count } => Box::new(SkipOp::new(build_op(input), *count)),
         LogicalPlan::Limit { input, count } => Box::new(LimitOp::new(build_op(input), *count)),
+        LogicalPlan::MergeNode {
+            var,
+            labels,
+            properties,
+        } => Box::new(MergeNodeOp::new(
+            var.clone(),
+            labels.clone(),
+            properties.clone(),
+        )),
     }
 }
 
@@ -569,6 +578,92 @@ impl Operator for NodeScanByLabelsOp {
 
 fn has_all_labels(node: &Node, labels: &[String]) -> bool {
     labels.iter().all(|l| node.labels.contains(l))
+}
+
+fn matches_pattern_props(node: &Node, props: &[(String, Literal)]) -> bool {
+    props.iter().all(|(k, v)| {
+        node.properties
+            .get(k)
+            .map(|stored| *stored == literal_to_property(v))
+            .unwrap_or(false)
+    })
+}
+
+struct MergeNodeOp {
+    var: String,
+    labels: Vec<String>,
+    properties: Vec<(String, Literal)>,
+    initialized: bool,
+    matched: Vec<Node>,
+    cursor: usize,
+}
+
+impl MergeNodeOp {
+    fn new(var: String, labels: Vec<String>, properties: Vec<(String, Literal)>) -> Self {
+        Self {
+            var,
+            labels,
+            properties,
+            initialized: false,
+            matched: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    fn scan(&mut self, ctx: &ExecCtx) -> Result<()> {
+        // Pick a candidate set: by-label index when one is given, else
+        // a full node scan. Any extra labels beyond the first get filtered
+        // per-node, mirroring NodeScanByLabelsOp.
+        let candidate_ids: Vec<NodeId> = if let Some(primary) = self.labels.first() {
+            ctx.store.nodes_by_label(primary)?
+        } else {
+            ctx.store.all_node_ids()?
+        };
+        for id in candidate_ids {
+            if let Some(node) = ctx.store.get_node(id)? {
+                if has_all_labels(&node, &self.labels)
+                    && matches_pattern_props(&node, &self.properties)
+                {
+                    self.matched.push(node);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Operator for MergeNodeOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        if !self.initialized {
+            self.scan(ctx)?;
+            if self.matched.is_empty() {
+                // No match — create exactly one node carrying the pattern's
+                // labels and properties, then fall through to emit it. The
+                // write goes through `ctx.writer`, so in cluster mode this
+                // becomes part of the BufferingGraphWriter's batch and
+                // commits atomically with any sibling mutations.
+                let mut node = Node::new();
+                for label in &self.labels {
+                    node.labels.push(label.clone());
+                }
+                for (k, v) in &self.properties {
+                    node.properties.insert(k.clone(), literal_to_property(v));
+                }
+                ctx.writer.put_node(&node)?;
+                self.matched.push(node);
+            }
+            self.initialized = true;
+        }
+        if self.cursor < self.matched.len() {
+            let node = self.matched[self.cursor].clone();
+            self.cursor += 1;
+            let mut row = Row::new();
+            row.insert(self.var.clone(), Value::Node(node));
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 struct EdgeExpandOp {

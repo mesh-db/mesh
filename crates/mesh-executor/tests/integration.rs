@@ -1516,6 +1516,110 @@ fn set_on_edge_property() {
 }
 
 #[test]
+fn merge_creates_node_when_no_match_exists() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "MERGE (n:Person {name: 'Ada'}) RETURN n.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+
+    // The created node should be persisted.
+    let rows = run(&store, "MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn merge_binds_existing_node_without_creating() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada', age: 36})");
+
+    // Second MERGE on the same key should be a no-op write-wise. Verify
+    // both that the rows reflect the existing entity and that the store
+    // still only has one Person.
+    let rows = run(
+        &store,
+        "MERGE (n:Person {name: 'Ada'}) RETURN n.age AS age",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("age") {
+        Some(Value::Property(Property::Int64(36))) => {}
+        other => panic!("expected age=36, got {other:?}"),
+    }
+
+    let count_rows = run(&store, "MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(count_rows.len(), 1, "MERGE must not create a duplicate");
+}
+
+#[test]
+fn merge_returns_all_existing_matches() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (a:Person {name: 'Ada', city: 'London'})");
+    run(&store, "CREATE (b:Person {name: 'Grace', city: 'London'})");
+
+    // Two existing nodes match the city pattern. MERGE should return both
+    // rather than appending a third.
+    let rows = run(
+        &store,
+        "MERGE (n:Person {city: 'London'}) RETURN n.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string(), "Grace".to_string()]);
+
+    // Still no third node.
+    let all = run(&store, "MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn merge_repeated_invocations_are_idempotent() {
+    let (store, _d) = open_store();
+    for _ in 0..5 {
+        run(&store, "MERGE (n:Person {name: 'Ada'})");
+    }
+    let rows = run(&store, "MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn merge_without_label_uses_full_scan() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n {tag: 'one'})");
+    let rows = run(&store, "MERGE (n {tag: 'one'}) RETURN n.tag AS tag");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "tag"), "one");
+
+    // A pattern with no matches should create exactly one new node.
+    let rows = run(&store, "MERGE (n {tag: 'two'}) RETURN n.tag AS tag");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "tag"), "two");
+}
+
+#[test]
+fn merge_with_multi_label_pattern_matches_intersection() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person:Engineer {name: 'Ada'})");
+    run(&store, "CREATE (n:Person {name: 'Bob'})");
+
+    // Only the Person+Engineer node should match — the second create
+    // is missing the Engineer label.
+    let rows = run(
+        &store,
+        "MERGE (n:Person:Engineer {name: 'Ada'}) RETURN n.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+
+    // Verify no extra node was created (still 2 Persons total).
+    let all = run(&store, "MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");

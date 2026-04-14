@@ -1,6 +1,6 @@
 use crate::ast::{
-    CallArgs, CreateStmt, Direction, Expr, Literal, MatchStmt, NodePattern, Pattern, ReturnItem,
-    SortItem, Statement,
+    CallArgs, CreateStmt, Direction, Expr, Literal, MatchStmt, MergeStmt, NodePattern, Pattern,
+    ReturnItem, SortItem, Statement,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -79,6 +79,15 @@ pub enum LogicalPlan {
     SetProperty {
         input: Box<LogicalPlan>,
         assignments: Vec<SetAssignment>,
+    },
+    /// Match-or-create a single node. If at least one node matches the
+    /// `(labels, properties)` pattern, returns one row per match (binding
+    /// the existing node to `var`). If none match, creates exactly one
+    /// node with the given labels + properties and returns one row.
+    MergeNode {
+        var: String,
+        labels: Vec<String>,
+        properties: Vec<(String, Literal)>,
     },
 }
 
@@ -161,6 +170,35 @@ pub fn plan(statement: &Statement) -> Result<LogicalPlan> {
     match statement {
         Statement::Create(c) => plan_create(c),
         Statement::Match(m) => plan_match(m),
+        Statement::Merge(m) => plan_merge(m),
+    }
+}
+
+fn plan_merge(stmt: &MergeStmt) -> Result<LogicalPlan> {
+    // Auto-name the binding when the user wrote `MERGE (:Label {...})` — we
+    // still need *some* var so RETURN can refer to it via the auto-name.
+    let var = stmt
+        .pattern
+        .var
+        .clone()
+        .unwrap_or_else(|| "__merge0".to_string());
+    let plan = LogicalPlan::MergeNode {
+        var,
+        labels: stmt.pattern.labels.clone(),
+        properties: stmt.pattern.properties.clone(),
+    };
+
+    if stmt.return_items.is_empty() {
+        Ok(plan)
+    } else {
+        apply_return_pipeline(
+            plan,
+            &stmt.return_items,
+            stmt.distinct,
+            &stmt.order_by,
+            stmt.skip,
+            stmt.limit,
+        )
     }
 }
 
