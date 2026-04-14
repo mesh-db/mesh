@@ -8,8 +8,11 @@ description = "Cluster membership and partitioning for Mesh"
 [dependencies]
 mesh-core = { path = "../mesh-core" }
 openraft = { version = "0.9", features = ["serde"] }
+async-trait = "0.1"
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror.workspace = true
+tokio = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+tokio = { workspace = true }

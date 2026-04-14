@@ -343,6 +343,90 @@ fn apply_routing_reflects_state_changes() {
     );
 }
 
+#[tokio::test]
+async fn raft_single_node_bootstraps_and_applies_commands() {
+    use mesh_cluster::raft::RaftCluster;
+    use mesh_cluster::{ClusterState, Membership, PartitionMap};
+
+    // Initial state: one peer (self), one partition.
+    let initial = ClusterState::new(
+        Membership::new(vec![Peer::new(PeerId(1), "127.0.0.1:7001")]),
+        PartitionMap::round_robin(&[PeerId(1)], 1).unwrap(),
+    );
+
+    let cluster = RaftCluster::new_single_node(1, initial)
+        .await
+        .expect("raft should bootstrap");
+
+    // Drive a command through the full client_write → commit → apply cycle.
+    cluster
+        .propose(ClusterCommand::AddPeer {
+            id: PeerId(2),
+            address: "127.0.0.1:7002".into(),
+        })
+        .await
+        .expect("propose should succeed");
+
+    // State machine applied the change.
+    let state = cluster.current_state().await;
+    assert_eq!(state.membership.len(), 2);
+    assert_eq!(state.membership.address(PeerId(2)), Some("127.0.0.1:7002"));
+
+    cluster.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn raft_single_node_applies_command_sequence_in_order() {
+    use mesh_cluster::raft::RaftCluster;
+    use mesh_cluster::{ClusterState, Membership, PartitionMap};
+
+    let initial = ClusterState::new(
+        Membership::new(vec![Peer::new(PeerId(1), "127.0.0.1:7001")]),
+        PartitionMap::round_robin(&[PeerId(1)], 4).unwrap(),
+    );
+    let cluster = RaftCluster::new_single_node(1, initial).await.unwrap();
+
+    cluster
+        .propose(ClusterCommand::AddPeer {
+            id: PeerId(2),
+            address: "b".into(),
+        })
+        .await
+        .unwrap();
+    cluster
+        .propose(ClusterCommand::AddPeer {
+            id: PeerId(3),
+            address: "c".into(),
+        })
+        .await
+        .unwrap();
+    cluster.propose(ClusterCommand::Rebalance).await.unwrap();
+    cluster
+        .propose(ClusterCommand::UpdatePeerAddress {
+            id: PeerId(2),
+            address: "b-new".into(),
+        })
+        .await
+        .unwrap();
+
+    let state = cluster.current_state().await;
+    assert_eq!(state.membership.len(), 3);
+    assert_eq!(state.membership.address(PeerId(2)), Some("b-new"));
+    // All current members referenced by the partition map after Rebalance.
+    for owner in state.partition_map.assignments() {
+        assert!(state.membership.contains(*owner));
+    }
+    // Every peer should own at least one partition after the 3-peer rebalance.
+    for pid in [PeerId(1), PeerId(2), PeerId(3)] {
+        assert!(
+            state.partition_map.assignments().contains(&pid),
+            "{pid} missing from partition map"
+        );
+    }
+
+    cluster.shutdown().await.ok();
+}
+
 #[test]
 fn openraft_type_config_binds_domain_types() {
     // The declare_raft_types! macro at mesh_cluster::raft ties ClusterCommand

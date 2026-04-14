@@ -22,4 +22,7 @@ pub enum Error {
 
     #[error("cannot remove the local peer from the cluster")]
     CannotRemoveSelf,
+
+    #[error("raft error: {0}")]
+    Raft(String),
 }
