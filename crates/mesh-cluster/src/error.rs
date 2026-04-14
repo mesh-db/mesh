@@ -25,4 +25,12 @@ pub enum Error {
 
     #[error("raft error: {0}")]
     Raft(String),
+
+    #[error(
+        "not the raft leader; forward to peer {leader_id:?} at {leader_address:?}"
+    )]
+    ForwardToLeader {
+        leader_id: Option<PeerId>,
+        leader_address: Option<String>,
+    },
 }

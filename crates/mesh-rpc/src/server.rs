@@ -3,6 +3,7 @@ use crate::convert::{
     node_to_proto, uuid_to_proto,
 };
 use crate::proto::mesh_query_server::{MeshQuery, MeshQueryServer};
+use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
     DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest, DetachDeleteNodeResponse,
@@ -12,10 +13,11 @@ use crate::proto::{
 };
 use crate::routing::Routing;
 use mesh_cluster::raft::RaftCluster;
-use mesh_cluster::{GraphCommand, PeerId};
+use mesh_cluster::{Error as ClusterError, GraphCommand, PeerId};
 use mesh_storage::Store;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
@@ -68,6 +70,12 @@ impl MeshService {
 
 fn raft_propose_failed<E: std::fmt::Display>(e: E) -> Status {
     Status::internal(format!("raft propose failed: {e}"))
+}
+
+fn leader_write_client(addr: &str) -> Result<MeshWriteClient<Channel>, Status> {
+    let endpoint = Endpoint::from_shared(format!("http://{}", addr))
+        .map_err(|e| Status::internal(format!("invalid leader address {addr}: {e}")))?;
+    Ok(MeshWriteClient::new(endpoint.connect_lazy()))
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> Status {
@@ -292,12 +300,27 @@ impl MeshWrite for MeshService {
         let id = node.id;
 
         // Raft mode: propose through consensus. Every replica's state
-        // machine applies the same write via StoreGraphApplier.
+        // machine applies the same write via StoreGraphApplier. If we are
+        // not the leader, openraft surfaces a ForwardToLeader error with
+        // the leader's address; we transparently forward the original RPC
+        // there so clients can write to any peer.
         if let Some(raft) = &self.raft {
-            raft.propose_graph(GraphCommand::PutNode(node))
-                .await
-                .map_err(raft_propose_failed)?;
-            return Ok(Response::new(PutNodeResponse {}));
+            match raft.propose_graph(GraphCommand::PutNode(node)).await {
+                Ok(_) => return Ok(Response::new(PutNodeResponse {})),
+                Err(ClusterError::ForwardToLeader {
+                    leader_address: Some(addr),
+                    ..
+                }) => {
+                    let mut client = leader_write_client(&addr)?;
+                    return client
+                        .put_node(PutNodeRequest {
+                            node: Some(proto_node),
+                            local_only,
+                        })
+                        .await;
+                }
+                Err(e) => return Err(raft_propose_failed(e)),
+            }
         }
 
         // Route to the owner when we aren't it.
@@ -333,10 +356,22 @@ impl MeshWrite for MeshService {
         let edge = edge_from_proto(proto_edge.clone()).map_err(bad_request)?;
 
         if let Some(raft) = &self.raft {
-            raft.propose_graph(GraphCommand::PutEdge(edge))
-                .await
-                .map_err(raft_propose_failed)?;
-            return Ok(Response::new(PutEdgeResponse {}));
+            match raft.propose_graph(GraphCommand::PutEdge(edge)).await {
+                Ok(_) => return Ok(Response::new(PutEdgeResponse {})),
+                Err(ClusterError::ForwardToLeader {
+                    leader_address: Some(addr),
+                    ..
+                }) => {
+                    let mut client = leader_write_client(&addr)?;
+                    return client
+                        .put_edge(PutEdgeRequest {
+                            edge: Some(proto_edge),
+                            local_only,
+                        })
+                        .await;
+                }
+                Err(e) => return Err(raft_propose_failed(e)),
+            }
         }
 
         if let Some(routing) = &self.routing {
@@ -384,10 +419,22 @@ impl MeshWrite for MeshService {
         let id = edge_id_from_proto(&id_proto).map_err(bad_request)?;
 
         if let Some(raft) = &self.raft {
-            raft.propose_graph(GraphCommand::DeleteEdge(id))
-                .await
-                .map_err(raft_propose_failed)?;
-            return Ok(Response::new(DeleteEdgeResponse {}));
+            match raft.propose_graph(GraphCommand::DeleteEdge(id)).await {
+                Ok(_) => return Ok(Response::new(DeleteEdgeResponse {})),
+                Err(ClusterError::ForwardToLeader {
+                    leader_address: Some(addr),
+                    ..
+                }) => {
+                    let mut client = leader_write_client(&addr)?;
+                    return client
+                        .delete_edge(DeleteEdgeRequest {
+                            edge_id: Some(id_proto),
+                            local_only,
+                        })
+                        .await;
+                }
+                Err(e) => return Err(raft_propose_failed(e)),
+            }
         }
 
         // Local delete is idempotent (check-then-delete).
@@ -431,10 +478,22 @@ impl MeshWrite for MeshService {
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
 
         if let Some(raft) = &self.raft {
-            raft.propose_graph(GraphCommand::DetachDeleteNode(id))
-                .await
-                .map_err(raft_propose_failed)?;
-            return Ok(Response::new(DetachDeleteNodeResponse {}));
+            match raft.propose_graph(GraphCommand::DetachDeleteNode(id)).await {
+                Ok(_) => return Ok(Response::new(DetachDeleteNodeResponse {})),
+                Err(ClusterError::ForwardToLeader {
+                    leader_address: Some(addr),
+                    ..
+                }) => {
+                    let mut client = leader_write_client(&addr)?;
+                    return client
+                        .detach_delete_node(DetachDeleteNodeRequest {
+                            node_id: Some(id_proto),
+                            local_only,
+                        })
+                        .await;
+                }
+                Err(e) => return Err(raft_propose_failed(e)),
+            }
         }
 
         // Local detach-delete is idempotent — no-op if the node isn't here.

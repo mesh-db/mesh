@@ -337,6 +337,154 @@ async fn build_components_multi_peer_builds_raft() {
 }
 
 #[tokio::test]
+async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
+    // The leader-forwarding payoff: a `MeshWrite::PutNode` RPC sent to peer B
+    // (the follower) is transparently forwarded by B's MeshService to peer A
+    // (the leader) over gRPC. The leader proposes via Raft, the follower's
+    // state machine applies the commit, and reads on either peer find the
+    // node. Clients can write to *any* peer in the cluster.
+
+    use std::time::Duration;
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        PeerConfig {
+            id: 1,
+            address: addr_a.to_string(),
+        },
+        PeerConfig {
+            id: 2,
+            address: addr_b.to_string(),
+        },
+    ];
+    let config_a = ServerConfig {
+        self_id: 1,
+        listen_address: addr_a.to_string(),
+        data_dir: dir_a.path().to_path_buf(),
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap: true,
+    };
+    let config_b = ServerConfig {
+        self_id: 2,
+        listen_address: addr_b.to_string(),
+        data_dir: dir_b.path().to_path_buf(),
+        num_partitions: 4,
+        peers,
+        bootstrap: false,
+    };
+
+    let components_a = mesh_server::build_components(&config_a).await.unwrap();
+    let components_b = mesh_server::build_components(&config_b).await.unwrap();
+
+    let raft_a = components_a.raft.clone().unwrap();
+
+    let ServerComponents {
+        service: service_a,
+        raft: _,
+        raft_service: raft_service_a,
+    } = components_a;
+    let ServerComponents {
+        service: service_b,
+        raft: _,
+        raft_service: raft_service_b,
+    } = components_b;
+    let raft_service_a = raft_service_a.unwrap();
+    let raft_service_b = raft_service_b.unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_a.clone().into_query_server())
+            .add_service(service_a.into_write_server())
+            .add_service(raft_service_a.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_a))
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_b.clone().into_query_server())
+            .add_service(service_b.into_write_server())
+            .add_service(raft_service_b.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener_b))
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    mesh_server::initialize_if_seed(&config_a, &raft_a)
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if raft_a.raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+
+    // *** The actual test: write to peer B, the follower. ***
+    let mut writer_to_follower = MeshWriteClient::connect(format!("http://{}", addr_b))
+        .await
+        .unwrap();
+    let node = Node::new()
+        .with_label("Person")
+        .with_property("name", "Grace");
+    let node_id = node.id;
+    writer_to_follower
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&node).unwrap()),
+            local_only: false,
+        })
+        .await
+        .expect("follower should transparently forward to leader");
+
+    // Visible on the leader (peer A).
+    let mut reader_a = MeshQueryClient::connect(format!("http://{}", addr_a))
+        .await
+        .unwrap();
+    let resp = reader_a
+        .get_node(GetNodeRequest {
+            id: Some(uuid_to_proto(node_id.as_uuid())),
+        })
+        .await
+        .unwrap();
+    assert!(
+        resp.into_inner().found,
+        "leader should hold the forwarded write"
+    );
+
+    // Visible on the follower (peer B) after Raft replication.
+    let mut reader_b = MeshQueryClient::connect(format!("http://{}", addr_b))
+        .await
+        .unwrap();
+    let mut visible_on_b = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let resp = reader_b
+            .get_node(GetNodeRequest {
+                id: Some(uuid_to_proto(node_id.as_uuid())),
+            })
+            .await
+            .unwrap();
+        if resp.into_inner().found {
+            visible_on_b = true;
+            break;
+        }
+    }
+    assert!(
+        visible_on_b,
+        "follower didn't see its own forwarded-then-replicated write"
+    );
+}
+
+#[tokio::test]
 async fn write_via_grpc_replicates_through_raft_to_follower() {
     // The user-facing payoff: a `MeshWrite::PutNode` RPC sent to peer A goes
     // through Raft consensus, replicates to peer B, and a `MeshQuery::GetNode`

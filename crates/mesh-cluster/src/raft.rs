@@ -482,14 +482,25 @@ impl RaftCluster {
         self.propose_entry(MeshLogEntry::Graph(command)).await
     }
 
-    /// Propose an arbitrary [`MeshLogEntry`].
+    /// Propose an arbitrary [`MeshLogEntry`]. Returns
+    /// [`Error::ForwardToLeader`] when called on a non-leader peer so the
+    /// caller can route the request to the actual leader.
     pub async fn propose_entry(&self, entry: MeshLogEntry) -> Result<ApplyResponse> {
-        let response = self
-            .raft
-            .client_write(entry)
-            .await
-            .map_err(|e| Error::Raft(e.to_string()))?;
-        Ok(response.data)
+        use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
+        match self.raft.client_write(entry).await {
+            Ok(response) => Ok(response.data),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(
+                ForwardToLeader {
+                    leader_id,
+                    leader_node,
+                    ..
+                },
+            ))) => Err(Error::ForwardToLeader {
+                leader_id: leader_id.map(crate::PeerId),
+                leader_address: leader_node.map(|n| n.addr),
+            }),
+            Err(e) => Err(Error::Raft(e.to_string())),
+        }
     }
 
     pub async fn current_state(&self) -> ClusterState {
