@@ -376,6 +376,58 @@ async fn raft_single_node_bootstraps_and_applies_commands() {
 }
 
 #[tokio::test]
+async fn raft_propose_surfaces_state_machine_apply_errors() {
+    // The divergence-detection payoff: when a committed entry is rejected
+    // by the local state machine, the proposing client gets a typed
+    // `Error::Apply` rather than a silent success. Demonstrated with a
+    // duplicate `AddPeer` — first proposal succeeds, second hits the
+    // `PeerAlreadyExists` invariant inside `ClusterState::apply` and the
+    // error string from that path bubbles through `ApplyResponse.error`
+    // back into `propose_entry`.
+
+    use mesh_cluster::raft::RaftCluster;
+    use mesh_cluster::{ClusterState, Membership, PartitionMap};
+
+    let initial = ClusterState::new(
+        Membership::new(vec![Peer::new(PeerId(1), "127.0.0.1:7001")]),
+        PartitionMap::round_robin(&[PeerId(1)], 1).unwrap(),
+    );
+    let cluster = RaftCluster::new_single_node(1, initial)
+        .await
+        .expect("raft should bootstrap");
+
+    cluster
+        .propose(ClusterCommand::AddPeer {
+            id: PeerId(2),
+            address: "127.0.0.1:7002".into(),
+        })
+        .await
+        .expect("first AddPeer should commit and apply");
+
+    let err = cluster
+        .propose(ClusterCommand::AddPeer {
+            id: PeerId(2),
+            address: "127.0.0.1:7002".into(),
+        })
+        .await
+        .expect_err("second AddPeer must surface the apply error");
+    match err {
+        Error::Apply(msg) => assert!(
+            msg.contains("peer already exists"),
+            "expected PeerAlreadyExists message, got: {msg}"
+        ),
+        other => panic!("expected Error::Apply, got {other:?}"),
+    }
+
+    // Sanity: state machine still reflects the *first* successful apply.
+    let state = cluster.current_state().await;
+    assert_eq!(state.membership.len(), 2);
+    assert_eq!(state.membership.address(PeerId(2)), Some("127.0.0.1:7002"));
+
+    cluster.shutdown().await.ok();
+}
+
+#[tokio::test]
 async fn raft_persistent_store_reloads_state_machine_after_restart() {
     // The persistent state-machine payoff: if last_applied / cluster_state /
     // stored_membership survive process restart, openraft can resume

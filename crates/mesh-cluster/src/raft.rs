@@ -80,8 +80,31 @@ fn write_sm_err<E: std::error::Error + 'static>(e: E) -> StorageError<NodeId> {
 pub type NodeId = u64;
 
 /// Response returned from the state machine when an entry is applied.
+/// `error: Some(_)` means the entry committed through Raft (so every replica
+/// will observe it) but the local apply step rejected it — for example, a
+/// `ClusterCommand::AddPeer` for a peer that's already a member. Callers
+/// should treat a populated `error` as a write failure even though the
+/// underlying `client_write` returned Ok.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApplyResponse;
+pub struct ApplyResponse {
+    pub error: Option<String>,
+}
+
+impl ApplyResponse {
+    pub fn ok() -> Self {
+        Self { error: None }
+    }
+
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self {
+            error: Some(msg.into()),
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        self.error.is_none()
+    }
+}
 
 /// Wire format for a Raft snapshot. Carries both the cluster-metadata
 /// state and the opaque graph blob produced by [`GraphStateMachine::snapshot`].
@@ -462,26 +485,33 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         let mut results = Vec::with_capacity(entries.len());
         for entry in entries {
             inner.last_applied = Some(entry.log_id);
-            match &entry.payload {
-                EntryPayload::Blank => {}
+            // Per-entry apply result. Raft progress is unaffected — every
+            // replica sees the same Result for the same entry, so we get
+            // deterministic divergence rather than silent drift. The
+            // proposing client can then turn the error into a typed
+            // failure via `propose_entry`.
+            let response = match &entry.payload {
+                EntryPayload::Blank => ApplyResponse::ok(),
                 EntryPayload::Normal(log_entry) => match log_entry {
-                    MeshLogEntry::Cluster(cmd) => {
-                        // Apply errors are swallowed so Raft keeps making
-                        // progress; a follow-up step will surface them.
-                        let _ = inner.state.apply(cmd);
-                    }
-                    MeshLogEntry::Graph(cmd) => {
-                        if let Some(applier) = &graph_applier {
-                            let _ = applier.apply(cmd);
-                        }
-                    }
+                    MeshLogEntry::Cluster(cmd) => match inner.state.apply(cmd) {
+                        Ok(()) => ApplyResponse::ok(),
+                        Err(e) => ApplyResponse::err(e.to_string()),
+                    },
+                    MeshLogEntry::Graph(cmd) => match &graph_applier {
+                        Some(applier) => match applier.apply(cmd) {
+                            Ok(()) => ApplyResponse::ok(),
+                            Err(e) => ApplyResponse::err(e),
+                        },
+                        None => ApplyResponse::ok(),
+                    },
                 },
                 EntryPayload::Membership(m) => {
                     inner.stored_membership =
                         StoredMembership::new(Some(entry.log_id), m.clone());
+                    ApplyResponse::ok()
                 }
-            }
-            results.push(ApplyResponse);
+            };
+            results.push(response);
         }
         // Flush state-machine state in one synced rocksdb batch. Persisting
         // last_applied + cluster_state + stored_membership together means a
@@ -819,11 +849,16 @@ impl RaftCluster {
 
     /// Propose an arbitrary [`MeshLogEntry`]. Returns
     /// [`Error::ForwardToLeader`] when called on a non-leader peer so the
-    /// caller can route the request to the actual leader.
+    /// caller can route the request to the actual leader, and
+    /// [`Error::Apply`] when the entry committed through Raft but the
+    /// local state machine rejected it (e.g. duplicate AddPeer).
     pub async fn propose_entry(&self, entry: MeshLogEntry) -> Result<ApplyResponse> {
         use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
         match self.raft.client_write(entry).await {
-            Ok(response) => Ok(response.data),
+            Ok(response) => match response.data.error {
+                Some(err) => Err(Error::Apply(err)),
+                None => Ok(response.data),
+            },
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(
                 ForwardToLeader {
                     leader_id,

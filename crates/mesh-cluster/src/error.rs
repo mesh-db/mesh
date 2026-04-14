@@ -26,6 +26,9 @@ pub enum Error {
     #[error("raft error: {0}")]
     Raft(String),
 
+    #[error("apply rejected by state machine: {0}")]
+    Apply(String),
+
     #[error(
         "not the raft leader; forward to peer {leader_id:?} at {leader_address:?}"
     )]
