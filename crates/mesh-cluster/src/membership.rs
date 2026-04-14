@@ -1,6 +1,9 @@
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct PeerId(pub u64);
 
 impl std::fmt::Display for PeerId {
@@ -9,7 +12,7 @@ impl std::fmt::Display for PeerId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     pub id: PeerId,
     pub address: String,
@@ -25,6 +28,10 @@ impl Peer {
 }
 
 /// Static membership list: peer id -> network address.
+///
+/// Internally stores a `BTreeMap<PeerId, String>` for O(log n) address
+/// lookup, but serializes as a `Vec<Peer>` so the wire format is independent
+/// of JSON's string-key constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
     peers: BTreeMap<PeerId, String>,
@@ -58,5 +65,26 @@ impl Membership {
 
     pub fn iter(&self) -> impl Iterator<Item = (PeerId, &str)> {
         self.peers.iter().map(|(id, addr)| (*id, addr.as_str()))
+    }
+}
+
+impl Serialize for Membership {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let peers: Vec<Peer> = self
+            .peers
+            .iter()
+            .map(|(id, addr)| Peer {
+                id: *id,
+                address: addr.clone(),
+            })
+            .collect();
+        peers.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Membership {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let peers: Vec<Peer> = Vec::deserialize(deserializer)?;
+        Ok(Membership::new(peers))
     }
 }

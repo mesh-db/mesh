@@ -343,6 +343,82 @@ fn apply_routing_reflects_state_changes() {
 }
 
 #[test]
+fn cluster_command_roundtrips_through_serde_json() {
+    let commands = vec![
+        ClusterCommand::AddPeer {
+            id: PeerId(7),
+            address: "10.0.0.7:9000".into(),
+        },
+        ClusterCommand::RemovePeer { id: PeerId(3) },
+        ClusterCommand::UpdatePeerAddress {
+            id: PeerId(2),
+            address: "new-addr:1234".into(),
+        },
+        ClusterCommand::Rebalance,
+    ];
+    for cmd in commands {
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: ClusterCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+}
+
+#[test]
+fn cluster_state_roundtrips_through_serde_json() {
+    use mesh_cluster::{ClusterState, Membership, PartitionMap};
+    let membership = Membership::new(sample_peers());
+    let partition_map =
+        PartitionMap::round_robin(&[PeerId(1), PeerId(2), PeerId(3)], 6).unwrap();
+    let state = ClusterState::new(membership, partition_map);
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: ClusterState = serde_json::from_str(&json).unwrap();
+    assert_eq!(state, back);
+}
+
+#[test]
+fn cluster_state_serializes_membership_as_vec_of_peers() {
+    // Verify the wire format of Membership is a JSON array, not an
+    // object-keyed-by-int — that's the property we wanted when switching to
+    // the custom impl, and we want to lock it in so future changes are caught.
+    use mesh_cluster::{ClusterState, Membership, PartitionMap};
+    let membership = Membership::new(sample_peers());
+    let partition_map =
+        PartitionMap::round_robin(&[PeerId(1), PeerId(2), PeerId(3)], 3).unwrap();
+    let state = ClusterState::new(membership, partition_map);
+    let json = serde_json::to_value(&state).unwrap();
+    let membership_json = &json["membership"];
+    assert!(
+        membership_json.is_array(),
+        "expected membership to serialize as array, got {membership_json}"
+    );
+    assert_eq!(membership_json.as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn cluster_state_after_apply_still_roundtrips() {
+    use mesh_cluster::{ClusterState, Membership, PartitionMap};
+    let membership = Membership::new(sample_peers());
+    let partition_map =
+        PartitionMap::round_robin(&[PeerId(1), PeerId(2), PeerId(3)], 6).unwrap();
+    let mut state = ClusterState::new(membership, partition_map);
+    state
+        .apply(&ClusterCommand::AddPeer {
+            id: PeerId(4),
+            address: "d".into(),
+        })
+        .unwrap();
+    state.apply(&ClusterCommand::Rebalance).unwrap();
+    state
+        .apply(&ClusterCommand::RemovePeer { id: PeerId(2) })
+        .unwrap();
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: ClusterState = serde_json::from_str(&json).unwrap();
+    assert_eq!(state, back);
+}
+
+#[test]
 fn membership_address_lookup_and_iter() {
     use mesh_cluster::Membership;
     let m = Membership::new(sample_peers());

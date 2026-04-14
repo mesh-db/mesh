@@ -1,4 +1,5 @@
 use crate::{Error, Membership, PartitionMap, Peer, PeerId, Result};
+use serde::{Deserialize, Serialize};
 
 /// The replicated portion of a cluster: who the members are and which peer
 /// owns each partition. This is the type a consensus layer (Raft) will
@@ -10,7 +11,7 @@ use crate::{Error, Membership, PartitionMap, Peer, PeerId, Result};
 ///   `membership`.
 /// - The partitioner (held by [`crate::Cluster`]) is fixed; `apply` never
 ///   changes the number of partitions.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterState {
     pub membership: Membership,
     pub partition_map: PartitionMap,
@@ -23,7 +24,7 @@ pub struct ClusterState {
 /// Removing a peer, however, must reassign that peer's partitions (otherwise
 /// they'd have no owner), so `RemovePeer` implicitly reassigns them
 /// round-robin across the remaining members.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClusterCommand {
     AddPeer { id: PeerId, address: String },
     RemovePeer { id: PeerId },

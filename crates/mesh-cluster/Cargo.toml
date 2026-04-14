@@ -7,4 +7,8 @@ description = "Cluster membership and partitioning for Mesh"
 
 [dependencies]
 mesh-core = { path = "../mesh-core" }
+serde = { workspace = true }
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }

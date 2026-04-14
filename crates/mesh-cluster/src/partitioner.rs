@@ -1,6 +1,9 @@
 use mesh_core::NodeId;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct PartitionId(pub u32);
 
 impl std::fmt::Display for PartitionId {
@@ -11,7 +14,7 @@ impl std::fmt::Display for PartitionId {
 
 /// Deterministic hash-based partitioner. Uses FNV-1a over the node's 16 raw
 /// bytes so partition assignment is stable across processes and Rust versions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Partitioner {
     num_partitions: u32,
 }
