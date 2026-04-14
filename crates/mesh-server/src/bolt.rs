@@ -3,7 +3,9 @@
 //! Bridges the pure `mesh-bolt` protocol primitives (PackStream, chunked
 //! framing, handshake, typed messages) onto a live TCP socket and drives
 //! a per-connection state machine that dispatches `RUN` messages into
-//! [`MeshService::execute_cypher_local`].
+//! [`MeshService::execute_cypher_local`] (or `execute_cypher_buffered`
+//! plus `commit_buffered_commands` when the connection is inside an
+//! explicit transaction).
 //!
 //! Supports Bolt 4.4 only. Auth accepts any `HELLO` unconditionally —
 //! the server is not multi-tenant and there's no user store yet.
@@ -14,15 +16,40 @@
 //!     Connected ──handshake──> Negotiated ──HELLO──> Ready
 //!     Ready ──RUN──> Streaming
 //!     Streaming ──PULL──> Ready
-//!     *         ──RESET──> Ready          (also clears Failed)
-//!     *         ──GOODBYE──> <close>
+//!     Ready ──BEGIN──> InTxReady
+//!     InTxReady ──RUN──> InTxStreaming
+//!     InTxStreaming ──PULL──> InTxReady
+//!     InTxReady ──COMMIT──> Ready  (dispatches accumulated batch)
+//!     InTxReady ──ROLLBACK──> Ready  (drops accumulated batch)
+//!     *         ──RESET──> Ready  (also clears Failed and any tx)
+//!     *         ──GOODBYE──> <close>  (implicit rollback)
 //! ```
+//!
+//! ## Explicit-transaction semantics
+//!
+//! `BEGIN` opens a write-batch transaction: every subsequent `RUN`
+//! executes against the live store for **reads**, but mutations are
+//! buffered into a per-connection `Vec<GraphCommand>`. `COMMIT`
+//! dispatches the whole buffer through [`MeshService::commit_buffered_commands`],
+//! which uses the same backend (Raft propose, routing 2PC, or direct
+//! store apply) the auto-commit path uses for a single `RUN`. The
+//! whole transaction lands atomically — or, on failure, not at all.
+//!
+//! **Limitation: no read-after-write inside a transaction.** A `MATCH`
+//! issued after a `CREATE` in the same `BEGIN`/`COMMIT` block sees the
+//! store as it was at `BEGIN` time and will *not* observe the buffered
+//! mutations. This matches the "tx is a write batch" model and is
+//! sufficient for the common idiom of wrapping multiple writes in one
+//! atomic commit; it's insufficient for drivers that rely on
+//! read-your-writes semantics inside a transaction. Implementing
+//! overlay-storage-style read-your-writes is a separate change.
 
 use crate::value_conv::{bolt_params_to_param_map, field_names_from_rows, row_to_bolt_fields};
 use mesh_bolt::{
     perform_server_handshake, read_message, write_message, BoltError, BoltMessage, BoltValue,
     BOLT_4_4,
 };
+use mesh_cluster::GraphCommand;
 use mesh_executor::Row;
 use mesh_rpc::MeshService;
 use std::sync::Arc;
@@ -32,16 +59,33 @@ use tokio::net::TcpListener;
 /// Current connection phase used by the message-dispatch loop.
 #[derive(Debug)]
 enum Phase {
-    /// Waiting for a `RUN`. `BEGIN` / `COMMIT` / `ROLLBACK` are accepted
-    /// and replied to with `SUCCESS` as no-ops (all statements are
-    /// auto-committed inside `execute_cypher_local`).
+    /// Waiting for a `RUN` (auto-commit) or a `BEGIN`. `COMMIT` /
+    /// `ROLLBACK` outside a transaction are protocol errors and get
+    /// `IGNORED` + transition to `Failed`.
     Ready,
-    /// A `RUN` succeeded; we're holding its rows + field names and
-    /// waiting for `PULL` or `DISCARD` to hand them out.
+    /// A `RUN` succeeded outside a transaction; we're holding its rows
+    /// + field names and waiting for `PULL` or `DISCARD` to hand them
+    /// out. The next message returns the connection to `Ready` and
+    /// auto-commits any writes that ran during the RUN.
     Streaming { rows: Vec<Row>, fields: Vec<String> },
+    /// Inside an explicit transaction, idle between RUNs. `buffered`
+    /// holds every `GraphCommand` that previous RUNs in this tx have
+    /// accumulated; `COMMIT` dispatches the whole vector at once.
+    InTxReady { buffered: Vec<GraphCommand> },
+    /// Inside an explicit transaction, mid-RUN — waiting for `PULL` or
+    /// `DISCARD`. `buffered` carries the accumulated batch (including
+    /// the writes the *current* RUN just produced); the next message
+    /// transitions back to `InTxReady` with `buffered` preserved.
+    InTxStreaming {
+        buffered: Vec<GraphCommand>,
+        rows: Vec<Row>,
+        fields: Vec<String>,
+    },
     /// A prior message produced a FAILURE. Every subsequent message
     /// except `RESET` / `GOODBYE` gets `IGNORED` until the client
-    /// resets the session.
+    /// resets the session. Transitioning here from any tx-state
+    /// implicitly drops the buffered commands — failed RUNs inside a
+    /// tx invalidate the whole batch.
     Failed,
 }
 
@@ -136,22 +180,21 @@ where
         match (&phase, msg) {
             // -- Universal messages ------------------------------------
             (_, BoltMessage::Goodbye) => {
+                // GOODBYE inside an in-tx state is an implicit
+                // ROLLBACK: the buffered commands just go away with
+                // the connection.
                 tracing::debug!("bolt goodbye received");
                 let _ = writer.flush().await;
                 return Ok(());
             }
             (_, BoltMessage::Reset) => {
+                // RESET also implicitly rolls back any in-progress tx.
                 phase = Phase::Ready;
                 send(&mut writer, &empty_success()).await?;
             }
 
             // -- Ready phase -------------------------------------------
             (Phase::Ready, BoltMessage::Run { query, params, .. }) => {
-                // Convert the driver-supplied params blob from Bolt's
-                // BoltValue tree into the executor's `ParamMap`. A
-                // malformed params blob (wrong shape, unsupported type)
-                // surfaces as a client-side FAILURE so the driver can
-                // report the bug clearly.
                 let param_map = match bolt_params_to_param_map(&params) {
                     Ok(m) => m,
                     Err(e) => {
@@ -164,21 +207,13 @@ where
                         continue;
                     }
                 };
+                // Auto-commit path: execute_cypher_local already
+                // dispatches buffered writes through the active backend
+                // before returning rows.
                 match service.execute_cypher_local(query, param_map).await {
                     Ok(rows) => {
                         let fields = field_names_from_rows(&rows);
-                        let success = BoltMessage::Success {
-                            metadata: BoltValue::map([(
-                                "fields",
-                                BoltValue::List(
-                                    fields
-                                        .iter()
-                                        .map(|f| BoltValue::String(f.clone()))
-                                        .collect(),
-                                ),
-                            )]),
-                        };
-                        send(&mut writer, &success).await?;
+                        send(&mut writer, &fields_success(&fields)).await?;
                         phase = Phase::Streaming { rows, fields };
                     }
                     Err(status) => {
@@ -188,79 +223,158 @@ where
                 }
             }
             (Phase::Ready, BoltMessage::Begin { .. }) => {
-                // Explicit transactions are treated as no-op wrappers —
-                // every RUN inside Mesh is auto-committed. Accepting
-                // BEGIN keeps drivers that open explicit transactions
-                // (neo4j-driver's `session.begin_transaction()`)
-                // functional, at the cost of not actually isolating
-                // the inner statements from each other.
+                // Open a new explicit transaction with an empty
+                // accumulator. Subsequent RUNs in this connection will
+                // append their writes to it until COMMIT or ROLLBACK.
+                phase = Phase::InTxReady {
+                    buffered: Vec::new(),
+                };
                 send(&mut writer, &empty_success()).await?;
             }
             (Phase::Ready, BoltMessage::Commit | BoltMessage::Rollback) => {
-                // Matching close for the BEGIN shim above. Mesh has
-                // already committed each RUN individually, so there's
-                // nothing left to do on COMMIT / ROLLBACK.
+                // COMMIT / ROLLBACK outside of a transaction is a
+                // protocol error.
                 send(
                     &mut writer,
-                    &BoltMessage::Success {
-                        metadata: BoltValue::map([(
-                            "bookmark",
-                            BoltValue::String("mesh:0".into()),
-                        )]),
-                    },
+                    &failure(
+                        "Mesh.ClientError.Protocol",
+                        "COMMIT / ROLLBACK outside of an explicit transaction",
+                    ),
                 )
                 .await?;
+                phase = Phase::Failed;
             }
             (Phase::Ready, BoltMessage::Pull { .. } | BoltMessage::Discard { .. }) => {
-                // PULL / DISCARD outside of a streaming phase is a
-                // protocol error on the client side. Reply IGNORED and
-                // let the client recover via RESET.
                 send(&mut writer, &BoltMessage::Ignored).await?;
                 phase = Phase::Failed;
             }
 
-            // -- Streaming phase ---------------------------------------
+            // -- Streaming phase (auto-commit) -------------------------
             (Phase::Streaming { .. }, BoltMessage::Pull { .. }) => {
-                // Consume the streaming state by value; we'll return
-                // to Ready once all records have been sent.
                 let (rows, fields) = match std::mem::replace(&mut phase, Phase::Ready) {
                     Phase::Streaming { rows, fields } => (rows, fields),
                     _ => unreachable!(),
                 };
-                let rows_len = rows.len();
-                for row in &rows {
-                    let values = row_to_bolt_fields(row, &fields);
-                    send(&mut writer, &BoltMessage::Record { fields: values }).await?;
-                }
-                // Trailing SUCCESS metadata is what drivers look at for
-                // `result_consumed_after`, `type`, etc. Keep it minimal.
-                send(
-                    &mut writer,
-                    &BoltMessage::Success {
-                        metadata: BoltValue::map([
-                            ("type", BoltValue::String("r".into())),
-                            ("has_more", BoltValue::Bool(false)),
-                            ("record_count", BoltValue::Int(rows_len as i64)),
-                        ]),
-                    },
-                )
-                .await?;
+                stream_records(&mut writer, &rows, &fields).await?;
             }
             (Phase::Streaming { .. }, BoltMessage::Discard { .. }) => {
                 phase = Phase::Ready;
-                send(
-                    &mut writer,
-                    &BoltMessage::Success {
-                        metadata: BoltValue::map([
-                            ("type", BoltValue::String("r".into())),
-                            ("has_more", BoltValue::Bool(false)),
-                        ]),
-                    },
-                )
-                .await?;
+                send(&mut writer, &discard_success()).await?;
             }
             (Phase::Streaming { .. }, BoltMessage::Run { .. }) => {
-                // Nested RUN is a protocol violation.
+                send(&mut writer, &BoltMessage::Ignored).await?;
+                phase = Phase::Failed;
+            }
+
+            // -- InTxReady phase (between RUNs in an explicit tx) ------
+            (Phase::InTxReady { .. }, BoltMessage::Run { query, params, .. }) => {
+                let param_map = match bolt_params_to_param_map(&params) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &failure("Mesh.ClientError.InvalidArgument", &e.to_string()),
+                        )
+                        .await?;
+                        phase = Phase::Failed;
+                        continue;
+                    }
+                };
+                // Take the existing buffer out of the phase so we can
+                // extend it with this RUN's commands and rebuild the
+                // tx phase below.
+                let mut buffered = match std::mem::replace(&mut phase, Phase::Ready) {
+                    Phase::InTxReady { buffered } => buffered,
+                    _ => unreachable!(),
+                };
+                match service.execute_cypher_buffered(query, param_map).await {
+                    Ok((rows, mut commands)) => {
+                        buffered.append(&mut commands);
+                        let fields = field_names_from_rows(&rows);
+                        send(&mut writer, &fields_success(&fields)).await?;
+                        phase = Phase::InTxStreaming {
+                            buffered,
+                            rows,
+                            fields,
+                        };
+                    }
+                    Err(status) => {
+                        // Drop the entire tx buffer on error — the user
+                        // must RESET and start over. Drivers expect a
+                        // failed RUN inside a tx to invalidate the
+                        // whole transaction, which is exactly what
+                        // dropping the buffer does.
+                        send(&mut writer, &failure_from_status(&status)).await?;
+                        phase = Phase::Failed;
+                    }
+                }
+            }
+            (Phase::InTxReady { .. }, BoltMessage::Commit) => {
+                // Drain the buffered commands and dispatch as one
+                // batch. Empty batch is fine — equivalent to BEGIN +
+                // immediate COMMIT, which COMMITs nothing.
+                let buffered = match std::mem::replace(&mut phase, Phase::Ready) {
+                    Phase::InTxReady { buffered } => buffered,
+                    _ => unreachable!(),
+                };
+                match service.commit_buffered_commands(buffered).await {
+                    Ok(()) => {
+                        send(&mut writer, &commit_success()).await?;
+                    }
+                    Err(status) => {
+                        send(&mut writer, &failure_from_status(&status)).await?;
+                        phase = Phase::Failed;
+                    }
+                }
+            }
+            (Phase::InTxReady { .. }, BoltMessage::Rollback) => {
+                // Drop the accumulated buffer and return to Ready.
+                phase = Phase::Ready;
+                send(&mut writer, &empty_success()).await?;
+            }
+            (Phase::InTxReady { .. }, BoltMessage::Begin { .. }) => {
+                // Nested transactions are not supported — Bolt 4.4
+                // doesn't model nesting either.
+                send(
+                    &mut writer,
+                    &failure("Mesh.ClientError.Protocol", "nested BEGIN is not supported"),
+                )
+                .await?;
+                phase = Phase::Failed;
+            }
+            (Phase::InTxReady { .. }, BoltMessage::Pull { .. } | BoltMessage::Discard { .. }) => {
+                send(&mut writer, &BoltMessage::Ignored).await?;
+                phase = Phase::Failed;
+            }
+
+            // -- InTxStreaming phase -----------------------------------
+            (Phase::InTxStreaming { .. }, BoltMessage::Pull { .. }) => {
+                let (buffered, rows, fields) = match std::mem::replace(&mut phase, Phase::Ready) {
+                    Phase::InTxStreaming {
+                        buffered,
+                        rows,
+                        fields,
+                    } => (buffered, rows, fields),
+                    _ => unreachable!(),
+                };
+                stream_records(&mut writer, &rows, &fields).await?;
+                // Stay in the tx — only PULL drains the rows, the
+                // accumulated write buffer is preserved.
+                phase = Phase::InTxReady { buffered };
+            }
+            (Phase::InTxStreaming { .. }, BoltMessage::Discard { .. }) => {
+                let (buffered, _rows, _fields) = match std::mem::replace(&mut phase, Phase::Ready) {
+                    Phase::InTxStreaming {
+                        buffered,
+                        rows,
+                        fields,
+                    } => (buffered, rows, fields),
+                    _ => unreachable!(),
+                };
+                send(&mut writer, &discard_success()).await?;
+                phase = Phase::InTxReady { buffered };
+            }
+            (Phase::InTxStreaming { .. }, BoltMessage::Run { .. }) => {
                 send(&mut writer, &BoltMessage::Ignored).await?;
                 phase = Phase::Failed;
             }
@@ -284,6 +398,60 @@ where
                 phase = Phase::Failed;
             }
         }
+    }
+}
+
+/// Stream RECORDs for one buffered result set, then send the trailing
+/// SUCCESS with `type=r`, `has_more=false`, and the record count.
+async fn stream_records<W>(writer: &mut W, rows: &[Row], fields: &[String]) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let rows_len = rows.len();
+    for row in rows {
+        let values = row_to_bolt_fields(row, fields);
+        send(writer, &BoltMessage::Record { fields: values }).await?;
+    }
+    send(
+        writer,
+        &BoltMessage::Success {
+            metadata: BoltValue::map([
+                ("type", BoltValue::String("r".into())),
+                ("has_more", BoltValue::Bool(false)),
+                ("record_count", BoltValue::Int(rows_len as i64)),
+            ]),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn fields_success(fields: &[String]) -> BoltMessage {
+    BoltMessage::Success {
+        metadata: BoltValue::map([(
+            "fields",
+            BoltValue::List(
+                fields
+                    .iter()
+                    .map(|f| BoltValue::String(f.clone()))
+                    .collect(),
+            ),
+        )]),
+    }
+}
+
+fn discard_success() -> BoltMessage {
+    BoltMessage::Success {
+        metadata: BoltValue::map([
+            ("type", BoltValue::String("r".into())),
+            ("has_more", BoltValue::Bool(false)),
+        ]),
+    }
+}
+
+fn commit_success() -> BoltMessage {
+    BoltMessage::Success {
+        metadata: BoltValue::map([("bookmark", BoltValue::String("mesh:0".into()))]),
     }
 }
 

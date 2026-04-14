@@ -100,126 +100,172 @@ impl MeshService {
         query: String,
         params: mesh_executor::ParamMap,
     ) -> std::result::Result<Vec<mesh_executor::Row>, Status> {
-        // Parse + plan on the async task — cheap and synchronous.
+        // Two-step auto-commit: run the executor against a buffer,
+        // then dispatch the buffered writes through the active
+        // backend. The two halves are public on their own so the Bolt
+        // explicit-transaction handler can interleave multiple buffered
+        // RUNs and commit them as one batch.
+        let (rows, commands) = self
+            .execute_cypher_buffered(query.clone(), params.clone())
+            .await?;
+        if !commands.is_empty() {
+            // Raft mode needs to forward the *original query string* to
+            // the leader on a ForwardToLeader error, not the buffered
+            // commands (whose ids would clash with anything the leader
+            // already minted). Detect that case here and re-issue the
+            // gRPC call with params; the leader runs the whole pipeline
+            // on its end and returns the resulting rows.
+            match self.commit_buffered_commands(commands).await {
+                Ok(()) => {}
+                Err(status) => {
+                    if let Some(addr) = leader_redirect_address(&status) {
+                        return self
+                            .forward_execute_cypher_to_leader(&addr, query, params)
+                            .await;
+                    }
+                    return Err(status);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Run a Cypher query end-to-end without committing — returns the
+    /// projection rows alongside the buffered `GraphCommand`s the
+    /// executor produced. Shared by [`execute_cypher_local`] (which
+    /// commits immediately) and the Bolt explicit-transaction handler
+    /// (which accumulates the commands across multiple `RUN`s and
+    /// commits them in one batch at COMMIT time).
+    pub async fn execute_cypher_buffered(
+        &self,
+        query: String,
+        params: mesh_executor::ParamMap,
+    ) -> std::result::Result<(Vec<mesh_executor::Row>, Vec<GraphCommand>), Status> {
         let statement = mesh_cypher::parse(&query).map_err(bad_request)?;
         let plan = mesh_cypher::plan(&statement).map_err(bad_request)?;
 
         let store = self.store.clone();
-        let raft = self.raft.clone();
         let routing = self.routing.clone();
-        // Move the params into the spawn_blocking closure so the
-        // executor sees them. Cloned for the leader-forward branch
-        // below, which has to re-encode them for the gRPC re-issue.
-        let exec_params = params.clone();
-        let (rows, raft_batch, routing_batch) = tokio::task::spawn_blocking(
+        let exec_params = params;
+
+        let (rows, commands) = tokio::task::spawn_blocking(
             move || -> std::result::Result<
-                (
-                    Vec<mesh_executor::Row>,
-                    Option<Vec<GraphCommand>>,
-                    Option<Vec<GraphCommand>>,
-                ),
+                (Vec<mesh_executor::Row>, Vec<GraphCommand>),
                 mesh_executor::Error,
             > {
                 let store_ref: &Store = &store;
-                if raft.is_some() {
-                    // Raft mode: reads go local (every replica holds the
-                    // full graph), writes buffer into a single Raft entry
-                    // further down so a crash mid-query can't leave a
-                    // partial result on any replica.
-                    let writer = BufferingGraphWriter::new();
-                    let rows = execute_with_reader(
-                        &plan,
-                        store_ref as &dyn GraphReader,
-                        &writer as &dyn GraphWriter,
-                        &exec_params,
-                    )?;
-                    Ok((rows, Some(writer.into_commands()), None))
-                } else if let Some(r) = routing.as_ref() {
-                    // Routing mode: reads use a partitioned reader that
-                    // fans out to owners / scatter-gathers scans; writes
-                    // buffer so the async side can drive a 2PC batch
-                    // against every participating peer — per-peer and
-                    // cross-peer atomicity via prepare/commit.
+                let writer = BufferingGraphWriter::new();
+                let rows = if let Some(r) = routing.as_ref() {
+                    // Routing mode: reads go through a partitioned
+                    // reader. Single-node and Raft modes use the local
+                    // store directly (Raft replicates the full graph).
                     let reader = PartitionedGraphReader::new(store.clone(), r.clone());
-                    let writer = BufferingGraphWriter::new();
-                    let rows = execute_with_reader(
+                    execute_with_reader(
                         &plan,
                         &reader as &dyn GraphReader,
                         &writer as &dyn GraphWriter,
                         &exec_params,
-                    )?;
-                    Ok((rows, None, Some(writer.into_commands())))
+                    )?
                 } else {
-                    let rows = execute_with_reader(
+                    execute_with_reader(
                         &plan,
                         store_ref as &dyn GraphReader,
-                        store_ref as &dyn GraphWriter,
+                        &writer as &dyn GraphWriter,
                         &exec_params,
-                    )?;
-                    Ok((rows, None, None))
-                }
+                    )?
+                };
+                Ok((rows, writer.into_commands()))
             },
         )
         .await
         .map_err(|e| Status::internal(format!("executor task panicked: {e}")))?
         .map_err(|e| Status::internal(format!("cypher execution failed: {e}")))?;
 
-        // Routing mode: run the buffered writes through the 2PC
-        // coordinator so the whole Cypher transaction lands atomically
-        // across every participating peer (or not at all).
-        if let (Some(routing), Some(commands)) = (&self.routing, routing_batch) {
-            if !commands.is_empty() {
-                let coordinator = TxCoordinator::new(&self.store, &self.pending_batches, routing);
-                coordinator.run(commands).await?;
-            }
-        }
-
-        if let (Some(raft), Some(commands)) = (&self.raft, raft_batch) {
-            if !commands.is_empty() {
-                let entry = if commands.len() == 1 {
-                    commands.into_iter().next().unwrap()
-                } else {
-                    GraphCommand::Batch(commands)
-                };
-                match raft.propose_graph(entry).await {
-                    Ok(_) => {}
-                    Err(ClusterError::ForwardToLeader {
-                        leader_address: Some(addr),
-                        ..
-                    }) => {
-                        // Re-issue the *original* query — and the
-                        // params — to the leader. The leader re-parses,
-                        // re-plans, and commits through its own Raft
-                        // group. Forwarding params is critical: without
-                        // it, parameterized writes against a follower
-                        // would silently fail with "unbound parameter"
-                        // on the leader.
-                        let endpoint =
-                            Endpoint::from_shared(format!("http://{}", addr)).map_err(|e| {
-                                Status::internal(format!("invalid leader address {addr}: {e}"))
-                            })?;
-                        let mut client = crate::proto::mesh_query_client::MeshQueryClient::new(
-                            endpoint.connect_lazy(),
-                        );
-                        let params_json = serde_json::to_vec(&params).map_err(|e| {
-                            Status::internal(format!("encoding forwarded params: {e}"))
-                        })?;
-                        let resp = client
-                            .execute_cypher(ExecuteCypherRequest { query, params_json })
-                            .await?;
-                        let forwarded: Vec<mesh_executor::Row> =
-                            serde_json::from_slice(&resp.into_inner().rows_json).map_err(|e| {
-                                Status::internal(format!("decoding forwarded rows: {e}"))
-                            })?;
-                        return Ok(forwarded);
-                    }
-                    Err(e) => return Err(raft_propose_failed(e)),
-                }
-            }
-        }
-
-        Ok(rows)
+        Ok((rows, commands))
     }
+
+    /// Commit a batch of `GraphCommand`s through the active backend.
+    /// Used by both the auto-commit single-RUN path and the Bolt
+    /// explicit-transaction COMMIT phase. No-op for an empty batch.
+    ///
+    /// In Raft mode this is a single `propose_graph(Batch)` call, so a
+    /// multi-RUN tx commits atomically as one log entry. In routing
+    /// mode the [`TxCoordinator`] groups by destination peer and runs
+    /// the existing 2PC protocol. Single-node mode writes directly to
+    /// the local store.
+    pub async fn commit_buffered_commands(
+        &self,
+        commands: Vec<GraphCommand>,
+    ) -> std::result::Result<(), Status> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        if let Some(routing) = &self.routing {
+            let coordinator = TxCoordinator::new(&self.store, &self.pending_batches, routing);
+            coordinator.run(commands).await?;
+            return Ok(());
+        }
+        if let Some(raft) = &self.raft {
+            let entry = if commands.len() == 1 {
+                commands.into_iter().next().unwrap()
+            } else {
+                GraphCommand::Batch(commands)
+            };
+            return match raft.propose_graph(entry).await {
+                Ok(_) => Ok(()),
+                Err(ClusterError::ForwardToLeader {
+                    leader_address: Some(addr),
+                    ..
+                }) => Err(Status::failed_precondition(format!(
+                    "raft leader is at {addr}; reconnect and retry there"
+                ))),
+                Err(e) => Err(raft_propose_failed(e)),
+            };
+        }
+        // Single-node: apply the batch directly through the store's
+        // atomic apply_batch helper (one rocksdb WriteBatch).
+        apply_prepared_batch(&self.store, &commands).map_err(internal)?;
+        Ok(())
+    }
+
+    /// Re-issue an `execute_cypher` gRPC call to the Raft leader and
+    /// return the leader's rows. Used by [`execute_cypher_local`] when
+    /// `commit_buffered_commands` reports a leader-redirect, and only
+    /// reachable from the auto-commit path — Bolt explicit transactions
+    /// surface the redirect to the driver via a FAILURE.
+    async fn forward_execute_cypher_to_leader(
+        &self,
+        addr: &str,
+        query: String,
+        params: mesh_executor::ParamMap,
+    ) -> std::result::Result<Vec<mesh_executor::Row>, Status> {
+        let endpoint = Endpoint::from_shared(format!("http://{}", addr))
+            .map_err(|e| Status::internal(format!("invalid leader address {addr}: {e}")))?;
+        let mut client =
+            crate::proto::mesh_query_client::MeshQueryClient::new(endpoint.connect_lazy());
+        let params_json = serde_json::to_vec(&params)
+            .map_err(|e| Status::internal(format!("encoding forwarded params: {e}")))?;
+        let resp = client
+            .execute_cypher(ExecuteCypherRequest { query, params_json })
+            .await?;
+        serde_json::from_slice(&resp.into_inner().rows_json)
+            .map_err(|e| Status::internal(format!("decoding forwarded rows: {e}")))
+    }
+}
+
+/// Sniff a `Status` produced by `commit_buffered_commands` for the
+/// "raft leader is at {addr}" leader-redirect message and return the
+/// parsed address. Returns `None` for any other error so the caller
+/// surfaces it verbatim.
+fn leader_redirect_address(status: &Status) -> Option<String> {
+    if status.code() != tonic::Code::FailedPrecondition {
+        return None;
+    }
+    let msg = status.message();
+    let prefix = "raft leader is at ";
+    let rest = msg.strip_prefix(prefix)?;
+    let addr = rest.split(';').next()?.trim();
+    Some(addr.to_string())
 }
 
 /// Flatten a tree of [`GraphCommand`] (which may nest `Batch` variants)

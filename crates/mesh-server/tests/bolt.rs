@@ -277,30 +277,260 @@ async fn bolt_reset_after_failure_returns_to_ready() {
     goodbye(sock).await;
 }
 
+/// Send a BEGIN and assert SUCCESS — used by every explicit-tx test
+/// that follows.
+async fn begin_tx(sock: &mut TcpStream) {
+    write_message(
+        sock,
+        &BoltMessage::Begin {
+            extra: BoltValue::Map(vec![]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let reply = BoltMessage::decode(&read_message(sock).await.unwrap()).unwrap();
+    assert!(
+        matches!(reply, BoltMessage::Success { .. }),
+        "expected BEGIN SUCCESS, got {:?}",
+        reply
+    );
+}
+
+async fn commit_tx(sock: &mut TcpStream) -> BoltMessage {
+    write_message(sock, &BoltMessage::Commit.encode())
+        .await
+        .unwrap();
+    BoltMessage::decode(&read_message(sock).await.unwrap()).unwrap()
+}
+
+async fn rollback_tx(sock: &mut TcpStream) -> BoltMessage {
+    write_message(sock, &BoltMessage::Rollback.encode())
+        .await
+        .unwrap();
+    BoltMessage::decode(&read_message(sock).await.unwrap()).unwrap()
+}
+
 #[tokio::test]
-async fn bolt_begin_commit_are_accepted_as_noops() {
+async fn bolt_explicit_tx_commit_persists_buffered_writes() {
+    // BEGIN; CREATE n; CREATE m; COMMIT; MATCH (...) — the two
+    // creates accumulate into the connection's tx buffer and land
+    // atomically when COMMIT dispatches them through
+    // commit_buffered_commands. After COMMIT the nodes are visible.
     let (addr, _dir) = spawn_bolt_server().await;
     let mut sock = connect_and_hello(&addr).await;
 
-    let begin = BoltMessage::Begin {
-        extra: BoltValue::Map(vec![]),
-    };
-    write_message(&mut sock, &begin.encode()).await.unwrap();
-    let reply = BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE (n:T {i: 1})").await;
+    let _ = run_and_pull(&mut sock, "CREATE (n:T {i: 2})").await;
+    let reply = commit_tx(&mut sock).await;
+    assert!(
+        matches!(reply, BoltMessage::Success { .. }),
+        "expected COMMIT SUCCESS, got {:?}",
+        reply
+    );
+
+    // Both nodes are visible after COMMIT.
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:T) RETURN n.i AS i ORDER BY i").await;
+    let xs: Vec<i64> = records
+        .iter()
+        .map(|fields| fields[0].as_int().unwrap())
+        .collect();
+    assert_eq!(xs, vec![1, 2]);
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_explicit_tx_rollback_drops_buffered_writes() {
+    // BEGIN; CREATE; ROLLBACK leaves the store unchanged. A
+    // post-ROLLBACK MATCH returns zero rows because the buffered
+    // commands were dropped instead of committed.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE (n:Discard)").await;
+    let reply = rollback_tx(&mut sock).await;
+    assert!(
+        matches!(reply, BoltMessage::Success { .. }),
+        "expected ROLLBACK SUCCESS, got {:?}",
+        reply
+    );
+
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Discard) RETURN n").await;
+    assert!(records.is_empty(), "ROLLBACK must not persist writes");
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_explicit_tx_atomic_across_multiple_runs() {
+    // Three CREATEs in one tx, COMMIT, verify we observe exactly the
+    // committed set and nothing leaks from a possible partial commit.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    for i in 0..5 {
+        let _ = run_and_pull(&mut sock, &format!("CREATE (n:Batch {{i: {i}}})")).await;
+    }
+    let reply = commit_tx(&mut sock).await;
     assert!(matches!(reply, BoltMessage::Success { .. }));
 
-    // Drain the CREATE's PULL response (one row with the node binding).
-    let _ = run_and_pull(&mut sock, "CREATE (n:T)").await;
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Batch) RETURN n.i AS i ORDER BY i").await;
+    let xs: Vec<i64> = records
+        .iter()
+        .map(|fields| fields[0].as_int().unwrap())
+        .collect();
+    assert_eq!(xs, vec![0, 1, 2, 3, 4]);
 
-    write_message(&mut sock, &BoltMessage::Commit.encode())
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_explicit_tx_failed_run_invalidates_whole_tx() {
+    // A CREATE that succeeds, then a malformed RUN that fails, then a
+    // COMMIT attempt — the failed RUN must drop the whole buffer and
+    // transition to the IGNORED-everything Failed state. RESET clears
+    // and the previously-buffered CREATE must NOT show up afterwards.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE (n:Half {step: 'first'})").await;
+
+    // Send a parse-failing RUN.
+    write_message(
+        &mut sock,
+        &BoltMessage::Run {
+            query: "THIS IS NOT CYPHER".into(),
+            params: BoltValue::Map(vec![]),
+            extra: BoltValue::Map(vec![]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let reply = BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
+    assert!(matches!(reply, BoltMessage::Failure { .. }));
+
+    // COMMIT in Failed state is IGNORED.
+    let reply = commit_tx(&mut sock).await;
+    assert!(matches!(reply, BoltMessage::Ignored));
+
+    // RESET to recover.
+    write_message(&mut sock, &BoltMessage::Reset.encode())
         .await
         .unwrap();
     let reply = BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
     assert!(matches!(reply, BoltMessage::Success { .. }));
 
-    // Post-commit: the node is visible.
-    let (records, _) = run_and_pull(&mut sock, "MATCH (n:T) RETURN n").await;
-    assert_eq!(records.len(), 1);
+    // The successful CREATE from inside the failed tx must NOT have
+    // landed — failed RUNs invalidate the whole tx buffer.
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Half) RETURN n").await;
+    assert!(
+        records.is_empty(),
+        "writes from a failed tx should not persist"
+    );
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_nested_begin_rejected() {
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+
+    // Second BEGIN inside the same tx → FAILURE with a Mesh.ClientError.* code.
+    write_message(
+        &mut sock,
+        &BoltMessage::Begin {
+            extra: BoltValue::Map(vec![]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let reply = BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
+    match reply {
+        BoltMessage::Failure { metadata } => {
+            let code = metadata.get("code").and_then(BoltValue::as_str).unwrap();
+            assert!(
+                code.starts_with("Mesh.ClientError."),
+                "expected client-error code, got {code}"
+            );
+        }
+        other => panic!("expected FAILURE, got {:?}", other),
+    }
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_commit_outside_tx_is_protocol_error() {
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    // COMMIT from Ready (no preceding BEGIN) must FAILURE.
+    let reply = commit_tx(&mut sock).await;
+    match reply {
+        BoltMessage::Failure { metadata } => {
+            let msg = metadata
+                .get("message")
+                .and_then(BoltValue::as_str)
+                .unwrap_or("");
+            assert!(
+                msg.contains("COMMIT") || msg.contains("transaction"),
+                "expected protocol error message, got {msg}"
+            );
+        }
+        other => panic!("expected FAILURE, got {:?}", other),
+    }
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_rollback_after_failure_clears_via_reset() {
+    // Documents the recovery path: after any failure inside a tx the
+    // session is in Failed state and ROLLBACK gets IGNORED. RESET is
+    // the canonical way out — equivalent to an implicit rollback.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+
+    // Fail the tx with a bad query.
+    write_message(
+        &mut sock,
+        &BoltMessage::Run {
+            query: "PARSE FAIL".into(),
+            params: BoltValue::Map(vec![]),
+            extra: BoltValue::Map(vec![]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let _ = BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
+
+    // ROLLBACK after failure is IGNORED.
+    let reply = rollback_tx(&mut sock).await;
+    assert!(matches!(reply, BoltMessage::Ignored));
+
+    // RESET to recover and confirm we're back in Ready by issuing a
+    // simple read.
+    write_message(&mut sock, &BoltMessage::Reset.encode())
+        .await
+        .unwrap();
+    let reply = BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
+    assert!(matches!(reply, BoltMessage::Success { .. }));
+
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n) RETURN n").await;
+    assert!(records.is_empty());
 
     goodbye(sock).await;
 }
