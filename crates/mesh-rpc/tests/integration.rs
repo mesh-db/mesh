@@ -4,9 +4,9 @@ use mesh_rpc::convert::{edge_to_proto, node_to_proto, uuid_to_proto};
 use mesh_rpc::proto::mesh_query_client::MeshQueryClient;
 use mesh_rpc::proto::mesh_write_client::MeshWriteClient;
 use mesh_rpc::proto::{
-    DeleteEdgeRequest, DetachDeleteNodeRequest, ExecuteCypherRequest, GetEdgeRequest,
-    GetNodeRequest, HealthRequest, NeighborRequest, NodesByLabelRequest, PutEdgeRequest,
-    PutNodeRequest, UuidBytes,
+    BatchPhase, BatchWriteRequest, DeleteEdgeRequest, DetachDeleteNodeRequest,
+    ExecuteCypherRequest, GetEdgeRequest, GetNodeRequest, HealthRequest, NeighborRequest,
+    NodesByLabelRequest, PutEdgeRequest, PutNodeRequest, UuidBytes,
 };
 use mesh_rpc::{MeshService, Routing};
 use mesh_storage::Store;
@@ -613,6 +613,284 @@ async fn cypher_create_edge_lands_on_both_owners() {
     let rows: Vec<serde_json::Value> =
         serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
     assert_eq!(rows.len(), 15);
+}
+
+#[tokio::test]
+async fn batch_write_prepare_commit_applies_atomically() {
+    // Exercise the BatchWrite RPC directly: two PutNode commands
+    // prepared on a single peer, then committed — should atomically
+    // materialize both nodes in one rocksdb WriteBatch.
+    let h = spawn_two_peer().await;
+    let mut w = MeshWriteClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
+
+    // Pick two nodes that both hash to peer A so we can target a
+    // single participant and skip cross-peer coordination for this
+    // lower-level test.
+    let mut nodes: Vec<Node> = Vec::new();
+    while nodes.len() < 2 {
+        let n = Node::new().with_label("T");
+        if h.cluster_a.owner_of(n.id) == PeerId(1) {
+            nodes.push(n);
+        }
+    }
+    let node_ids: Vec<_> = nodes.iter().map(|n| n.id).collect();
+
+    // Commands as serde-json Vec<GraphCommand>.
+    let commands: Vec<mesh_cluster::GraphCommand> = nodes
+        .into_iter()
+        .map(mesh_cluster::GraphCommand::PutNode)
+        .collect();
+    let payload = serde_json::to_vec(&commands).unwrap();
+
+    let txid = "tx-prep-commit-1".to_string();
+    w.batch_write(BatchWriteRequest {
+        txid: txid.clone(),
+        phase: BatchPhase::Prepare as i32,
+        commands_json: payload,
+    })
+    .await
+    .unwrap();
+
+    // Before COMMIT the nodes must NOT be visible in the local store.
+    for id in &node_ids {
+        assert!(h.store_a.get_node(*id).unwrap().is_none());
+    }
+
+    w.batch_write(BatchWriteRequest {
+        txid,
+        phase: BatchPhase::Commit as i32,
+        commands_json: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    // After COMMIT both nodes exist.
+    for id in &node_ids {
+        assert!(h.store_a.get_node(*id).unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn batch_write_abort_discards_staged_commands() {
+    // Prepare, then abort — the staged commands must not land on disk.
+    let h = spawn_two_peer().await;
+    let mut w = MeshWriteClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
+
+    let node = loop {
+        let n = Node::new().with_label("AbortMe");
+        if h.cluster_a.owner_of(n.id) == PeerId(1) {
+            break n;
+        }
+    };
+    let node_id = node.id;
+
+    let commands = vec![mesh_cluster::GraphCommand::PutNode(node)];
+    let payload = serde_json::to_vec(&commands).unwrap();
+
+    let txid = "tx-abort-1".to_string();
+    w.batch_write(BatchWriteRequest {
+        txid: txid.clone(),
+        phase: BatchPhase::Prepare as i32,
+        commands_json: payload,
+    })
+    .await
+    .unwrap();
+
+    w.batch_write(BatchWriteRequest {
+        txid: txid.clone(),
+        phase: BatchPhase::Abort as i32,
+        commands_json: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    assert!(h.store_a.get_node(node_id).unwrap().is_none());
+
+    // A follow-up COMMIT on the same txid must fail — abort removed
+    // the staged entry, so there's nothing to commit. This proves
+    // ABORT actually discards staging state.
+    let err = w
+        .batch_write(BatchWriteRequest {
+            txid,
+            phase: BatchPhase::Commit as i32,
+            commands_json: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn batch_write_duplicate_prepare_rejected() {
+    // Preparing the same txid twice must fail so a coordinator bug
+    // can't silently clobber a concurrent transaction's staged state.
+    let h = spawn_two_peer().await;
+    let mut w = MeshWriteClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
+
+    let commands: Vec<mesh_cluster::GraphCommand> = Vec::new();
+    let payload = serde_json::to_vec(&commands).unwrap();
+
+    let txid = "tx-dup".to_string();
+    w.batch_write(BatchWriteRequest {
+        txid: txid.clone(),
+        phase: BatchPhase::Prepare as i32,
+        commands_json: payload.clone(),
+    })
+    .await
+    .unwrap();
+
+    let err = w
+        .batch_write(BatchWriteRequest {
+            txid,
+            phase: BatchPhase::Prepare as i32,
+            commands_json: payload,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+}
+
+#[tokio::test]
+async fn cypher_multi_op_query_atomic_across_peers() {
+    // A multi-node CREATE whose nodes hash to BOTH peers. With 2PC
+    // wiring the whole transaction either lands on both peers or on
+    // neither; specifically, neither peer's store should hold half a
+    // transaction after a successful execute_cypher call.
+    //
+    // We don't have a fault-injection hook yet to prove the ABORT
+    // rollback branch, so this test just pins the happy-path atomic
+    // shape and asserts the exact shard split matches the partitioner.
+    let h = spawn_two_peer().await;
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+
+    // One Cypher query that creates eight nodes — the partitioner will
+    // almost certainly split them across both peers on a hash layout,
+    // so the coordinator runs PREPARE+COMMIT on both.
+    client
+        .execute_cypher(ExecuteCypherRequest {
+            query:
+                "CREATE (a:Batch {i:0}), (b:Batch {i:1}), (c:Batch {i:2}), (d:Batch {i:3}),
+                        (e:Batch {i:4}), (f:Batch {i:5}), (g:Batch {i:6}), (h:Batch {i:7})"
+                    .to_string(),
+        })
+        .await
+        .unwrap();
+
+    let a_ids = h.store_a.all_node_ids().unwrap();
+    let b_ids = h.store_b.all_node_ids().unwrap();
+
+    // Total is exactly eight — the PREPARE-then-COMMIT sequence
+    // committed without dropping or duplicating any mutation.
+    assert_eq!(a_ids.len() + b_ids.len(), 8);
+
+    // Each node lives on the peer its id hashes to (sharding invariant).
+    for id in &a_ids {
+        assert_eq!(h.cluster_a.owner_of(*id), PeerId(1));
+    }
+    for id in &b_ids {
+        assert_eq!(h.cluster_a.owner_of(*id), PeerId(2));
+    }
+
+    // Round-trip MATCH returns the full set regardless of which peer
+    // holds which node.
+    let resp = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:Batch) RETURN n.i AS i".to_string(),
+        })
+        .await
+        .unwrap();
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    assert_eq!(rows.len(), 8);
+    let seen: std::collections::BTreeSet<i64> = rows
+        .iter()
+        .map(|r| r["i"]["Property"]["value"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seen, (0..8).collect());
+}
+
+#[tokio::test]
+async fn cypher_reverse_traversal_via_ghost_edges() {
+    // Cross-partition reverse traversal test. The spec calls for
+    // ghost/stub edge copies on the target's partition so a query
+    // starting from the target and walking backwards along the edge
+    // finds the source. In practice, `RoutingGraphWriter::put_edge`
+    // already replicates each edge to both source-owner and target-
+    // owner, and `Store::put_edge` populates both adj_out and adj_in
+    // — so the target owner ends up with a populated `incoming(t)`
+    // entry for every edge pointing at one of its nodes. This test
+    // pins that invariant by driving a reverse-direction MATCH.
+    let h = spawn_two_peer().await;
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+
+    // Create 15 (a)-[:KNOWS]->(b) pairs. With a 4-partition hash
+    // layout the hash partitioner will straddle some pairs across
+    // peers — that's the case we care about.
+    for i in 0..15 {
+        client
+            .execute_cypher(ExecuteCypherRequest {
+                query: format!(
+                    "CREATE (a:Src {{name: 'a{i}'}})-[:KNOWS]->(b:Dst {{name: 'b{i}'}})"
+                ),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Sanity: at least one edge must actually cross partitions, else
+    // the test isn't exercising cross-partition reverse traversal.
+    let all_edges: Vec<_> = h
+        .store_a
+        .all_edges()
+        .unwrap()
+        .into_iter()
+        .chain(h.store_b.all_edges().unwrap().into_iter())
+        .collect();
+    let cross_partition_exists = all_edges.iter().any(|e| {
+        h.cluster_a.owner_of(e.source) != h.cluster_a.owner_of(e.target)
+    });
+    assert!(
+        cross_partition_exists,
+        "need at least one cross-partition edge to exercise ghost-edge reverse traversal"
+    );
+
+    // Reverse MATCH: start from Dst (the target side), walk edges
+    // backwards to find Src. This forces the executor to call
+    // `incoming(dst)` on the target's partition owner — which only
+    // returns the edge if the ghost-copy invariant holds.
+    let resp = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (b:Dst)<-[:KNOWS]-(a:Src) RETURN a.name AS src, b.name AS dst"
+                .to_string(),
+        })
+        .await
+        .unwrap();
+
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    assert_eq!(
+        rows.len(),
+        15,
+        "reverse traversal should reach every (Src)->(Dst) pair"
+    );
+    let pairs: std::collections::BTreeSet<(String, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["src"]["Property"]["value"].as_str().unwrap().to_string(),
+                r["dst"]["Property"]["value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let expected: std::collections::BTreeSet<(String, String)> =
+        (0..15).map(|i| (format!("a{i}"), format!("b{i}"))).collect();
+    assert_eq!(pairs, expected);
 }
 
 #[tokio::test]

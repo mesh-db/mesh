@@ -12,6 +12,7 @@ mod raft_service;
 mod routing;
 mod routing_writer;
 mod server;
+mod tx_coordinator;
 
 pub use error::ConvertError;
 pub use executor_writer::{BufferingGraphWriter, RaftGraphWriter};

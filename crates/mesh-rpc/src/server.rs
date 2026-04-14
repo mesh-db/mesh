@@ -4,33 +4,42 @@ use crate::convert::{
 };
 use crate::executor_writer::BufferingGraphWriter;
 use crate::partitioned_reader::PartitionedGraphReader;
-use crate::routing_writer::RoutingGraphWriter;
+use crate::tx_coordinator::TxCoordinator;
 use crate::proto::mesh_query_server::{MeshQuery, MeshQueryServer};
 use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
-    AllNodeIdsRequest, AllNodeIdsResponse, DeleteEdgeRequest, DeleteEdgeResponse,
-    DetachDeleteNodeRequest, DetachDeleteNodeResponse, ExecuteCypherRequest,
-    ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse, GetNodeRequest, GetNodeResponse,
-    HealthRequest, HealthResponse, NeighborInfo, NeighborRequest, NeighborResponse,
-    NodesByLabelRequest, NodesByLabelResponse, PutEdgeRequest, PutEdgeResponse, PutNodeRequest,
-    PutNodeResponse,
+    AllNodeIdsRequest, AllNodeIdsResponse, BatchPhase, BatchWriteRequest, BatchWriteResponse,
+    DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest, DetachDeleteNodeResponse,
+    ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse,
+    GetNodeRequest, GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo,
+    NeighborRequest, NeighborResponse, NodesByLabelRequest, NodesByLabelResponse,
+    PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
 };
 use crate::routing::Routing;
 use mesh_cluster::raft::RaftCluster;
 use mesh_cluster::{Error as ClusterError, GraphCommand, PeerId};
 use mesh_executor::{execute_with_reader, execute_with_writer, GraphReader, GraphWriter};
 use mesh_storage::Store;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
+
+/// Per-service in-memory staging for multi-peer [`BatchWrite`] transactions
+/// in the PREPARE state. Keyed by the coordinator-supplied `txid`; a
+/// successful PREPARE inserts an entry, COMMIT removes + applies, ABORT
+/// just removes. If the process crashes between PREPARE and COMMIT the
+/// staged batch is lost — standard 2PC participant semantics, equivalent
+/// to an implicit ABORT from the coordinator's perspective.
+type PendingBatches = Arc<Mutex<HashMap<String, Vec<GraphCommand>>>>;
 
 #[derive(Clone)]
 pub struct MeshService {
     store: Arc<Store>,
     routing: Option<Arc<Routing>>,
     raft: Option<Arc<RaftCluster>>,
+    pending_batches: PendingBatches,
 }
 
 impl MeshService {
@@ -40,6 +49,7 @@ impl MeshService {
             store,
             routing: None,
             raft: None,
+            pending_batches: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -50,6 +60,7 @@ impl MeshService {
             store,
             routing: Some(routing),
             raft: None,
+            pending_batches: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -62,6 +73,7 @@ impl MeshService {
             store,
             routing: None,
             raft: Some(raft),
+            pending_batches: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -72,6 +84,38 @@ impl MeshService {
     pub fn into_write_server(self) -> MeshWriteServer<Self> {
         MeshWriteServer::new(self)
     }
+}
+
+/// Flatten a tree of [`GraphCommand`] (which may nest `Batch` variants)
+/// into a flat `Vec<StoreMutation>` so `Store::apply_batch` can commit
+/// them as one rocksdb `WriteBatch`.
+pub(crate) fn flatten_commands(
+    cmds: &[GraphCommand],
+    out: &mut Vec<mesh_storage::StoreMutation>,
+) {
+    use mesh_storage::StoreMutation;
+    for cmd in cmds {
+        match cmd {
+            GraphCommand::PutNode(n) => out.push(StoreMutation::PutNode(n.clone())),
+            GraphCommand::PutEdge(e) => out.push(StoreMutation::PutEdge(e.clone())),
+            GraphCommand::DeleteEdge(id) => out.push(StoreMutation::DeleteEdge(*id)),
+            GraphCommand::DetachDeleteNode(id) => {
+                out.push(StoreMutation::DetachDeleteNode(*id))
+            }
+            GraphCommand::Batch(inner) => flatten_commands(inner, out),
+        }
+    }
+}
+
+/// Apply a prepared batch to `store` atomically. Used by both the
+/// `BatchWrite` commit phase and the in-process coordinator shortcut.
+pub(crate) fn apply_prepared_batch(
+    store: &Store,
+    cmds: &[GraphCommand],
+) -> std::result::Result<(), mesh_storage::Error> {
+    let mut flat = Vec::with_capacity(cmds.len());
+    flatten_commands(cmds, &mut flat);
+    store.apply_batch(&flat)
 }
 
 fn raft_propose_failed<E: std::fmt::Display>(e: E) -> Status {
@@ -372,8 +416,15 @@ impl MeshQuery for MeshService {
         let store = self.store.clone();
         let raft = self.raft.clone();
         let routing = self.routing.clone();
-        let (rows, batch) = tokio::task::spawn_blocking(
-            move || -> Result<(Vec<mesh_executor::Row>, Option<Vec<GraphCommand>>), mesh_executor::Error> {
+        let (rows, raft_batch, routing_batch) = tokio::task::spawn_blocking(
+            move || -> Result<
+                (
+                    Vec<mesh_executor::Row>,
+                    Option<Vec<GraphCommand>>,
+                    Option<Vec<GraphCommand>>,
+                ),
+                mesh_executor::Error,
+            > {
                 let store_ref: &Store = &store;
                 if raft.is_some() {
                     // Raft mode: every peer holds a full replica, so reads
@@ -383,30 +434,31 @@ impl MeshQuery for MeshService {
                     let writer = BufferingGraphWriter::new();
                     let rows =
                         execute_with_writer(&plan, store_ref, &writer as &dyn GraphWriter)?;
-                    Ok((rows, Some(writer.into_commands())))
+                    Ok((rows, Some(writer.into_commands()), None))
                 } else if let Some(r) = routing.as_ref() {
                     // Routing mode: nodes are sharded across peers by hash
                     // partition. Reads go through a partitioned reader that
                     // routes point lookups to owners and scatter-gathers
-                    // bulk scans; writes go through a routing writer that
-                    // sends each mutation to the partition owner (or both
-                    // owners for edges). Together these make Cypher queries
-                    // behave correctly over a sharded graph.
+                    // bulk scans. Writes buffer into a local Vec so the
+                    // async side can group them by destination peer and
+                    // drive a 2PC batch against each — atomic both within
+                    // a peer (one rocksdb WriteBatch) and across peers
+                    // (prepare all, commit or abort).
                     let reader = PartitionedGraphReader::new(store.clone(), r.clone());
-                    let writer = RoutingGraphWriter::new(store.clone(), r.clone());
+                    let writer = BufferingGraphWriter::new();
                     let rows = execute_with_reader(
                         &plan,
                         &reader as &dyn GraphReader,
                         &writer as &dyn GraphWriter,
                     )?;
-                    Ok((rows, None))
+                    Ok((rows, None, Some(writer.into_commands())))
                 } else {
                     let rows = execute_with_writer(
                         &plan,
                         store_ref,
                         store_ref as &dyn GraphWriter,
                     )?;
-                    Ok((rows, None))
+                    Ok((rows, None, None))
                 }
             },
         )
@@ -414,7 +466,21 @@ impl MeshQuery for MeshService {
         .map_err(|e| Status::internal(format!("executor task panicked: {e}")))?
         .map_err(|e| Status::internal(format!("cypher execution failed: {e}")))?;
 
-        if let (Some(raft), Some(commands)) = (&self.raft, batch) {
+        // Routing mode: run the buffered writes through the 2PC
+        // coordinator so the whole Cypher transaction lands atomically
+        // across every participating peer (or not at all).
+        if let (Some(routing), Some(commands)) = (&self.routing, routing_batch) {
+            if !commands.is_empty() {
+                let coordinator = TxCoordinator::new(
+                    &self.store,
+                    &self.pending_batches,
+                    routing,
+                );
+                coordinator.run(commands).await?;
+            }
+        }
+
+        if let (Some(raft), Some(commands)) = (&self.raft, raft_batch) {
             if !commands.is_empty() {
                 let entry = if commands.len() == 1 {
                     commands.into_iter().next().unwrap()
@@ -698,5 +764,61 @@ impl MeshWrite for MeshService {
         }
 
         Ok(Response::new(DetachDeleteNodeResponse {}))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "batch_write", txid, phase))]
+    async fn batch_write(
+        &self,
+        request: Request<BatchWriteRequest>,
+    ) -> Result<Response<BatchWriteResponse>, Status> {
+        let req = request.into_inner();
+        let txid = req.txid;
+        let phase = BatchPhase::try_from(req.phase)
+            .map_err(|_| Status::invalid_argument(format!("unknown phase {}", req.phase)))?;
+        tracing::Span::current().record("txid", txid.as_str());
+        tracing::Span::current().record("phase", format!("{:?}", phase).as_str());
+
+        if txid.is_empty() {
+            return Err(Status::invalid_argument("empty txid"));
+        }
+
+        match phase {
+            BatchPhase::Unspecified => {
+                Err(Status::invalid_argument("phase UNSPECIFIED is not valid"))
+            }
+            BatchPhase::Prepare => {
+                let commands: Vec<GraphCommand> =
+                    serde_json::from_slice(&req.commands_json).map_err(bad_request)?;
+                let mut pending = self.pending_batches.lock().unwrap();
+                if pending.contains_key(&txid) {
+                    return Err(Status::already_exists(format!(
+                        "txid {} already prepared",
+                        txid
+                    )));
+                }
+                pending.insert(txid, commands);
+                Ok(Response::new(BatchWriteResponse {}))
+            }
+            BatchPhase::Commit => {
+                let cmds = {
+                    let mut pending = self.pending_batches.lock().unwrap();
+                    pending.remove(&txid).ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "txid {} not prepared on this peer",
+                            txid
+                        ))
+                    })?
+                };
+                apply_prepared_batch(&self.store, &cmds).map_err(internal)?;
+                Ok(Response::new(BatchWriteResponse {}))
+            }
+            BatchPhase::Abort => {
+                // Abort is always idempotent: dropping the staged entry is
+                // safe even if PREPARE never arrived (e.g., coordinator
+                // sends ABORT defensively on a partial failure).
+                let _ = self.pending_batches.lock().unwrap().remove(&txid);
+                Ok(Response::new(BatchWriteResponse {}))
+            }
+        }
     }
 }
