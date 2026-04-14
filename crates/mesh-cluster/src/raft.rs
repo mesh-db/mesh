@@ -9,7 +9,7 @@
 //! [`RaftCluster`] wrapper that bootstraps the Raft instance and exposes
 //! `propose` / `current_state`.
 
-use crate::{ClusterCommand, ClusterState, Error, Result};
+use crate::{ClusterCommand, ClusterState, Error, GraphCommand, MeshLogEntry, Result};
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -38,9 +38,11 @@ pub type NodeId = u64;
 pub struct ApplyResponse;
 
 openraft::declare_raft_types!(
-    /// Type binding for Mesh's Raft consensus layer.
+    /// Type binding for Mesh's Raft consensus layer. `D = MeshLogEntry`
+    /// so a single Raft group replicates both cluster metadata changes
+    /// and graph mutations.
     pub MeshRaftConfig:
-        D = ClusterCommand,
+        D = MeshLogEntry,
         R = ApplyResponse,
         NodeId = NodeId,
         Node = BasicNode,
@@ -48,6 +50,15 @@ openraft::declare_raft_types!(
         SnapshotData = Cursor<Vec<u8>>,
         AsyncRuntime = openraft::TokioRuntime,
 );
+
+/// Pluggable applier for [`GraphCommand`] entries. mesh-cluster doesn't
+/// know about [`mesh_storage::Store`] — downstream crates implement this
+/// trait and pass an instance to [`RaftCluster::new_with_applier`].
+pub trait GraphStateMachine: std::fmt::Debug + Send + Sync + 'static {
+    /// Apply a single graph mutation. Errors are surfaced as strings for
+    /// simplicity; a future step will introduce a typed error.
+    fn apply(&self, command: &GraphCommand) -> std::result::Result<(), String>;
+}
 
 impl From<crate::PeerId> for NodeId {
     fn from(p: crate::PeerId) -> Self {
@@ -87,6 +98,7 @@ pub struct MemStoreInner {
     pub state: ClusterState,
     pub last_applied: Option<LogId<NodeId>>,
     pub stored_membership: StoredMembership<NodeId, BasicNode>,
+    pub graph_applier: Option<Arc<dyn GraphStateMachine>>,
 
     // Snapshot
     pub snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, Vec<u8>)>,
@@ -100,6 +112,13 @@ pub struct MemStore {
 
 impl MemStore {
     pub fn new(initial_state: ClusterState) -> Self {
+        Self::new_with_applier(initial_state, None)
+    }
+
+    pub fn new_with_applier(
+        initial_state: ClusterState,
+        graph_applier: Option<Arc<dyn GraphStateMachine>>,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(MemStoreInner {
                 log: BTreeMap::new(),
@@ -108,6 +127,7 @@ impl MemStore {
                 state: initial_state,
                 last_applied: None,
                 stored_membership: StoredMembership::default(),
+                graph_applier,
                 snapshot: None,
                 snapshot_counter: 0,
             })),
@@ -219,16 +239,24 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         entries: &[Entry<MeshRaftConfig>],
     ) -> std::result::Result<Vec<ApplyResponse>, StorageError<NodeId>> {
         let mut inner = self.inner.write().await;
+        let graph_applier = inner.graph_applier.clone();
         let mut results = Vec::with_capacity(entries.len());
         for entry in entries {
             inner.last_applied = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Blank => {}
-                EntryPayload::Normal(cmd) => {
-                    // Apply errors are swallowed so Raft keeps making progress;
-                    // a follow-up step will surface them through ApplyResponse.
-                    let _ = inner.state.apply(cmd);
-                }
+                EntryPayload::Normal(log_entry) => match log_entry {
+                    MeshLogEntry::Cluster(cmd) => {
+                        // Apply errors are swallowed so Raft keeps making
+                        // progress; a follow-up step will surface them.
+                        let _ = inner.state.apply(cmd);
+                    }
+                    MeshLogEntry::Graph(cmd) => {
+                        if let Some(applier) = &graph_applier {
+                            let _ = applier.apply(cmd);
+                        }
+                    }
+                },
                 EntryPayload::Membership(m) => {
                     inner.stored_membership =
                         StoredMembership::new(Some(entry.log_id), m.clone());
@@ -390,12 +418,26 @@ impl RaftCluster {
     where
         N: RaftNetworkFactory<MeshRaftConfig>,
     {
+        Self::new_with_applier(id, initial_state, network, None).await
+    }
+
+    /// Like [`new`], but accepts a [`GraphStateMachine`] that handles
+    /// `MeshLogEntry::Graph` entries on top of the cluster-metadata state.
+    pub async fn new_with_applier<N>(
+        id: NodeId,
+        initial_state: ClusterState,
+        network: N,
+        graph_applier: Option<Arc<dyn GraphStateMachine>>,
+    ) -> Result<Self>
+    where
+        N: RaftNetworkFactory<MeshRaftConfig>,
+    {
         let config = Arc::new(
             default_config()
                 .validate()
                 .map_err(|e| Error::Raft(e.to_string()))?,
         );
-        let store = MemStore::new(initial_state);
+        let store = MemStore::new_with_applier(initial_state, graph_applier);
         let (log_store, state_machine) = Adaptor::new(store.clone());
 
         let raft = Raft::new(id, config, network, log_store, state_machine)
@@ -427,10 +469,24 @@ impl RaftCluster {
         Ok(cluster)
     }
 
+    /// Propose a [`ClusterCommand`] entry. Wraps internally as
+    /// [`MeshLogEntry::Cluster`] so existing callers don't need to touch
+    /// the entry type.
     pub async fn propose(&self, command: ClusterCommand) -> Result<ApplyResponse> {
+        self.propose_entry(MeshLogEntry::Cluster(command)).await
+    }
+
+    /// Propose a [`GraphCommand`] entry that the configured
+    /// [`GraphStateMachine`] will apply on every replica.
+    pub async fn propose_graph(&self, command: GraphCommand) -> Result<ApplyResponse> {
+        self.propose_entry(MeshLogEntry::Graph(command)).await
+    }
+
+    /// Propose an arbitrary [`MeshLogEntry`].
+    pub async fn propose_entry(&self, entry: MeshLogEntry) -> Result<ApplyResponse> {
         let response = self
             .raft
-            .client_write(command)
+            .client_write(entry)
             .await
             .map_err(|e| Error::Raft(e.to_string()))?;
         Ok(response.data)

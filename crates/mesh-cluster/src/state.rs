@@ -1,4 +1,5 @@
 use crate::{Error, Membership, PartitionMap, Peer, PeerId, Result};
+use mesh_core::{Edge, EdgeId, Node, NodeId};
 use serde::{Deserialize, Serialize};
 
 /// The replicated portion of a cluster: who the members are and which peer
@@ -30,6 +31,29 @@ pub enum ClusterCommand {
     RemovePeer { id: PeerId },
     UpdatePeerAddress { id: PeerId, address: String },
     Rebalance,
+}
+
+/// Mutations applied to the graph store. Replicated through Raft so every
+/// peer's local store ends up with the same data.
+///
+/// `PutNode` / `PutEdge` carry the full entity bytes; `DeleteEdge` /
+/// `DetachDeleteNode` carry only the id. Float properties on `Node`/`Edge`
+/// mean this enum can only derive `PartialEq`, not `Eq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GraphCommand {
+    PutNode(Node),
+    PutEdge(Edge),
+    DeleteEdge(EdgeId),
+    DetachDeleteNode(NodeId),
+}
+
+/// Top-level Raft log entry: either a cluster-metadata mutation or a graph
+/// mutation. `MeshRaftConfig::D` is bound to this so a single Raft group
+/// replicates both layers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MeshLogEntry {
+    Cluster(ClusterCommand),
+    Graph(GraphCommand),
 }
 
 impl ClusterState {
