@@ -631,3 +631,223 @@ async fn bolt_rejects_bolt_5_only_clients() {
     // Server wrote 00000000 and closed; client surfaces NoCompatibleVersion.
     matches!(err, mesh_bolt::BoltError::NoCompatibleVersion(_));
 }
+
+// ---------------------------------------------------------------------------
+// Read-your-writes inside an explicit transaction
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bolt_tx_match_sees_prior_create_in_same_tx() {
+    // The canonical case: CREATE a node in one RUN, MATCH for it in
+    // a later RUN of the same tx. Before the overlay was wired in,
+    // the second RUN would see the pre-BEGIN store and return zero
+    // rows. With the overlay, it returns the buffered node.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE (n:Draft {title: 'hello'})").await;
+
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Draft) RETURN n.title AS title").await;
+    assert_eq!(records.len(), 1, "MATCH should see the buffered CREATE");
+    assert_eq!(records[0][0].as_str(), Some("hello"));
+
+    // COMMIT persists it. A post-commit MATCH also returns it.
+    let reply = commit_tx(&mut sock).await;
+    assert!(matches!(reply, BoltMessage::Success { .. }));
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Draft) RETURN n.title AS title").await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0][0].as_str(), Some("hello"));
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_match_sees_buffered_edge_via_traversal() {
+    // Create two nodes and an edge between them across three RUNs
+    // inside a tx, then MATCH the path in a fourth RUN. The overlay
+    // must thread uncommitted put_edges through outgoing()/incoming().
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE (a:Person {name: 'alice'})").await;
+    let _ = run_and_pull(&mut sock, "CREATE (b:Person {name: 'bob'})").await;
+    let _ = run_and_pull(
+        &mut sock,
+        "MATCH (a:Person {name: 'alice'}), (b:Person {name: 'bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    )
+    .await;
+
+    let (records, _) = run_and_pull(
+        &mut sock,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS src, b.name AS dst",
+    )
+    .await;
+    assert_eq!(records.len(), 1, "traversal should see the buffered edge");
+    // `field_names_from_rows` sorts column names alphabetically, so
+    // the RECORD arrives as [dst, src] regardless of RETURN order.
+    assert_eq!(records[0][0].as_str(), Some("bob"));
+    assert_eq!(records[0][1].as_str(), Some("alice"));
+
+    let _ = commit_tx(&mut sock).await;
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_set_is_visible_to_subsequent_read() {
+    // Seed a node outside the tx so the SET in the tx has something
+    // to update, then verify the updated property is visible to a
+    // subsequent MATCH inside the same tx.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    let _ = run_and_pull(&mut sock, "CREATE (n:Item {color: 'blue', size: 1})").await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "MATCH (n:Item) SET n.color = 'red'").await;
+
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Item) RETURN n.color AS color").await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0][0].as_str(),
+        Some("red"),
+        "in-tx MATCH should see the SET's new value, not the pre-BEGIN 'blue'"
+    );
+
+    let _ = commit_tx(&mut sock).await;
+
+    // Post-commit the new value is still visible.
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Item) RETURN n.color AS color").await;
+    assert_eq!(records[0][0].as_str(), Some("red"));
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_detach_delete_hides_node_from_subsequent_reads() {
+    // DETACH DELETE a node in one RUN, then a later RUN in the same
+    // tx should not see it. The overlay's DetachDeleteNode entry
+    // hides both the node and any incident buffered / base edges.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    let _ = run_and_pull(&mut sock, "CREATE (n:Doomed {name: 'gone'})").await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "MATCH (n:Doomed) DETACH DELETE n").await;
+
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Doomed) RETURN n.name AS name").await;
+    assert!(
+        records.is_empty(),
+        "in-tx MATCH should hide the detach-deleted node"
+    );
+
+    let _ = commit_tx(&mut sock).await;
+    // After commit it's also gone from the real store.
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Doomed) RETURN n.name AS name").await;
+    assert!(records.is_empty());
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_rollback_after_read_your_writes_leaves_store_untouched() {
+    // Regression guard: read-your-writes must not accidentally leak
+    // to the underlying store. A tx that creates a node, reads it
+    // back, and then rolls back should leave zero nodes behind.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE (n:Ephemeral)").await;
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Ephemeral) RETURN n").await;
+    assert_eq!(records.len(), 1, "overlay should expose the buffered node");
+
+    let reply = rollback_tx(&mut sock).await;
+    assert!(matches!(reply, BoltMessage::Success { .. }));
+
+    // Post-rollback MATCH sees nothing — the base store never got
+    // the write.
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n:Ephemeral) RETURN n").await;
+    assert!(records.is_empty());
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_nodes_by_label_unions_base_and_buffered() {
+    // Mix: seed one node pre-tx, create a second with the same
+    // label inside the tx, and assert the in-tx MATCH returns
+    // both. The overlay's nodes_by_label implementation folds
+    // base + buffered rather than picking one.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    let _ = run_and_pull(&mut sock, "CREATE (n:Species {name: 'cat'})").await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE (n:Species {name: 'dog'})").await;
+    let (records, _) = run_and_pull(
+        &mut sock,
+        "MATCH (n:Species) RETURN n.name AS name ORDER BY name",
+    )
+    .await;
+    let names: Vec<String> = records
+        .iter()
+        .map(|fields| fields[0].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["cat", "dog"]);
+
+    let _ = commit_tx(&mut sock).await;
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_delete_edge_hides_edge_from_traversal() {
+    // Seed two nodes and an edge, then DELETE the edge inside a tx.
+    // A subsequent MATCH traversal should not find the edge, and
+    // rollback should restore it.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    let _ = run_and_pull(
+        &mut sock,
+        "CREATE (a:Node {n: 'a'})-[:LINK]->(b:Node {n: 'b'})",
+    )
+    .await;
+
+    // Pre-tx sanity: traversal finds the edge.
+    let (records, _) = run_and_pull(
+        &mut sock,
+        "MATCH (a:Node)-[:LINK]->(b:Node) RETURN a.n AS src",
+    )
+    .await;
+    assert_eq!(records.len(), 1);
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "MATCH (a)-[r:LINK]->(b) DELETE r").await;
+
+    let (records, _) = run_and_pull(
+        &mut sock,
+        "MATCH (a:Node)-[:LINK]->(b:Node) RETURN a.n AS src",
+    )
+    .await;
+    assert!(
+        records.is_empty(),
+        "in-tx traversal should hide the deleted edge"
+    );
+
+    // Rollback — edge should reappear since the DELETE was never
+    // committed to the store.
+    let _ = rollback_tx(&mut sock).await;
+    let (records, _) = run_and_pull(
+        &mut sock,
+        "MATCH (a:Node)-[:LINK]->(b:Node) RETURN a.n AS src",
+    )
+    .await;
+    assert_eq!(records.len(), 1, "rollback should restore the edge");
+
+    goodbye(sock).await;
+}

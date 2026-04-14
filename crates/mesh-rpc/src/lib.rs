@@ -14,6 +14,7 @@ mod routing;
 mod routing_writer;
 mod server;
 mod tx_coordinator;
+mod tx_overlay;
 
 pub use coordinator_log::{CoordinatorLog, TxDecision, TxLogEntry, TxState};
 pub use error::ConvertError;
@@ -25,3 +26,4 @@ pub use raft_service::MeshRaftService;
 pub use routing::{Routing, RoutingError};
 pub use routing_writer::RoutingGraphWriter;
 pub use server::MeshService;
+pub use tx_overlay::{OverlayGraphReader, TxOverlayState};

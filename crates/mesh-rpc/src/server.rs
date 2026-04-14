@@ -159,6 +159,29 @@ impl MeshService {
         query: String,
         params: mesh_executor::ParamMap,
     ) -> std::result::Result<(Vec<mesh_executor::Row>, Vec<GraphCommand>), Status> {
+        // Equivalent to running an explicit tx with an empty
+        // accumulator — no previously-buffered writes to overlay.
+        self.execute_cypher_in_tx(query, params, Vec::new()).await
+    }
+
+    /// Run a Cypher query with a read-your-writes overlay derived
+    /// from `prev_commands`. Used by the Bolt explicit-transaction
+    /// handler so subsequent `RUN`s inside a `BEGIN` / `COMMIT`
+    /// block see the writes from earlier RUNs in the same tx.
+    ///
+    /// Returns `(rows, new_commands)` where `new_commands` are *this*
+    /// RUN's writes only; the caller is responsible for appending
+    /// them to its accumulator for subsequent RUNs.
+    ///
+    /// With an empty `prev_commands`, this collapses to the normal
+    /// auto-commit read path — the overlay is a no-op and every read
+    /// hits the base reader directly.
+    pub async fn execute_cypher_in_tx(
+        &self,
+        query: String,
+        params: mesh_executor::ParamMap,
+        prev_commands: Vec<GraphCommand>,
+    ) -> std::result::Result<(Vec<mesh_executor::Row>, Vec<GraphCommand>), Status> {
         let statement = mesh_cypher::parse(&query).map_err(bad_request)?;
         let plan = mesh_cypher::plan(&statement).map_err(bad_request)?;
 
@@ -173,11 +196,19 @@ impl MeshService {
             > {
                 let store_ref: &Store = &store;
                 let writer = BufferingGraphWriter::new();
+                // Fold the previously-buffered tx writes into an
+                // overlay state. Empty for auto-commit RUNs; populated
+                // for in-tx RUNs so the executor sees the prior writes.
+                let overlay = crate::TxOverlayState::from_commands(&prev_commands);
+
                 let rows = if let Some(r) = routing.as_ref() {
                     // Routing mode: reads go through a partitioned
                     // reader. Single-node and Raft modes use the local
                     // store directly (Raft replicates the full graph).
-                    let reader = PartitionedGraphReader::new(store.clone(), r.clone());
+                    let partitioned =
+                        PartitionedGraphReader::new(store.clone(), r.clone());
+                    let base: &dyn GraphReader = &partitioned;
+                    let reader = crate::OverlayGraphReader::new(base, &overlay);
                     execute_with_reader(
                         &plan,
                         &reader as &dyn GraphReader,
@@ -185,9 +216,11 @@ impl MeshService {
                         &exec_params,
                     )?
                 } else {
+                    let base: &dyn GraphReader = store_ref as &dyn GraphReader;
+                    let reader = crate::OverlayGraphReader::new(base, &overlay);
                     execute_with_reader(
                         &plan,
-                        store_ref as &dyn GraphReader,
+                        &reader as &dyn GraphReader,
                         &writer as &dyn GraphWriter,
                         &exec_params,
                     )?

@@ -27,22 +27,25 @@
 //!
 //! ## Explicit-transaction semantics
 //!
-//! `BEGIN` opens a write-batch transaction: every subsequent `RUN`
-//! executes against the live store for **reads**, but mutations are
-//! buffered into a per-connection `Vec<GraphCommand>`. `COMMIT`
-//! dispatches the whole buffer through [`MeshService::commit_buffered_commands`],
-//! which uses the same backend (Raft propose, routing 2PC, or direct
-//! store apply) the auto-commit path uses for a single `RUN`. The
-//! whole transaction lands atomically — or, on failure, not at all.
+//! `BEGIN` opens a transaction: every subsequent `RUN` buffers its
+//! writes into a per-connection `Vec<GraphCommand>` and the whole
+//! buffer is dispatched at `COMMIT` through
+//! [`MeshService::commit_buffered_commands`], which uses the same
+//! backend (Raft propose, routing 2PC, or direct store apply) the
+//! auto-commit path uses for a single `RUN`. The transaction lands
+//! atomically — or, on failure, not at all.
 //!
-//! **Limitation: no read-after-write inside a transaction.** A `MATCH`
-//! issued after a `CREATE` in the same `BEGIN`/`COMMIT` block sees the
-//! store as it was at `BEGIN` time and will *not* observe the buffered
-//! mutations. This matches the "tx is a write batch" model and is
-//! sufficient for the common idiom of wrapping multiple writes in one
-//! atomic commit; it's insufficient for drivers that rely on
-//! read-your-writes semantics inside a transaction. Implementing
-//! overlay-storage-style read-your-writes is a separate change.
+//! **Read-your-writes inside a transaction is supported.** A `MATCH`
+//! issued after a `CREATE` in the same `BEGIN` / `COMMIT` block sees
+//! the buffered node: the in-tx RUN handler calls
+//! [`MeshService::execute_cypher_in_tx`] with the accumulated buffer,
+//! which constructs a `TxOverlayState` and wraps the normal base
+//! reader in an `OverlayGraphReader`. Every `get_node`, `get_edge`,
+//! `all_node_ids`, `nodes_by_label`, `outgoing`, and `incoming` call
+//! the executor makes sees the overlay's view: uncommitted puts are
+//! visible, uncommitted deletes are hidden, and `DetachDeleteNode`
+//! cascades implicitly to incident edges. See
+//! `mesh-rpc/src/tx_overlay.rs` for the exact semantics.
 
 use crate::value_conv::{bolt_params_to_param_map, field_names_from_rows, row_to_bolt_fields};
 use mesh_bolt::{
@@ -282,12 +285,19 @@ where
                 };
                 // Take the existing buffer out of the phase so we can
                 // extend it with this RUN's commands and rebuild the
-                // tx phase below.
+                // tx phase below. We pass the buffer as prev_commands
+                // so `execute_cypher_in_tx` overlays it on top of the
+                // base reader, giving this RUN read-your-writes
+                // semantics for everything committed by earlier RUNs
+                // in the same transaction.
                 let mut buffered = match std::mem::replace(&mut phase, Phase::Ready) {
                     Phase::InTxReady { buffered } => buffered,
                     _ => unreachable!(),
                 };
-                match service.execute_cypher_buffered(query, param_map).await {
+                match service
+                    .execute_cypher_in_tx(query, param_map, buffered.clone())
+                    .await
+                {
                     Ok((rows, mut commands)) => {
                         buffered.append(&mut commands);
                         let fields = field_names_from_rows(&rows);
