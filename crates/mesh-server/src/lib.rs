@@ -3,7 +3,7 @@ pub mod config;
 pub mod value_conv;
 
 use anyhow::{anyhow, Context, Result};
-use config::ServerConfig;
+use config::{ClusterMode, ServerConfig};
 use mesh_cluster::raft::{BasicNode, GraphStateMachine, RaftCluster};
 use mesh_cluster::{Cluster, ClusterState, Membership, PartitionMap, Peer, PeerId};
 use mesh_rpc::{
@@ -30,10 +30,11 @@ pub struct ServerComponents {
     pub raft_service: Option<MeshRaftService>,
 }
 
-/// Build the storage-backed [`MeshService`] for a single-node deployment.
-/// Kept as a sync entry point for legacy callers; multi-peer deployments
-/// should go through [`build_components`] instead.
+/// Build the storage-backed [`MeshService`] synchronously. Supports
+/// single-node and routing mode — Raft mode requires async bootstrap
+/// and must go through [`build_components`] instead.
 pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
+    config.validate().map_err(|e| anyhow!(e))?;
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
     let store = Arc::new(
@@ -41,22 +42,30 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
             .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
     );
 
-    if config.peers.is_empty() {
-        return Ok(MeshService::new(store));
+    match config.resolved_mode() {
+        ClusterMode::Single => Ok(MeshService::new(store)),
+        ClusterMode::Routing => Ok(build_routing_service(config, store)?),
+        ClusterMode::Raft => Err(anyhow!(
+            "Raft mode requires async bootstrap; call build_components instead"
+        )),
     }
+}
 
+/// Shared routing-mode assembly used by both `build_service` (sync)
+/// and `build_components` (async). Opens the durable 2PC coordinator
+/// log under `data_dir` so recovery and rotation are wired up
+/// end-to-end regardless of which entry point the caller used.
+fn build_routing_service(config: &ServerConfig, store: Arc<Store>) -> Result<MeshService> {
     let peers: Vec<Peer> = config
         .peers
         .iter()
         .map(|p| Peer::new(PeerId(p.id), p.address.clone()))
         .collect();
-
     let cluster = Arc::new(
         Cluster::new(PeerId(config.self_id), config.num_partitions, peers)
             .context("building cluster")?,
     );
     let routing = Arc::new(Routing::new(cluster).context("building routing")?);
-    // Routing mode owns a durable 2PC log for crash recovery.
     let log = Arc::new(
         CoordinatorLog::open(coordinator_log_path(&config.data_dir))
             .context("opening coordinator log")?,
@@ -71,13 +80,18 @@ pub fn coordinator_log_path(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("coordinator-log.jsonl")
 }
 
-/// Build the full [`ServerComponents`] bundle. For multi-peer configs this
-/// constructs a [`RaftCluster`] (with a [`StoreGraphApplier`] so graph
-/// writes replicate via the state machine), wires the [`MeshService`]'s
-/// write path through `propose_graph`, and exposes a [`MeshRaftService`]
-/// for incoming Raft RPCs. Single-node configs return a local-only service
-/// with `raft: None`.
+/// Build the full [`ServerComponents`] bundle. Switches on
+/// [`ServerConfig::resolved_mode`]:
+///
+/// - [`ClusterMode::Single`] → local-only service, no Raft, no
+///   routing.
+/// - [`ClusterMode::Routing`] → hash-partitioned routing service
+///   with a durable 2PC coordinator log under `data_dir`. No Raft.
+/// - [`ClusterMode::Raft`] → single-Raft-group replication with a
+///   [`StoreGraphApplier`] wiring the executor's writes into the
+///   state machine.
 pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents> {
+    config.validate().map_err(|e| anyhow!(e))?;
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
     let store = Arc::new(
@@ -85,12 +99,24 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
             .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
     );
 
-    if config.peers.is_empty() {
-        return Ok(ServerComponents {
-            service: MeshService::new(store),
-            raft: None,
-            raft_service: None,
-        });
+    match config.resolved_mode() {
+        ClusterMode::Single => {
+            return Ok(ServerComponents {
+                service: MeshService::new(store),
+                raft: None,
+                raft_service: None,
+            });
+        }
+        ClusterMode::Routing => {
+            return Ok(ServerComponents {
+                service: build_routing_service(config, store)?,
+                raft: None,
+                raft_service: None,
+            });
+        }
+        ClusterMode::Raft => {
+            // Fall through to the Raft bootstrap path below.
+        }
     }
 
     // Build the initial cluster state Raft will manage.

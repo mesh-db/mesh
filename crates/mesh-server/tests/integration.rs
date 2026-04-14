@@ -99,6 +99,7 @@ async fn spawn_single_node_server() -> Harness {
         peers: vec![],
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let service = mesh_server::build_service(&config).unwrap();
@@ -150,6 +151,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         peers: peers.clone(),
         bootstrap: false,
         bolt_address: None,
+        mode: Some(mesh_server::config::ClusterMode::Routing),
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -159,6 +161,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: Some(mesh_server::config::ClusterMode::Routing),
     };
 
     let service_a = mesh_server::build_service(&config_a).unwrap();
@@ -313,6 +316,7 @@ async fn build_components_single_node_has_no_raft() {
         peers: vec![],
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
     let components = mesh_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_none());
@@ -339,10 +343,49 @@ async fn build_components_multi_peer_builds_raft() {
         ],
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
     let components = mesh_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_some());
     assert!(components.raft_service.is_some());
+}
+
+#[tokio::test]
+async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
+    // The whole point of the ClusterMode::Routing wiring: the async
+    // `build_components` path used by `serve()` must reach the routing
+    // service + durable coordinator log, not the Raft bootstrap path.
+    let dir = TempDir::new().unwrap();
+    let config = ServerConfig {
+        self_id: 1,
+        listen_address: "127.0.0.1:0".into(),
+        data_dir: dir.path().to_path_buf(),
+        num_partitions: 4,
+        peers: vec![
+            PeerConfig {
+                id: 1,
+                address: "127.0.0.1:7001".into(),
+            },
+            PeerConfig {
+                id: 2,
+                address: "127.0.0.1:7002".into(),
+            },
+        ],
+        bootstrap: false,
+        bolt_address: None,
+        mode: Some(mesh_server::config::ClusterMode::Routing),
+    };
+    let components = mesh_server::build_components(&config).await.unwrap();
+    assert!(components.raft.is_none());
+    assert!(components.raft_service.is_none());
+    // Opening the coordinator log creates the file on disk — this is the
+    // observable signal that routing mode was actually wired in.
+    let log_path = mesh_server::coordinator_log_path(&config.data_dir);
+    assert!(
+        log_path.exists(),
+        "routing build_components should open the coordinator log at {}",
+        log_path.display()
+    );
 }
 
 #[tokio::test]
@@ -380,6 +423,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        mode: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -389,6 +433,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -535,6 +580,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        mode: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -544,6 +590,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -737,6 +784,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        mode: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -746,6 +794,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -876,6 +925,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        mode: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -885,6 +935,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -1050,6 +1101,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        mode: None,
     };
     let config_b1 = ServerConfig {
         self_id: 2,
@@ -1059,6 +1111,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         peers: peers.clone(),
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -1151,6 +1204,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let listener_b2 = TcpListener::bind(addr_b).await.unwrap();
@@ -1289,6 +1343,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        mode: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1298,6 +1353,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -1455,6 +1511,7 @@ async fn cypher_merge_replicates_through_raft() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        mode: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1464,6 +1521,7 @@ async fn cypher_merge_replicates_through_raft() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -1601,6 +1659,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        mode: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1610,6 +1669,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     let components_a = mesh_server::build_components(&config_a).await.unwrap();
@@ -1750,6 +1810,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         peers: peers.clone(),
         bootstrap: true,
         bolt_address: None,
+        mode: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1759,6 +1820,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         peers,
         bootstrap: false,
         bolt_address: None,
+        mode: None,
     };
 
     // Build components for both peers.

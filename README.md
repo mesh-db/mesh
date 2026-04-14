@@ -228,6 +228,19 @@ pipeline end-to-end with a raw TCP Bolt client.
 
 ## Cluster mode (multi-peer)
 
+Multi-peer configs pick one of two modes via the top-level `mode` field:
+
+- `mode = "raft"` — single Raft group replicates the full graph to every
+  peer. Reads are cheap-local everywhere; writes go through the leader
+  (followers transparently forward). Default when `peers` is non-empty
+  and `mode` is omitted, for backward compatibility with pre-`mode`
+  configs.
+- `mode = "routing"` — hash-partitioned sharding. Each node lives on
+  exactly one peer; cross-peer reads scatter-gather and cross-peer
+  writes go through the 2PC coordinator with a durable recovery log
+  under `data_dir/coordinator-log.jsonl`. No consensus, so a peer
+  crash loses that peer's shard until it restarts.
+
 A two-peer Raft cluster, one bootstrap seed, both speaking Bolt:
 
 `/tmp/mesh-a.toml`:
@@ -278,6 +291,27 @@ Connect Bolt clients to either `127.0.0.1:7687` (peer A) or
 `127.0.0.1:7688` (peer B). In Raft mode every peer holds the full graph,
 so reads are cheap on either side; writes go through the leader (with
 transparent forwarding from followers in the auto-commit path).
+
+To run the same pair in routing (sharded) mode instead, add
+`mode = "routing"` to both configs and drop the `bootstrap` line — no
+seed is needed since there's no Raft group to initialize:
+
+```toml
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/mesh-data-a"
+bolt_address = "127.0.0.1:7687"
+num_partitions = 4
+mode = "routing"
+
+[[peers]]
+id = 1
+address = "127.0.0.1:7001"
+
+[[peers]]
+id = 2
+address = "127.0.0.1:7002"
+```
 
 ---
 
