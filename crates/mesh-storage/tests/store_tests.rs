@@ -1,5 +1,5 @@
 use mesh_core::{Edge, Node, NodeId};
-use mesh_storage::Store;
+use mesh_storage::{Store, StoreMutation};
 use tempfile::TempDir;
 
 fn tmp_store() -> (Store, TempDir) {
@@ -235,6 +235,89 @@ fn indexes_share_no_state_across_similar_prefixes() {
 
     assert_eq!(store.nodes_by_label("Pers").unwrap(), vec![p.id]);
     assert_eq!(store.nodes_by_label("Person").unwrap(), vec![person.id]);
+}
+
+#[test]
+fn apply_batch_commits_multi_op_atomically() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new().with_label("Person").with_property("name", "Ada");
+    let b = Node::new()
+        .with_label("Person")
+        .with_property("name", "Grace");
+    let edge = Edge::new("KNOWS", a.id, b.id);
+
+    store
+        .apply_batch(&[
+            StoreMutation::PutNode(a.clone()),
+            StoreMutation::PutNode(b.clone()),
+            StoreMutation::PutEdge(edge.clone()),
+        ])
+        .unwrap();
+
+    assert_eq!(store.get_node(a.id).unwrap().unwrap(), a);
+    assert_eq!(store.get_node(b.id).unwrap().unwrap(), b);
+    assert_eq!(store.get_edge(edge.id).unwrap().unwrap(), edge);
+
+    // Both indexes should reflect the post-batch state.
+    let person_ids = store.nodes_by_label("Person").unwrap();
+    assert!(person_ids.contains(&a.id) && person_ids.contains(&b.id));
+    assert_eq!(store.edges_by_type("KNOWS").unwrap(), vec![edge.id]);
+}
+
+#[test]
+fn apply_batch_delete_edge_is_idempotent_for_missing_target() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    let edge = Edge::new("KNOWS", a.id, b.id);
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    store.put_edge(&edge).unwrap();
+
+    // Deleting twice in one batch must not error — the second sees the
+    // edge already gone (live read) and skips.
+    store
+        .apply_batch(&[
+            StoreMutation::DeleteEdge(edge.id),
+            StoreMutation::DeleteEdge(edge.id),
+        ])
+        .unwrap();
+    assert!(store.get_edge(edge.id).unwrap().is_none());
+}
+
+#[test]
+fn apply_batch_detach_delete_then_reinsert_in_one_commit() {
+    let (store, _dir) = tmp_store();
+    let original = Node::new().with_label("Person").with_property("v", 1_i64);
+    let id = original.id;
+    store.put_node(&original).unwrap();
+
+    // Replace an existing node atomically: delete then reinsert with a
+    // different label set. The post-state must reflect the second put,
+    // and label indexes must not leak the old label.
+    let replacement = Node {
+        id,
+        labels: vec!["Hero".into()],
+        properties: Default::default(),
+    };
+    store
+        .apply_batch(&[
+            StoreMutation::DetachDeleteNode(id),
+            StoreMutation::PutNode(replacement.clone()),
+        ])
+        .unwrap();
+
+    let fetched = store.get_node(id).unwrap().unwrap();
+    assert_eq!(fetched.labels, vec!["Hero"]);
+    assert!(store.nodes_by_label("Person").unwrap().is_empty());
+    assert_eq!(store.nodes_by_label("Hero").unwrap(), vec![id]);
+}
+
+#[test]
+fn apply_batch_empty_is_a_noop() {
+    let (store, _dir) = tmp_store();
+    store.apply_batch(&[]).unwrap();
+    assert!(store.all_node_ids().unwrap().is_empty());
 }
 
 #[test]

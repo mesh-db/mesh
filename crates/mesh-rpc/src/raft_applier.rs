@@ -7,7 +7,7 @@
 
 use mesh_cluster::raft::GraphStateMachine;
 use mesh_cluster::GraphCommand;
-use mesh_storage::Store;
+use mesh_storage::{Store, StoreMutation};
 use std::sync::Arc;
 
 pub struct StoreGraphApplier {
@@ -54,17 +54,33 @@ impl GraphStateMachine for StoreGraphApplier {
                     .map_err(|e| e.to_string())
             }
             GraphCommand::Batch(cmds) => {
-                // Sequential apply on top of the per-op idempotency above.
-                // Local atomicity isn't enforced (no Store-level WriteBatch
-                // yet), but it doesn't have to be: log replay re-applies
-                // the entire MeshLogEntry::Graph entry from the start, so a
-                // mid-batch crash recovers correctly because every sub-op
-                // is idempotent.
-                for cmd in cmds {
-                    self.apply(cmd)?;
-                }
-                Ok(())
+                // Translate to StoreMutation and apply atomically through
+                // a single rocksdb WriteBatch — either every mutation in
+                // the Cypher query lands or none does, even across a
+                // process crash. Nested Batch variants are flattened
+                // because `Store::apply_batch` only knows the leaf ops.
+                let mut flat = Vec::with_capacity(cmds.len());
+                flatten_into(cmds, &mut flat)?;
+                self.store.apply_batch(&flat).map_err(|e| e.to_string())
             }
         }
     }
+}
+
+fn flatten_into(
+    cmds: &[GraphCommand],
+    out: &mut Vec<StoreMutation>,
+) -> Result<(), String> {
+    for cmd in cmds {
+        match cmd {
+            GraphCommand::PutNode(n) => out.push(StoreMutation::PutNode(n.clone())),
+            GraphCommand::PutEdge(e) => out.push(StoreMutation::PutEdge(e.clone())),
+            GraphCommand::DeleteEdge(id) => out.push(StoreMutation::DeleteEdge(*id)),
+            GraphCommand::DetachDeleteNode(id) => {
+                out.push(StoreMutation::DetachDeleteNode(*id))
+            }
+            GraphCommand::Batch(inner) => flatten_into(inner, out)?,
+        }
+    }
+    Ok(())
 }

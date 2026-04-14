@@ -25,6 +25,22 @@ const ALL_CFS: &[&str] = &[
     CF_TYPE_INDEX,
 ];
 
+/// A single mutation that can be combined with others into an atomic
+/// [`Store::apply_batch`] call. Mirrors the shape of the per-op `Store`
+/// methods but lets the caller commit a sequence of mutations as one
+/// rocksdb [`WriteBatch`] — useful for giving multi-write Cypher queries
+/// crash-atomic local persistence.
+#[derive(Debug, Clone)]
+pub enum StoreMutation {
+    PutNode(Node),
+    PutEdge(Edge),
+    /// Idempotent within a batch: missing edges are skipped silently so a
+    /// log replay that re-applies a partially-committed batch is safe.
+    DeleteEdge(EdgeId),
+    /// Idempotent within a batch: missing nodes contribute no operations.
+    DetachDeleteNode(NodeId),
+}
+
 pub struct Store {
     db: DB,
 }
@@ -51,6 +67,13 @@ impl Store {
     }
 
     pub fn put_node(&self, node: &Node) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        self.append_put_node(&mut batch, node)?;
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    fn append_put_node(&self, batch: &mut WriteBatch, node: &Node) -> Result<()> {
         let nodes_cf = self.cf(CF_NODES)?;
         let label_cf = self.cf(CF_LABEL_INDEX)?;
 
@@ -63,7 +86,6 @@ impl Store {
         };
 
         let bytes = serde_json::to_vec(node)?;
-        let mut batch = WriteBatch::default();
         batch.put_cf(nodes_cf, node.id.as_bytes(), bytes);
 
         for old in &existing_labels {
@@ -77,7 +99,6 @@ impl Store {
             }
         }
 
-        self.db.write(batch)?;
         Ok(())
     }
 
@@ -90,13 +111,19 @@ impl Store {
     }
 
     pub fn put_edge(&self, edge: &Edge) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        self.append_put_edge(&mut batch, edge)?;
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    fn append_put_edge(&self, batch: &mut WriteBatch, edge: &Edge) -> Result<()> {
         let edges_cf = self.cf(CF_EDGES)?;
         let out_cf = self.cf(CF_ADJ_OUT)?;
         let in_cf = self.cf(CF_ADJ_IN)?;
         let type_cf = self.cf(CF_TYPE_INDEX)?;
 
         let bytes = serde_json::to_vec(edge)?;
-        let mut batch = WriteBatch::default();
         batch.put_cf(edges_cf, edge.id.as_bytes(), bytes);
         batch.put_cf(
             out_cf,
@@ -109,7 +136,6 @@ impl Store {
             edge.source.as_bytes(),
         );
         batch.put_cf(type_cf, type_index_key(&edge.edge_type, edge.id), EMPTY);
-        self.db.write(batch)?;
         Ok(())
     }
 
@@ -123,21 +149,42 @@ impl Store {
 
     pub fn delete_edge(&self, id: EdgeId) -> Result<()> {
         let edge = self.get_edge(id)?.ok_or(Error::EdgeNotFound(id))?;
+        let mut batch = WriteBatch::default();
+        self.append_delete_edge(&mut batch, id, &edge)?;
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    fn append_delete_edge(
+        &self,
+        batch: &mut WriteBatch,
+        id: EdgeId,
+        edge: &Edge,
+    ) -> Result<()> {
         let edges_cf = self.cf(CF_EDGES)?;
         let out_cf = self.cf(CF_ADJ_OUT)?;
         let in_cf = self.cf(CF_ADJ_IN)?;
         let type_cf = self.cf(CF_TYPE_INDEX)?;
 
-        let mut batch = WriteBatch::default();
         batch.delete_cf(edges_cf, id.as_bytes());
         batch.delete_cf(out_cf, adj_key(edge.source, id));
         batch.delete_cf(in_cf, adj_key(edge.target, id));
         batch.delete_cf(type_cf, type_index_key(&edge.edge_type, id));
-        self.db.write(batch)?;
         Ok(())
     }
 
     pub fn detach_delete_node(&self, id: NodeId) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        self.append_detach_delete_node(&mut batch, id)?;
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    fn append_detach_delete_node(
+        &self,
+        batch: &mut WriteBatch,
+        id: NodeId,
+    ) -> Result<()> {
         let node = self.get_node(id)?;
         let outgoing = self.outgoing(id)?;
         let incoming = self.incoming(id)?;
@@ -148,8 +195,6 @@ impl Store {
         let in_cf = self.cf(CF_ADJ_IN)?;
         let label_cf = self.cf(CF_LABEL_INDEX)?;
         let type_cf = self.cf(CF_TYPE_INDEX)?;
-
-        let mut batch = WriteBatch::default();
 
         if let Some(n) = &node {
             for label in &n.labels {
@@ -174,6 +219,35 @@ impl Store {
             batch.delete_cf(in_cf, adj_key(id, *edge_id));
         }
         batch.delete_cf(nodes_cf, id.as_bytes());
+        Ok(())
+    }
+
+    /// Apply a sequence of mutations as one atomic rocksdb write. Either
+    /// every mutation lands or none does — no replica can observe a
+    /// partial result, even across a process crash.
+    ///
+    /// Reads performed during batch construction (existing labels for
+    /// PutNode, edge metadata for DeleteEdge / DetachDeleteNode) hit the
+    /// live store, not the in-flight batch. Read-your-writes across
+    /// mutations in the same batch is *not* supported. The executor never
+    /// generates such patterns: it produces fresh ids per row and
+    /// dedupes mutated entities before flushing.
+    pub fn apply_batch(&self, mutations: &[StoreMutation]) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        for m in mutations {
+            match m {
+                StoreMutation::PutNode(n) => self.append_put_node(&mut batch, n)?,
+                StoreMutation::PutEdge(e) => self.append_put_edge(&mut batch, e)?,
+                StoreMutation::DeleteEdge(id) => {
+                    if let Some(edge) = self.get_edge(*id)? {
+                        self.append_delete_edge(&mut batch, *id, &edge)?;
+                    }
+                }
+                StoreMutation::DetachDeleteNode(id) => {
+                    self.append_detach_delete_node(&mut batch, *id)?;
+                }
+            }
+        }
         self.db.write(batch)?;
         Ok(())
     }
