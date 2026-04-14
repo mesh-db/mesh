@@ -1396,14 +1396,26 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
     // ClusterState should at least carry the bootstrapped 2-peer membership.
     assert_eq!(payload.cluster.membership.len(), 2);
 
-    // Decode the graph blob shape — it's the StoreGraphApplier's
-    // GraphSnapshot { nodes, edges } JSON. We only care that nodes are present.
-    let graph_value: serde_json::Value = serde_json::from_slice(&payload.graph).unwrap();
-    let nodes = graph_value["nodes"].as_array().unwrap();
+    // Decode the graph blob by feeding it through the applier's
+    // restore path into a fresh Store, then inspect the result.
+    // The blob is a binary rocksdb checkpoint archive (see
+    // mesh_rpc::raft_applier) — the previous test decoded it as
+    // JSON, but that format only existed in the old Vec<Node>-of-the-
+    // world implementation and isn't how real production snapshots
+    // are shaped anymore.
+    let restored_dir = tempfile::TempDir::new().unwrap();
+    let restored_store =
+        std::sync::Arc::new(mesh_storage::Store::open(restored_dir.path()).unwrap());
+    let applier = mesh_rpc::StoreGraphApplier::new(restored_store.clone());
+    use mesh_cluster::raft::GraphStateMachine;
+    applier
+        .restore(&payload.graph)
+        .expect("restoring the graph snapshot into a fresh store");
+    let nodes = restored_store.all_nodes().unwrap();
     // The snapshot may have fired before every CREATE was applied — what
     // matters is that the graph payload carries *some* of the data, not
     // just the cluster metadata. A previous-version snapshot with only
-    // ClusterState would land here with `nodes` absent or empty.
+    // ClusterState would land here with zero nodes.
     assert!(
         nodes.len() >= 5,
         "graph snapshot should contain a meaningful slice of created nodes, got {}",

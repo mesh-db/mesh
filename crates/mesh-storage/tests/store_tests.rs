@@ -341,3 +341,45 @@ fn store_reopens_and_data_persists() {
     let fetched = store.get_node(node_id).unwrap().unwrap();
     assert_eq!(fetched.labels, vec!["Persistent"]);
 }
+
+#[test]
+fn create_checkpoint_produces_a_consistent_clone() {
+    // Populate a source store, checkpoint it into a sibling dir,
+    // then open that dir as a fresh Store and confirm the data is
+    // visible. The checkpoint must reflect the source's state at
+    // `create_checkpoint` call time, independent of any subsequent
+    // mutations to the source.
+    let src_dir = TempDir::new().unwrap();
+    let cp_parent = TempDir::new().unwrap();
+    let cp_path = cp_parent.path().join("snap");
+
+    let src = Store::open(src_dir.path()).unwrap();
+    let node = Node::new().with_label("Snapshotted");
+    let node_id = node.id;
+    src.put_node(&node).unwrap();
+
+    src.create_checkpoint(&cp_path).unwrap();
+
+    // After the checkpoint, mutate the source to prove the clone is
+    // decoupled from subsequent writes.
+    src.put_node(&Node::new().with_label("AfterSnapshot"))
+        .unwrap();
+
+    // Drop the source handle so the checkpoint dir isn't sharing any
+    // open FDs with the live DB when we open it.
+    drop(src);
+
+    let cp = Store::open(&cp_path).unwrap();
+    // The snapshotted node is visible via the checkpoint.
+    let fetched = cp.get_node(node_id).unwrap().unwrap();
+    assert_eq!(fetched.labels, vec!["Snapshotted"]);
+    // The post-checkpoint write is NOT visible.
+    let after: Vec<Vec<String>> = cp
+        .all_nodes()
+        .unwrap()
+        .into_iter()
+        .map(|n| n.labels)
+        .collect();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0], vec!["Snapshotted"]);
+}

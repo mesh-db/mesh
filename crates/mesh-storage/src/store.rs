@@ -6,7 +6,10 @@ use crate::{
     },
 };
 use mesh_core::{Edge, EdgeId, Node, NodeId};
-use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{
+    checkpoint::Checkpoint, ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch,
+    DB,
+};
 use std::path::Path;
 
 const CF_NODES: &str = "nodes";
@@ -260,6 +263,23 @@ impl Store {
             edges.push(serde_json::from_slice(&value)?);
         }
         Ok(edges)
+    }
+
+    /// Produce a consistent point-in-time checkpoint of the store at
+    /// `path`. Wraps rocksdb's [`Checkpoint`] API — on the same
+    /// filesystem the checkpoint is effectively free (hard links over
+    /// the underlying SST files); cross-filesystem it falls back to a
+    /// full copy. `path` must NOT already exist; rocksdb creates it.
+    ///
+    /// Used by the Raft state machine's streaming snapshot path: a
+    /// snapshot is built by checkpointing into a temp dir, packing
+    /// the checkpoint's files into a length-prefixed archive, and
+    /// shipping the bytes. Skips the "Vec<Node> in memory" materialization
+    /// path that the previous JSON-over-everything snapshot used.
+    pub fn create_checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        let checkpoint = Checkpoint::new(&self.db)?;
+        checkpoint.create_checkpoint(path)?;
+        Ok(())
     }
 
     /// Drop every key from every column family. Used by snapshot install
