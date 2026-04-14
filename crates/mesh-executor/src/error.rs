@@ -34,6 +34,9 @@ pub enum Error {
 
     #[error("write failed: {0}")]
     Write(String),
+
+    #[error("remote read failed: {0}")]
+    Remote(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

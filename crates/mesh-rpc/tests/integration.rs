@@ -4,8 +4,9 @@ use mesh_rpc::convert::{edge_to_proto, node_to_proto, uuid_to_proto};
 use mesh_rpc::proto::mesh_query_client::MeshQueryClient;
 use mesh_rpc::proto::mesh_write_client::MeshWriteClient;
 use mesh_rpc::proto::{
-    DeleteEdgeRequest, DetachDeleteNodeRequest, GetEdgeRequest, GetNodeRequest, HealthRequest,
-    NeighborRequest, NodesByLabelRequest, PutEdgeRequest, PutNodeRequest, UuidBytes,
+    DeleteEdgeRequest, DetachDeleteNodeRequest, ExecuteCypherRequest, GetEdgeRequest,
+    GetNodeRequest, HealthRequest, NeighborRequest, NodesByLabelRequest, PutEdgeRequest,
+    PutNodeRequest, UuidBytes,
 };
 use mesh_rpc::{MeshService, Routing};
 use mesh_storage::Store;
@@ -77,6 +78,7 @@ async fn get_node_roundtrips_labels_and_properties() {
     let resp = c
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -95,7 +97,7 @@ async fn get_node_missing_returns_not_found() {
 
     // Random 16-byte id that doesn't exist.
     let fake = uuid_to_proto(mesh_core::NodeId::new().as_uuid());
-    let resp = c.get_node(GetNodeRequest { id: Some(fake) }).await.unwrap();
+    let resp = c.get_node(GetNodeRequest { id: Some(fake), local_only: false }).await.unwrap();
     let inner = resp.into_inner();
     assert!(!inner.found);
     assert!(inner.node.is_none());
@@ -137,6 +139,7 @@ async fn outgoing_returns_edge_and_neighbor() {
     let resp = c
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(a.id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -161,6 +164,7 @@ async fn incoming_mirrors_outgoing() {
     let resp = c
         .incoming(NeighborRequest {
             node_id: Some(uuid_to_proto(b.id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -286,6 +290,7 @@ async fn routed_get_node_crosses_peers() {
         let resp = client
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(node.id.as_uuid())),
+                local_only: false,
             })
             .await
             .unwrap();
@@ -381,6 +386,7 @@ async fn routed_outgoing_forwards_to_source_owner() {
     let resp = client
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(src.id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -393,6 +399,167 @@ async fn routed_outgoing_forwards_to_source_owner() {
 }
 
 #[tokio::test]
+async fn cypher_match_scatter_gathers_across_partitions() {
+    // Routing mode: nodes are sharded by hash across two peers, so any
+    // single peer's local store holds a strict subset of the graph. A
+    // Cypher MATCH issued against either peer must fan out to the other
+    // peer through the PartitionedGraphReader or it would return a
+    // fragment instead of the union.
+    let h = spawn_two_peer().await;
+
+    let mut owned_by_a = 0;
+    let mut owned_by_b = 0;
+    for i in 0..40 {
+        let n = Node::new()
+            .with_label("Worker")
+            .with_property("i", i as i64);
+        let owner = put_node_on_owner(&n, &h);
+        match owner {
+            PeerId(1) => owned_by_a += 1,
+            PeerId(2) => owned_by_b += 1,
+            _ => unreachable!(),
+        }
+    }
+    // Sanity: the hash partitioner actually spread nodes across both peers.
+    assert!(owned_by_a > 0 && owned_by_b > 0);
+    assert_eq!(owned_by_a + owned_by_b, 40);
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let resp = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:Worker) RETURN n.i AS i".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // `rows_json` is a serde-serialized Vec<mesh_executor::Row>. Decode
+    // just enough to count rows and pull out the `i` property.
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    assert_eq!(
+        rows.len(),
+        40,
+        "expected scatter-gather to return all 40 nodes, got {}",
+        rows.len()
+    );
+    let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for row in rows {
+        // Row shape: {"i": {"Property": {"type":"Int64","value":<n>}}}
+        let prop = &row["i"]["Property"];
+        assert_eq!(prop["type"], "Int64");
+        seen.insert(prop["value"].as_i64().expect("i should be an integer"));
+    }
+    assert_eq!(seen, (0..40).collect());
+}
+
+#[tokio::test]
+async fn cypher_match_with_filter_scatter_gathers() {
+    // Same two-peer setup; make sure WHERE filtering composes correctly
+    // over the partitioned reader — each peer applies the filter locally
+    // and the coordinator unions the survivors.
+    let h = spawn_two_peer().await;
+
+    for i in 0..20 {
+        let n = Node::new()
+            .with_label("Box")
+            .with_property("size", i as i64);
+        put_node_on_owner(&n, &h);
+    }
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let resp = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:Box) WHERE n.size > 14 RETURN n.size AS s ORDER BY s"
+                .to_string(),
+        })
+        .await
+        .unwrap();
+
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    let sizes: Vec<i64> = rows
+        .iter()
+        .map(|r| r["s"]["Property"]["value"].as_i64().unwrap())
+        .collect();
+    assert_eq!(sizes, vec![15, 16, 17, 18, 19]);
+}
+
+#[tokio::test]
+async fn cypher_traversal_crosses_partitions() {
+    // Seed a KNOWS chain whose source and destination are likely on
+    // different peers; the partitioned reader must route the outgoing()
+    // lookup to whichever peer owns each source node.
+    let h = spawn_two_peer().await;
+
+    // Build a fan of edges (a)-[:KNOWS]->(bᵢ) so at least one b is on
+    // the other peer regardless of which peer owns a. Edges currently
+    // land on the local store of whoever holds `a`, which is fine —
+    // the cross-partition hop under test is the Cypher read.
+    let a = Node::new().with_label("Person").with_property("name", "A");
+    let a_id = a.id;
+    let a_owner = put_node_on_owner(&a, &h);
+
+    let mut targets: Vec<Node> = Vec::new();
+    for i in 0..20 {
+        targets.push(
+            Node::new()
+                .with_label("Person")
+                .with_property("name", format!("B{}", i)),
+        );
+    }
+
+    // Place each target on its true owner so nodes_by_label/get_node work.
+    let mut a_side_targets = 0;
+    let mut other_side_targets = 0;
+    for b in &targets {
+        let owner = put_node_on_owner(b, &h);
+        if owner == a_owner {
+            a_side_targets += 1;
+        } else {
+            other_side_targets += 1;
+        }
+    }
+    assert!(other_side_targets > 0, "expected at least one cross-peer target");
+    assert!(a_side_targets < 20, "expected some local-to-a targets too");
+
+    // Edges are stored on A's owner's local store — that's where the
+    // adjacency lookup for `a` will run.
+    for b in &targets {
+        let edge = Edge::new("KNOWS", a_id, b.id);
+        match a_owner {
+            PeerId(1) => h.store_a.put_edge(&edge).unwrap(),
+            PeerId(2) => h.store_b.put_edge(&edge).unwrap(),
+            _ => unreachable!(),
+        }
+    }
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
+    let resp = client
+        .execute_cypher(ExecuteCypherRequest {
+            query:
+                "MATCH (a:Person {name: 'A'})-[:KNOWS]->(b:Person) RETURN b.name AS name"
+                    .to_string(),
+        })
+        .await
+        .unwrap();
+
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    assert_eq!(
+        rows.len(),
+        20,
+        "expected all 20 KNOWS targets after cross-partition expand"
+    );
+    let names: std::collections::BTreeSet<String> = rows
+        .iter()
+        .map(|r| r["name"]["Property"]["value"].as_str().unwrap().to_string())
+        .collect();
+    let expected: std::collections::BTreeSet<String> =
+        (0..20).map(|i| format!("B{}", i)).collect();
+    assert_eq!(names, expected);
+}
+
+#[tokio::test]
 async fn routed_get_node_missing_returns_not_found_on_either_peer() {
     let h = spawn_two_peer().await;
     let mut client = MeshQueryClient::connect(h.client_addr_a.clone()).await.unwrap();
@@ -400,6 +567,7 @@ async fn routed_get_node_missing_returns_not_found_on_either_peer() {
     let resp = client
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(mesh_core::NodeId::new().as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -668,6 +836,7 @@ async fn write_then_routed_read_full_cycle() {
     let resp = reader
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(src.id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -676,6 +845,7 @@ async fn write_then_routed_read_full_cycle() {
     let resp = reader
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(src.id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -684,6 +854,7 @@ async fn write_then_routed_read_full_cycle() {
     let resp = reader
         .incoming(NeighborRequest {
             node_id: Some(uuid_to_proto(dst.id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -698,7 +869,7 @@ async fn invalid_uuid_length_returns_invalid_argument() {
         value: vec![0, 1, 2, 3], // too short
     };
     let err = c
-        .get_node(GetNodeRequest { id: Some(bad) })
+        .get_node(GetNodeRequest { id: Some(bad), local_only: false })
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);

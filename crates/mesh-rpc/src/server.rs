@@ -3,20 +3,22 @@ use crate::convert::{
     node_to_proto, uuid_to_proto,
 };
 use crate::executor_writer::BufferingGraphWriter;
+use crate::partitioned_reader::PartitionedGraphReader;
 use crate::proto::mesh_query_server::{MeshQuery, MeshQueryServer};
 use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
-    DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest, DetachDeleteNodeResponse,
-    ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse, GetNodeRequest,
-    GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo, NeighborRequest,
-    NeighborResponse, NodesByLabelRequest, NodesByLabelResponse, PutEdgeRequest, PutEdgeResponse,
-    PutNodeRequest, PutNodeResponse,
+    AllNodeIdsRequest, AllNodeIdsResponse, DeleteEdgeRequest, DeleteEdgeResponse,
+    DetachDeleteNodeRequest, DetachDeleteNodeResponse, ExecuteCypherRequest,
+    ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse, GetNodeRequest, GetNodeResponse,
+    HealthRequest, HealthResponse, NeighborInfo, NeighborRequest, NeighborResponse,
+    NodesByLabelRequest, NodesByLabelResponse, PutEdgeRequest, PutEdgeResponse, PutNodeRequest,
+    PutNodeResponse,
 };
 use crate::routing::Routing;
 use mesh_cluster::raft::RaftCluster;
 use mesh_cluster::{Error as ClusterError, GraphCommand, PeerId};
-use mesh_executor::{execute_with_writer, GraphWriter};
+use mesh_executor::{execute_with_reader, execute_with_writer, GraphReader, GraphWriter};
 use mesh_storage::Store;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -100,20 +102,29 @@ impl MeshQuery for MeshService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeResponse>, Status> {
-        let id_proto = request
-            .into_inner()
+        let req = request.into_inner();
+        let local_only = req.local_only;
+        let id_proto = req
             .id
             .ok_or_else(|| Status::invalid_argument("missing id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
 
         // Forward to the partition owner if this node doesn't live locally.
-        if let Some(routing) = &self.routing {
-            if !routing.cluster().is_local(id) {
-                let owner = routing.cluster().owner_of(id);
-                let mut client = routing.query_client(owner).ok_or_else(|| no_client(owner))?;
-                return client
-                    .get_node(GetNodeRequest { id: Some(id_proto) })
-                    .await;
+        // `local_only` short-circuits forwarding so the partitioned reader
+        // can issue direct point reads against a specific peer.
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                if !routing.cluster().is_local(id) {
+                    let owner = routing.cluster().owner_of(id);
+                    let mut client =
+                        routing.query_client(owner).ok_or_else(|| no_client(owner))?;
+                    return client
+                        .get_node(GetNodeRequest {
+                            id: Some(id_proto),
+                            local_only: false,
+                        })
+                        .await;
+                }
             }
         }
 
@@ -222,21 +233,26 @@ impl MeshQuery for MeshService {
         &self,
         request: Request<NeighborRequest>,
     ) -> Result<Response<NeighborResponse>, Status> {
-        let id_proto = request
-            .into_inner()
+        let req = request.into_inner();
+        let local_only = req.local_only;
+        let id_proto = req
             .node_id
             .ok_or_else(|| Status::invalid_argument("missing node_id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
 
-        if let Some(routing) = &self.routing {
-            if !routing.cluster().is_local(id) {
-                let owner = routing.cluster().owner_of(id);
-                let mut client = routing.query_client(owner).ok_or_else(|| no_client(owner))?;
-                return client
-                    .outgoing(NeighborRequest {
-                        node_id: Some(id_proto),
-                    })
-                    .await;
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                if !routing.cluster().is_local(id) {
+                    let owner = routing.cluster().owner_of(id);
+                    let mut client =
+                        routing.query_client(owner).ok_or_else(|| no_client(owner))?;
+                    return client
+                        .outgoing(NeighborRequest {
+                            node_id: Some(id_proto),
+                            local_only: false,
+                        })
+                        .await;
+                }
             }
         }
 
@@ -256,21 +272,26 @@ impl MeshQuery for MeshService {
         &self,
         request: Request<NeighborRequest>,
     ) -> Result<Response<NeighborResponse>, Status> {
-        let id_proto = request
-            .into_inner()
+        let req = request.into_inner();
+        let local_only = req.local_only;
+        let id_proto = req
             .node_id
             .ok_or_else(|| Status::invalid_argument("missing node_id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
 
-        if let Some(routing) = &self.routing {
-            if !routing.cluster().is_local(id) {
-                let owner = routing.cluster().owner_of(id);
-                let mut client = routing.query_client(owner).ok_or_else(|| no_client(owner))?;
-                return client
-                    .incoming(NeighborRequest {
-                        node_id: Some(id_proto),
-                    })
-                    .await;
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                if !routing.cluster().is_local(id) {
+                    let owner = routing.cluster().owner_of(id);
+                    let mut client =
+                        routing.query_client(owner).ok_or_else(|| no_client(owner))?;
+                    return client
+                        .incoming(NeighborRequest {
+                            node_id: Some(id_proto),
+                            local_only: false,
+                        })
+                        .await;
+                }
             }
         }
 
@@ -283,6 +304,41 @@ impl MeshQuery for MeshService {
             })
             .collect();
         Ok(Response::new(NeighborResponse { neighbors }))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "all_node_ids"))]
+    async fn all_node_ids(
+        &self,
+        request: Request<AllNodeIdsRequest>,
+    ) -> Result<Response<AllNodeIdsResponse>, Status> {
+        let local_only = request.into_inner().local_only;
+
+        let mut ids: Vec<_> = self
+            .store
+            .all_node_ids()
+            .map_err(internal)?
+            .into_iter()
+            .map(|id| uuid_to_proto(id.as_uuid()))
+            .collect();
+
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                let self_id = routing.cluster().self_id();
+                for peer_id in routing.cluster().membership().peer_ids() {
+                    if peer_id == self_id {
+                        continue;
+                    }
+                    let mut client =
+                        routing.query_client(peer_id).ok_or_else(|| no_client(peer_id))?;
+                    let resp = client
+                        .all_node_ids(AllNodeIdsRequest { local_only: true })
+                        .await?;
+                    ids.extend(resp.into_inner().ids);
+                }
+            }
+        }
+
+        Ok(Response::new(AllNodeIdsResponse { ids }))
     }
 
     async fn health(
@@ -314,14 +370,34 @@ impl MeshQuery for MeshService {
         // store directly, since there's no Raft group to commit to.
         let store = self.store.clone();
         let raft = self.raft.clone();
+        let routing = self.routing.clone();
         let (rows, batch) = tokio::task::spawn_blocking(
             move || -> Result<(Vec<mesh_executor::Row>, Option<Vec<GraphCommand>>), mesh_executor::Error> {
                 let store_ref: &Store = &store;
                 if raft.is_some() {
+                    // Raft mode: every peer holds a full replica, so reads
+                    // are cheap-local. Writes buffer to a single Raft entry
+                    // further down so a crash mid-query can't leave a
+                    // partial result on any replica.
                     let writer = BufferingGraphWriter::new();
                     let rows =
                         execute_with_writer(&plan, store_ref, &writer as &dyn GraphWriter)?;
                     Ok((rows, Some(writer.into_commands())))
+                } else if let Some(r) = routing.as_ref() {
+                    // Routing mode: nodes are sharded across peers by hash
+                    // partition, so a MATCH on any single peer would see
+                    // only a fragment of the graph. Drive reads through a
+                    // partitioned reader that routes point lookups to
+                    // owners and scatter-gathers bulk scans across peers.
+                    // Writes still hit the local store — Cypher writes
+                    // routing across partitions is a separate task.
+                    let reader = PartitionedGraphReader::new(store.clone(), r.clone());
+                    let rows = execute_with_reader(
+                        &plan,
+                        &reader as &dyn GraphReader,
+                        store_ref as &dyn GraphWriter,
+                    )?;
+                    Ok((rows, None))
                 } else {
                     let rows = execute_with_writer(
                         &plan,

@@ -1,6 +1,7 @@
 use crate::{
     error::{Error, Result},
     eval::{compare_values, eval_expr, literal_to_property, row_key, to_bool, value_key},
+    reader::GraphReader,
     value::{Row, Value},
     writer::GraphWriter,
 };
@@ -14,7 +15,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 pub struct ExecCtx<'a> {
-    pub store: &'a Store,
+    pub store: &'a dyn GraphReader,
     pub writer: &'a dyn GraphWriter,
 }
 
@@ -23,21 +24,39 @@ pub trait Operator {
 }
 
 /// Execute a plan using the given store for both reads and writes.
-/// Equivalent to [`execute_with_writer`] with the store as the writer.
+/// Equivalent to [`execute_with_reader`] with the store acting as both.
 pub fn execute(plan: &LogicalPlan, store: &Store) -> Result<Vec<Row>> {
-    execute_with_writer(plan, store, store)
+    execute_with_reader(
+        plan,
+        store as &dyn GraphReader,
+        store as &dyn GraphWriter,
+    )
 }
 
-/// Execute a plan, sending mutations to a separate [`GraphWriter`]. Reads
-/// always go to `store`. In cluster mode the caller supplies a writer that
-/// proposes each mutation through Raft.
+/// Execute a plan against a local [`Store`] for reads, sending mutations to
+/// a separate [`GraphWriter`]. Used by in-process setups where reads are
+/// always cheap-local (single node or full-replica Raft).
 pub fn execute_with_writer(
     plan: &LogicalPlan,
     store: &Store,
     writer: &dyn GraphWriter,
 ) -> Result<Vec<Row>> {
+    execute_with_reader(plan, store as &dyn GraphReader, writer)
+}
+
+/// Execute a plan with an arbitrary [`GraphReader`] for reads. In routing
+/// mode the caller supplies a partitioned reader that fans out point reads
+/// to partition owners and scatter-gathers bulk scans across peers.
+pub fn execute_with_reader(
+    plan: &LogicalPlan,
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+) -> Result<Vec<Row>> {
     let mut op = build_op(plan);
-    let ctx = ExecCtx { store, writer };
+    let ctx = ExecCtx {
+        store: reader,
+        writer,
+    };
     let mut rows = Vec::new();
     while let Some(row) = op.next(&ctx)? {
         rows.push(row);

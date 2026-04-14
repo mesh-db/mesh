@@ -225,6 +225,7 @@ async fn server_write_then_read_single_node() {
     let resp = reader
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -261,6 +262,7 @@ async fn two_peer_cluster_via_config_routes_writes_and_reads() {
         let resp = reader
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(id.as_uuid())),
+                local_only: false,
             })
             .await
             .unwrap();
@@ -456,6 +458,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
     let resp = reader_a
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -474,6 +477,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         let resp = reader_b
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(node_id.as_uuid())),
+                local_only: false,
             })
             .await
             .unwrap();
@@ -611,6 +615,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
     let resp = reader_a
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
+            local_only: false,
         })
         .await
         .unwrap();
@@ -626,6 +631,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         let resp = reader_b
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(node_id.as_uuid())),
+                local_only: false,
             })
             .await
             .unwrap();
@@ -691,6 +697,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
             let resp = reader
                 .get_node(GetNodeRequest {
                     id: Some(uuid_to_proto(id.as_uuid())),
+                    local_only: false,
                 })
                 .await
                 .unwrap();
@@ -1175,6 +1182,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         let resp = query_b
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(pinned_id.as_uuid())),
+                local_only: false,
             })
             .await
             .unwrap();

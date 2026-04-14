@@ -46,6 +46,7 @@ service MeshQuery {
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc GetEdge(GetEdgeRequest) returns (GetEdgeResponse);
   rpc NodesByLabel(NodesByLabelRequest) returns (NodesByLabelResponse);
+  rpc AllNodeIds(AllNodeIdsRequest) returns (AllNodeIdsResponse);
   rpc Outgoing(NeighborRequest) returns (NeighborResponse);
   rpc Incoming(NeighborRequest) returns (NeighborResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
@@ -56,11 +57,24 @@ service MeshQuery {
   rpc ExecuteCypher(ExecuteCypherRequest) returns (ExecuteCypherResponse);
 }
 
-message GetNodeRequest { UuidBytes id = 1; }
+message GetNodeRequest {
+  UuidBytes id = 1;
+  // When true, the server answers only from its local store and does not
+  // forward to the partition owner. Used by the partitioned reader to issue
+  // direct point reads against a specific peer.
+  bool local_only = 2;
+}
 message GetNodeResponse {
   bool found = 1;
   Node node = 2;
 }
+
+message AllNodeIdsRequest {
+  // When true, the server returns only node ids on its local store and does
+  // not scatter-gather to other peers.
+  bool local_only = 1;
+}
+message AllNodeIdsResponse { repeated UuidBytes ids = 1; }
 
 message GetEdgeRequest {
   UuidBytes id = 1;
@@ -80,7 +94,12 @@ message NodesByLabelRequest {
 }
 message NodesByLabelResponse { repeated UuidBytes ids = 1; }
 
-message NeighborRequest { UuidBytes node_id = 1; }
+message NeighborRequest {
+  UuidBytes node_id = 1;
+  // When true, the server answers only from its local store and does not
+  // forward to the partition owner.
+  bool local_only = 2;
+}
 message NeighborResponse { repeated NeighborInfo neighbors = 1; }
 
 message HealthRequest {}
