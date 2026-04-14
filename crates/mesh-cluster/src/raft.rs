@@ -22,13 +22,45 @@ use openraft::{
     Entry, EntryPayload, LogId, OptionalSend, Raft, RaftStorage, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership, Vote,
 };
+use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::io::Cursor;
 use std::ops::RangeBounds;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+// Persistent-storage key schema — a single rocksdb namespace is enough for
+// the handful of things Raft needs durable:
+//   "vote"        → Vote<NodeId>                (JSON)
+//   "last_purged" → LogId<NodeId>               (JSON)
+//   "log/<be64>"  → Entry<MeshRaftConfig>       (JSON)
+const VOTE_KEY: &[u8] = b"vote";
+const LAST_PURGED_KEY: &[u8] = b"last_purged";
+const LOG_PREFIX: &[u8] = b"log/";
+
+fn log_key(index: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(LOG_PREFIX.len() + 8);
+    k.extend_from_slice(LOG_PREFIX);
+    k.extend_from_slice(&index.to_be_bytes());
+    k
+}
+
+fn synced_writes() -> WriteOptions {
+    let mut opts = WriteOptions::default();
+    opts.set_sync(true);
+    opts
+}
+
+fn write_logs_err<E: std::error::Error + 'static>(e: E) -> StorageError<NodeId> {
+    StorageIOError::write_logs(&e).into()
+}
+
+fn write_vote_err<E: std::error::Error + 'static>(e: E) -> StorageError<NodeId> {
+    StorageIOError::write_vote(&e).into()
+}
 
 /// Cluster-wide peer identifier as seen by openraft.
 pub type NodeId = u64;
@@ -87,7 +119,6 @@ pub fn default_config() -> openraft::Config {
 // MemStore: in-memory RaftStorage (v1) — Adaptor converts it to v2 traits.
 // ============================================================================
 
-#[derive(Debug)]
 pub struct MemStoreInner {
     // Log
     pub log: BTreeMap<u64, Entry<MeshRaftConfig>>,
@@ -103,6 +134,24 @@ pub struct MemStoreInner {
     // Snapshot
     pub snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, Vec<u8>)>,
     pub snapshot_counter: u64,
+
+    // Durable backing. When `Some`, every mutation to vote / log / last_purged
+    // is also written through to this rocksdb handle with sync=true so Raft
+    // safety invariants survive process restarts. The state machine itself
+    // stays in-memory for now and is rebuilt on restart via log replay.
+    pub persistent: Option<Arc<DB>>,
+}
+
+impl Debug for MemStoreInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemStoreInner")
+            .field("log_entries", &self.log.len())
+            .field("last_purged", &self.last_purged)
+            .field("vote", &self.vote)
+            .field("last_applied", &self.last_applied)
+            .field("persistent", &self.persistent.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,8 +179,65 @@ impl MemStore {
                 graph_applier,
                 snapshot: None,
                 snapshot_counter: 0,
+                persistent: None,
             })),
         }
+    }
+
+    /// Open a [`MemStore`] backed by a rocksdb instance at `path`. On
+    /// restart this hydrates the vote, log entries, and last-purged pointer
+    /// from disk; the state machine itself starts from `initial_state` and
+    /// is rebuilt as openraft re-applies committed log entries.
+    ///
+    /// The rocksdb handle is opened with `create_if_missing = true`, so a
+    /// fresh data directory also works — it'll simply start empty.
+    pub fn open_persistent<P: AsRef<Path>>(
+        path: P,
+        initial_state: ClusterState,
+        graph_applier: Option<Arc<dyn GraphStateMachine>>,
+    ) -> std::result::Result<Self, rocksdb::Error> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = Arc::new(DB::open(&opts, path)?);
+
+        let vote: Option<Vote<NodeId>> = db
+            .get(VOTE_KEY)?
+            .and_then(|v| serde_json::from_slice(&v).ok());
+
+        let last_purged: Option<LogId<NodeId>> = db
+            .get(LAST_PURGED_KEY)?
+            .and_then(|v| serde_json::from_slice(&v).ok());
+
+        let mut log = BTreeMap::new();
+        for kv in db.prefix_iterator(LOG_PREFIX) {
+            let (key, value) = kv?;
+            if !key.starts_with(LOG_PREFIX) {
+                break;
+            }
+            let idx_bytes = &key[LOG_PREFIX.len()..];
+            if idx_bytes.len() != 8 {
+                continue;
+            }
+            let idx = u64::from_be_bytes(idx_bytes.try_into().unwrap());
+            if let Ok(entry) = serde_json::from_slice::<Entry<MeshRaftConfig>>(&value) {
+                log.insert(idx, entry);
+            }
+        }
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(MemStoreInner {
+                log,
+                last_purged,
+                vote,
+                state: initial_state,
+                last_applied: None,
+                stored_membership: StoredMembership::default(),
+                graph_applier,
+                snapshot: None,
+                snapshot_counter: 0,
+                persistent: Some(db),
+            })),
+        })
     }
 
     pub fn inner(&self) -> Arc<RwLock<MemStoreInner>> {
@@ -181,7 +287,13 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         &mut self,
         vote: &Vote<NodeId>,
     ) -> std::result::Result<(), StorageError<NodeId>> {
-        self.inner.write().await.vote = Some(*vote);
+        let mut inner = self.inner.write().await;
+        if let Some(db) = inner.persistent.as_ref() {
+            let bytes = serde_json::to_vec(vote).map_err(write_vote_err)?;
+            db.put_opt(VOTE_KEY, &bytes, &synced_writes())
+                .map_err(write_vote_err)?;
+        }
+        inner.vote = Some(*vote);
         Ok(())
     }
 
@@ -199,6 +311,16 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         I: IntoIterator<Item = Entry<MeshRaftConfig>> + OptionalSend,
     {
         let mut inner = self.inner.write().await;
+        let entries: Vec<Entry<MeshRaftConfig>> = entries.into_iter().collect();
+        if let Some(db) = inner.persistent.as_ref() {
+            let mut batch = WriteBatch::default();
+            for entry in &entries {
+                let value = serde_json::to_vec(entry).map_err(write_logs_err)?;
+                batch.put(log_key(entry.log_id.index), value);
+            }
+            db.write_opt(batch, &synced_writes())
+                .map_err(write_logs_err)?;
+        }
         for entry in entries {
             inner.log.insert(entry.log_id.index, entry);
         }
@@ -210,6 +332,14 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         log_id: LogId<NodeId>,
     ) -> std::result::Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.write().await;
+        if let Some(db) = inner.persistent.as_ref() {
+            let mut batch = WriteBatch::default();
+            for idx in inner.log.range(log_id.index..).map(|(k, _)| *k) {
+                batch.delete(log_key(idx));
+            }
+            db.write_opt(batch, &synced_writes())
+                .map_err(write_logs_err)?;
+        }
         inner.log.retain(|idx, _| *idx < log_id.index);
         Ok(())
     }
@@ -219,6 +349,21 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
         log_id: LogId<NodeId>,
     ) -> std::result::Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.write().await;
+        if let Some(db) = inner.persistent.as_ref() {
+            let mut batch = WriteBatch::default();
+            for idx in inner
+                .log
+                .range(..=log_id.index)
+                .map(|(k, _)| *k)
+            {
+                batch.delete(log_key(idx));
+            }
+            let last_purged_bytes =
+                serde_json::to_vec(&log_id).map_err(write_logs_err)?;
+            batch.put(LAST_PURGED_KEY, last_purged_bytes);
+            db.write_opt(batch, &synced_writes())
+                .map_err(write_logs_err)?;
+        }
         inner.log.retain(|idx, _| *idx > log_id.index);
         inner.last_purged = Some(log_id);
         Ok(())
@@ -432,18 +577,43 @@ impl RaftCluster {
     where
         N: RaftNetworkFactory<MeshRaftConfig>,
     {
+        let store = MemStore::new_with_applier(initial_state, graph_applier);
+        Self::from_store(id, store, network).await
+    }
+
+    /// Open a [`RaftCluster`] whose storage is backed by a rocksdb instance
+    /// at `path`. The log and vote are hydrated from disk on startup; the
+    /// state machine rebuilds via log replay as openraft re-applies
+    /// committed entries.
+    pub async fn open_persistent<N, P>(
+        id: NodeId,
+        path: P,
+        initial_state: ClusterState,
+        network: N,
+        graph_applier: Option<Arc<dyn GraphStateMachine>>,
+    ) -> Result<Self>
+    where
+        N: RaftNetworkFactory<MeshRaftConfig>,
+        P: AsRef<Path>,
+    {
+        let store = MemStore::open_persistent(path, initial_state, graph_applier)
+            .map_err(|e| Error::Raft(format!("opening persistent raft store: {e}")))?;
+        Self::from_store(id, store, network).await
+    }
+
+    async fn from_store<N>(id: NodeId, store: MemStore, network: N) -> Result<Self>
+    where
+        N: RaftNetworkFactory<MeshRaftConfig>,
+    {
         let config = Arc::new(
             default_config()
                 .validate()
                 .map_err(|e| Error::Raft(e.to_string()))?,
         );
-        let store = MemStore::new_with_applier(initial_state, graph_applier);
         let (log_store, state_machine) = Adaptor::new(store.clone());
-
         let raft = Raft::new(id, config, network, log_store, state_machine)
             .await
             .map_err(|e| Error::Raft(e.to_string()))?;
-
         Ok(Self { id, raft, store })
     }
 

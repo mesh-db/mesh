@@ -106,8 +106,12 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
     let applier: Arc<dyn GraphStateMachine> =
         Arc::new(StoreGraphApplier::new(store.clone()));
 
-    let raft_cluster = RaftCluster::new_with_applier(
+    let raft_dir = config.data_dir.join("raft");
+    std::fs::create_dir_all(&raft_dir)
+        .with_context(|| format!("creating raft dir {}", raft_dir.display()))?;
+    let raft_cluster = RaftCluster::open_persistent(
         config.self_id,
+        &raft_dir,
         initial_state,
         network,
         Some(applier),

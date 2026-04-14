@@ -376,6 +376,77 @@ async fn raft_single_node_bootstraps_and_applies_commands() {
 }
 
 #[tokio::test]
+async fn raft_persistent_store_reloads_log_and_vote_after_restart() {
+    use mesh_cluster::raft::{MemStore, MeshRaftConfig, NoOpNetwork, RaftCluster};
+    use mesh_cluster::{ClusterState, Membership, PartitionMap};
+    use openraft::storage::{RaftLogReader, RaftStorage};
+    use openraft::Vote;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("raft");
+
+    let initial = || {
+        ClusterState::new(
+            Membership::new(vec![Peer::new(PeerId(1), "127.0.0.1:7001")]),
+            PartitionMap::round_robin(&[PeerId(1)], 1).unwrap(),
+        )
+    };
+
+    // Bootstrap a single-node cluster against the persistent store and
+    // drive a few commands through it so the log has non-trivial content.
+    {
+        let cluster =
+            RaftCluster::open_persistent(1, &path, initial(), NoOpNetwork, None)
+                .await
+                .expect("open persistent raft");
+        let mut members = std::collections::BTreeSet::new();
+        members.insert(1u64);
+        cluster
+            .raft
+            .initialize(members)
+            .await
+            .expect("initialize single-node cluster");
+        cluster
+            .propose(ClusterCommand::AddPeer {
+                id: PeerId(2),
+                address: "127.0.0.1:7002".into(),
+            })
+            .await
+            .expect("propose add peer");
+        cluster
+            .propose(ClusterCommand::AddPeer {
+                id: PeerId(3),
+                address: "127.0.0.1:7003".into(),
+            })
+            .await
+            .expect("propose add peer");
+        cluster.shutdown().await.ok();
+    }
+
+    // Re-open the store directly (bypassing RaftCluster, whose startup
+    // would race with the NoOpNetwork-backed election loop) and confirm
+    // the log and vote survived the drop.
+    let mut store = MemStore::open_persistent(&path, initial(), None)
+        .expect("reopen persistent store");
+    let entries = <MemStore as RaftLogReader<MeshRaftConfig>>::try_get_log_entries(
+        &mut store,
+        ..,
+    )
+    .await
+    .expect("read log entries");
+    assert!(
+        entries.len() >= 2,
+        "expected at least 2 entries (initial membership + 2 AddPeer), got {}",
+        entries.len()
+    );
+    let vote = <MemStore as RaftStorage<MeshRaftConfig>>::read_vote(&mut store)
+        .await
+        .expect("read vote");
+    assert!(vote.is_some(), "vote should have been persisted");
+    let _: Vote<RaftNodeId> = vote.unwrap();
+}
+
+#[tokio::test]
 async fn raft_single_node_applies_command_sequence_in_order() {
     use mesh_cluster::raft::RaftCluster;
     use mesh_cluster::{ClusterState, Membership, PartitionMap};
