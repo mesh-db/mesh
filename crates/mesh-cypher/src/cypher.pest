@@ -16,7 +16,16 @@ statement = {
 return_only_stmt = { return_tail }
 
 create_stmt = { kw_create ~ pattern_list ~ return_tail? }
-merge_stmt  = { kw_merge ~ node_pattern ~ return_tail? }
+merge_stmt  = { kw_merge ~ node_pattern ~ merge_action* ~ return_tail? }
+
+// `ON CREATE SET ...` / `ON MATCH SET ...` clauses on a MERGE.
+// Both are optional and may appear in any order; the action is
+// distinguished by whether the embedded `kw_create` or `kw_match`
+// fires, both of which are silent (`_{}`) keywords reused from
+// the top-level statement grammar.
+merge_action = { kw_on ~ (merge_on_create | merge_on_match) ~ kw_set ~ set_items }
+merge_on_create = @{ ^"create" ~ !id_cont }
+merge_on_match  = @{ ^"match" ~ !id_cont }
 
 // Schema DDL for property indexes. Uses the modern Neo4j 4.x+ form
 // (`CREATE INDEX FOR (n:Label) ON (n.prop)`) without the optional

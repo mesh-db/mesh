@@ -1034,6 +1034,45 @@ fn bare_return_supports_multiple_items() {
 }
 
 #[test]
+fn merge_on_create_set_parses() {
+    let stmt =
+        parse("MERGE (p:Person {email: 'a@b'}) ON CREATE SET p.name = 'Ada' RETURN p").unwrap();
+    let m = match stmt {
+        Statement::Merge(m) => m,
+        other => panic!("expected Merge, got {other:?}"),
+    };
+    assert_eq!(m.on_create.len(), 1);
+    assert!(m.on_match.is_empty());
+}
+
+#[test]
+fn merge_on_match_set_parses() {
+    let stmt = parse("MERGE (p:Person {email: 'a@b'}) ON MATCH SET p.seen = true").unwrap();
+    let m = match stmt {
+        Statement::Merge(m) => m,
+        other => panic!("expected Merge, got {other:?}"),
+    };
+    assert!(m.on_create.is_empty());
+    assert_eq!(m.on_match.len(), 1);
+}
+
+#[test]
+fn merge_on_create_and_on_match_both_parse() {
+    let stmt = parse(
+        "MERGE (p:Person {email: 'a@b'}) \
+         ON CREATE SET p.name = 'Ada', p.created = true \
+         ON MATCH SET p.seen = true",
+    )
+    .unwrap();
+    let m = match stmt {
+        Statement::Merge(m) => m,
+        other => panic!("expected Merge, got {other:?}"),
+    };
+    assert_eq!(m.on_create.len(), 2);
+    assert_eq!(m.on_match.len(), 1);
+}
+
+#[test]
 fn bare_return_supports_skip_and_limit() {
     match parse("RETURN 1 AS x SKIP 0 LIMIT 1").unwrap() {
         Statement::Return(r) => {

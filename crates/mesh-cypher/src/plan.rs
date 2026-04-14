@@ -112,6 +112,14 @@ pub enum LogicalPlan {
         var: String,
         labels: Vec<String>,
         properties: Vec<(String, Expr)>,
+        /// `ON CREATE SET ...` assignments — applied to the
+        /// freshly-created node when MERGE took the create path.
+        /// Empty when the user wrote no `ON CREATE` clause.
+        on_create: Vec<SetAssignment>,
+        /// `ON MATCH SET ...` assignments — applied to every
+        /// matched node when MERGE took the match path. Empty
+        /// when the user wrote no `ON MATCH` clause.
+        on_match: Vec<SetAssignment>,
     },
     /// Evaluate `expr` once, cast it to a list, and emit one row per element
     /// binding the element to `var`. The expression is evaluated against an
@@ -322,10 +330,14 @@ fn plan_merge(stmt: &MergeStmt) -> Result<LogicalPlan> {
         .var
         .clone()
         .unwrap_or_else(|| "__merge0".to_string());
+    let on_create: Vec<SetAssignment> = stmt.on_create.iter().map(set_item_to_assignment).collect();
+    let on_match: Vec<SetAssignment> = stmt.on_match.iter().map(set_item_to_assignment).collect();
     let plan = LogicalPlan::MergeNode {
         var,
         labels: stmt.pattern.labels.clone(),
         properties: stmt.pattern.properties.clone(),
+        on_create,
+        on_match,
     };
 
     if stmt.return_items.is_empty() {
@@ -339,6 +351,31 @@ fn plan_merge(stmt: &MergeStmt) -> Result<LogicalPlan> {
             stmt.skip,
             stmt.limit,
         )
+    }
+}
+
+/// Lower an AST `SetItem` to an executor-side `SetAssignment`.
+/// Pulled out of `plan_match` so `plan_merge` can reuse the same
+/// mapping for `ON CREATE SET` / `ON MATCH SET` actions.
+fn set_item_to_assignment(item: &crate::ast::SetItem) -> SetAssignment {
+    match item {
+        crate::ast::SetItem::Property { var, key, value } => SetAssignment::Property {
+            var: var.clone(),
+            key: key.clone(),
+            value: value.clone(),
+        },
+        crate::ast::SetItem::Labels { var, labels } => SetAssignment::Labels {
+            var: var.clone(),
+            labels: labels.clone(),
+        },
+        crate::ast::SetItem::Replace { var, properties } => SetAssignment::Replace {
+            var: var.clone(),
+            properties: properties.clone(),
+        },
+        crate::ast::SetItem::Merge { var, properties } => SetAssignment::Merge {
+            var: var.clone(),
+            properties: properties.clone(),
+        },
     }
 }
 
@@ -802,29 +839,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
             vars: delete_clause.vars.clone(),
         };
     } else if !stmt.set_items.is_empty() {
-        let assignments = stmt
-            .set_items
-            .iter()
-            .map(|s| match s {
-                crate::ast::SetItem::Property { var, key, value } => SetAssignment::Property {
-                    var: var.clone(),
-                    key: key.clone(),
-                    value: value.clone(),
-                },
-                crate::ast::SetItem::Labels { var, labels } => SetAssignment::Labels {
-                    var: var.clone(),
-                    labels: labels.clone(),
-                },
-                crate::ast::SetItem::Replace { var, properties } => SetAssignment::Replace {
-                    var: var.clone(),
-                    properties: properties.clone(),
-                },
-                crate::ast::SetItem::Merge { var, properties } => SetAssignment::Merge {
-                    var: var.clone(),
-                    properties: properties.clone(),
-                },
-            })
-            .collect();
+        let assignments = stmt.set_items.iter().map(set_item_to_assignment).collect();
         plan = LogicalPlan::SetProperty {
             input: Box::new(plan),
             assignments,

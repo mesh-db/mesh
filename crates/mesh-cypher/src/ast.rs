@@ -50,6 +50,14 @@ pub struct UnwindStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeStmt {
     pub pattern: NodePattern,
+    /// `ON CREATE SET ...` items — applied only when the MERGE
+    /// took the create branch (no existing node matched the
+    /// pattern). May be empty.
+    pub on_create: Vec<SetItem>,
+    /// `ON MATCH SET ...` items — applied to every row when the
+    /// MERGE took the match branch (one or more existing nodes
+    /// matched). May be empty.
+    pub on_match: Vec<SetItem>,
     pub return_items: Vec<ReturnItem>,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,

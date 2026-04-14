@@ -239,10 +239,14 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             var,
             labels,
             properties,
+            on_create,
+            on_match,
         } => Box::new(MergeNodeOp::new(
             var.clone(),
             labels.clone(),
             properties.clone(),
+            on_create.clone(),
+            on_match.clone(),
         )),
         LogicalPlan::Unwind { var, expr } => Box::new(UnwindOp::new(var.clone(), expr.clone())),
         LogicalPlan::IndexSeek {
@@ -859,6 +863,15 @@ struct MergeNodeOp {
     /// stay as `Expr` because evaluation needs `ExecCtx::params`, which
     /// isn't available until `next()` is called.
     properties: Vec<(String, Expr)>,
+    /// `ON CREATE SET ...` assignments — applied only when the
+    /// merge took the create branch. Evaluated against a row
+    /// `{var → Node}` so the value expressions can reference the
+    /// just-created node.
+    on_create: Vec<SetAssignment>,
+    /// `ON MATCH SET ...` assignments — applied to every matched
+    /// node when the merge took the match branch. Same row shape
+    /// as `on_create`.
+    on_match: Vec<SetAssignment>,
     initialized: bool,
     matched: Vec<Node>,
     /// Resolved property values stashed by `scan()` so the create
@@ -868,11 +881,19 @@ struct MergeNodeOp {
 }
 
 impl MergeNodeOp {
-    fn new(var: String, labels: Vec<String>, properties: Vec<(String, Expr)>) -> Self {
+    fn new(
+        var: String,
+        labels: Vec<String>,
+        properties: Vec<(String, Expr)>,
+        on_create: Vec<SetAssignment>,
+        on_match: Vec<SetAssignment>,
+    ) -> Self {
         Self {
             var,
             labels,
             properties,
+            on_create,
+            on_match,
             initialized: false,
             matched: Vec::new(),
             resolved_for_create: None,
@@ -943,8 +964,22 @@ impl Operator for MergeNodeOp {
                 for (k, prop) in resolved {
                     node.properties.insert(k, prop);
                 }
+                // Apply ON CREATE SET *before* the first put_node
+                // so the persisted node already has the SET-derived
+                // values — avoids an extra write.
+                apply_merge_actions(&mut node, &self.on_create, &self.var, ctx.params)?;
                 ctx.writer.put_node(&node)?;
                 self.matched.push(node);
+            } else if !self.on_match.is_empty() {
+                // Match path with ON MATCH SET — apply to every
+                // matched node and persist each one through the
+                // writer. The unconditional `if` skips this loop
+                // entirely when there's no on_match clause, so
+                // existing MERGE workloads pay no overhead.
+                for node in self.matched.iter_mut() {
+                    apply_merge_actions(node, &self.on_match, &self.var, ctx.params)?;
+                    ctx.writer.put_node(node)?;
+                }
             }
             self.initialized = true;
         }
@@ -958,6 +993,99 @@ impl Operator for MergeNodeOp {
             Ok(None)
         }
     }
+}
+
+/// Apply MERGE-conditional SET assignments (`ON CREATE` or
+/// `ON MATCH`) to `node` in place. Mirrors the `SetPropertyOp`
+/// dispatch but specialized to a single bound variable so we
+/// don't have to materialize a full row dispatcher.
+///
+/// Value expressions are evaluated against a temporary row
+/// `{var → Node(node.clone())}` so the RHS can reference the
+/// node's existing properties — `MERGE (n) ON MATCH SET n.hits = n.hits + 1`
+/// works the same as if the SET ran in a SetPropertyOp pipeline.
+fn apply_merge_actions(
+    node: &mut Node,
+    actions: &[SetAssignment],
+    var: &str,
+    params: &ParamMap,
+) -> Result<()> {
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let mut row = Row::new();
+    row.insert(var.to_string(), Value::Node(node.clone()));
+    for action in actions {
+        match action {
+            SetAssignment::Property {
+                var: target,
+                key,
+                value,
+            } => {
+                if target != var {
+                    return Err(Error::UnboundVariable(target.clone()));
+                }
+                let evaluated = eval_expr(value, &row, params)?;
+                let prop = value_to_property(evaluated)?;
+                node.properties.insert(key.clone(), prop);
+                row.insert(var.to_string(), Value::Node(node.clone()));
+            }
+            SetAssignment::Labels {
+                var: target,
+                labels,
+            } => {
+                if target != var {
+                    return Err(Error::UnboundVariable(target.clone()));
+                }
+                for label in labels {
+                    if !node.labels.contains(label) {
+                        node.labels.push(label.clone());
+                    }
+                }
+                row.insert(var.to_string(), Value::Node(node.clone()));
+            }
+            SetAssignment::Replace {
+                var: target,
+                properties,
+            } => {
+                if target != var {
+                    return Err(Error::UnboundVariable(target.clone()));
+                }
+                let resolved: Vec<(String, Property)> = properties
+                    .iter()
+                    .map(|(k, expr)| {
+                        let v = eval_expr(expr, &row, params)?;
+                        Ok((k.clone(), value_to_property(v)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                node.properties.clear();
+                for (k, p) in resolved {
+                    node.properties.insert(k, p);
+                }
+                row.insert(var.to_string(), Value::Node(node.clone()));
+            }
+            SetAssignment::Merge {
+                var: target,
+                properties,
+            } => {
+                if target != var {
+                    return Err(Error::UnboundVariable(target.clone()));
+                }
+                let resolved: Vec<(String, Property)> = properties
+                    .iter()
+                    .map(|(k, expr)| {
+                        let v = eval_expr(expr, &row, params)?;
+                        Ok((k.clone(), value_to_property(v)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for (k, p) in resolved {
+                    node.properties.insert(k, p);
+                }
+                row.insert(var.to_string(), Value::Node(node.clone()));
+            }
+        }
+    }
+    Ok(())
 }
 
 struct EdgeExpandOp {

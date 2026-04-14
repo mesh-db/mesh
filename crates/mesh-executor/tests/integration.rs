@@ -2209,6 +2209,113 @@ fn bare_return_with_parameter() {
 }
 
 #[test]
+fn merge_on_create_sets_properties_on_first_run() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "MERGE (p:Person {email: 'ada@example.com'}) \
+         ON CREATE SET p.name = 'Ada', p.age = 37",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person {email: 'ada@example.com'}) RETURN p.name AS name, p.age AS age",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+    assert_eq!(int_prop(&rows[0], "age"), 37);
+}
+
+#[test]
+fn merge_on_match_runs_only_when_node_exists() {
+    let (store, _d) = open_store();
+    // First MERGE creates and applies ON CREATE only.
+    run(
+        &store,
+        "MERGE (p:Person {email: 'ada@example.com'}) \
+         ON CREATE SET p.created = true \
+         ON MATCH SET p.seen = true",
+    );
+    let initial = run(
+        &store,
+        "MATCH (p:Person {email: 'ada@example.com'}) RETURN p.created AS c",
+    );
+    assert_eq!(initial.len(), 1);
+    assert!(matches!(
+        initial[0].get("c"),
+        Some(Value::Property(Property::Bool(true)))
+    ));
+    // The matched row from the first MERGE should NOT have `seen`.
+    let seen_initial = run(
+        &store,
+        "MATCH (p:Person {email: 'ada@example.com'}) RETURN p.seen AS s",
+    );
+    // `seen` is missing → projection emits Null.
+    assert!(matches!(
+        seen_initial[0].get("s"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+
+    // Second MERGE with same key: now match path fires and applies ON MATCH.
+    run(
+        &store,
+        "MERGE (p:Person {email: 'ada@example.com'}) \
+         ON CREATE SET p.created = false \
+         ON MATCH SET p.seen = true",
+    );
+    let after = run(
+        &store,
+        "MATCH (p:Person {email: 'ada@example.com'}) \
+         RETURN p.created AS c, p.seen AS s",
+    );
+    assert_eq!(after.len(), 1);
+    // ON CREATE didn't fire on the second run, so created stays true.
+    assert!(matches!(
+        after[0].get("c"),
+        Some(Value::Property(Property::Bool(true)))
+    ));
+    // ON MATCH did fire, so seen is now true.
+    assert!(matches!(
+        after[0].get("s"),
+        Some(Value::Property(Property::Bool(true)))
+    ));
+}
+
+#[test]
+fn merge_on_create_supports_parameters() {
+    let (store, _d) = open_store();
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".into(),
+        Value::Property(Property::String("Grace".into())),
+    );
+    params.insert("age".into(), Value::Property(Property::Int64(85)));
+    run_with_params(
+        &store,
+        "MERGE (p:Person {email: 'grace@example.com'}) \
+         ON CREATE SET p.name = $name, p.age = $age",
+        &params,
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person {email: 'grace@example.com'}) RETURN p.name AS n, p.age AS a",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Grace");
+    assert_eq!(int_prop(&rows[0], "a"), 85);
+}
+
+#[test]
+fn merge_without_actions_still_works() {
+    // Regression check: existing MERGE callers without ON CREATE/MATCH
+    // shouldn't be broken by the new fields.
+    let (store, _d) = open_store();
+    run(&store, "MERGE (p:Person {name: 'Ada'})");
+    let rows = run(&store, "MATCH (p:Person) RETURN p.name AS n");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Ada");
+}
+
+#[test]
 fn bare_return_does_not_leak_placeholder_column() {
     // The lowering uses a synthetic UNWIND with an unutterable
     // variable name; the Project step must drop it from the

@@ -173,6 +173,8 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
 
 fn build_merge(pair: Pair<Rule>) -> Result<MergeStmt> {
     let mut pattern: Option<NodePattern> = None;
+    let mut on_create: Vec<crate::ast::SetItem> = Vec::new();
+    let mut on_match: Vec<crate::ast::SetItem> = Vec::new();
     let mut return_items = Vec::new();
     let mut distinct = false;
     let mut order_by: Vec<SortItem> = Vec::new();
@@ -182,6 +184,13 @@ fn build_merge(pair: Pair<Rule>) -> Result<MergeStmt> {
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::node_pattern => pattern = Some(build_node_pattern(p)?),
+            Rule::merge_action => {
+                let (which, items) = build_merge_action(p)?;
+                match which {
+                    MergeActionKind::OnCreate => on_create.extend(items),
+                    MergeActionKind::OnMatch => on_match.extend(items),
+                }
+            }
             Rule::return_tail => {
                 parse_return_tail(
                     p,
@@ -199,12 +208,53 @@ fn build_merge(pair: Pair<Rule>) -> Result<MergeStmt> {
     let pattern = pattern.ok_or_else(|| Error::Parse("MERGE requires a node pattern".into()))?;
     Ok(MergeStmt {
         pattern,
+        on_create,
+        on_match,
         return_items,
         distinct,
         order_by,
         skip,
         limit,
     })
+}
+
+enum MergeActionKind {
+    OnCreate,
+    OnMatch,
+}
+
+/// Walk one `merge_action` pair (`ON CREATE SET ...` or
+/// `ON MATCH SET ...`) and return its kind plus the list of
+/// `SetItem` lowered from the embedded `set_items` rule. Reuses
+/// the existing `build_set_item` so SET semantics stay identical
+/// across plain SET and the MERGE-conditional flavor.
+fn build_merge_action(pair: Pair<Rule>) -> Result<(MergeActionKind, Vec<crate::ast::SetItem>)> {
+    let mut kind: Option<MergeActionKind> = None;
+    let mut items: Vec<crate::ast::SetItem> = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::merge_on_create => kind = Some(MergeActionKind::OnCreate),
+            Rule::merge_on_match => kind = Some(MergeActionKind::OnMatch),
+            Rule::set_items => {
+                for set_item_pair in inner.into_inner() {
+                    debug_assert_eq!(set_item_pair.as_rule(), Rule::set_item);
+                    // build_set_item expects the inner alternative
+                    // (set_prop_item, set_label_item, …), not the
+                    // set_item wrapper.
+                    let inner = set_item_pair
+                        .into_inner()
+                        .next()
+                        .ok_or_else(|| Error::Parse("empty set item".into()))?;
+                    items.push(build_set_item(inner)?);
+                }
+            }
+            // Silent kw_on / kw_set don't produce pairs at all,
+            // but other tokens shouldn't appear here.
+            _ => {}
+        }
+    }
+    let kind = kind.ok_or_else(|| Error::Parse("merge_action missing CREATE/MATCH".into()))?;
+    Ok((kind, items))
 }
 
 fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
