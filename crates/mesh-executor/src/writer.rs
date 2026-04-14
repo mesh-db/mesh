@@ -16,6 +16,31 @@ pub trait GraphWriter {
     fn put_edge(&self, edge: &Edge) -> Result<()>;
     fn delete_edge(&self, id: EdgeId) -> Result<()>;
     fn detach_delete_node(&self, id: NodeId) -> Result<()>;
+
+    /// Declare a new property index. Default impl errors so remote
+    /// writers (Raft, routing) that don't yet support cluster-aware
+    /// DDL surface the limitation immediately. The `Store` writer
+    /// overrides this to call the backing store directly.
+    fn create_property_index(&self, _label: &str, _property: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "property-index DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Tear down a property index. Mirrors [`Self::create_property_index`].
+    fn drop_property_index(&self, _label: &str, _property: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "property-index DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Snapshot the currently-registered property indexes as
+    /// `(label, property)` pairs for `SHOW INDEXES`. Default impl
+    /// returns an empty list — remote writers will wire real
+    /// fan-out in Phase C.
+    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
 }
 
 impl GraphWriter for Store {
@@ -39,5 +64,22 @@ impl GraphWriter for Store {
     fn detach_delete_node(&self, id: NodeId) -> Result<()> {
         Store::detach_delete_node(self, id)?;
         Ok(())
+    }
+
+    fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
+        Store::create_property_index(self, label, property)?;
+        Ok(())
+    }
+
+    fn drop_property_index(&self, label: &str, property: &str) -> Result<()> {
+        Store::drop_property_index(self, label, property)?;
+        Ok(())
+    }
+
+    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(Store::list_property_indexes(self)
+            .into_iter()
+            .map(|s| (s.label, s.property))
+            .collect())
     }
 }

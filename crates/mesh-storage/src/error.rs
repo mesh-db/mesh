@@ -27,6 +27,12 @@ pub enum Error {
 
     #[error("edge not found: {0}")]
     EdgeNotFound(EdgeId),
+
+    #[error("property {property} of type {kind} is not indexable")]
+    UnindexableValue {
+        property: String,
+        kind: &'static str,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

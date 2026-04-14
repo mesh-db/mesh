@@ -183,6 +183,38 @@ impl<'a> GraphReader for OverlayGraphReader<'a> {
         Ok(result.into_iter().collect())
     }
 
+    fn nodes_by_property(
+        &self,
+        label: &str,
+        property: &str,
+        value: &mesh_core::Property,
+    ) -> ExecResult<Vec<NodeId>> {
+        // Same overlay pattern as nodes_by_label: start from the base
+        // result, drop anything the overlay has shadowed, then re-add
+        // from the overlay's puts when the current row matches. This
+        // preserves read-your-writes across in-tx property mutations.
+        let mut result: HashSet<NodeId> = self
+            .base
+            .nodes_by_property(label, property, value)?
+            .into_iter()
+            .collect();
+        for id in &self.overlay.deleted_nodes {
+            result.remove(id);
+        }
+        for id in self.overlay.put_nodes.keys() {
+            result.remove(id);
+        }
+        for (id, node) in &self.overlay.put_nodes {
+            if !node.labels.iter().any(|l| l == label) {
+                continue;
+            }
+            if node.properties.get(property) == Some(value) {
+                result.insert(*id);
+            }
+        }
+        Ok(result.into_iter().collect())
+    }
+
     fn outgoing(&self, source: NodeId) -> ExecResult<Vec<(EdgeId, NodeId)>> {
         // A deleted source has no outgoing edges in the overlay view.
         if self.overlay.deleted_nodes.contains(&source) {
@@ -276,6 +308,22 @@ mod tests {
                 .unwrap()
                 .values()
                 .filter(|n| n.labels.iter().any(|l| l == label))
+                .map(|n| n.id)
+                .collect())
+        }
+        fn nodes_by_property(
+            &self,
+            label: &str,
+            property: &str,
+            value: &mesh_core::Property,
+        ) -> ExecResult<Vec<NodeId>> {
+            Ok(self
+                .nodes
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|n| n.labels.iter().any(|l| l == label))
+                .filter(|n| n.properties.get(property) == Some(value))
                 .map(|n| n.id)
                 .collect())
         }

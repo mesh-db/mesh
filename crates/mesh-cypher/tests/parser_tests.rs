@@ -822,3 +822,39 @@ fn property_value_rejects_free_identifier() {
     // is a parse error rather than an "unbound variable" runtime error.
     assert!(parse("MATCH (n {name: foo}) RETURN n").is_err());
 }
+
+#[test]
+fn create_index_parses() {
+    match parse("CREATE INDEX FOR (p:Person) ON (p.name)").unwrap() {
+        Statement::CreateIndex(ddl) => {
+            assert_eq!(ddl.label, "Person");
+            assert_eq!(ddl.property, "name");
+        }
+        other => panic!("expected CreateIndex, got {:?}", other),
+    }
+}
+
+#[test]
+fn drop_index_parses() {
+    match parse("DROP INDEX FOR (n:Person) ON (n.name)").unwrap() {
+        Statement::DropIndex(ddl) => {
+            assert_eq!(ddl.label, "Person");
+            assert_eq!(ddl.property, "name");
+        }
+        other => panic!("expected DropIndex, got {:?}", other),
+    }
+}
+
+#[test]
+fn show_indexes_parses() {
+    assert!(matches!(
+        parse("SHOW INDEXES").unwrap(),
+        Statement::ShowIndexes
+    ));
+}
+
+#[test]
+fn create_index_rejects_missing_label() {
+    // Grammar requires `(var:Label)` — omitting the label should fail.
+    assert!(parse("CREATE INDEX FOR (p) ON (p.name)").is_err());
+}

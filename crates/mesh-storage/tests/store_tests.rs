@@ -1,5 +1,5 @@
-use mesh_core::{Edge, Node, NodeId};
-use mesh_storage::{Store, StoreMutation};
+use mesh_core::{Edge, Node, NodeId, Property};
+use mesh_storage::{PropertyIndexSpec, Store, StoreMutation};
 use tempfile::TempDir;
 
 fn tmp_store() -> (Store, TempDir) {
@@ -382,4 +382,221 @@ fn create_checkpoint_produces_a_consistent_clone() {
         .collect();
     assert_eq!(after.len(), 1);
     assert_eq!(after[0], vec!["Snapshotted"]);
+}
+
+#[test]
+fn property_index_create_backfills_existing_nodes() {
+    let (store, _dir) = tmp_store();
+    let ada = Node::new()
+        .with_label("Person")
+        .with_property("name", "Ada");
+    let bob = Node::new()
+        .with_label("Person")
+        .with_property("name", "Bob");
+    let cid = Node::new().with_label("Robot").with_property("name", "C3");
+    store.put_node(&ada).unwrap();
+    store.put_node(&bob).unwrap();
+    store.put_node(&cid).unwrap();
+
+    store.create_property_index("Person", "name").unwrap();
+
+    let ada_hits = store
+        .nodes_by_property("Person", "name", &Property::String("Ada".into()))
+        .unwrap();
+    assert_eq!(ada_hits, vec![ada.id]);
+    // Different label: unindexed, backfill excluded it.
+    let c3_hits = store
+        .nodes_by_property("Person", "name", &Property::String("C3".into()))
+        .unwrap();
+    assert!(c3_hits.is_empty());
+}
+
+#[test]
+fn property_index_tracks_subsequent_puts_and_overwrites() {
+    let (store, _dir) = tmp_store();
+    store.create_property_index("Person", "name").unwrap();
+
+    let mut ada = Node::new()
+        .with_label("Person")
+        .with_property("name", "Ada");
+    store.put_node(&ada).unwrap();
+    assert_eq!(
+        store
+            .nodes_by_property("Person", "name", &Property::String("Ada".into()))
+            .unwrap(),
+        vec![ada.id]
+    );
+
+    ada.properties
+        .insert("name".into(), Property::String("Ada Lovelace".into()));
+    store.put_node(&ada).unwrap();
+    // Old value no longer resolves.
+    assert!(store
+        .nodes_by_property("Person", "name", &Property::String("Ada".into()))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .nodes_by_property("Person", "name", &Property::String("Ada Lovelace".into()))
+            .unwrap(),
+        vec![ada.id]
+    );
+}
+
+#[test]
+fn property_index_detach_delete_removes_entry() {
+    let (store, _dir) = tmp_store();
+    store.create_property_index("Person", "name").unwrap();
+    let ada = Node::new()
+        .with_label("Person")
+        .with_property("name", "Ada");
+    store.put_node(&ada).unwrap();
+    store.detach_delete_node(ada.id).unwrap();
+    assert!(store
+        .nodes_by_property("Person", "name", &Property::String("Ada".into()))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn property_index_drop_clears_entries_and_registry() {
+    let (store, _dir) = tmp_store();
+    store.create_property_index("Person", "name").unwrap();
+    let ada = Node::new()
+        .with_label("Person")
+        .with_property("name", "Ada");
+    store.put_node(&ada).unwrap();
+
+    store.drop_property_index("Person", "name").unwrap();
+    assert!(store.list_property_indexes().is_empty());
+    // Re-creating with no backfill source still works; a subsequent
+    // put_node also won't resurrect the stale entry because drop
+    // swept the CF.
+    store.create_property_index("Person", "name").unwrap();
+    assert!(store
+        .nodes_by_property("Person", "name", &Property::String("Ada".into()))
+        .unwrap()
+        .contains(&ada.id));
+}
+
+#[test]
+fn property_index_registry_survives_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = Store::open(dir.path()).unwrap();
+        store.create_property_index("Person", "name").unwrap();
+        store
+            .put_node(
+                &Node::new()
+                    .with_label("Person")
+                    .with_property("name", "Ada"),
+            )
+            .unwrap();
+    }
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store.list_property_indexes(),
+        vec![PropertyIndexSpec {
+            label: "Person".into(),
+            property: "name".into(),
+        }]
+    );
+    let hits = store
+        .nodes_by_property("Person", "name", &Property::String("Ada".into()))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn property_index_rejects_float_values_at_query_time() {
+    let (store, _dir) = tmp_store();
+    store.create_property_index("M", "score").unwrap();
+    let err = store
+        .nodes_by_property("M", "score", &Property::Float64(1.5))
+        .unwrap_err();
+    assert!(err.to_string().contains("not indexable"));
+}
+
+#[test]
+fn property_index_tracks_label_change() {
+    // Adding an indexed label to an existing node should start
+    // indexing it; removing the label should drop the entry.
+    let (store, _dir) = tmp_store();
+    store.create_property_index("Person", "name").unwrap();
+
+    let mut n = Node::new().with_label("Thing").with_property("name", "Ada");
+    store.put_node(&n).unwrap();
+    assert!(store
+        .nodes_by_property("Person", "name", &Property::String("Ada".into()))
+        .unwrap()
+        .is_empty());
+
+    n.labels.push("Person".into());
+    store.put_node(&n).unwrap();
+    assert_eq!(
+        store
+            .nodes_by_property("Person", "name", &Property::String("Ada".into()))
+            .unwrap(),
+        vec![n.id]
+    );
+
+    n.labels.retain(|l| l != "Person");
+    store.put_node(&n).unwrap();
+    assert!(store
+        .nodes_by_property("Person", "name", &Property::String("Ada".into()))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn property_index_int64_and_bool_values_round_trip() {
+    let (store, _dir) = tmp_store();
+    store.create_property_index("P", "age").unwrap();
+    store.create_property_index("P", "active").unwrap();
+    let n = Node::new()
+        .with_label("P")
+        .with_property("age", 37_i64)
+        .with_property("active", true);
+    store.put_node(&n).unwrap();
+
+    assert_eq!(
+        store
+            .nodes_by_property("P", "age", &Property::Int64(37))
+            .unwrap(),
+        vec![n.id]
+    );
+    assert_eq!(
+        store
+            .nodes_by_property("P", "active", &Property::Bool(true))
+            .unwrap(),
+        vec![n.id]
+    );
+    assert!(store
+        .nodes_by_property("P", "age", &Property::Int64(38))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn property_index_string_int_same_value_do_not_alias() {
+    // Ensures the type-tag byte prevents a String "42" from aliasing
+    // an Int64 42 under the same (label, prop) prefix.
+    let (store, _dir) = tmp_store();
+    store.create_property_index("M", "x").unwrap();
+    let a = Node::new().with_label("M").with_property("x", "42");
+    let b = Node::new().with_label("M").with_property("x", 42_i64);
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    assert_eq!(
+        store
+            .nodes_by_property("M", "x", &Property::String("42".into()))
+            .unwrap(),
+        vec![a.id]
+    );
+    assert_eq!(
+        store
+            .nodes_by_property("M", "x", &Property::Int64(42))
+            .unwrap(),
+        vec![b.id]
+    );
 }

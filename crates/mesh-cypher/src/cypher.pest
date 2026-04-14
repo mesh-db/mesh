@@ -2,10 +2,30 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
 query = { SOI ~ statement ~ EOI }
 
-statement = { unwind_stmt | merge_stmt | create_stmt | match_stmt }
+statement = {
+    create_index_stmt | drop_index_stmt | show_indexes_stmt |
+    unwind_stmt | merge_stmt | create_stmt | match_stmt
+}
 
 create_stmt = { kw_create ~ pattern_list ~ return_tail? }
 merge_stmt  = { kw_merge ~ node_pattern ~ return_tail? }
+
+// Schema DDL for property indexes. Uses the modern Neo4j 4.x+ form
+// (`CREATE INDEX FOR (n:Label) ON (n.prop)`) without the optional
+// index name — Mesh identifies indexes by their (label, property)
+// pair, which keeps DROP/SHOW behavior uniform across the executor
+// and the storage layer. Parens on both sides are mandatory so the
+// grammar unambiguously terminates.
+create_index_stmt = { kw_create ~ kw_index ~ kw_for ~ "(" ~ index_target ~ ")" ~ kw_on ~ "(" ~ index_property ~ ")" }
+drop_index_stmt   = { kw_drop ~ kw_index ~ kw_for ~ "(" ~ index_target ~ ")" ~ kw_on ~ "(" ~ index_property ~ ")" }
+show_indexes_stmt = { kw_show ~ kw_indexes }
+
+// `n:Label` — the variable is required by the grammar but discarded
+// by the builder (the index is per-label, not per-variable).
+index_target = { identifier ~ ":" ~ identifier }
+// `n.prop` — same: variable is required to be syntactically valid
+// Cypher but ignored semantically.
+index_property = { identifier ~ "." ~ identifier }
 
 unwind_stmt = {
     kw_unwind ~ expression ~ kw_as ~ identifier ~
@@ -150,7 +170,8 @@ reserved = @{
      ^"as" | ^"or" | ^"and" | ^"not" | ^"true" | ^"false" | ^"null" |
      ^"set" | ^"delete" | ^"detach" |
      ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc" |
-     ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind")
+     ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind" |
+     ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on")
     ~ !id_cont
 }
 
@@ -180,3 +201,9 @@ kw_else = @{ ^"else" ~ !id_cont }
 kw_end = @{ ^"end" ~ !id_cont }
 kw_in = @{ ^"in" ~ !id_cont }
 kw_unwind = _{ ^"unwind" ~ !id_cont }
+kw_index = @{ ^"index" ~ !id_cont }
+kw_indexes = @{ ^"indexes" ~ !id_cont }
+kw_drop = @{ ^"drop" ~ !id_cont }
+kw_show = @{ ^"show" ~ !id_cont }
+kw_for = @{ ^"for" ~ !id_cont }
+kw_on = @{ ^"on" ~ !id_cont }

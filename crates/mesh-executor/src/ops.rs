@@ -63,6 +63,13 @@ pub fn execute_with_reader(
     writer: &dyn GraphWriter,
     params: &ParamMap,
 ) -> Result<Vec<Row>> {
+    // Schema DDL never enters the operator pipeline — it's a
+    // side-effect on the backing store, not a row-producing query.
+    // Short-circuit here so `build_op` stays a pure plan-to-operator
+    // mapping and doesn't need DDL-specific cases.
+    if let Some(rows) = try_execute_ddl(plan, writer)? {
+        return Ok(rows);
+    }
     let mut op = build_op(plan);
     let ctx = ExecCtx {
         store: reader,
@@ -74,6 +81,66 @@ pub fn execute_with_reader(
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// DDL dispatch. Returns `Ok(Some(rows))` when `plan` is a schema
+/// statement and was handled; `Ok(None)` when it's a regular graph
+/// operation that the operator pipeline should execute normally.
+///
+/// `CREATE INDEX` / `DROP INDEX` return one row carrying an `ok`
+/// value so Bolt clients see a non-empty RECORD stream rather than
+/// an empty SUCCESS — mirrors how Neo4j reports schema writes.
+/// `SHOW INDEXES` returns one row per registered index with
+/// `label`, `property`, and `state` columns.
+fn try_execute_ddl(plan: &LogicalPlan, writer: &dyn GraphWriter) -> Result<Option<Vec<Row>>> {
+    match plan {
+        LogicalPlan::CreatePropertyIndex { label, property } => {
+            writer.create_property_index(label, property)?;
+            Ok(Some(vec![ddl_ack_row("created", label, property)]))
+        }
+        LogicalPlan::DropPropertyIndex { label, property } => {
+            writer.drop_property_index(label, property)?;
+            Ok(Some(vec![ddl_ack_row("dropped", label, property)]))
+        }
+        LogicalPlan::ShowPropertyIndexes => {
+            let specs = writer.list_property_indexes()?;
+            let rows = specs
+                .into_iter()
+                .map(|(label, property)| {
+                    let mut row = Row::default();
+                    row.insert("label".into(), Value::Property(Property::String(label)));
+                    row.insert(
+                        "property".into(),
+                        Value::Property(Property::String(property)),
+                    );
+                    row.insert(
+                        "state".into(),
+                        Value::Property(Property::String("online".into())),
+                    );
+                    row
+                })
+                .collect();
+            Ok(Some(rows))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
+    let mut row = Row::default();
+    row.insert(
+        "state".into(),
+        Value::Property(Property::String(state.into())),
+    );
+    row.insert(
+        "label".into(),
+        Value::Property(Property::String(label.into())),
+    );
+    row.insert(
+        "property".into(),
+        Value::Property(Property::String(property.into())),
+    );
+    row
 }
 
 fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
@@ -171,6 +238,26 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             properties.clone(),
         )),
         LogicalPlan::Unwind { var, expr } => Box::new(UnwindOp::new(var.clone(), expr.clone())),
+        LogicalPlan::IndexSeek {
+            var,
+            label,
+            property,
+            value,
+        } => Box::new(IndexSeekOp::new(
+            var.clone(),
+            label.clone(),
+            property.clone(),
+            value.clone(),
+        )),
+        // DDL plans are handled by `try_execute_ddl` before the
+        // operator pipeline is built, so they should never reach
+        // this point. An assertion here catches any future
+        // refactor that forgets to gate them.
+        LogicalPlan::CreatePropertyIndex { .. }
+        | LogicalPlan::DropPropertyIndex { .. }
+        | LogicalPlan::ShowPropertyIndexes => {
+            panic!("schema DDL must be dispatched via try_execute_ddl before build_op")
+        }
     }
 }
 
@@ -683,6 +770,70 @@ impl Operator for NodeScanByLabelsOp {
 
 fn has_all_labels(node: &Node, labels: &[String]) -> bool {
     labels.iter().all(|l| node.labels.contains(l))
+}
+
+/// Equality-lookup operator backed by a property index. Evaluates
+/// the value expression lazily on the first `next()` — crucially
+/// so parameters resolve against the per-query `ExecCtx::params`
+/// map, not against a literal baked in at plan-construction time.
+///
+/// Unindexable value types (Float, List, Map, Null, or a Node/Edge
+/// that slipped through) surface as `Error::InvalidSetValue`. The
+/// planner only emits this op for indexes that do exist, so the
+/// reader call should find a populated CF unless a concurrent DROP
+/// raced us (in which case the result is just empty, which matches
+/// how Neo4j's planner handles the race).
+struct IndexSeekOp {
+    var: String,
+    label: String,
+    property: String,
+    value_expr: Expr,
+    results: Option<Vec<NodeId>>,
+    cursor: usize,
+}
+
+impl IndexSeekOp {
+    fn new(var: String, label: String, property: String, value_expr: Expr) -> Self {
+        Self {
+            var,
+            label,
+            property,
+            value_expr,
+            results: None,
+            cursor: 0,
+        }
+    }
+}
+
+impl Operator for IndexSeekOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.results.is_none() {
+            let empty = Row::new();
+            let value = eval_expr(&self.value_expr, &empty, ctx.params)?;
+            let property = match value {
+                Value::Property(p) => p,
+                Value::Null => Property::Null,
+                Value::Node(_) | Value::Edge(_) | Value::List(_) => {
+                    return Err(Error::InvalidSetValue);
+                }
+            };
+            let ids = ctx
+                .store
+                .nodes_by_property(&self.label, &self.property, &property)?;
+            self.results = Some(ids);
+        }
+        let ids = self.results.as_ref().unwrap();
+        while self.cursor < ids.len() {
+            let id = ids[self.cursor];
+            self.cursor += 1;
+            if let Some(node) = ctx.store.get_node(id)? {
+                let mut row = Row::new();
+                row.insert(self.var.clone(), Value::Node(node));
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn matches_pattern_props(node: &Node, props: &[(String, Property)]) -> bool {

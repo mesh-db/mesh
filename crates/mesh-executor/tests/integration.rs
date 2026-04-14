@@ -1,5 +1,5 @@
 use mesh_core::{Edge, Node, NodeId, Property};
-use mesh_cypher::{parse, plan};
+use mesh_cypher::{parse, plan, plan_with_context, PlannerContext};
 use mesh_executor::{execute, execute_with_reader, GraphReader, GraphWriter, ParamMap, Row, Value};
 use mesh_storage::Store;
 use tempfile::TempDir;
@@ -1922,4 +1922,187 @@ fn unbound_parameter_errors_at_execute_time() {
         msg.contains("unbound parameter") && msg.contains("missing"),
         "expected UnboundParameter error, got: {msg}"
     );
+}
+
+/// Run a query with a `PlannerContext` populated from the store's
+/// currently-registered property indexes. This is the entry point
+/// the real server uses, so using it here means the tests exercise
+/// the same `plan_with_context` -> `IndexSeek` rewrite path.
+fn run_with_ctx(store: &Store, q: &str) -> Vec<Row> {
+    let ctx = PlannerContext {
+        indexes: store
+            .list_property_indexes()
+            .into_iter()
+            .map(|s| (s.label, s.property))
+            .collect(),
+    };
+    let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+    let plan = plan_with_context(&stmt, &ctx).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+    let params = ParamMap::new();
+    execute_with_reader(
+        &plan,
+        store as &dyn GraphReader,
+        store as &dyn GraphWriter,
+        &params,
+    )
+    .unwrap_or_else(|e| panic!("exec {q}: {e}"))
+}
+
+/// `run_with_ctx` plus an explicit `ParamMap` so the index tests can
+/// exercise parameterized seek values.
+fn run_with_ctx_params(store: &Store, q: &str, params: &ParamMap) -> Vec<Row> {
+    let ctx = PlannerContext {
+        indexes: store
+            .list_property_indexes()
+            .into_iter()
+            .map(|s| (s.label, s.property))
+            .collect(),
+    };
+    let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+    let plan = plan_with_context(&stmt, &ctx).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+    execute_with_reader(
+        &plan,
+        store as &dyn GraphReader,
+        store as &dyn GraphWriter,
+        params,
+    )
+    .unwrap_or_else(|e| panic!("exec {q}: {e}"))
+}
+
+#[test]
+fn create_index_and_show_indexes_round_trip() {
+    let (store, _d) = open_store();
+    let create_rows = run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    assert_eq!(create_rows.len(), 1);
+    assert_eq!(str_prop(&create_rows[0], "state"), "created");
+    assert_eq!(str_prop(&create_rows[0], "label"), "Person");
+    assert_eq!(str_prop(&create_rows[0], "property"), "name");
+
+    let shown = run(&store, "SHOW INDEXES");
+    assert_eq!(shown.len(), 1);
+    assert_eq!(str_prop(&shown[0], "label"), "Person");
+    assert_eq!(str_prop(&shown[0], "property"), "name");
+    assert_eq!(str_prop(&shown[0], "state"), "online");
+}
+
+#[test]
+fn drop_index_empties_show_indexes() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "DROP INDEX FOR (p:Person) ON (p.name)");
+    assert!(run(&store, "SHOW INDEXES").is_empty());
+}
+
+#[test]
+fn match_with_pattern_property_uses_index() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada', age: 37})");
+    run(&store, "CREATE (:Person {name: 'Bob', age: 28})");
+    run(&store, "CREATE (:Person {name: 'Cid', age: 44})");
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+
+    let rows = run_with_ctx(&store, "MATCH (p:Person {name: 'Bob'}) RETURN p.age AS age");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "age"), 28);
+}
+
+#[test]
+fn index_backfills_pre_existing_nodes() {
+    let (store, _d) = open_store();
+    // Insert before creating the index — backfill must find them.
+    run(&store, "CREATE (:Product {sku: 'abc', qty: 2})");
+    run(&store, "CREATE (:Product {sku: 'def', qty: 5})");
+    run(&store, "CREATE INDEX FOR (n:Product) ON (n.sku)");
+
+    let rows = run_with_ctx(&store, "MATCH (p:Product {sku: 'abc'}) RETURN p.qty AS qty");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "qty"), 2);
+}
+
+#[test]
+fn index_lookup_with_parameter_value() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "who".into(),
+        Value::Property(Property::String("Ada".into())),
+    );
+    let rows = run_with_ctx_params(
+        &store,
+        "MATCH (p:Person {name: $who}) RETURN p.name AS n",
+        &params,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Ada");
+}
+
+#[test]
+fn index_respects_subsequent_updates() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    // Rename via SET
+    run(&store, "MATCH (p:Person) SET p.name = 'Ada Lovelace'");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (p:Person {name: 'Ada Lovelace'}) RETURN p.name AS n",
+    );
+    assert_eq!(rows.len(), 1);
+    let stale = run_with_ctx(&store, "MATCH (p:Person {name: 'Ada'}) RETURN p.name AS n");
+    assert!(stale.is_empty(), "old value should not resolve anymore");
+}
+
+#[test]
+fn index_drop_falls_back_to_label_scan() {
+    // After DROP, the same MATCH still works via NodeScanByLabels + filter
+    // — correctness doesn't depend on the index being present.
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "DROP INDEX FOR (p:Person) ON (p.name)");
+
+    let rows = run_with_ctx(&store, "MATCH (p:Person {name: 'Ada'}) RETURN p.name AS n");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Ada");
+}
+
+#[test]
+fn index_seek_on_int_and_bool_values() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (w:Widget) ON (w.qty)");
+    run(&store, "CREATE INDEX FOR (w:Widget) ON (w.active)");
+    run(&store, "CREATE (:Widget {qty: 3, active: true})");
+    run(&store, "CREATE (:Widget {qty: 7, active: false})");
+    run(&store, "CREATE (:Widget {qty: 3, active: false})");
+
+    let by_qty = run_with_ctx(&store, "MATCH (w:Widget {qty: 3}) RETURN w.qty AS q");
+    assert_eq!(by_qty.len(), 2);
+
+    let by_active = run_with_ctx(&store, "MATCH (w:Widget {active: true}) RETURN w.qty AS q");
+    assert_eq!(by_active.len(), 1);
+    assert_eq!(int_prop(&by_active[0], "q"), 3);
+}
+
+#[test]
+fn index_seek_with_residual_property_filter() {
+    // When the pattern has multiple properties and only one is
+    // indexed, the index lookup produces the candidates and the
+    // remaining properties become a residual filter.
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "CREATE (:Person {name: 'Ada', age: 37})");
+    run(&store, "CREATE (:Person {name: 'Ada', age: 22})");
+    run(&store, "CREATE (:Person {name: 'Bob', age: 37})");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (p:Person {name: 'Ada', age: 37}) RETURN p.age AS age",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "age"), 37);
 }

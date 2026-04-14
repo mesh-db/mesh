@@ -1,16 +1,19 @@
 use crate::{
     error::{Error, Result},
     keys::{
-        adj_key, edge_from_adj_key, id_from_str_index_key, label_index_key, label_index_prefix,
-        node_from_adj_value, type_index_key, type_index_prefix, ID_LEN,
+        adj_key, edge_from_adj_key, encode_index_value, id_from_str_index_key, label_index_key,
+        label_index_prefix, node_from_adj_value, node_id_from_property_index_key,
+        property_index_key, property_index_name_prefix, property_index_value_prefix,
+        type_index_key, type_index_prefix, ID_LEN,
     },
 };
-use mesh_core::{Edge, EdgeId, Node, NodeId};
+use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use rocksdb::{
     checkpoint::Checkpoint, ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch,
     DB,
 };
 use std::path::Path;
+use std::sync::RwLock;
 
 const CF_NODES: &str = "nodes";
 const CF_EDGES: &str = "edges";
@@ -18,6 +21,8 @@ const CF_ADJ_OUT: &str = "adj_out";
 const CF_ADJ_IN: &str = "adj_in";
 const CF_LABEL_INDEX: &str = "label_index";
 const CF_TYPE_INDEX: &str = "type_index";
+const CF_PROPERTY_INDEX: &str = "property_index";
+const CF_INDEX_META: &str = "index_meta";
 
 const ALL_CFS: &[&str] = &[
     CF_NODES,
@@ -26,7 +31,60 @@ const ALL_CFS: &[&str] = &[
     CF_ADJ_IN,
     CF_LABEL_INDEX,
     CF_TYPE_INDEX,
+    CF_PROPERTY_INDEX,
+    CF_INDEX_META,
 ];
+
+/// Declarative spec for a single-property equality index. An index is
+/// uniquely identified by its `(label, property)` pair — users don't
+/// name them, which keeps DROP/SHOW behavior simple and matches the
+/// way the planner looks them up when deciding whether to emit
+/// `IndexSeek`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PropertyIndexSpec {
+    pub label: String,
+    pub property: String,
+}
+
+impl PropertyIndexSpec {
+    /// Stable persistence key under [`CF_INDEX_META`]: `<label>\0<property>`.
+    /// Neither label nor property key can contain a NUL byte (the
+    /// grammar restricts them to identifier characters), so the NUL
+    /// separator is unambiguous on decode.
+    fn meta_key(&self) -> Vec<u8> {
+        let mut k = Vec::with_capacity(self.label.len() + 1 + self.property.len());
+        k.extend_from_slice(self.label.as_bytes());
+        k.push(0);
+        k.extend_from_slice(self.property.as_bytes());
+        k
+    }
+
+    fn from_meta_key(key: &[u8]) -> Result<Self> {
+        let sep = key
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or(Error::CorruptBytes {
+                cf: CF_INDEX_META,
+                expected: 1,
+                actual: 0,
+            })?;
+        let label = std::str::from_utf8(&key[..sep])
+            .map_err(|_| Error::CorruptBytes {
+                cf: CF_INDEX_META,
+                expected: sep,
+                actual: sep,
+            })?
+            .to_string();
+        let property = std::str::from_utf8(&key[sep + 1..])
+            .map_err(|_| Error::CorruptBytes {
+                cf: CF_INDEX_META,
+                expected: key.len() - sep - 1,
+                actual: key.len() - sep - 1,
+            })?
+            .to_string();
+        Ok(Self { label, property })
+    }
+}
 
 /// A single mutation that can be combined with others into an atomic
 /// [`Store::apply_batch`] call. Mirrors the shape of the per-op `Store`
@@ -46,6 +104,16 @@ pub enum StoreMutation {
 
 pub struct Store {
     db: DB,
+    /// In-memory view of the registered property indexes, populated
+    /// from [`CF_INDEX_META`] at open time and kept in sync by
+    /// [`Store::create_property_index`] and [`Store::drop_property_index`].
+    ///
+    /// The write-path consults this on every `append_put_node` /
+    /// `append_detach_delete_node` call to decide which index entries
+    /// to emit, so it absolutely must not hit the DB on the hot path.
+    /// `RwLock` rather than `Mutex` because the common access pattern
+    /// is many concurrent reads with only DDL-time writes.
+    indexes: RwLock<Vec<PropertyIndexSpec>>,
 }
 
 impl Store {
@@ -60,7 +128,11 @@ impl Store {
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)?;
-        Ok(Self { db })
+        let indexes = load_index_meta(&db)?;
+        Ok(Self {
+            db,
+            indexes: RwLock::new(indexes),
+        })
     }
 
     fn cf(&self, name: &'static str) -> Result<&rocksdb::ColumnFamily> {
@@ -79,19 +151,18 @@ impl Store {
     fn append_put_node(&self, batch: &mut WriteBatch, node: &Node) -> Result<()> {
         let nodes_cf = self.cf(CF_NODES)?;
         let label_cf = self.cf(CF_LABEL_INDEX)?;
+        let prop_cf = self.cf(CF_PROPERTY_INDEX)?;
 
-        let existing_labels: Vec<String> = match self.db.get_cf(nodes_cf, node.id.as_bytes())? {
-            Some(bytes) => {
-                let existing: Node = serde_json::from_slice(&bytes)?;
-                existing.labels
-            }
-            None => Vec::new(),
+        let existing: Option<Node> = match self.db.get_cf(nodes_cf, node.id.as_bytes())? {
+            Some(bytes) => Some(serde_json::from_slice(&bytes)?),
+            None => None,
         };
+        let existing_labels: &[String] = existing.as_ref().map(|n| &n.labels[..]).unwrap_or(&[]);
 
         let bytes = serde_json::to_vec(node)?;
         batch.put_cf(nodes_cf, node.id.as_bytes(), bytes);
 
-        for old in &existing_labels {
+        for old in existing_labels {
             if !node.labels.contains(old) {
                 batch.delete_cf(label_cf, label_index_key(old, node.id));
             }
@@ -99,6 +170,48 @@ impl Store {
         for new in &node.labels {
             if !existing_labels.contains(new) {
                 batch.put_cf(label_cf, label_index_key(new, node.id), EMPTY);
+            }
+        }
+
+        // Property-index maintenance: for each registered (label, prop)
+        // index, compute the delta between the previous entry (if any)
+        // and the new one, and emit the minimal set of put/delete
+        // operations. Skipping an update when the entry is unchanged
+        // keeps steady-state writes free of index churn.
+        let indexes = self.indexes.read().expect("indexes lock poisoned");
+        for spec in indexes.iter() {
+            let was_indexed = existing_labels.iter().any(|l| l == &spec.label);
+            let now_indexed = node.labels.iter().any(|l| l == &spec.label);
+            let old_encoded = if was_indexed {
+                existing
+                    .as_ref()
+                    .and_then(|n| n.properties.get(&spec.property))
+                    .and_then(encode_index_value)
+            } else {
+                None
+            };
+            let new_encoded = if now_indexed {
+                node.properties
+                    .get(&spec.property)
+                    .and_then(encode_index_value)
+            } else {
+                None
+            };
+            if old_encoded == new_encoded {
+                continue;
+            }
+            if let Some(bytes) = &old_encoded {
+                batch.delete_cf(
+                    prop_cf,
+                    property_index_key(&spec.label, &spec.property, bytes, node.id),
+                );
+            }
+            if let Some(bytes) = &new_encoded {
+                batch.put_cf(
+                    prop_cf,
+                    property_index_key(&spec.label, &spec.property, bytes, node.id),
+                    EMPTY,
+                );
             }
         }
 
@@ -185,10 +298,29 @@ impl Store {
         let in_cf = self.cf(CF_ADJ_IN)?;
         let label_cf = self.cf(CF_LABEL_INDEX)?;
         let type_cf = self.cf(CF_TYPE_INDEX)?;
+        let prop_cf = self.cf(CF_PROPERTY_INDEX)?;
 
         if let Some(n) = &node {
             for label in &n.labels {
                 batch.delete_cf(label_cf, label_index_key(label, id));
+            }
+            // Remove every property-index entry this node was holding
+            // open. Mirrors the put path: for each registered index
+            // whose label matches, if the node carries an indexable
+            // value for the property, delete the corresponding entry.
+            let indexes = self.indexes.read().expect("indexes lock poisoned");
+            for spec in indexes.iter() {
+                if !n.labels.iter().any(|l| l == &spec.label) {
+                    continue;
+                }
+                if let Some(value) = n.properties.get(&spec.property) {
+                    if let Some(encoded) = encode_index_value(value) {
+                        batch.delete_cf(
+                            prop_cf,
+                            property_index_key(&spec.label, &spec.property, &encoded, id),
+                        );
+                    }
+                }
             }
         }
 
@@ -325,6 +457,132 @@ impl Store {
         self.scan_adj(CF_ADJ_IN, target)
     }
 
+    /// Snapshot the currently-registered property indexes. Cheap clone
+    /// — specs are tiny (a label + a property key).
+    pub fn list_property_indexes(&self) -> Vec<PropertyIndexSpec> {
+        self.indexes.read().expect("indexes lock poisoned").clone()
+    }
+
+    /// Declare a new `(label, property)` single-property equality
+    /// index and backfill it by scanning every node that currently
+    /// carries `label`. Idempotent: re-creating an already-registered
+    /// index is a no-op, matching how Neo4j's `CREATE INDEX IF NOT
+    /// EXISTS` behaves.
+    ///
+    /// Backfill is done in the same [`WriteBatch`] as the meta insert,
+    /// so a crash mid-backfill leaves the store with either zero
+    /// entries (batch not yet written) or a fully-populated index
+    /// (batch committed). No partial-build state is ever visible.
+    pub fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
+        let spec = PropertyIndexSpec {
+            label: label.to_string(),
+            property: property.to_string(),
+        };
+        let mut guard = self.indexes.write().expect("indexes lock poisoned");
+        if guard.contains(&spec) {
+            return Ok(());
+        }
+
+        let meta_cf = self.cf(CF_INDEX_META)?;
+        let prop_cf = self.cf(CF_PROPERTY_INDEX)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(meta_cf, spec.meta_key(), EMPTY);
+
+        // Backfill: walk the label index to find every current member
+        // and probe its node record for the property. Nodes missing
+        // the property (or carrying an unindexable type like Float)
+        // contribute nothing.
+        for node_id in self.nodes_by_label(label)? {
+            let node = match self.get_node(node_id)? {
+                Some(n) => n,
+                None => continue,
+            };
+            if let Some(value) = node.properties.get(property) {
+                if let Some(encoded) = encode_index_value(value) {
+                    batch.put_cf(
+                        prop_cf,
+                        property_index_key(label, property, &encoded, node_id),
+                        EMPTY,
+                    );
+                }
+            }
+        }
+
+        self.db.write(batch)?;
+        guard.push(spec);
+        Ok(())
+    }
+
+    /// Tear down a property index: removes the meta entry and every
+    /// entry under the `(label, prop)` prefix. Idempotent: dropping a
+    /// non-existent index is a no-op. Atomic via one [`WriteBatch`].
+    pub fn drop_property_index(&self, label: &str, property: &str) -> Result<()> {
+        let spec = PropertyIndexSpec {
+            label: label.to_string(),
+            property: property.to_string(),
+        };
+        let mut guard = self.indexes.write().expect("indexes lock poisoned");
+        if !guard.contains(&spec) {
+            return Ok(());
+        }
+
+        let meta_cf = self.cf(CF_INDEX_META)?;
+        let prop_cf = self.cf(CF_PROPERTY_INDEX)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(meta_cf, spec.meta_key());
+
+        let prefix = property_index_name_prefix(label, property);
+        let iter = self
+            .db
+            .iterator_cf(prop_cf, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            batch.delete_cf(prop_cf, key);
+        }
+
+        self.db.write(batch)?;
+        guard.retain(|s| s != &spec);
+        Ok(())
+    }
+
+    /// Look up node ids for a `(label, property, value)` equality via
+    /// the property index CF. The caller is responsible for checking
+    /// that the index exists first (e.g. the planner only emits
+    /// `IndexSeek` when it has verified via [`Store::list_property_indexes`]).
+    ///
+    /// Unindexable value types (Float64, List, Map, Null) return
+    /// [`Error::UnindexableValue`] — callers should surface this to
+    /// the user rather than silently returning an empty result.
+    pub fn nodes_by_property(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Property,
+    ) -> Result<Vec<NodeId>> {
+        let encoded = encode_index_value(value).ok_or_else(|| Error::UnindexableValue {
+            property: property.to_string(),
+            kind: value.type_name(),
+        })?;
+        let cf = self.cf(CF_PROPERTY_INDEX)?;
+        let prefix = property_index_value_prefix(label, property, &encoded);
+        let mut results = Vec::new();
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let bytes = node_id_from_property_index_key(&key, prefix.len())?;
+            results.push(NodeId::from_bytes(bytes));
+        }
+        Ok(results)
+    }
+
     pub fn nodes_by_label(&self, label: &str) -> Result<Vec<NodeId>> {
         let cf = self.cf(CF_LABEL_INDEX)?;
         let prefix = label_index_prefix(label);
@@ -382,3 +640,18 @@ impl Store {
 }
 
 const EMPTY: &[u8] = &[];
+
+/// Rehydrate the property-index registry from [`CF_INDEX_META`] at
+/// [`Store::open`] time. Runs once per process, so walking the CF
+/// sequentially is fine even for large index counts.
+fn load_index_meta(db: &DB) -> Result<Vec<PropertyIndexSpec>> {
+    let cf = db
+        .cf_handle(CF_INDEX_META)
+        .ok_or(Error::MissingColumnFamily(CF_INDEX_META))?;
+    let mut specs = Vec::new();
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, _) = item?;
+        specs.push(PropertyIndexSpec::from_meta_key(&key)?);
+    }
+    Ok(specs)
+}

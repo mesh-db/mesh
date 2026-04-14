@@ -1,9 +1,31 @@
 use crate::ast::{
-    CallArgs, CreateStmt, Direction, Expr, MatchStmt, MergeStmt, NodePattern, Pattern, ReturnItem,
-    SortItem, Statement, UnwindStmt,
+    CallArgs, CreateStmt, Direction, Expr, IndexDdl, MatchStmt, MergeStmt, NodePattern, Pattern,
+    ReturnItem, SortItem, Statement, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
+
+/// What the planner needs to know about the current store beyond the
+/// statement itself — right now just the registered property indexes,
+/// which gate whether `plan_pattern` rewrites a label-scan-plus-filter
+/// to an `IndexSeek`. Kept intentionally small: extend by adding
+/// fields as new optimizations need catalog data.
+#[derive(Debug, Default, Clone)]
+pub struct PlannerContext {
+    /// `(label, property)` pairs corresponding to active property
+    /// indexes in the backing store. Stored as a flat Vec rather than
+    /// a HashMap because N is small (single digits in practice) and
+    /// iterating a Vec is faster than hashing for that size.
+    pub indexes: Vec<(String, String)>,
+}
+
+impl PlannerContext {
+    pub fn has_index(&self, label: &str, property: &str) -> bool {
+        self.indexes
+            .iter()
+            .any(|(l, p)| l == label && p == property)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
@@ -98,6 +120,37 @@ pub enum LogicalPlan {
         var: String,
         expr: Expr,
     },
+    /// Equality lookup through a property index. The executor evaluates
+    /// `value` (which may be a literal or a parameter) at run time,
+    /// converts it to a concrete [`mesh_core::Property`], then calls
+    /// `reader.nodes_by_property(label, property, value)`. Emitted
+    /// only when the planner context confirms the `(label, property)`
+    /// index exists; otherwise the planner falls back to a
+    /// `NodeScanByLabels` + `Filter`.
+    IndexSeek {
+        var: String,
+        label: String,
+        property: String,
+        value: Expr,
+    },
+    /// Schema DDL — declare a new property index. Has no input and
+    /// produces no rows. The executor short-circuits this before
+    /// constructing the operator pipeline, dispatching to
+    /// `Store::create_property_index`.
+    CreatePropertyIndex {
+        label: String,
+        property: String,
+    },
+    /// Schema DDL — tear down a property index. Same dispatch
+    /// pattern as [`LogicalPlan::CreatePropertyIndex`].
+    DropPropertyIndex {
+        label: String,
+        property: String,
+    },
+    /// Schema DDL — emit one row per registered property index
+    /// describing `(label, property)`. The executor builds the rows
+    /// from `Store::list_property_indexes`.
+    ShowPropertyIndexes,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,12 +232,35 @@ fn aggregate_fn_from_name(name: &str) -> Option<AggregateFn> {
     }
 }
 
+/// Plan a statement with no catalog context — the executor will
+/// never see an `IndexSeek` through this entry point. Use
+/// [`plan_with_context`] when the caller wants index-aware planning.
 pub fn plan(statement: &Statement) -> Result<LogicalPlan> {
+    plan_with_context(statement, &PlannerContext::default())
+}
+
+/// Plan a statement with awareness of the backing store's registered
+/// property indexes. `MATCH` rewrites pattern-property equality to
+/// [`LogicalPlan::IndexSeek`] when a matching index exists in `ctx`;
+/// `Statement::CreateIndex` / `DropIndex` / `ShowIndexes` lower
+/// directly to the DDL plan variants.
+pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<LogicalPlan> {
     match statement {
         Statement::Create(c) => plan_create(c),
-        Statement::Match(m) => plan_match(m),
+        Statement::Match(m) => plan_match(m, ctx),
         Statement::Merge(m) => plan_merge(m),
         Statement::Unwind(u) => plan_unwind(u),
+        Statement::CreateIndex(IndexDdl { label, property }) => {
+            Ok(LogicalPlan::CreatePropertyIndex {
+                label: label.clone(),
+                property: property.clone(),
+            })
+        }
+        Statement::DropIndex(IndexDdl { label, property }) => Ok(LogicalPlan::DropPropertyIndex {
+            label: label.clone(),
+            property: property.clone(),
+        }),
+        Statement::ShowIndexes => Ok(LogicalPlan::ShowPropertyIndexes),
     }
 }
 
@@ -334,27 +410,26 @@ fn add_create_node(
     idx
 }
 
-fn plan_pattern(pattern: &Pattern, pattern_idx: usize) -> Result<LogicalPlan> {
+fn plan_pattern(
+    pattern: &Pattern,
+    pattern_idx: usize,
+    ctx: &PlannerContext,
+) -> Result<LogicalPlan> {
     let start_var = pattern
         .start
         .var
         .clone()
         .unwrap_or_else(|| format!("__p{}_a0", pattern_idx));
 
-    let mut plan = if pattern.start.labels.is_empty() {
-        LogicalPlan::NodeScanAll {
-            var: start_var.clone(),
-        }
-    } else {
-        LogicalPlan::NodeScanByLabels {
-            var: start_var.clone(),
-            labels: pattern.start.labels.clone(),
-        }
-    };
-    // Lower the start node's pattern properties to a Filter on top of
-    // the scan. Without this, `MATCH (n {name: 'Ada'})` would return
-    // every node and silently ignore the property predicate.
-    plan = wrap_with_pattern_prop_filter(plan, &start_var, &pattern.start.properties);
+    let (mut plan, remaining_props) = plan_start_node(
+        &start_var,
+        &pattern.start.labels,
+        &pattern.start.properties,
+        ctx,
+    );
+    // Any pattern properties not consumed by an IndexSeek still need a
+    // filter so the executor actually enforces them.
+    plan = wrap_with_pattern_prop_filter(plan, &start_var, &remaining_props);
 
     let mut current_var = start_var;
     for (i, hop) in pattern.hops.iter().enumerate() {
@@ -398,6 +473,55 @@ fn plan_pattern(pattern: &Pattern, pattern_idx: usize) -> Result<LogicalPlan> {
         current_var = dst_var;
     }
     Ok(plan)
+}
+
+/// Decide how to scan the start node of a pattern. When the node has
+/// exactly one label and at least one pattern property covered by a
+/// registered index, emit [`LogicalPlan::IndexSeek`] for that property
+/// and return the rest as a residual filter. Otherwise fall back to
+/// the existing `NodeScanAll` / `NodeScanByLabels` path with all
+/// pattern properties as residuals.
+///
+/// Only the *first* covered property is picked — a node pattern with
+/// two indexed properties uses the first one as the seek key and the
+/// second as a residual filter. Richer multi-predicate seek costing
+/// can replace this later without changing the IndexSeek variant.
+fn plan_start_node(
+    var: &str,
+    labels: &[String],
+    properties: &[(String, Expr)],
+    ctx: &PlannerContext,
+) -> (LogicalPlan, Vec<(String, Expr)>) {
+    if labels.len() == 1 && !properties.is_empty() {
+        let label = &labels[0];
+        if let Some(seek_idx) = properties.iter().position(|(k, _)| ctx.has_index(label, k)) {
+            let (key, value_expr) = &properties[seek_idx];
+            let seek = LogicalPlan::IndexSeek {
+                var: var.to_string(),
+                label: label.clone(),
+                property: key.clone(),
+                value: value_expr.clone(),
+            };
+            let residual: Vec<(String, Expr)> = properties
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != seek_idx)
+                .map(|(_, kv)| kv.clone())
+                .collect();
+            return (seek, residual);
+        }
+    }
+    let base = if labels.is_empty() {
+        LogicalPlan::NodeScanAll {
+            var: var.to_string(),
+        }
+    } else {
+        LogicalPlan::NodeScanByLabels {
+            var: var.to_string(),
+            labels: labels.to_vec(),
+        }
+    };
+    (base, properties.to_vec())
 }
 
 /// If `properties` is non-empty, wrap `plan` in a `Filter` whose
@@ -449,7 +573,7 @@ fn collect_pattern_vars(pattern: &Pattern, out: &mut HashSet<String>) {
     }
 }
 
-fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
+fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     // Validate no shared variable names across the pattern list (not yet supported).
     let mut all_vars: HashSet<String> = HashSet::new();
     for pattern in &stmt.patterns {
@@ -467,7 +591,7 @@ fn plan_match(stmt: &MatchStmt) -> Result<LogicalPlan> {
 
     let mut plans: Vec<LogicalPlan> = Vec::new();
     for (i, pattern) in stmt.patterns.iter().enumerate() {
-        plans.push(plan_pattern(pattern, i)?);
+        plans.push(plan_pattern(pattern, i, ctx)?);
     }
     let mut plan = plans.remove(0);
     for rhs in plans {

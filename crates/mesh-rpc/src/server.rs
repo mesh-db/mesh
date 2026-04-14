@@ -214,7 +214,39 @@ impl MeshService {
         prev_commands: Vec<GraphCommand>,
     ) -> std::result::Result<(Vec<mesh_executor::Row>, Vec<GraphCommand>), Status> {
         let statement = mesh_cypher::parse(&query).map_err(bad_request)?;
-        let plan = mesh_cypher::plan(&statement).map_err(bad_request)?;
+
+        // Schema DDL is single-node only in Phase A. Raft and routing
+        // modes need coordinated DDL (Raft-log replication for the
+        // former, parallel fan-out for the latter) — both land in
+        // follow-up phases. Surface the limitation with a clear
+        // error rather than silently accepting on one peer.
+        let is_ddl = matches!(
+            statement,
+            mesh_cypher::Statement::CreateIndex(_)
+                | mesh_cypher::Statement::DropIndex(_)
+                | mesh_cypher::Statement::ShowIndexes
+        );
+        if is_ddl && (self.routing.is_some() || self.raft.is_some()) {
+            return Err(Status::unimplemented(
+                "property-index DDL is only supported in single-node mode in this release; \
+                 cross-peer index replication lands in a follow-up phase",
+            ));
+        }
+
+        // Populate the planner context with the registered indexes so
+        // `MATCH (n:Label {prop: ...})` can rewrite to `IndexSeek`
+        // when a matching index exists. In Raft/routing modes this is
+        // currently always empty because DDL is rejected above; once
+        // phases B/C land the same call will surface the full set.
+        let planner_ctx = mesh_cypher::PlannerContext {
+            indexes: self
+                .store
+                .list_property_indexes()
+                .into_iter()
+                .map(|s| (s.label, s.property))
+                .collect(),
+        };
+        let plan = mesh_cypher::plan_with_context(&statement, &planner_ctx).map_err(bad_request)?;
 
         let store = self.store.clone();
         let routing = self.routing.clone();

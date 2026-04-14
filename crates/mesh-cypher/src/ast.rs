@@ -4,6 +4,19 @@ pub enum Statement {
     Match(MatchStmt),
     Merge(MergeStmt),
     Unwind(UnwindStmt),
+    CreateIndex(IndexDdl),
+    DropIndex(IndexDdl),
+    ShowIndexes,
+}
+
+/// Declarative description of a property index for DDL statements.
+/// `CreateIndex` and `DropIndex` both use this shape because Mesh
+/// identifies indexes by their `(label, property)` pair — users don't
+/// assign names — and the two commands carry identical payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDdl {
+    pub label: String,
+    pub property: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

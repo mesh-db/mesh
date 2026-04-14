@@ -5,7 +5,7 @@ use crate::proto::{
     AllNodeIdsRequest, GetEdgeRequest, GetNodeRequest, NeighborRequest, NodesByLabelRequest,
 };
 use crate::routing::Routing;
-use mesh_core::{Edge, EdgeId, Node, NodeId};
+use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use mesh_executor::{Error as ExecError, GraphReader, Result as ExecResult};
 use mesh_storage::Store;
 use std::collections::HashSet;
@@ -230,6 +230,31 @@ impl GraphReader for PartitionedGraphReader {
                 .map_err(Self::remote)?;
             neighbors_from_proto(resp.into_inner().neighbors)
         })
+    }
+
+    fn nodes_by_property(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Property,
+    ) -> ExecResult<Vec<NodeId>> {
+        // Phase A placeholder: the planner never emits IndexSeek in
+        // routing mode (CREATE INDEX is rejected at the server layer
+        // until Phase C), so this code path is unreachable via real
+        // queries. A correct-but-slow fallback still satisfies the
+        // trait contract if something else ever calls it: scatter the
+        // label scan, then probe each candidate via the normal point
+        // read and match the property locally.
+        let candidates = self.nodes_by_label(label)?;
+        let mut out = Vec::new();
+        for id in candidates {
+            if let Some(n) = self.get_node(id)? {
+                if n.properties.get(property) == Some(value) {
+                    out.push(id);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

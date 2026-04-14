@@ -33,8 +33,53 @@ fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
         Rule::match_stmt => Ok(Statement::Match(build_match(inner)?)),
         Rule::merge_stmt => Ok(Statement::Merge(build_merge(inner)?)),
         Rule::unwind_stmt => Ok(Statement::Unwind(build_unwind(inner)?)),
+        Rule::create_index_stmt => Ok(Statement::CreateIndex(build_index_ddl(inner)?)),
+        Rule::drop_index_stmt => Ok(Statement::DropIndex(build_index_ddl(inner)?)),
+        Rule::show_indexes_stmt => Ok(Statement::ShowIndexes),
         r => Err(Error::Parse(format!("unexpected rule: {:?}", r))),
     }
+}
+
+/// Shared builder for the two DDL statements that carry a
+/// `(label, property)` payload (`CREATE INDEX`, `DROP INDEX`). The
+/// grammar puts `index_target` and `index_property` in a fixed order,
+/// so we extract them positionally and discard the required-but-
+/// ignored variable identifiers.
+fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
+    let mut label = None;
+    let mut property = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::index_target => {
+                // `ident ":" ident` — the leading identifier is a
+                // pattern variable required by Cypher surface
+                // syntax but has no meaning at the index level.
+                let mut inner = p.into_inner();
+                let _var = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("index target missing var".into()))?;
+                let lab = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("index target missing label".into()))?;
+                label = Some(lab.as_str().to_string());
+            }
+            Rule::index_property => {
+                let mut inner = p.into_inner();
+                let _var = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("index property missing var".into()))?;
+                let key = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("index property missing key".into()))?;
+                property = Some(key.as_str().to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(crate::ast::IndexDdl {
+        label: label.ok_or_else(|| Error::Parse("index ddl missing label".into()))?,
+        property: property.ok_or_else(|| Error::Parse("index ddl missing property".into()))?,
+    })
 }
 
 fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
