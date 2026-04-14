@@ -21,25 +21,22 @@ use mesh_cluster::raft::RaftCluster;
 use mesh_cluster::{Error as ClusterError, GraphCommand, PeerId};
 use mesh_executor::{execute_with_reader, GraphReader, GraphWriter};
 use mesh_storage::Store;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::Arc;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
-
-/// Per-service in-memory staging for multi-peer [`BatchWrite`] transactions
-/// in the PREPARE state. Keyed by the coordinator-supplied `txid`; a
-/// successful PREPARE inserts an entry, COMMIT removes + applies, ABORT
-/// just removes. If the process crashes between PREPARE and COMMIT the
-/// staged batch is lost — standard 2PC participant semantics, equivalent
-/// to an implicit ABORT from the coordinator's perspective.
-type PendingBatches = Arc<Mutex<HashMap<String, Vec<GraphCommand>>>>;
 
 #[derive(Clone)]
 pub struct MeshService {
     store: Arc<Store>,
     routing: Option<Arc<Routing>>,
     raft: Option<Arc<RaftCluster>>,
-    pending_batches: PendingBatches,
+    /// Per-service 2PC participant staging. Bounded-lifetime map of
+    /// txid → staged commands with a background sweeper that drops
+    /// entries older than the configured TTL. Shared across all
+    /// routing-mode peers so a `BatchWrite(Prepare)` on any gRPC
+    /// worker lands in the same map the sweeper walks.
+    pending_batches: Arc<crate::ParticipantStaging>,
     /// Durable 2PC coordinator log. Only populated in routing mode,
     /// where multi-peer transactions need a crash-recovery record.
     coordinator_log: Option<Arc<crate::CoordinatorLog>>,
@@ -52,7 +49,7 @@ impl MeshService {
             store,
             routing: None,
             raft: None,
-            pending_batches: Arc::new(Mutex::new(HashMap::new())),
+            pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
         }
     }
@@ -66,7 +63,7 @@ impl MeshService {
     /// Routed service with an optional durable coordinator log. The
     /// log records 2PC progress so a coordinator crash between PREPARE
     /// and COMMIT can be recovered via
-    /// [`recover_pending_transactions`] at startup.
+    /// [`Self::recover_pending_transactions`] at startup.
     pub fn with_routing_and_log(
         store: Arc<Store>,
         routing: Arc<Routing>,
@@ -76,7 +73,7 @@ impl MeshService {
             store,
             routing: Some(routing),
             raft: None,
-            pending_batches: Arc::new(Mutex::new(HashMap::new())),
+            pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log,
         }
     }
@@ -90,9 +87,28 @@ impl MeshService {
             store,
             routing: None,
             raft: Some(raft),
-            pending_batches: Arc::new(Mutex::new(HashMap::new())),
+            pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
         }
+    }
+
+    /// Replace the default participant staging with a custom one.
+    /// Used by tests that want a short TTL (milliseconds) so the
+    /// sweeper behavior is observable without waiting 60s.
+    pub fn with_staging(mut self, staging: Arc<crate::ParticipantStaging>) -> Self {
+        self.pending_batches = staging;
+        self
+    }
+
+    /// Spawn the participant-staging TTL sweeper as a background
+    /// task. Returns the `JoinHandle` so the caller can abort it at
+    /// shutdown. Safe to call zero or one times per service; calling
+    /// more than once leaks the earlier sweeper's handle.
+    pub fn spawn_staging_sweeper(
+        &self,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        self.pending_batches.clone().spawn_sweeper(interval)
     }
 
     pub fn into_query_server(self) -> MeshQueryServer<Self> {
@@ -424,7 +440,7 @@ impl MeshService {
                 // pending_batches map is fresh after restart, so this
                 // is a no-op in practice — kept for completeness and
                 // in case we ever persist participant staging.
-                let _ = self.pending_batches.lock().unwrap().remove(txid);
+                let _ = self.pending_batches.take(txid);
                 continue;
             }
             if let Err(e) = send_abort_remote(routing, *peer_id, txid).await {
@@ -1142,26 +1158,17 @@ impl MeshWrite for MeshService {
             BatchPhase::Prepare => {
                 let commands: Vec<GraphCommand> =
                     serde_json::from_slice(&req.commands_json).map_err(bad_request)?;
-                let mut pending = self.pending_batches.lock().unwrap();
-                if pending.contains_key(&txid) {
-                    return Err(Status::already_exists(format!(
-                        "txid {} already prepared",
-                        txid
-                    )));
-                }
-                pending.insert(txid, commands);
+                self.pending_batches
+                    .try_insert(txid.clone(), commands)
+                    .map_err(|()| {
+                        Status::already_exists(format!("txid {} already prepared", txid))
+                    })?;
                 Ok(Response::new(BatchWriteResponse {}))
             }
             BatchPhase::Commit => {
-                let cmds = {
-                    let mut pending = self.pending_batches.lock().unwrap();
-                    pending.remove(&txid).ok_or_else(|| {
-                        Status::failed_precondition(format!(
-                            "txid {} not prepared on this peer",
-                            txid
-                        ))
-                    })?
-                };
+                let cmds = self.pending_batches.take(&txid).ok_or_else(|| {
+                    Status::failed_precondition(format!("txid {} not prepared on this peer", txid))
+                })?;
                 apply_prepared_batch(&self.store, &cmds).map_err(internal)?;
                 Ok(Response::new(BatchWriteResponse {}))
             }
@@ -1169,7 +1176,7 @@ impl MeshWrite for MeshService {
                 // Abort is always idempotent: dropping the staged entry is
                 // safe even if PREPARE never arrived (e.g., coordinator
                 // sends ABORT defensively on a partial failure).
-                let _ = self.pending_batches.lock().unwrap().remove(&txid);
+                let _ = self.pending_batches.take(&txid);
                 Ok(Response::new(BatchWriteResponse {}))
             }
         }

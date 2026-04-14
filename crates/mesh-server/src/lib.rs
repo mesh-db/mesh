@@ -193,6 +193,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         tracing::warn!(error = %e, "coordinator recovery failed; continuing");
     }
 
+    // Bound-lifetime garbage collection for 2PC participant staging.
+    // Drops any `BatchWrite(Prepare)` entry whose coordinator never
+    // followed up with COMMIT / ABORT within DEFAULT_STAGING_TTL,
+    // covering the case where a coordinator disappears without ever
+    // restarting to trigger the recovery log path.
+    let staging_sweeper = service.spawn_staging_sweeper(mesh_rpc::DEFAULT_SWEEP_INTERVAL);
+
     // Optional Bolt listener. Binds before we start the gRPC server so
     // that a port-in-use error at startup is immediately fatal rather
     // than surfacing only on the first Bolt client connection.
@@ -249,6 +256,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
 
     tokio::signal::ctrl_c().await.ok();
     let _ = shutdown_tx.send(());
+
+    staging_sweeper.abort();
+    let _ = staging_sweeper.await;
 
     if let Some(handle) = bolt_task {
         handle.abort();

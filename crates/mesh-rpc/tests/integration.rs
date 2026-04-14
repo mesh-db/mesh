@@ -1697,3 +1697,144 @@ async fn recovery_compacts_completed_entries() {
     // recovery tests don't exercise directly.
     let _ = h.log_a_path;
 }
+
+// ---------------------------------------------------------------------------
+// Participant staging TTL sweeper
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn staging_sweep_drops_stale_prepare_via_batch_write_rpc() {
+    // End-to-end: stand up a single-peer service with a very short
+    // TTL, send a Prepare via the gRPC batch_write handler, wait
+    // past the TTL, sweep, and verify a subsequent Commit returns
+    // FailedPrecondition ("not prepared") because the entry has
+    // been collected.
+    use mesh_rpc::ParticipantStaging;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peers = vec![Peer::new(PeerId(1), addr.to_string())];
+    let cluster = Arc::new(Cluster::new(PeerId(1), 1, peers).unwrap());
+    let routing = Arc::new(Routing::new(cluster).unwrap());
+
+    // 50ms TTL — short enough for a test to wait past without
+    // inflating total runtime.
+    let staging = ParticipantStaging::new(Duration::from_millis(50));
+
+    let service = MeshService::with_routing(store, routing).with_staging(staging.clone());
+    let stream = TcpListenerStream::new(listener);
+    let server_service = service.clone();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(server_service.clone().into_query_server())
+            .add_service(server_service.into_write_server())
+            .serve_with_incoming(stream)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    // PREPARE via gRPC. An empty commands list is fine — the
+    // sweeper doesn't care about payload shape, only age.
+    let mut w = MeshWriteClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let commands: Vec<mesh_cluster::GraphCommand> = Vec::new();
+    let payload = serde_json::to_vec(&commands).unwrap();
+    let txid = "stale-tx".to_string();
+    w.batch_write(BatchWriteRequest {
+        txid: txid.clone(),
+        phase: BatchPhase::Prepare as i32,
+        commands_json: payload,
+    })
+    .await
+    .unwrap();
+
+    // Immediately after PREPARE, the entry is staged.
+    assert!(staging.contains(&txid));
+
+    // Wait past the TTL and run the sweeper directly. Calling
+    // sweep_expired inline keeps the test deterministic; the
+    // background sweeper is covered by the staging unit tests.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let dropped = staging.sweep_expired();
+    assert_eq!(dropped, 1, "sweep should drop the stale entry");
+    assert!(!staging.contains(&txid));
+
+    // A late COMMIT for the swept tx surfaces the "not prepared"
+    // protocol error, just as if the entry had never been staged.
+    let err = w
+        .batch_write(BatchWriteRequest {
+            txid,
+            phase: BatchPhase::Commit as i32,
+            commands_json: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn staging_commit_before_ttl_still_succeeds() {
+    // Complement of the sweep test: a Commit that arrives within
+    // the TTL must still find its prepared entry. Guards against a
+    // too-aggressive sweeper that collects entries immediately.
+    use mesh_rpc::ParticipantStaging;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peers = vec![Peer::new(PeerId(1), addr.to_string())];
+    let cluster = Arc::new(Cluster::new(PeerId(1), 1, peers).unwrap());
+    let routing = Arc::new(Routing::new(cluster).unwrap());
+    let staging = ParticipantStaging::new(Duration::from_secs(30));
+
+    let service = MeshService::with_routing(store, routing).with_staging(staging.clone());
+    let stream = TcpListenerStream::new(listener);
+    let server_service = service.clone();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(server_service.clone().into_query_server())
+            .add_service(server_service.into_write_server())
+            .serve_with_incoming(stream)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let mut w = MeshWriteClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let commands: Vec<mesh_cluster::GraphCommand> = Vec::new();
+    let payload = serde_json::to_vec(&commands).unwrap();
+    let txid = "fresh-tx".to_string();
+    w.batch_write(BatchWriteRequest {
+        txid: txid.clone(),
+        phase: BatchPhase::Prepare as i32,
+        commands_json: payload,
+    })
+    .await
+    .unwrap();
+
+    // Sweep immediately — a 30s TTL means the entry is fresh and
+    // survives.
+    let dropped = staging.sweep_expired();
+    assert_eq!(dropped, 0);
+    assert!(staging.contains(&txid));
+
+    // Commit succeeds because the entry is still there.
+    w.batch_write(BatchWriteRequest {
+        txid,
+        phase: BatchPhase::Commit as i32,
+        commands_json: Vec::new(),
+    })
+    .await
+    .unwrap();
+}

@@ -20,16 +20,14 @@ use crate::routing::Routing;
 use mesh_cluster::{GraphCommand, PeerId};
 use mesh_storage::Store;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tonic::transport::Channel;
 use tonic::Status;
 use uuid::Uuid;
 
-type PendingBatches = Arc<Mutex<HashMap<String, Vec<GraphCommand>>>>;
-
 pub(crate) struct TxCoordinator<'a> {
     local_store: &'a Store,
-    local_pending: &'a PendingBatches,
+    local_pending: &'a Arc<crate::ParticipantStaging>,
     routing: &'a Routing,
     /// Optional durable log used to recover from a coordinator crash
     /// between PREPARE and COMMIT. When `None`, the coordinator runs
@@ -41,7 +39,7 @@ pub(crate) struct TxCoordinator<'a> {
 impl<'a> TxCoordinator<'a> {
     pub fn new(
         local_store: &'a Store,
-        local_pending: &'a PendingBatches,
+        local_pending: &'a Arc<crate::ParticipantStaging>,
         routing: &'a Routing,
     ) -> Self {
         Self {
@@ -261,16 +259,15 @@ impl<'a> TxCoordinator<'a> {
 
     async fn prepare(&self, peer: PeerId, txid: &str, cmds: &[GraphCommand]) -> Result<(), Status> {
         if peer == self.routing.cluster().self_id() {
-            // Local shortcut: stage directly into the service's pending
-            // map. Matches the remote BatchWrite(PREPARE) semantics.
-            let mut pending = self.local_pending.lock().unwrap();
-            if pending.contains_key(txid) {
-                return Err(Status::already_exists(format!(
-                    "txid {} already prepared locally",
-                    txid
-                )));
-            }
-            pending.insert(txid.to_string(), cmds.to_vec());
+            // Local shortcut: stage directly into the service's
+            // participant staging. Matches the remote
+            // BatchWrite(PREPARE) semantics, including the
+            // already-exists error on duplicate txid.
+            self.local_pending
+                .try_insert(txid.to_string(), cmds.to_vec())
+                .map_err(|()| {
+                    Status::already_exists(format!("txid {} already prepared locally", txid))
+                })?;
             return Ok(());
         }
 
@@ -289,12 +286,9 @@ impl<'a> TxCoordinator<'a> {
 
     async fn commit(&self, peer: PeerId, txid: &str) -> Result<(), Status> {
         if peer == self.routing.cluster().self_id() {
-            let cmds = {
-                let mut pending = self.local_pending.lock().unwrap();
-                pending.remove(txid).ok_or_else(|| {
-                    Status::failed_precondition(format!("txid {} not prepared locally", txid))
-                })?
-            };
+            let cmds = self.local_pending.take(txid).ok_or_else(|| {
+                Status::failed_precondition(format!("txid {} not prepared locally", txid))
+            })?;
             crate::server::apply_prepared_batch(self.local_store, &cmds)
                 .map_err(|e| Status::internal(e.to_string()))?;
             return Ok(());
@@ -313,7 +307,7 @@ impl<'a> TxCoordinator<'a> {
 
     async fn abort(&self, peer: PeerId, txid: &str) -> Result<(), Status> {
         if peer == self.routing.cluster().self_id() {
-            let _ = self.local_pending.lock().unwrap().remove(txid);
+            let _ = self.local_pending.take(txid);
             return Ok(());
         }
         let mut client = self.write_client(peer)?;
