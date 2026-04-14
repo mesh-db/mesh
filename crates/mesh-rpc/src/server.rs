@@ -95,6 +95,7 @@ fn no_client(peer: PeerId) -> Status {
 
 #[tonic::async_trait]
 impl MeshQuery for MeshService {
+    #[tracing::instrument(skip_all, fields(rpc = "get_node"))]
     async fn get_node(
         &self,
         request: Request<GetNodeRequest>,
@@ -124,6 +125,7 @@ impl MeshQuery for MeshService {
         Ok(Response::new(GetNodeResponse { found, node }))
     }
 
+    #[tracing::instrument(skip_all, fields(rpc = "get_edge"))]
     async fn get_edge(
         &self,
         request: Request<GetEdgeRequest>,
@@ -175,6 +177,7 @@ impl MeshQuery for MeshService {
         }))
     }
 
+    #[tracing::instrument(skip_all, fields(rpc = "nodes_by_label"))]
     async fn nodes_by_label(
         &self,
         request: Request<NodesByLabelRequest>,
@@ -214,6 +217,7 @@ impl MeshQuery for MeshService {
         Ok(Response::new(NodesByLabelResponse { ids }))
     }
 
+    #[tracing::instrument(skip_all, fields(rpc = "outgoing"))]
     async fn outgoing(
         &self,
         request: Request<NeighborRequest>,
@@ -247,6 +251,7 @@ impl MeshQuery for MeshService {
         Ok(Response::new(NeighborResponse { neighbors }))
     }
 
+    #[tracing::instrument(skip_all, fields(rpc = "incoming"))]
     async fn incoming(
         &self,
         request: Request<NeighborRequest>,
@@ -287,11 +292,13 @@ impl MeshQuery for MeshService {
         Ok(Response::new(HealthResponse { serving: true }))
     }
 
+    #[tracing::instrument(skip_all, fields(rpc = "execute_cypher", query_len))]
     async fn execute_cypher(
         &self,
         request: Request<ExecuteCypherRequest>,
     ) -> Result<Response<ExecuteCypherResponse>, Status> {
         let query = request.into_inner().query;
+        tracing::Span::current().record("query_len", query.len());
 
         // Parse + plan on the async task — cheap and synchronous.
         let statement = mesh_cypher::parse(&query).map_err(bad_request)?;
@@ -375,6 +382,7 @@ impl MeshQuery for MeshService {
 
 #[tonic::async_trait]
 impl MeshWrite for MeshService {
+    #[tracing::instrument(skip_all, fields(rpc = "put_node"))]
     async fn put_node(
         &self,
         request: Request<PutNodeRequest>,
@@ -432,6 +440,7 @@ impl MeshWrite for MeshService {
         Ok(Response::new(PutNodeResponse {}))
     }
 
+    #[tracing::instrument(skip_all, fields(rpc = "put_edge"))]
     async fn put_edge(
         &self,
         request: Request<PutEdgeRequest>,
@@ -495,6 +504,7 @@ impl MeshWrite for MeshService {
         Ok(Response::new(PutEdgeResponse {}))
     }
 
+    #[tracing::instrument(skip_all, fields(rpc = "delete_edge"))]
     async fn delete_edge(
         &self,
         request: Request<DeleteEdgeRequest>,
@@ -554,6 +564,7 @@ impl MeshWrite for MeshService {
         Ok(Response::new(DeleteEdgeResponse {}))
     }
 
+    #[tracing::instrument(skip_all, fields(rpc = "detach_delete_node"))]
     async fn detach_delete_node(
         &self,
         request: Request<DetachDeleteNodeRequest>,

@@ -511,6 +511,13 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
                     ApplyResponse::ok()
                 }
             };
+            if let Some(err) = response.error.as_ref() {
+                tracing::warn!(
+                    log_index = entry.log_id.index,
+                    error = %err,
+                    "state machine apply rejected entry"
+                );
+            }
             results.push(response);
         }
         // Flush state-machine state in one synced rocksdb batch. Persisting
@@ -581,6 +588,12 @@ impl RaftStorage<MeshRaftConfig> for MemStore {
                 ))
             })?;
         }
+        tracing::info!(
+            snapshot_id = %meta.snapshot_id,
+            last_log = ?meta.last_log_id,
+            graph_bytes = payload.graph.len(),
+            "installed raft snapshot from leader"
+        );
 
         if let Some(db) = inner.persistent.as_ref() {
             let mut batch = WriteBatch::default();
@@ -665,6 +678,14 @@ impl RaftSnapshotBuilder<MeshRaftConfig> for MemSnapshotBuilder {
             db.write_opt(batch, &synced_writes())
                 .map_err(write_sm_err)?;
         }
+
+        tracing::info!(
+            snapshot_id = %meta.snapshot_id,
+            last_applied = ?meta.last_log_id,
+            graph_bytes = payload.graph.len(),
+            total_bytes = data.len(),
+            "built raft snapshot"
+        );
 
         Ok(Snapshot {
             meta,
@@ -852,6 +873,7 @@ impl RaftCluster {
     /// caller can route the request to the actual leader, and
     /// [`Error::Apply`] when the entry committed through Raft but the
     /// local state machine rejected it (e.g. duplicate AddPeer).
+    #[tracing::instrument(level = "debug", skip_all, fields(node_id = self.id))]
     pub async fn propose_entry(&self, entry: MeshLogEntry) -> Result<ApplyResponse> {
         use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
         match self.raft.client_write(entry).await {
