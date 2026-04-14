@@ -1,0 +1,14 @@
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/mesh-data-a"
+bolt_address = "127.0.0.1:7687"
+num_partitions = 4
+bootstrap = true
+
+[[peers]]
+id = 1
+address = "127.0.0.1:7001"
+
+[[peers]]
+id = 2
+address = "127.0.0.1:7002"
