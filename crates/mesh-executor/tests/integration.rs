@@ -2089,6 +2089,65 @@ fn index_seek_on_int_and_bool_values() {
 }
 
 #[test]
+fn where_clause_uses_index_seek_end_to_end() {
+    // The WHERE rewrite should make `MATCH (n:L) WHERE n.p = $x`
+    // behave identically to the pattern-property form, including
+    // returning the right rows. End-to-end check that the rewritten
+    // plan produces the same answer as the un-rewritten baseline.
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "CREATE (:Person {name: 'Ada', age: 37})");
+    run(&store, "CREATE (:Person {name: 'Bob', age: 28})");
+    run(&store, "CREATE (:Person {name: 'Cid', age: 44})");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (p:Person) WHERE p.name = 'Bob' RETURN p.age AS age",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "age"), 28);
+}
+
+#[test]
+fn where_clause_with_residual_filter_after_seek() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "CREATE (:Person {name: 'Ada', age: 37})");
+    run(&store, "CREATE (:Person {name: 'Ada', age: 22})");
+    run(&store, "CREATE (:Person {name: 'Bob', age: 37})");
+
+    // The seek narrows to two `Ada` rows; the residual `age > 30`
+    // filter then picks just one.
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (p:Person) WHERE p.name = 'Ada' AND p.age > 30 RETURN p.age AS age",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "age"), 37);
+}
+
+#[test]
+fn where_clause_with_parameter_uses_index_seek() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "who".into(),
+        Value::Property(Property::String("Ada".into())),
+    );
+    let rows = run_with_ctx_params(
+        &store,
+        "MATCH (p:Person) WHERE p.name = $who RETURN p.name AS n",
+        &params,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Ada");
+}
+
+#[test]
 fn index_seek_with_residual_property_filter() {
     // When the pattern has multiple properties and only one is
     // indexed, the index lookup produces the candidates and the

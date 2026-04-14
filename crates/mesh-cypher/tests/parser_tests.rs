@@ -858,3 +858,178 @@ fn create_index_rejects_missing_label() {
     // Grammar requires `(var:Label)` — omitting the label should fail.
     assert!(parse("CREATE INDEX FOR (p) ON (p.name)").is_err());
 }
+
+// ---------------------------------------------------------------
+// WHERE-clause IndexSeek rewrite: planner-level assertions.
+// ---------------------------------------------------------------
+
+fn ctx_with_index(label: &str, prop: &str) -> PlannerContext {
+    PlannerContext {
+        indexes: vec![(label.into(), prop.into())],
+    }
+}
+
+fn plan_with(query: &str, ctx: &PlannerContext) -> LogicalPlan {
+    plan_with_context(&parse(query).unwrap(), ctx).unwrap()
+}
+
+#[test]
+fn where_eq_on_indexed_property_rewrites_to_index_seek() {
+    let ctx = ctx_with_index("Person", "name");
+    let p = plan_with("MATCH (n:Person) WHERE n.name = 'Ada' RETURN n", &ctx);
+    // RETURN wraps the IndexSeek in Project; unwrap one level.
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project at top, got {p:?}");
+    };
+    let LogicalPlan::IndexSeek {
+        label, property, ..
+    } = *input
+    else {
+        panic!("expected IndexSeek under Project");
+    };
+    assert_eq!(label, "Person");
+    assert_eq!(property, "name");
+}
+
+#[test]
+fn where_eq_symmetric_form_rewrites_to_index_seek() {
+    let ctx = ctx_with_index("Person", "name");
+    let p = plan_with("MATCH (n:Person) WHERE 'Ada' = n.name RETURN n", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    assert!(matches!(*input, LogicalPlan::IndexSeek { .. }));
+}
+
+#[test]
+fn where_eq_with_parameter_rewrites_to_index_seek() {
+    let ctx = ctx_with_index("Person", "name");
+    let p = plan_with("MATCH (n:Person) WHERE n.name = $who RETURN n", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::IndexSeek { value, .. } = *input else {
+        panic!("expected IndexSeek");
+    };
+    assert!(matches!(value, Expr::Parameter(ref s) if s == "who"));
+}
+
+#[test]
+fn where_eq_with_residual_keeps_filter_wrap() {
+    let ctx = ctx_with_index("Person", "name");
+    let p = plan_with(
+        "MATCH (n:Person) WHERE n.name = 'Ada' AND n.age > 20 RETURN n",
+        &ctx,
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::Filter {
+        input: seek_input,
+        predicate,
+    } = *input
+    else {
+        panic!("expected Filter wrapping IndexSeek, got {input:?}");
+    };
+    assert!(matches!(*seek_input, LogicalPlan::IndexSeek { .. }));
+    // Residual is the age > 20 comparison, not the name = 'Ada' one.
+    let Expr::Compare { left, .. } = predicate else {
+        panic!("expected Compare residual");
+    };
+    assert!(matches!(*left, Expr::Property { ref key, .. } if key == "age"));
+}
+
+#[test]
+fn where_eq_picks_indexed_conjunct_when_unindexed_first() {
+    // The non-indexed `age` shouldn't block the indexed `name`
+    // from being lifted into the seek.
+    let ctx = ctx_with_index("Person", "name");
+    let p = plan_with(
+        "MATCH (n:Person) WHERE n.age = 30 AND n.name = 'Ada' RETURN n",
+        &ctx,
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::Filter { input: seek, .. } = *input else {
+        panic!("expected residual Filter");
+    };
+    assert!(matches!(*seek, LogicalPlan::IndexSeek { .. }));
+}
+
+#[test]
+fn where_or_does_not_rewrite() {
+    // Disjunction can't be safely converted to a seek — the rewrite
+    // pass should leave the Filter intact.
+    let ctx = ctx_with_index("Person", "name");
+    let p = plan_with(
+        "MATCH (n:Person) WHERE n.name = 'Ada' OR n.age = 30 RETURN n",
+        &ctx,
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::Filter { input: scan, .. } = *input else {
+        panic!("expected Filter, got {input:?}");
+    };
+    assert!(matches!(*scan, LogicalPlan::NodeScanByLabels { .. }));
+}
+
+#[test]
+fn where_eq_against_other_var_does_not_rewrite() {
+    // `n.name = m.name` is row-dependent on `m`, can't hoist.
+    let ctx = ctx_with_index("Person", "name");
+    let p = plan_with(
+        "MATCH (n:Person), (m:Person) WHERE n.name = m.name RETURN n",
+        &ctx,
+    );
+    // Should still be a Filter at the top (under Project), not IndexSeek.
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    assert!(matches!(*input, LogicalPlan::Filter { .. }));
+}
+
+#[test]
+fn where_non_equality_does_not_rewrite() {
+    let ctx = ctx_with_index("Person", "name");
+    let p = plan_with("MATCH (n:Person) WHERE n.name > 'A' RETURN n", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    assert!(matches!(*input, LogicalPlan::Filter { .. }));
+}
+
+#[test]
+fn where_eq_with_no_matching_index_does_not_rewrite() {
+    // Empty planner context — no rewrite even though the query
+    // pattern looks indexable.
+    let p = plan_with(
+        "MATCH (n:Person) WHERE n.name = 'Ada' RETURN n",
+        &PlannerContext::default(),
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    assert!(matches!(*input, LogicalPlan::Filter { .. }));
+}
+
+#[test]
+fn pattern_prop_filter_plus_where_rewrites_through_chain() {
+    // MATCH (n:Person {age: 30}) WHERE n.name = 'Ada' — pattern-prop
+    // emits a Filter chain over NodeScanByLabels (since `age` isn't
+    // indexed), and the WHERE rewrite has to walk through that
+    // inner filter to reach the scan.
+    let ctx = ctx_with_index("Person", "name");
+    let p = plan_with(
+        "MATCH (n:Person {age: 30}) WHERE n.name = 'Ada' RETURN n",
+        &ctx,
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::Filter { input: seek, .. } = *input else {
+        panic!("expected residual Filter (age=30)");
+    };
+    assert!(matches!(*seek, LogicalPlan::IndexSeek { .. }));
+}

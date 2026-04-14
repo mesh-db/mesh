@@ -559,6 +559,156 @@ fn wrap_with_pattern_prop_filter(
     }
 }
 
+/// Try to rewrite a `Filter(... NodeScanByLabels)` chain into an
+/// `IndexSeek` plus a residual filter when one of the conjuncts is
+/// an indexed equality on the scan's variable.
+///
+/// Walks down through any number of stacked `Filter` wrappers
+/// (collecting all their conjuncts), inspects the leaf, and only
+/// rewrites when the leaf is `NodeScanByLabels` with exactly one
+/// label. If no covered equality is found, the original chain is
+/// rebuilt unchanged. If a rewrite happens and no conjuncts are
+/// left over, the residual `Filter` wrapper is dropped entirely.
+///
+/// Only fires at the top of the plan. Filters buried under
+/// `EdgeExpand` / `CartesianProduct` / etc. don't get rewritten by
+/// this pass — they belong to a downstream join scope and the
+/// extra plumbing for cost-based seek selection there isn't
+/// justified by the current workloads. The pattern-property rewrite
+/// in `plan_start_node` already covers the most common buried case.
+fn optimize_filter_chain_to_index_seek(plan: LogicalPlan, ctx: &PlannerContext) -> LogicalPlan {
+    if !matches!(plan, LogicalPlan::Filter { .. }) {
+        return plan;
+    }
+
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    let mut current = plan;
+    while let LogicalPlan::Filter { input, predicate } = current {
+        push_conjuncts(predicate, &mut conjuncts);
+        current = *input;
+    }
+
+    let (scan_var, scan_label) = match &current {
+        LogicalPlan::NodeScanByLabels { var, labels } if labels.len() == 1 => {
+            (var.clone(), labels[0].clone())
+        }
+        _ => return rebuild_filter_chain(current, conjuncts),
+    };
+
+    let seek_idx = conjuncts
+        .iter()
+        .position(|c| extract_indexed_eq(c, &scan_var, &scan_label, ctx).is_some());
+    let Some(seek_idx) = seek_idx else {
+        return rebuild_filter_chain(current, conjuncts);
+    };
+    let (seek_key, seek_value) =
+        extract_indexed_eq(&conjuncts[seek_idx], &scan_var, &scan_label, ctx)
+            .expect("position above just confirmed match");
+
+    let seek = LogicalPlan::IndexSeek {
+        var: scan_var,
+        label: scan_label,
+        property: seek_key,
+        value: seek_value,
+    };
+    let residual: Vec<Expr> = conjuncts
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| *i != seek_idx)
+        .map(|(_, c)| c)
+        .collect();
+    rebuild_filter_chain(seek, residual)
+}
+
+/// Decompose `e` into a flat list of conjuncts. `Expr::And` is
+/// recursively split; everything else becomes a single entry.
+/// Used by the WHERE-rewrite pass to find an indexed equality
+/// hidden inside an arbitrary `AND` chain.
+fn push_conjuncts(e: Expr, out: &mut Vec<Expr>) {
+    match e {
+        Expr::And(l, r) => {
+            push_conjuncts(*l, out);
+            push_conjuncts(*r, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Reassemble `conjuncts` into a single `And`-chain wrapped around
+/// `leaf` as a `Filter`. An empty conjunct list returns `leaf` bare.
+/// Inverse of `push_conjuncts`.
+fn rebuild_filter_chain(leaf: LogicalPlan, mut conjuncts: Vec<Expr>) -> LogicalPlan {
+    if conjuncts.is_empty() {
+        return leaf;
+    }
+    if conjuncts.len() == 1 {
+        return LogicalPlan::Filter {
+            input: Box::new(leaf),
+            predicate: conjuncts.pop().unwrap(),
+        };
+    }
+    let mut iter = conjuncts.into_iter();
+    let first = iter.next().unwrap();
+    let predicate = iter.fold(first, |acc, c| Expr::And(Box::new(acc), Box::new(c)));
+    LogicalPlan::Filter {
+        input: Box::new(leaf),
+        predicate,
+    }
+}
+
+/// Try to interpret `c` as an indexed equality predicate on
+/// `scan_var.scan_label`. Returns the property key and the
+/// row-independent value expression so the caller can build an
+/// `IndexSeek`.
+///
+/// Accepts both `Property == value` and `value == Property` forms.
+/// "Row-independent" means the value side is a literal or a
+/// parameter — anything else (e.g., `n.name = m.name`) can't be
+/// hoisted into a seek because the value isn't known when the
+/// scan starts.
+fn extract_indexed_eq(
+    c: &Expr,
+    scan_var: &str,
+    scan_label: &str,
+    ctx: &PlannerContext,
+) -> Option<(String, Expr)> {
+    use crate::ast::CompareOp;
+    let Expr::Compare { op, left, right } = c else {
+        return None;
+    };
+    if *op != CompareOp::Eq {
+        return None;
+    }
+    if let Some((key, value)) = match_property_eq(left, right, scan_var) {
+        if ctx.has_index(scan_label, &key) && expr_is_row_independent(&value) {
+            return Some((key, value));
+        }
+    }
+    if let Some((key, value)) = match_property_eq(right, left, scan_var) {
+        if ctx.has_index(scan_label, &key) && expr_is_row_independent(&value) {
+            return Some((key, value));
+        }
+    }
+    None
+}
+
+fn match_property_eq(maybe_prop: &Expr, value: &Expr, scan_var: &str) -> Option<(String, Expr)> {
+    if let Expr::Property { var, key } = maybe_prop {
+        if var == scan_var {
+            return Some((key.clone(), value.clone()));
+        }
+    }
+    None
+}
+
+/// True when `e` can be evaluated against an empty row — i.e., when
+/// the executor can resolve it once at scan time without binding
+/// any pattern variables. Only literals and parameters qualify in
+/// v1; this is enough for the cases drivers actually emit.
+fn expr_is_row_independent(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(_) | Expr::Parameter(_))
+}
+
 fn collect_pattern_vars(pattern: &Pattern, out: &mut HashSet<String>) {
     if let Some(var) = &pattern.start.var {
         out.insert(var.clone());
@@ -607,6 +757,15 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
             predicate: predicate.clone(),
         };
     }
+
+    // Index-aware WHERE rewrite: scan the Filter chain at the top
+    // of the plan and try to extract an indexed equality conjunct
+    // into an `IndexSeek` on the underlying `NodeScanByLabels`. The
+    // pattern-property rewrite handled the `(n:L {prop: ...})` form
+    // earlier; this pass handles the equivalent `WHERE n.prop = ...`
+    // shape that drivers actually emit, plus the mixed form
+    // `(n:L {nonindexed: ...}) WHERE n.indexed = ...`.
+    plan = optimize_filter_chain_to_index_seek(plan, ctx);
 
     // Apply at most one mutation to the pipeline (they are grammatically exclusive).
     if let Some(delete_clause) = &stmt.delete {
