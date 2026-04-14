@@ -25,7 +25,7 @@ impl Peer {
 }
 
 /// Static membership list: peer id -> network address.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
     peers: BTreeMap<PeerId, String>,
 }

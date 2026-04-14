@@ -1,7 +1,7 @@
 use crate::{Error, PartitionId, PeerId, Result};
 
 /// Maps each partition id to the peer that currently owns it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionMap {
     assignments: Vec<PeerId>,
 }

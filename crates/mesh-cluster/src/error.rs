@@ -16,4 +16,10 @@ pub enum Error {
         "partition map length {map_len} does not match partition count {expected}"
     )]
     PartitionMapLengthMismatch { map_len: usize, expected: u32 },
+
+    #[error("peer already exists: {0}")]
+    PeerAlreadyExists(PeerId),
+
+    #[error("cannot remove the local peer from the cluster")]
+    CannotRemoveSelf,
 }

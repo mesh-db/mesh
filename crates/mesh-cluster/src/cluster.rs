@@ -1,19 +1,22 @@
 use crate::{
-    Error, Membership, PartitionId, PartitionMap, Partitioner, Peer, PeerId, Result,
+    ClusterCommand, ClusterState, Error, Membership, PartitionId, PartitionMap, Partitioner,
+    Peer, PeerId, Result,
 };
 use mesh_core::NodeId;
 
 /// Cluster configuration and routing facade.
 ///
-/// Holds a partitioner (hash -> partition), a partition map (partition ->
-/// owner peer), and a static membership (peer -> address). Combines them to
-/// answer the central routing question: given a NodeId, which peer owns it?
+/// Holds a [`Partitioner`] (hash → partition) plus a [`ClusterState`]
+/// (partition → owner, and peer → address). Combines them to answer the
+/// central routing question: given a `NodeId`, which peer owns it?
+///
+/// State-mutating operations go through [`Cluster::apply`], which is the
+/// hook a Raft-backed consensus layer will eventually drive.
 #[derive(Debug, Clone)]
 pub struct Cluster {
     self_id: PeerId,
     partitioner: Partitioner,
-    partition_map: PartitionMap,
-    membership: Membership,
+    state: ClusterState,
 }
 
 impl Cluster {
@@ -38,8 +41,7 @@ impl Cluster {
         Ok(Self {
             self_id,
             partitioner,
-            partition_map,
-            membership,
+            state: ClusterState::new(membership, partition_map),
         })
     }
 
@@ -71,8 +73,7 @@ impl Cluster {
         Ok(Self {
             self_id,
             partitioner,
-            partition_map,
-            membership,
+            state: ClusterState::new(membership, partition_map),
         })
     }
 
@@ -85,11 +86,15 @@ impl Cluster {
     }
 
     pub fn partition_map(&self) -> &PartitionMap {
-        &self.partition_map
+        &self.state.partition_map
     }
 
     pub fn membership(&self) -> &Membership {
-        &self.membership
+        &self.state.membership
+    }
+
+    pub fn state(&self) -> &ClusterState {
+        &self.state
     }
 
     pub fn num_partitions(&self) -> u32 {
@@ -103,7 +108,7 @@ impl Cluster {
 
     /// Which peer currently owns the partition this node id hashes to?
     pub fn owner_of(&self, node_id: NodeId) -> PeerId {
-        self.partition_map.owner(self.partition_for(node_id))
+        self.state.partition_map.owner(self.partition_for(node_id))
     }
 
     /// Does this node id belong to the local peer?
@@ -113,11 +118,24 @@ impl Cluster {
 
     /// Network address of the peer that owns this node id.
     pub fn owner_address(&self, node_id: NodeId) -> Option<&str> {
-        self.membership.address(self.owner_of(node_id))
+        self.state.membership.address(self.owner_of(node_id))
     }
 
     /// Network address of a specific peer.
     pub fn peer_address(&self, id: PeerId) -> Option<&str> {
-        self.membership.address(id)
+        self.state.membership.address(id)
+    }
+
+    /// Apply a command to the cluster state. Rejects commands that would
+    /// remove the local peer (that has to go through a leadership handoff
+    /// flow that doesn't exist yet). All other failures come from the
+    /// underlying [`ClusterState::apply`] transition.
+    pub fn apply(&mut self, command: &ClusterCommand) -> Result<()> {
+        if let ClusterCommand::RemovePeer { id } = command {
+            if *id == self.self_id {
+                return Err(Error::CannotRemoveSelf);
+            }
+        }
+        self.state.apply(command)
     }
 }

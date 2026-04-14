@@ -1,4 +1,6 @@
-use mesh_cluster::{Cluster, Error, PartitionId, PartitionMap, Partitioner, Peer, PeerId};
+use mesh_cluster::{
+    Cluster, ClusterCommand, Error, PartitionId, PartitionMap, Partitioner, Peer, PeerId,
+};
 use mesh_core::NodeId;
 use std::collections::HashMap;
 
@@ -156,6 +158,188 @@ fn from_parts_rejects_mismatched_map_length() {
             expected: 4
         }
     ));
+}
+
+#[test]
+fn apply_add_peer_extends_membership_without_rebalancing() {
+    let mut cluster = Cluster::new(PeerId(1), 6, sample_peers()).unwrap();
+    let before_partitions = cluster.partition_map().assignments().to_vec();
+    cluster
+        .apply(&ClusterCommand::AddPeer {
+            id: PeerId(4),
+            address: "127.0.0.1:7004".into(),
+        })
+        .unwrap();
+    assert_eq!(cluster.membership().len(), 4);
+    assert_eq!(cluster.peer_address(PeerId(4)), Some("127.0.0.1:7004"));
+    // AddPeer doesn't touch the partition map — Rebalance is required.
+    assert_eq!(cluster.partition_map().assignments(), &before_partitions[..]);
+}
+
+#[test]
+fn apply_add_peer_duplicate_rejected() {
+    let mut cluster = Cluster::new(PeerId(1), 4, sample_peers()).unwrap();
+    let err = cluster
+        .apply(&ClusterCommand::AddPeer {
+            id: PeerId(2),
+            address: "elsewhere".into(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::PeerAlreadyExists(PeerId(2))));
+}
+
+#[test]
+fn apply_remove_peer_reassigns_its_partitions() {
+    let mut cluster = Cluster::new(PeerId(1), 6, sample_peers()).unwrap();
+    cluster
+        .apply(&ClusterCommand::RemovePeer { id: PeerId(3) })
+        .unwrap();
+    assert_eq!(cluster.membership().len(), 2);
+    assert!(!cluster.membership().contains(PeerId(3)));
+    for owner in cluster.partition_map().assignments() {
+        assert_ne!(*owner, PeerId(3), "partition still owned by removed peer");
+        assert!(cluster.membership().contains(*owner));
+    }
+    assert_eq!(
+        cluster.partition_map().num_partitions(),
+        6,
+        "partition count must be invariant"
+    );
+}
+
+#[test]
+fn apply_remove_peer_unknown_rejected() {
+    let mut cluster = Cluster::new(PeerId(1), 4, sample_peers()).unwrap();
+    let err = cluster
+        .apply(&ClusterCommand::RemovePeer { id: PeerId(99) })
+        .unwrap_err();
+    assert!(matches!(err, Error::UnknownPeer(PeerId(99))));
+}
+
+#[test]
+fn apply_remove_peer_rejects_removing_self() {
+    let mut cluster = Cluster::new(PeerId(1), 4, sample_peers()).unwrap();
+    let err = cluster
+        .apply(&ClusterCommand::RemovePeer { id: PeerId(1) })
+        .unwrap_err();
+    assert!(matches!(err, Error::CannotRemoveSelf));
+    // State untouched.
+    assert_eq!(cluster.membership().len(), 3);
+}
+
+#[test]
+fn apply_update_peer_address_keeps_partitions() {
+    let mut cluster = Cluster::new(PeerId(1), 6, sample_peers()).unwrap();
+    let before = cluster.partition_map().assignments().to_vec();
+    cluster
+        .apply(&ClusterCommand::UpdatePeerAddress {
+            id: PeerId(2),
+            address: "10.0.0.2:9999".into(),
+        })
+        .unwrap();
+    assert_eq!(cluster.peer_address(PeerId(2)), Some("10.0.0.2:9999"));
+    assert_eq!(cluster.partition_map().assignments(), &before[..]);
+}
+
+#[test]
+fn apply_update_peer_address_unknown_rejected() {
+    let mut cluster = Cluster::new(PeerId(1), 4, sample_peers()).unwrap();
+    let err = cluster
+        .apply(&ClusterCommand::UpdatePeerAddress {
+            id: PeerId(42),
+            address: "x".into(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::UnknownPeer(PeerId(42))));
+}
+
+#[test]
+fn apply_rebalance_distributes_across_current_members() {
+    let mut cluster = Cluster::new(PeerId(1), 6, sample_peers()).unwrap();
+    cluster
+        .apply(&ClusterCommand::AddPeer {
+            id: PeerId(4),
+            address: "d".into(),
+        })
+        .unwrap();
+    // Before rebalance: partitions still split across {1,2,3}.
+    assert!(cluster
+        .partition_map()
+        .assignments()
+        .iter()
+        .all(|p| *p != PeerId(4)));
+
+    cluster.apply(&ClusterCommand::Rebalance).unwrap();
+
+    // After rebalance: every current member should own at least one partition.
+    for pid in [PeerId(1), PeerId(2), PeerId(3), PeerId(4)] {
+        assert!(
+            cluster.partition_map().assignments().contains(&pid),
+            "{pid} missing from rebalanced partition map"
+        );
+    }
+}
+
+#[test]
+fn apply_command_sequence_preserves_invariants() {
+    let mut cluster = Cluster::new(PeerId(1), 6, sample_peers()).unwrap();
+
+    let commands = vec![
+        ClusterCommand::AddPeer {
+            id: PeerId(4),
+            address: "d".into(),
+        },
+        ClusterCommand::Rebalance,
+        ClusterCommand::RemovePeer { id: PeerId(3) },
+        ClusterCommand::UpdatePeerAddress {
+            id: PeerId(4),
+            address: "new-d".into(),
+        },
+    ];
+    for cmd in &commands {
+        cluster.apply(cmd).unwrap();
+    }
+
+    // Self still present.
+    assert!(cluster.membership().contains(cluster.self_id()));
+    // Every partition owner is a known member.
+    for owner in cluster.partition_map().assignments() {
+        assert!(cluster.membership().contains(*owner));
+    }
+    // Applied update stuck.
+    assert_eq!(cluster.peer_address(PeerId(4)), Some("new-d"));
+    // Removed peer is absent.
+    assert!(!cluster.membership().contains(PeerId(3)));
+    // Partition count is invariant.
+    assert_eq!(cluster.partition_map().num_partitions(), 6);
+}
+
+#[test]
+fn apply_routing_reflects_state_changes() {
+    // Build a small cluster, record the owner of a specific NodeId, then
+    // rebalance after adding a new peer and verify `owner_of` can now return
+    // the new peer for at least one of a batch of node ids.
+    let mut cluster = Cluster::new(PeerId(1), 8, sample_peers()).unwrap();
+    cluster
+        .apply(&ClusterCommand::AddPeer {
+            id: PeerId(4),
+            address: "d".into(),
+        })
+        .unwrap();
+    cluster.apply(&ClusterCommand::Rebalance).unwrap();
+
+    let mut saw_new_peer_owner = false;
+    for _ in 0..200 {
+        let id = NodeId::new();
+        if cluster.owner_of(id) == PeerId(4) {
+            saw_new_peer_owner = true;
+            break;
+        }
+    }
+    assert!(
+        saw_new_peer_owner,
+        "Rebalance should allow the new peer to own at least one partition"
+    );
 }
 
 #[test]
