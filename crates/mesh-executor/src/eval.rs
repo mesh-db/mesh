@@ -59,7 +59,88 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row) -> Result<Value> {
             Ok(Value::Property(Property::Bool(compare(*op, &vl, &vr)?)))
         }
         Expr::Call { name, args } => call_scalar(name, args, row),
+        Expr::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for e in items {
+                out.push(eval_expr(e, row)?);
+            }
+            Ok(Value::List(out))
+        }
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            let scrutinee_val = match scrutinee {
+                Some(e) => Some(eval_expr(e, row)?),
+                None => None,
+            };
+            for (cond, result) in branches {
+                let cond_val = eval_expr(cond, row)?;
+                let matched = match &scrutinee_val {
+                    Some(sv) => case_equals(sv, &cond_val),
+                    None => to_bool(&cond_val).unwrap_or(false),
+                };
+                if matched {
+                    return eval_expr(result, row);
+                }
+            }
+            match else_expr {
+                Some(e) => eval_expr(e, row),
+                None => Ok(Value::Null),
+            }
+        }
+        Expr::ListComprehension {
+            var,
+            source,
+            predicate,
+            projection,
+        } => {
+            let source_val = eval_expr(source, row)?;
+            let items = match source_val {
+                Value::List(items) => items,
+                Value::Property(Property::List(props)) => {
+                    props.into_iter().map(Value::Property).collect()
+                }
+                Value::Null => return Ok(Value::Null),
+                _ => return Err(Error::TypeMismatch),
+            };
+            let mut scratch = row.clone();
+            let had_prev = scratch.contains_key(var);
+            let prev = scratch.get(var).cloned();
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                scratch.insert(var.clone(), item);
+                if let Some(pred) = predicate {
+                    let pv = eval_expr(pred, &scratch)?;
+                    if !to_bool(&pv).unwrap_or(false) {
+                        continue;
+                    }
+                }
+                let projected = match projection {
+                    Some(p) => eval_expr(p, &scratch)?,
+                    None => scratch.get(var).cloned().unwrap_or(Value::Null),
+                };
+                out.push(projected);
+            }
+            if had_prev {
+                if let Some(v) = prev {
+                    scratch.insert(var.clone(), v);
+                }
+            }
+            Ok(Value::List(out))
+        }
     }
+}
+
+/// Equality check used by the simple `CASE x WHEN v THEN ...` form. This is
+/// value-level equality rather than the three-valued logic used by `=`, so a
+/// WHEN branch with a NULL scrutinee or NULL value never matches.
+fn case_equals(a: &Value, b: &Value) -> bool {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return false;
+    }
+    a == b
 }
 
 fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {

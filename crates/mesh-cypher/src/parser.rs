@@ -32,8 +32,72 @@ fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
         Rule::create_stmt => Ok(Statement::Create(build_create(inner)?)),
         Rule::match_stmt => Ok(Statement::Match(build_match(inner)?)),
         Rule::merge_stmt => Ok(Statement::Merge(build_merge(inner)?)),
+        Rule::unwind_stmt => Ok(Statement::Unwind(build_unwind(inner)?)),
         r => Err(Error::Parse(format!("unexpected rule: {:?}", r))),
     }
+}
+
+fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
+    let mut expr: Option<Expr> = None;
+    let mut alias: Option<String> = None;
+    let mut where_clause = None;
+    let mut return_items = Vec::new();
+    let mut distinct = false;
+    let mut order_by: Vec<SortItem> = Vec::new();
+    let mut skip = None;
+    let mut limit = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::expression if expr.is_none() => {
+                expr = Some(build_expression(p)?);
+            }
+            Rule::identifier if alias.is_none() => {
+                alias = Some(p.as_str().to_string());
+            }
+            Rule::where_clause => {
+                let ep = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty where".into()))?;
+                where_clause = Some(build_expression(ep)?);
+            }
+            Rule::return_tail => {
+                parse_return_tail(
+                    p,
+                    &mut return_items,
+                    &mut distinct,
+                    &mut order_by,
+                    &mut skip,
+                    &mut limit,
+                )?;
+            }
+            Rule::kw_as => {}
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in unwind: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+
+    let expr = expr.ok_or_else(|| Error::Parse("UNWIND requires a source expression".into()))?;
+    let alias =
+        alias.ok_or_else(|| Error::Parse("UNWIND requires an AS alias".into()))?;
+    if return_items.is_empty() {
+        return Err(Error::Parse("UNWIND requires a RETURN clause".into()));
+    }
+    Ok(UnwindStmt {
+        expr,
+        alias,
+        where_clause,
+        return_items,
+        distinct,
+        order_by,
+        skip,
+        limit,
+    })
 }
 
 fn build_merge(pair: Pair<Rule>) -> Result<MergeStmt> {
@@ -722,8 +786,122 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             Ok(Expr::Property { var, key })
         }
         Rule::identifier => Ok(Expr::Identifier(pair.as_str().to_string())),
+        Rule::case_expr => build_case_expr(pair),
+        Rule::list_literal => {
+            let mut items = Vec::new();
+            for p in pair.into_inner() {
+                items.push(build_expression(p)?);
+            }
+            Ok(Expr::List(items))
+        }
+        Rule::list_comp => build_list_comp(pair),
         r => Err(Error::Parse(format!("unexpected rule in expression: {:?}", r))),
     }
+}
+
+fn build_case_expr(pair: Pair<Rule>) -> Result<Expr> {
+    let mut scrutinee: Option<Box<Expr>> = None;
+    let mut branches: Vec<(Expr, Expr)> = Vec::new();
+    let mut else_expr: Option<Box<Expr>> = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::kw_case | Rule::kw_end => {}
+            Rule::case_scrutinee => {
+                let inner = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty case scrutinee".into()))?;
+                scrutinee = Some(Box::new(build_expression(inner)?));
+            }
+            Rule::when_branch => {
+                let mut ii = p
+                    .into_inner()
+                    .filter(|q| q.as_rule() != Rule::kw_when && q.as_rule() != Rule::kw_then);
+                let cond = build_expression(
+                    ii.next()
+                        .ok_or_else(|| Error::Parse("empty when condition".into()))?,
+                )?;
+                let result = build_expression(
+                    ii.next()
+                        .ok_or_else(|| Error::Parse("empty when result".into()))?,
+                )?;
+                branches.push((cond, result));
+            }
+            Rule::else_branch => {
+                let inner = p
+                    .into_inner()
+                    .filter(|q| q.as_rule() != Rule::kw_else)
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty else branch".into()))?;
+                else_expr = Some(Box::new(build_expression(inner)?));
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in case expr: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+
+    if branches.is_empty() {
+        return Err(Error::Parse("CASE requires at least one WHEN branch".into()));
+    }
+    Ok(Expr::Case {
+        scrutinee,
+        branches,
+        else_expr,
+    })
+}
+
+fn build_list_comp(pair: Pair<Rule>) -> Result<Expr> {
+    let mut var: Option<String> = None;
+    let mut source: Option<Expr> = None;
+    let mut predicate: Option<Box<Expr>> = None;
+    let mut projection: Option<Box<Expr>> = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::kw_in => {}
+            Rule::identifier if var.is_none() => {
+                var = Some(p.as_str().to_string());
+            }
+            Rule::expression if source.is_none() => {
+                source = Some(build_expression(p)?);
+            }
+            Rule::list_comp_where => {
+                let inner = p
+                    .into_inner()
+                    .filter(|q| q.as_rule() != Rule::kw_where)
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty list comp where".into()))?;
+                predicate = Some(Box::new(build_expression(inner)?));
+            }
+            Rule::list_comp_proj => {
+                let inner = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty list comp projection".into()))?;
+                projection = Some(Box::new(build_expression(inner)?));
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in list comp: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+
+    let var = var.ok_or_else(|| Error::Parse("list comprehension missing variable".into()))?;
+    let source = source.ok_or_else(|| Error::Parse("list comprehension missing source".into()))?;
+    Ok(Expr::ListComprehension {
+        var,
+        source: Box::new(source),
+        predicate,
+        projection,
+    })
 }
 
 fn build_literal(pair: Pair<Rule>) -> Result<Literal> {

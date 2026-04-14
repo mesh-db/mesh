@@ -3,6 +3,19 @@ pub enum Statement {
     Create(CreateStmt),
     Match(MatchStmt),
     Merge(MergeStmt),
+    Unwind(UnwindStmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwindStmt {
+    pub expr: Expr,
+    pub alias: String,
+    pub where_clause: Option<Expr>,
+    pub return_items: Vec<ReturnItem>,
+    pub distinct: bool,
+    pub order_by: Vec<SortItem>,
+    pub skip: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +147,26 @@ pub enum Expr {
     Call {
         name: String,
         args: CallArgs,
+    },
+    /// `CASE [scrutinee] WHEN v1 THEN r1 WHEN v2 THEN r2 ELSE r END`.
+    /// When `scrutinee` is `Some`, each branch's condition is compared for
+    /// equality against it (simple form). When `None`, each branch's
+    /// condition is treated as a boolean predicate (generic form).
+    Case {
+        scrutinee: Option<Box<Expr>>,
+        branches: Vec<(Expr, Expr)>,
+        else_expr: Option<Box<Expr>>,
+    },
+    /// `[e1, e2, e3]` — produces a List value of eagerly evaluated elements.
+    List(Vec<Expr>),
+    /// `[var IN source WHERE pred | projection]`. Either `predicate` or
+    /// `projection` may be absent; when both are absent the comprehension
+    /// just reproduces the source list.
+    ListComprehension {
+        var: String,
+        source: Box<Expr>,
+        predicate: Option<Box<Expr>>,
+        projection: Option<Box<Expr>>,
     },
 }
 

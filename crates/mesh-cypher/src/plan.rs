@@ -1,6 +1,6 @@
 use crate::ast::{
     CallArgs, CreateStmt, Direction, Expr, Literal, MatchStmt, MergeStmt, NodePattern, Pattern,
-    ReturnItem, SortItem, Statement,
+    ReturnItem, SortItem, Statement, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -89,6 +89,13 @@ pub enum LogicalPlan {
         labels: Vec<String>,
         properties: Vec<(String, Literal)>,
     },
+    /// Evaluate `expr` once, cast it to a list, and emit one row per element
+    /// binding the element to `var`. The expression is evaluated against an
+    /// empty row — UNWIND is a top-level producer, not yet chained after MATCH.
+    Unwind {
+        var: String,
+        expr: Expr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,7 +178,31 @@ pub fn plan(statement: &Statement) -> Result<LogicalPlan> {
         Statement::Create(c) => plan_create(c),
         Statement::Match(m) => plan_match(m),
         Statement::Merge(m) => plan_merge(m),
+        Statement::Unwind(u) => plan_unwind(u),
     }
+}
+
+fn plan_unwind(stmt: &UnwindStmt) -> Result<LogicalPlan> {
+    let mut plan = LogicalPlan::Unwind {
+        var: stmt.alias.clone(),
+        expr: stmt.expr.clone(),
+    };
+
+    if let Some(predicate) = &stmt.where_clause {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: predicate.clone(),
+        };
+    }
+
+    apply_return_pipeline(
+        plan,
+        &stmt.return_items,
+        stmt.distinct,
+        &stmt.order_by,
+        stmt.skip,
+        stmt.limit,
+    )
 }
 
 fn plan_merge(stmt: &MergeStmt) -> Result<LogicalPlan> {
@@ -608,6 +639,40 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Call { args: CallArgs::Exprs(es), .. }
         | Expr::Call { args: CallArgs::DistinctExprs(es), .. } => {
             es.iter().any(contains_aggregate)
+        }
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            scrutinee
+                .as_deref()
+                .map(contains_aggregate)
+                .unwrap_or(false)
+                || branches
+                    .iter()
+                    .any(|(c, r)| contains_aggregate(c) || contains_aggregate(r))
+                || else_expr
+                    .as_deref()
+                    .map(contains_aggregate)
+                    .unwrap_or(false)
+        }
+        Expr::List(items) => items.iter().any(contains_aggregate),
+        Expr::ListComprehension {
+            source,
+            predicate,
+            projection,
+            ..
+        } => {
+            contains_aggregate(source)
+                || predicate
+                    .as_deref()
+                    .map(contains_aggregate)
+                    .unwrap_or(false)
+                || projection
+                    .as_deref()
+                    .map(contains_aggregate)
+                    .unwrap_or(false)
         }
         _ => false,
     }

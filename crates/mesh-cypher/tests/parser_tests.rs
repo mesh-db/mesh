@@ -575,6 +575,148 @@ fn reserved_word_as_variable_fails() {
     assert!(parse("MATCH (return) RETURN return").is_err());
 }
 
+fn unwrap_unwind(s: Statement) -> UnwindStmt {
+    match s {
+        Statement::Unwind(u) => u,
+        _ => panic!("expected unwind statement"),
+    }
+}
+
+#[test]
+fn case_generic_form_parses() {
+    let m = unwrap_match(
+        parse(
+            "MATCH (n) RETURN CASE WHEN n.age > 30 THEN 'old' ELSE 'young' END AS bucket",
+        )
+        .unwrap(),
+    );
+    assert_eq!(m.return_items.len(), 1);
+    match &m.return_items[0].expr {
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            assert!(scrutinee.is_none());
+            assert_eq!(branches.len(), 1);
+            assert!(else_expr.is_some());
+        }
+        other => panic!("expected Case, got {:?}", other),
+    }
+    assert_eq!(m.return_items[0].alias.as_deref(), Some("bucket"));
+}
+
+#[test]
+fn case_simple_form_with_scrutinee() {
+    let m = unwrap_match(
+        parse("MATCH (n) RETURN CASE n.kind WHEN 'a' THEN 1 WHEN 'b' THEN 2 END").unwrap(),
+    );
+    match &m.return_items[0].expr {
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            assert!(scrutinee.is_some());
+            assert_eq!(branches.len(), 2);
+            assert!(else_expr.is_none());
+        }
+        other => panic!("expected Case, got {:?}", other),
+    }
+}
+
+#[test]
+fn list_literal_parses() {
+    let m = unwrap_match(parse("MATCH (n) RETURN [1, 2, 3] AS xs").unwrap());
+    match &m.return_items[0].expr {
+        Expr::List(items) => assert_eq!(items.len(), 3),
+        other => panic!("expected List, got {:?}", other),
+    }
+}
+
+#[test]
+fn empty_list_literal_parses() {
+    let m = unwrap_match(parse("MATCH (n) RETURN [] AS xs").unwrap());
+    match &m.return_items[0].expr {
+        Expr::List(items) => assert!(items.is_empty()),
+        other => panic!("expected List, got {:?}", other),
+    }
+}
+
+#[test]
+fn list_comprehension_full_form() {
+    let m = unwrap_match(
+        parse("MATCH (n) RETURN [x IN [1, 2, 3] WHERE x > 1 | x] AS ys").unwrap(),
+    );
+    match &m.return_items[0].expr {
+        Expr::ListComprehension {
+            var,
+            predicate,
+            projection,
+            ..
+        } => {
+            assert_eq!(var, "x");
+            assert!(predicate.is_some());
+            assert!(projection.is_some());
+        }
+        other => panic!("expected ListComprehension, got {:?}", other),
+    }
+}
+
+#[test]
+fn list_comprehension_filter_only() {
+    let m = unwrap_match(
+        parse("MATCH (n) RETURN [x IN [1, 2, 3] WHERE x > 1] AS ys").unwrap(),
+    );
+    match &m.return_items[0].expr {
+        Expr::ListComprehension {
+            predicate,
+            projection,
+            ..
+        } => {
+            assert!(predicate.is_some());
+            assert!(projection.is_none());
+        }
+        other => panic!("expected ListComprehension, got {:?}", other),
+    }
+}
+
+#[test]
+fn list_comprehension_project_only() {
+    let m = unwrap_match(
+        parse("MATCH (n) RETURN [x IN [1, 2, 3] | x] AS ys").unwrap(),
+    );
+    match &m.return_items[0].expr {
+        Expr::ListComprehension {
+            predicate,
+            projection,
+            ..
+        } => {
+            assert!(predicate.is_none());
+            assert!(projection.is_some());
+        }
+        other => panic!("expected ListComprehension, got {:?}", other),
+    }
+}
+
+#[test]
+fn unwind_parses() {
+    let u = unwrap_unwind(parse("UNWIND [1, 2, 3] AS x RETURN x").unwrap());
+    assert_eq!(u.alias, "x");
+    assert!(matches!(u.expr, Expr::List(_)));
+    assert_eq!(u.return_items.len(), 1);
+}
+
+#[test]
+fn unwind_with_where_and_order() {
+    let u = unwrap_unwind(
+        parse("UNWIND [3, 1, 2] AS x WHERE x > 1 RETURN x ORDER BY x DESC").unwrap(),
+    );
+    assert!(u.where_clause.is_some());
+    assert_eq!(u.order_by.len(), 1);
+    assert!(u.order_by[0].descending);
+}
+
 #[test]
 fn parenthesized_expression() {
     let m = unwrap_match(

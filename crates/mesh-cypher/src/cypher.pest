@@ -2,10 +2,16 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
 query = { SOI ~ statement ~ EOI }
 
-statement = { merge_stmt | create_stmt | match_stmt }
+statement = { unwind_stmt | merge_stmt | create_stmt | match_stmt }
 
 create_stmt = { kw_create ~ pattern_list ~ return_tail? }
 merge_stmt  = { kw_merge ~ node_pattern ~ return_tail? }
+
+unwind_stmt = {
+    kw_unwind ~ expression ~ kw_as ~ identifier ~
+    where_clause? ~
+    return_tail
+}
 
 match_stmt = {
     kw_match ~ pattern_list ~
@@ -83,12 +89,30 @@ op_lt = { "<" }
 op_gt = { ">" }
 
 primary = {
+    case_expr |
+    list_comp |
+    list_literal |
     literal |
     function_call |
     property_access |
     identifier |
     ("(" ~ expression ~ ")")
 }
+
+case_expr = {
+    kw_case ~ case_scrutinee? ~ when_branch+ ~ else_branch? ~ kw_end
+}
+case_scrutinee = { expression }
+when_branch = { kw_when ~ expression ~ kw_then ~ expression }
+else_branch = { kw_else ~ expression }
+
+list_literal = { "[" ~ (expression ~ ("," ~ expression)*)? ~ "]" }
+list_comp = {
+    "[" ~ identifier ~ kw_in ~ expression ~
+    list_comp_where? ~ list_comp_proj? ~ "]"
+}
+list_comp_where = { kw_where ~ expression }
+list_comp_proj = { "|" ~ expression }
 
 function_call = { identifier ~ "(" ~ fn_args? ~ ")" }
 fn_args = { count_star | fn_arg_list }
@@ -113,7 +137,8 @@ reserved = @{
     (^"create" | ^"merge" | ^"match" | ^"where" | ^"return" | ^"skip" | ^"limit" |
      ^"as" | ^"or" | ^"and" | ^"not" | ^"true" | ^"false" | ^"null" |
      ^"set" | ^"delete" | ^"detach" |
-     ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc")
+     ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc" |
+     ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind")
     ~ !id_cont
 }
 
@@ -136,3 +161,10 @@ kw_by = _{ ^"by" }
 kw_asc = @{ ^"asc" ~ !id_cont }
 kw_desc = @{ ^"desc" ~ !id_cont }
 kw_distinct = @{ ^"distinct" ~ !id_cont }
+kw_case = @{ ^"case" ~ !id_cont }
+kw_when = @{ ^"when" ~ !id_cont }
+kw_then = @{ ^"then" ~ !id_cont }
+kw_else = @{ ^"else" ~ !id_cont }
+kw_end = @{ ^"end" ~ !id_cont }
+kw_in = @{ ^"in" ~ !id_cont }
+kw_unwind = _{ ^"unwind" ~ !id_cont }

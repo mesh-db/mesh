@@ -141,6 +141,55 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             labels.clone(),
             properties.clone(),
         )),
+        LogicalPlan::Unwind { var, expr } => {
+            Box::new(UnwindOp::new(var.clone(), expr.clone()))
+        }
+    }
+}
+
+struct UnwindOp {
+    var: String,
+    expr: Expr,
+    items: Option<Vec<Value>>,
+    cursor: usize,
+}
+
+impl UnwindOp {
+    fn new(var: String, expr: Expr) -> Self {
+        Self {
+            var,
+            expr,
+            items: None,
+            cursor: 0,
+        }
+    }
+}
+
+impl Operator for UnwindOp {
+    fn next(&mut self, _ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.items.is_none() {
+            let empty = Row::new();
+            let val = eval_expr(&self.expr, &empty)?;
+            let items = match val {
+                Value::List(items) => items,
+                Value::Property(Property::List(props)) => {
+                    props.into_iter().map(Value::Property).collect()
+                }
+                Value::Null => Vec::new(),
+                _ => return Err(Error::TypeMismatch),
+            };
+            self.items = Some(items);
+        }
+        let items = self.items.as_ref().unwrap();
+        if self.cursor < items.len() {
+            let v = items[self.cursor].clone();
+            self.cursor += 1;
+            let mut row = Row::new();
+            row.insert(self.var.clone(), v);
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
     }
 }
 

@@ -1620,6 +1620,165 @@ fn merge_with_multi_label_pattern_matches_intersection() {
 }
 
 #[test]
+fn case_generic_form_buckets_rows() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada', age: 20})");
+    run(&store, "CREATE (n:Person {name: 'Alan', age: 45})");
+    run(&store, "CREATE (n:Person {name: 'Grace', age: 85})");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) \
+         RETURN n.name AS name, \
+                CASE WHEN n.age < 30 THEN 'young' \
+                     WHEN n.age < 60 THEN 'middle' \
+                     ELSE 'old' END AS bucket \
+         ORDER BY name",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(str_prop(&rows[0], "bucket"), "young");
+    assert_eq!(str_prop(&rows[1], "bucket"), "middle");
+    assert_eq!(str_prop(&rows[2], "bucket"), "old");
+}
+
+#[test]
+fn case_without_else_yields_null_on_miss() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada', age: 90})");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) RETURN CASE WHEN n.age < 30 THEN 'young' END AS bucket",
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].get("bucket"), Some(Value::Null)));
+}
+
+#[test]
+fn case_simple_form_matches_scrutinee_equality() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Color {hue: 'red'})");
+    run(&store, "CREATE (n:Color {hue: 'blue'})");
+    run(&store, "CREATE (n:Color {hue: 'green'})");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Color) \
+         RETURN n.hue AS hue, \
+                CASE n.hue WHEN 'red' THEN 1 WHEN 'blue' THEN 2 ELSE 0 END AS code \
+         ORDER BY hue",
+    );
+    assert_eq!(rows.len(), 3);
+    // blue -> 2, green -> 0, red -> 1 (after alphabetic sort)
+    assert_eq!(int_prop(&rows[0], "code"), 2);
+    assert_eq!(int_prop(&rows[1], "code"), 0);
+    assert_eq!(int_prop(&rows[2], "code"), 1);
+}
+
+#[test]
+fn list_literal_returned_as_list_value() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Tag)");
+
+    let rows = run(&store, "MATCH (n:Tag) RETURN [1, 2, 3] AS xs");
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("xs") {
+        Some(Value::List(items)) => {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(
+                items[0],
+                Value::Property(Property::Int64(1))
+            ));
+        }
+        other => panic!("expected List, got {:?}", other),
+    }
+}
+
+#[test]
+fn list_comprehension_filters_and_projects() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Tag)");
+
+    let rows = run(
+        &store,
+        "MATCH (n:Tag) RETURN [x IN [1, 2, 3, 4, 5] WHERE x > 2 | x] AS xs",
+    );
+    match rows[0].get("xs") {
+        Some(Value::List(items)) => {
+            let ints: Vec<i64> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::Int64(i)) => *i,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(ints, vec![3, 4, 5]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn list_comprehension_reuses_outer_binding_scope() {
+    // Comprehensions should not clobber outer variables — after the
+    // comprehension evaluates, the row binding for the reused name should
+    // still point at the original node.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Tag {name: 'outer'})");
+
+    let rows = run(
+        &store,
+        "MATCH (x:Tag) RETURN [x IN [1, 2] | x] AS xs, x.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "outer");
+    match rows[0].get("xs") {
+        Some(Value::List(items)) => assert_eq!(items.len(), 2),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn unwind_produces_one_row_per_element() {
+    let (store, _d) = open_store();
+
+    let rows = run(&store, "UNWIND [1, 2, 3] AS x RETURN x");
+    assert_eq!(rows.len(), 3);
+    let mut vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "x")).collect();
+    vals.sort();
+    assert_eq!(vals, vec![1, 2, 3]);
+}
+
+#[test]
+fn unwind_with_where_and_order_by() {
+    let (store, _d) = open_store();
+
+    let rows = run(
+        &store,
+        "UNWIND [5, 1, 3, 2, 4] AS x WHERE x > 1 RETURN x ORDER BY x DESC LIMIT 2",
+    );
+    let vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "x")).collect();
+    assert_eq!(vals, vec![5, 4]);
+}
+
+#[test]
+fn unwind_empty_list_yields_no_rows() {
+    let (store, _d) = open_store();
+
+    let rows = run(&store, "UNWIND [] AS x RETURN x");
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn unwind_aggregate_counts_elements() {
+    let (store, _d) = open_store();
+
+    let rows = run(&store, "UNWIND [1, 2, 3, 4] AS x RETURN count(*) AS n");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "n"), 4);
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");
