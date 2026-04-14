@@ -943,6 +943,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
     query_a
         .execute_cypher(ExecuteCypherRequest {
             query: "CREATE (n:Person {name: 'Ada', age: 36}) RETURN n".into(),
+            params_json: vec![],
         })
         .await
         .expect("CREATE through Cypher should commit on leader");
@@ -958,6 +959,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         let resp = query_b
             .execute_cypher(ExecuteCypherRequest {
                 query: "MATCH (n:Person) RETURN n.name AS name, n.age AS age".into(),
+                params_json: vec![],
             })
             .await
             .unwrap();
@@ -1108,6 +1110,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         query_a
             .execute_cypher(ExecuteCypherRequest {
                 query: format!("CREATE (n:Marker {{idx: {i}}}) RETURN n"),
+                params_json: vec![],
             })
             .await
             .unwrap();
@@ -1204,6 +1207,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
     let resp = query_b
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (n:Marker) RETURN n".into(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -1323,6 +1327,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         query_a
             .execute_cypher(ExecuteCypherRequest {
                 query: format!("CREATE (n:Person {{idx: {i}}}) RETURN n"),
+                params_json: vec![],
             })
             .await
             .unwrap();
@@ -1505,6 +1510,7 @@ async fn cypher_merge_replicates_through_raft() {
     let resp = query_a
         .execute_cypher(ExecuteCypherRequest {
             query: "MERGE (n:Person {name: 'Ada'}) RETURN n.name AS name".into(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -1519,6 +1525,7 @@ async fn cypher_merge_replicates_through_raft() {
     query_a
         .execute_cypher(ExecuteCypherRequest {
             query: "MERGE (n:Person {name: 'Ada'}) RETURN n".into(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -1533,6 +1540,7 @@ async fn cypher_merge_replicates_through_raft() {
         let resp = query_b
             .execute_cypher(ExecuteCypherRequest {
                 query: "MATCH (n:Person) RETURN n.name AS name".into(),
+                params_json: vec![],
             })
             .await
             .unwrap();
@@ -1652,6 +1660,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
             query:
                 "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Grace'}) RETURN a, b"
                     .into(),
+            params_json: vec![],
         })
         .await
         .expect("multi-write CREATE should commit");
@@ -1676,6 +1685,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         let resp = query_b
             .execute_cypher(ExecuteCypherRequest {
                 query: "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS a_name, b.name AS b_name".into(),
+                params_json: vec![],
             })
             .await
             .unwrap();

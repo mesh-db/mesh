@@ -109,6 +109,12 @@ message HealthResponse {
 
 message ExecuteCypherRequest {
   string query = 1;
+  // serde_json-encoded HashMap<String, mesh_executor::Value>. Carries
+  // the driver-supplied `$param` bindings for parameterized Cypher
+  // queries. Empty / missing → no parameters. JSON keeps us out of
+  // proto schema design for the recursive Value type; the same trick
+  // is used by `rows_json` in the response.
+  bytes params_json = 2;
 }
 
 // Rows carried as a single JSON blob (serde-serialized Vec<mesh_executor::Row>).

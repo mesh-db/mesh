@@ -38,8 +38,8 @@ fn labeled_node_with_properties() {
     assert_eq!(
         c.patterns[0].start.properties,
         vec![
-            ("name".into(), Literal::String("Ada".into())),
-            ("age".into(), Literal::Integer(37)),
+            ("name".into(), Expr::Literal(Literal::String("Ada".into()))),
+            ("age".into(), Expr::Literal(Literal::Integer(37))),
         ]
     );
 }
@@ -560,9 +560,9 @@ fn negative_and_float_literals() {
     assert_eq!(
         c.patterns[0].start.properties,
         vec![
-            ("x".into(), Literal::Float(-3.14)),
-            ("y".into(), Literal::Integer(-42)),
-            ("z".into(), Literal::Float(2.5)),
+            ("x".into(), Expr::Literal(Literal::Float(-3.14))),
+            ("y".into(), Expr::Literal(Literal::Integer(-42))),
+            ("z".into(), Expr::Literal(Literal::Float(2.5))),
         ]
     );
 }
@@ -573,9 +573,9 @@ fn boolean_and_null_literals() {
     assert_eq!(
         c.patterns[0].start.properties,
         vec![
-            ("a".into(), Literal::Boolean(true)),
-            ("b".into(), Literal::Boolean(false)),
-            ("c".into(), Literal::Null),
+            ("a".into(), Expr::Literal(Literal::Boolean(true))),
+            ("b".into(), Expr::Literal(Literal::Boolean(false))),
+            ("c".into(), Expr::Literal(Literal::Null)),
         ]
     );
 }
@@ -585,7 +585,7 @@ fn single_quoted_string() {
     let c = unwrap_create(parse("CREATE (n {name: 'Ada'})").unwrap());
     assert_eq!(
         c.patterns[0].start.properties,
-        vec![("name".into(), Literal::String("Ada".into()))]
+        vec![("name".into(), Expr::Literal(Literal::String("Ada".into())))]
     );
 }
 
@@ -743,4 +743,82 @@ fn parenthesized_expression() {
         }
         other => panic!("expected top-level AND: {:?}", other),
     }
+}
+
+// --- Parameter parsing -------------------------------------------------
+
+#[test]
+fn parameter_in_where_clause_parses_as_compare_rhs() {
+    let m = unwrap_match(parse("MATCH (n) WHERE n.name = $name RETURN n").unwrap());
+    match m.where_clause.unwrap() {
+        Expr::Compare { right, .. } => {
+            assert_eq!(*right, Expr::Parameter("name".into()));
+        }
+        other => panic!("expected Compare, got {:?}", other),
+    }
+}
+
+#[test]
+fn parameter_in_node_pattern_property() {
+    let m = unwrap_match(parse("MATCH (n:Person {name: $name}) RETURN n").unwrap());
+    assert_eq!(
+        m.patterns[0].start.properties,
+        vec![("name".into(), Expr::Parameter("name".into()))]
+    );
+}
+
+#[test]
+fn parameter_in_create_pattern_property() {
+    let c = unwrap_create(parse("CREATE (n:Person {name: $name, age: $age})").unwrap());
+    assert_eq!(
+        c.patterns[0].start.properties,
+        vec![
+            ("name".into(), Expr::Parameter("name".into())),
+            ("age".into(), Expr::Parameter("age".into())),
+        ]
+    );
+}
+
+#[test]
+fn parameter_in_set_property_value() {
+    let m = unwrap_match(parse("MATCH (n:Person) SET n.age = $age RETURN n").unwrap());
+    match &m.set_items[0] {
+        SetItem::Property { value, .. } => {
+            assert_eq!(*value, Expr::Parameter("age".into()));
+        }
+        other => panic!("expected SetItem::Property, got {:?}", other),
+    }
+}
+
+#[test]
+fn parameter_in_unwind_source() {
+    let u = unwrap_unwind(parse("UNWIND $items AS x RETURN x").unwrap());
+    assert_eq!(u.expr, Expr::Parameter("items".into()));
+    assert_eq!(u.alias, "x");
+}
+
+#[test]
+fn positional_parameter_parses() {
+    let m = unwrap_match(parse("MATCH (n) WHERE n.id = $0 RETURN n").unwrap());
+    match m.where_clause.unwrap() {
+        Expr::Compare { right, .. } => {
+            assert_eq!(*right, Expr::Parameter("0".into()));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn parameter_in_return_expression() {
+    let m = unwrap_match(parse("MATCH (n) RETURN $constant AS k").unwrap());
+    assert_eq!(m.return_items[0].expr, Expr::Parameter("constant".into()));
+    assert_eq!(m.return_items[0].alias.as_deref(), Some("k"));
+}
+
+#[test]
+fn property_value_rejects_free_identifier() {
+    // Pattern property values are restricted to literal | parameter at
+    // the grammar level, so `(n {name: foo})` (foo as a free identifier)
+    // is a parse error rather than an "unbound variable" runtime error.
+    assert!(parse("MATCH (n {name: foo}) RETURN n").is_err());
 }

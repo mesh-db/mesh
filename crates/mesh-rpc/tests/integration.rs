@@ -448,6 +448,7 @@ async fn cypher_match_scatter_gathers_across_partitions() {
     let resp = client
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (n:Worker) RETURN n.i AS i".to_string(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -492,6 +493,7 @@ async fn cypher_match_with_filter_scatter_gathers() {
     let resp = client
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (n:Box) WHERE n.size > 14 RETURN n.size AS s ORDER BY s".to_string(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -522,6 +524,7 @@ async fn cypher_create_routes_writes_by_partition() {
         client
             .execute_cypher(ExecuteCypherRequest {
                 query: format!("CREATE (n:Worker {{i: {}}})", i),
+                params_json: vec![],
             })
             .await
             .unwrap();
@@ -553,6 +556,7 @@ async fn cypher_create_routes_writes_by_partition() {
     let resp = client
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (n:Worker) RETURN n.i AS i".to_string(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -591,6 +595,7 @@ async fn cypher_create_edge_lands_on_both_owners() {
                     "CREATE (a:Link {{name: 'a{}'}})-[:KNOWS]->(b:Link {{name: 'b{}'}})",
                     i, i
                 ),
+                params_json: vec![],
             })
             .await
             .unwrap();
@@ -632,6 +637,7 @@ async fn cypher_create_edge_lands_on_both_owners() {
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (a:Link)-[:KNOWS]->(b:Link) RETURN a.name AS an, b.name AS bn"
                 .to_string(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -804,6 +810,7 @@ async fn cypher_multi_op_query_atomic_across_peers() {
             query: "CREATE (a:Batch {i:0}), (b:Batch {i:1}), (c:Batch {i:2}), (d:Batch {i:3}),
                         (e:Batch {i:4}), (f:Batch {i:5}), (g:Batch {i:6}), (h:Batch {i:7})"
                 .to_string(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -828,6 +835,7 @@ async fn cypher_multi_op_query_atomic_across_peers() {
     let resp = client
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (n:Batch) RETURN n.i AS i".to_string(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -866,6 +874,7 @@ async fn cypher_reverse_traversal_via_ghost_edges() {
                 query: format!(
                     "CREATE (a:Src {{name: 'a{i}'}})-[:KNOWS]->(b:Dst {{name: 'b{i}'}})"
                 ),
+                params_json: vec![],
             })
             .await
             .unwrap();
@@ -896,6 +905,7 @@ async fn cypher_reverse_traversal_via_ghost_edges() {
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (b:Dst)<-[:KNOWS]-(a:Src) RETURN a.name AS src, b.name AS dst"
                 .to_string(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -981,6 +991,7 @@ async fn cypher_traversal_crosses_partitions() {
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (a:Person {name: 'A'})-[:KNOWS]->(b:Person) RETURN b.name AS name"
                 .to_string(),
+            params_json: vec![],
         })
         .await
         .unwrap();
@@ -1319,4 +1330,50 @@ async fn invalid_uuid_length_returns_invalid_argument() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn grpc_execute_cypher_with_params_round_trips() {
+    // gRPC parity for Bolt's parameter support. Encodes the params
+    // map as serde-json into ExecuteCypherRequest.params_json, sends
+    // it to the single-node server, and checks the rows decode back.
+    // Without this test, parameterized writes against a Raft follower
+    // (which forwards via this same proto field) would break silently.
+    let harness = spawn_server().await;
+    let mut c = client(&harness).await;
+
+    // Seed two Person nodes via Cypher CREATE so we can filter them
+    // by name with a parameter on the read side.
+    for (name, age) in [("Ada", 37_i64), ("Alan", 41)] {
+        let _ = c
+            .execute_cypher(ExecuteCypherRequest {
+                query: format!("CREATE (n:Person {{name: '{name}', age: {age}}})"),
+                params_json: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    // Now read with a parameter. ParamMap is just `HashMap<String, Value>`,
+    // and Value uses an internally-tagged JSON shape via serde.
+    let mut params: std::collections::HashMap<String, mesh_executor::Value> =
+        std::collections::HashMap::new();
+    params.insert(
+        "name".into(),
+        mesh_executor::Value::Property(mesh_core::Property::String("Ada".into())),
+    );
+    let params_json = serde_json::to_vec(&params).unwrap();
+
+    let resp = c
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:Person {name: $name}) RETURN n.age AS age".to_string(),
+            params_json,
+        })
+        .await
+        .unwrap();
+
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["age"]["Property"]["value"].as_i64(), Some(37));
 }

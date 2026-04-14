@@ -1,6 +1,6 @@
 use crate::ast::{
-    CallArgs, CreateStmt, Direction, Expr, Literal, MatchStmt, MergeStmt, NodePattern, Pattern,
-    ReturnItem, SortItem, Statement, UnwindStmt,
+    CallArgs, CreateStmt, Direction, Expr, MatchStmt, MergeStmt, NodePattern, Pattern, ReturnItem,
+    SortItem, Statement, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -84,10 +84,12 @@ pub enum LogicalPlan {
     /// `(labels, properties)` pattern, returns one row per match (binding
     /// the existing node to `var`). If none match, creates exactly one
     /// node with the given labels + properties and returns one row.
+    /// Property values are `Expr` so they can carry parameters; the
+    /// executor evaluates them once at the start of execution.
     MergeNode {
         var: String,
         labels: Vec<String>,
-        properties: Vec<(String, Literal)>,
+        properties: Vec<(String, Expr)>,
     },
     /// Evaluate `expr` once, cast it to a list, and emit one row per element
     /// binding the element to `var`. The expression is evaluated against an
@@ -103,7 +105,11 @@ pub enum CreateNodeSpec {
     New {
         var: Option<String>,
         labels: Vec<String>,
-        properties: Vec<(String, Literal)>,
+        /// Property expressions. The grammar restricts these to literals
+        /// and parameters (see `property_value` in cypher.pest), so
+        /// `CreatePathOp` evaluates them against an empty row plus the
+        /// per-query param map.
+        properties: Vec<(String, Expr)>,
     },
     Reference(String),
 }
@@ -129,11 +135,11 @@ pub enum SetAssignment {
     },
     Replace {
         var: String,
-        properties: Vec<(String, Literal)>,
+        properties: Vec<(String, Expr)>,
     },
     Merge {
         var: String,
-        properties: Vec<(String, Literal)>,
+        properties: Vec<(String, Expr)>,
     },
 }
 
@@ -345,6 +351,10 @@ fn plan_pattern(pattern: &Pattern, pattern_idx: usize) -> Result<LogicalPlan> {
             labels: pattern.start.labels.clone(),
         }
     };
+    // Lower the start node's pattern properties to a Filter on top of
+    // the scan. Without this, `MATCH (n {name: 'Ada'})` would return
+    // every node and silently ignore the property predicate.
+    plan = wrap_with_pattern_prop_filter(plan, &start_var, &pattern.start.properties);
 
     let mut current_var = start_var;
     for (i, hop) in pattern.hops.iter().enumerate() {
@@ -382,9 +392,47 @@ fn plan_pattern(pattern: &Pattern, pattern_idx: usize) -> Result<LogicalPlan> {
                 direction: hop.rel.direction,
             }
         };
+        // Lower the target node's pattern properties to a Filter
+        // wrapping the expand for the same reason as the start node.
+        plan = wrap_with_pattern_prop_filter(plan, &dst_var, &hop.target.properties);
         current_var = dst_var;
     }
     Ok(plan)
+}
+
+/// If `properties` is non-empty, wrap `plan` in a `Filter` whose
+/// predicate is `var.k1 = v1 AND var.k2 = v2 AND ...` for every entry.
+/// Used to lower MATCH-side pattern properties (which the executor
+/// otherwise doesn't see) into a real predicate. Empty `properties`
+/// leaves the plan unchanged.
+fn wrap_with_pattern_prop_filter(
+    plan: LogicalPlan,
+    var: &str,
+    properties: &[(String, Expr)],
+) -> LogicalPlan {
+    use crate::ast::CompareOp;
+    if properties.is_empty() {
+        return plan;
+    }
+    let mut acc: Option<Expr> = None;
+    for (key, value_expr) in properties {
+        let cmp = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Property {
+                var: var.to_string(),
+                key: key.clone(),
+            }),
+            right: Box::new(value_expr.clone()),
+        };
+        acc = Some(match acc {
+            None => cmp,
+            Some(prev) => Expr::And(Box::new(prev), Box::new(cmp)),
+        });
+    }
+    LogicalPlan::Filter {
+        input: Box::new(plan),
+        predicate: acc.expect("non-empty properties yields Some"),
+    }
 }
 
 fn collect_pattern_vars(pattern: &Pattern, out: &mut HashSet<String>) {

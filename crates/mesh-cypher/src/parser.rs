@@ -586,7 +586,7 @@ fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {
     })
 }
 
-fn build_properties(pair: Pair<Rule>) -> Result<Vec<(String, Literal)>> {
+fn build_properties(pair: Pair<Rule>) -> Result<Vec<(String, Expr)>> {
     let mut entries = Vec::new();
     for entry_pair in pair.into_inner() {
         debug_assert_eq!(entry_pair.as_rule(), Rule::property_entry);
@@ -596,12 +596,43 @@ fn build_properties(pair: Pair<Rule>) -> Result<Vec<(String, Literal)>> {
             .ok_or_else(|| Error::Parse("property key".into()))?
             .as_str()
             .to_string();
-        let lit_pair = inner
+        let value_pair = inner
             .next()
             .ok_or_else(|| Error::Parse("property value".into()))?;
-        entries.push((key, build_literal(lit_pair)?));
+        entries.push((key, build_property_value(value_pair)?));
     }
     Ok(entries)
+}
+
+/// Lower a `property_value` parse pair (literal or parameter) into an
+/// `Expr`. Mirrors the grammar's `property_value = { literal | parameter }`
+/// — node-pattern property values are deliberately a strict subset of
+/// `expression`.
+fn build_property_value(pair: Pair<Rule>) -> Result<Expr> {
+    debug_assert_eq!(pair.as_rule(), Rule::property_value);
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty property value".into()))?;
+    match inner.as_rule() {
+        Rule::literal => Ok(Expr::Literal(build_literal(inner)?)),
+        Rule::parameter => Ok(Expr::Parameter(parameter_name(inner))),
+        r => Err(Error::Parse(format!(
+            "unexpected rule in property value: {:?}",
+            r
+        ))),
+    }
+}
+
+/// Strip the leading `$` from a `parameter` parse pair and return the
+/// bare name (or positional index as a string). Shared by
+/// `build_property_value` and the `Rule::parameter` arm in
+/// `build_expression`.
+fn parameter_name(pair: Pair<Rule>) -> String {
+    debug_assert_eq!(pair.as_rule(), Rule::parameter);
+    let raw = pair.as_str();
+    debug_assert!(raw.starts_with('$'));
+    raw[1..].to_string()
 }
 
 fn build_return_items(pair: Pair<Rule>) -> Result<Vec<ReturnItem>> {
@@ -753,6 +784,7 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             Ok(Expr::Property { var, key })
         }
         Rule::identifier => Ok(Expr::Identifier(pair.as_str().to_string())),
+        Rule::parameter => Ok(Expr::Parameter(parameter_name(pair))),
         Rule::case_expr => build_case_expr(pair),
         Rule::list_literal => {
             let mut items = Vec::new();

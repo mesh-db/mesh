@@ -68,9 +68,20 @@ async fn connect_and_hello(addr: &str) -> TcpStream {
 /// Issue a RUN + PULL round-trip and return the decoded RECORD rows
 /// plus the trailing PULL SUCCESS metadata.
 async fn run_and_pull(sock: &mut TcpStream, query: &str) -> (Vec<Vec<BoltValue>>, BoltValue) {
+    run_and_pull_with_params(sock, query, BoltValue::Map(vec![])).await
+}
+
+/// Same as `run_and_pull` but binds `params` on the RUN message — used
+/// by the parameter end-to-end tests below to exercise the full
+/// pipeline from BoltValue → ParamMap → executor → result.
+async fn run_and_pull_with_params(
+    sock: &mut TcpStream,
+    query: &str,
+    params: BoltValue,
+) -> (Vec<Vec<BoltValue>>, BoltValue) {
     let run = BoltMessage::Run {
         query: query.to_string(),
-        params: BoltValue::Map(vec![]),
+        params,
         extra: BoltValue::Map(vec![]),
     };
     write_message(sock, &run.encode()).await.unwrap();
@@ -290,6 +301,91 @@ async fn bolt_begin_commit_are_accepted_as_noops() {
     // Post-commit: the node is visible.
     let (records, _) = run_and_pull(&mut sock, "MATCH (n:T) RETURN n").await;
     assert_eq!(records.len(), 1);
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_run_with_string_param_filters_match() {
+    // End-to-end: drive a parameterized RUN through the Bolt handler,
+    // exercising bolt_params_to_param_map → execute_cypher_local →
+    // executor → row encoding back through PackStream.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    let _ = run_and_pull(&mut sock, "CREATE (n:Person {name: 'Ada', age: 37})").await;
+    let _ = run_and_pull(&mut sock, "CREATE (n:Person {name: 'Alan', age: 41})").await;
+
+    let params = BoltValue::map([("name", BoltValue::String("Ada".into()))]);
+    let (records, _) = run_and_pull_with_params(
+        &mut sock,
+        "MATCH (n:Person {name: $name}) RETURN n.age AS age",
+        params,
+    )
+    .await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0][0].as_int(), Some(37));
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_unwind_with_param_list_returns_one_record_per_element() {
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    let params = BoltValue::map([(
+        "items",
+        BoltValue::List(vec![
+            BoltValue::Int(10),
+            BoltValue::Int(20),
+            BoltValue::Int(30),
+        ]),
+    )]);
+    let (records, meta) =
+        run_and_pull_with_params(&mut sock, "UNWIND $items AS x RETURN x ORDER BY x", params).await;
+    let xs: Vec<i64> = records
+        .iter()
+        .map(|fields| fields[0].as_int().unwrap())
+        .collect();
+    assert_eq!(xs, vec![10, 20, 30]);
+    assert_eq!(
+        meta.get("record_count").and_then(BoltValue::as_int),
+        Some(3)
+    );
+
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_unbound_parameter_surfaces_as_failure() {
+    // RUN with an empty params map but a query that references $missing
+    // — the executor returns `Error::UnboundParameter` which the Bolt
+    // handler maps to a FAILURE. The session enters Failed and a
+    // follow-up RESET clears it.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    let run = BoltMessage::Run {
+        query: "UNWIND $missing AS x RETURN x".into(),
+        params: BoltValue::Map(vec![]),
+        extra: BoltValue::Map(vec![]),
+    };
+    write_message(&mut sock, &run.encode()).await.unwrap();
+    let reply = BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
+    match reply {
+        BoltMessage::Failure { metadata } => {
+            let msg = metadata
+                .get("message")
+                .and_then(BoltValue::as_str)
+                .unwrap_or("");
+            assert!(
+                msg.contains("unbound parameter") && msg.contains("missing"),
+                "expected unbound-parameter failure, got: {msg}"
+            );
+        }
+        other => panic!("expected FAILURE, got {:?}", other),
+    }
 
     goodbye(sock).await;
 }

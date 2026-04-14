@@ -19,7 +19,7 @@ use crate::routing::Routing;
 use crate::tx_coordinator::TxCoordinator;
 use mesh_cluster::raft::RaftCluster;
 use mesh_cluster::{Error as ClusterError, GraphCommand, PeerId};
-use mesh_executor::{execute_with_reader, execute_with_writer, GraphReader, GraphWriter};
+use mesh_executor::{execute_with_reader, GraphReader, GraphWriter};
 use mesh_storage::Store;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -98,6 +98,7 @@ impl MeshService {
     pub async fn execute_cypher_local(
         &self,
         query: String,
+        params: mesh_executor::ParamMap,
     ) -> std::result::Result<Vec<mesh_executor::Row>, Status> {
         // Parse + plan on the async task — cheap and synchronous.
         let statement = mesh_cypher::parse(&query).map_err(bad_request)?;
@@ -106,6 +107,10 @@ impl MeshService {
         let store = self.store.clone();
         let raft = self.raft.clone();
         let routing = self.routing.clone();
+        // Move the params into the spawn_blocking closure so the
+        // executor sees them. Cloned for the leader-forward branch
+        // below, which has to re-encode them for the gRPC re-issue.
+        let exec_params = params.clone();
         let (rows, raft_batch, routing_batch) = tokio::task::spawn_blocking(
             move || -> std::result::Result<
                 (
@@ -122,10 +127,11 @@ impl MeshService {
                     // further down so a crash mid-query can't leave a
                     // partial result on any replica.
                     let writer = BufferingGraphWriter::new();
-                    let rows = execute_with_writer(
+                    let rows = execute_with_reader(
                         &plan,
-                        store_ref,
+                        store_ref as &dyn GraphReader,
                         &writer as &dyn GraphWriter,
+                        &exec_params,
                     )?;
                     Ok((rows, Some(writer.into_commands()), None))
                 } else if let Some(r) = routing.as_ref() {
@@ -140,13 +146,15 @@ impl MeshService {
                         &plan,
                         &reader as &dyn GraphReader,
                         &writer as &dyn GraphWriter,
+                        &exec_params,
                     )?;
                     Ok((rows, None, Some(writer.into_commands())))
                 } else {
-                    let rows = execute_with_writer(
+                    let rows = execute_with_reader(
                         &plan,
-                        store_ref,
+                        store_ref as &dyn GraphReader,
                         store_ref as &dyn GraphWriter,
+                        &exec_params,
                     )?;
                     Ok((rows, None, None))
                 }
@@ -179,12 +187,13 @@ impl MeshService {
                         leader_address: Some(addr),
                         ..
                     }) => {
-                        // Re-issue the *original* query to the leader.
-                        // The leader will re-parse, re-plan, re-execute,
-                        // and commit through its own Raft group — the
-                        // only safe option, because our buffered
-                        // GraphCommands carry fresh ids that would clash
-                        // with anything the leader minted for itself.
+                        // Re-issue the *original* query — and the
+                        // params — to the leader. The leader re-parses,
+                        // re-plans, and commits through its own Raft
+                        // group. Forwarding params is critical: without
+                        // it, parameterized writes against a follower
+                        // would silently fail with "unbound parameter"
+                        // on the leader.
                         let endpoint =
                             Endpoint::from_shared(format!("http://{}", addr)).map_err(|e| {
                                 Status::internal(format!("invalid leader address {addr}: {e}"))
@@ -192,8 +201,11 @@ impl MeshService {
                         let mut client = crate::proto::mesh_query_client::MeshQueryClient::new(
                             endpoint.connect_lazy(),
                         );
+                        let params_json = serde_json::to_vec(&params).map_err(|e| {
+                            Status::internal(format!("encoding forwarded params: {e}"))
+                        })?;
                         let resp = client
-                            .execute_cypher(ExecuteCypherRequest { query })
+                            .execute_cypher(ExecuteCypherRequest { query, params_json })
                             .await?;
                         let forwarded: Vec<mesh_executor::Row> =
                             serde_json::from_slice(&resp.into_inner().rows_json).map_err(|e| {
@@ -523,9 +535,19 @@ impl MeshQuery for MeshService {
         &self,
         request: Request<ExecuteCypherRequest>,
     ) -> Result<Response<ExecuteCypherResponse>, Status> {
-        let query = request.into_inner().query;
+        let req = request.into_inner();
+        let query = req.query;
         tracing::Span::current().record("query_len", query.len());
-        let rows = self.execute_cypher_local(query).await?;
+        // Decode the params blob — empty / missing means no params.
+        // Anything else is the serde_json-encoded HashMap that the
+        // forwarding leader path produced via `serde_json::to_vec`.
+        let params: mesh_executor::ParamMap = if req.params_json.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            serde_json::from_slice(&req.params_json)
+                .map_err(|e| Status::invalid_argument(format!("decoding params: {e}")))?
+        };
+        let rows = self.execute_cypher_local(query, params).await?;
         let rows_json = serde_json::to_vec(&rows)
             .map_err(|e| Status::internal(format!("encoding rows: {e}")))?;
         Ok(Response::new(ExecuteCypherResponse { rows_json }))

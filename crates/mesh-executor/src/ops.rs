@@ -1,14 +1,14 @@
 use crate::{
     error::{Error, Result},
-    eval::{compare_values, eval_expr, literal_to_property, row_key, to_bool, value_key},
+    eval::{compare_values, eval_expr, row_key, to_bool, value_key},
     reader::GraphReader,
-    value::{Row, Value},
+    value::{ParamMap, Row, Value},
     writer::GraphWriter,
 };
 use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use mesh_cypher::{
     AggregateArg, AggregateFn, AggregateSpec, CreateEdgeSpec, CreateNodeSpec, Direction, Expr,
-    Literal, LogicalPlan, ReturnItem, SetAssignment, SortItem,
+    LogicalPlan, ReturnItem, SetAssignment, SortItem,
 };
 use mesh_storage::Store;
 use std::cmp::Ordering;
@@ -17,6 +17,11 @@ use std::collections::{HashMap, HashSet};
 pub struct ExecCtx<'a> {
     pub store: &'a dyn GraphReader,
     pub writer: &'a dyn GraphWriter,
+    /// Per-query parameter bindings. Empty for the single-node and Raft
+    /// entry points that don't carry a Bolt RUN; populated with the
+    /// driver-supplied params on the Bolt path. Threaded into every
+    /// `eval_expr` call so `Expr::Parameter("name")` resolves.
+    pub params: &'a ParamMap,
 }
 
 pub trait Operator {
@@ -24,34 +29,45 @@ pub trait Operator {
 }
 
 /// Execute a plan using the given store for both reads and writes.
-/// Equivalent to [`execute_with_reader`] with the store acting as both.
+/// Equivalent to [`execute_with_reader`] with the store acting as both
+/// and an empty parameter map.
 pub fn execute(plan: &LogicalPlan, store: &Store) -> Result<Vec<Row>> {
-    execute_with_reader(plan, store as &dyn GraphReader, store as &dyn GraphWriter)
+    let params = ParamMap::new();
+    execute_with_reader(
+        plan,
+        store as &dyn GraphReader,
+        store as &dyn GraphWriter,
+        &params,
+    )
 }
 
 /// Execute a plan against a local [`Store`] for reads, sending mutations to
 /// a separate [`GraphWriter`]. Used by in-process setups where reads are
-/// always cheap-local (single node or full-replica Raft).
+/// always cheap-local (single node or full-replica Raft). No parameters.
 pub fn execute_with_writer(
     plan: &LogicalPlan,
     store: &Store,
     writer: &dyn GraphWriter,
 ) -> Result<Vec<Row>> {
-    execute_with_reader(plan, store as &dyn GraphReader, writer)
+    let params = ParamMap::new();
+    execute_with_reader(plan, store as &dyn GraphReader, writer, &params)
 }
 
-/// Execute a plan with an arbitrary [`GraphReader`] for reads. In routing
-/// mode the caller supplies a partitioned reader that fans out point reads
-/// to partition owners and scatter-gathers bulk scans across peers.
+/// Execute a plan with an arbitrary [`GraphReader`] for reads and a
+/// parameter map for `$param` resolution. Routing mode uses a
+/// partitioned reader that fans out reads across peers; the Bolt
+/// listener supplies the driver-bound param map.
 pub fn execute_with_reader(
     plan: &LogicalPlan,
     reader: &dyn GraphReader,
     writer: &dyn GraphWriter,
+    params: &ParamMap,
 ) -> Result<Vec<Row>> {
     let mut op = build_op(plan);
     let ctx = ExecCtx {
         store: reader,
         writer,
+        params,
     };
     let mut rows = Vec::new();
     while let Some(row) = op.next(&ctx)? {
@@ -177,10 +193,10 @@ impl UnwindOp {
 }
 
 impl Operator for UnwindOp {
-    fn next(&mut self, _ctx: &ExecCtx) -> Result<Option<Row>> {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         if self.items.is_none() {
             let empty = Row::new();
-            let val = eval_expr(&self.expr, &empty)?;
+            let val = eval_expr(&self.expr, &empty, ctx.params)?;
             let items = match val {
                 Value::List(items) => items,
                 Value::Property(Property::List(props)) => {
@@ -243,8 +259,14 @@ impl CreatePathOp {
                     for label in labels {
                         node.labels.push(label.clone());
                     }
-                    for (k, v) in properties {
-                        node.properties.insert(k.clone(), literal_to_property(v));
+                    // Property values are `Expr` (literal | parameter
+                    // per the grammar). Evaluate against the current row
+                    // + params and convert to a stored Property via the
+                    // existing helper, which rejects Node/Edge values.
+                    for (k, expr) in properties {
+                        let value = eval_expr(expr, row, ctx.params)?;
+                        let prop = value_to_property(value)?;
+                        node.properties.insert(k.clone(), prop);
                     }
                     ctx.writer.put_node(&node)?;
                     node_ids.push(node.id);
@@ -445,7 +467,7 @@ impl Operator for SetPropertyOp {
                 for a in &self.assignments {
                     match a {
                         SetAssignment::Property { var, key, value } => {
-                            let evaluated = eval_expr(value, &row)?;
+                            let evaluated = eval_expr(value, &row, ctx.params)?;
                             let prop = value_to_property(evaluated)?;
                             actions.push(Action::SetKey {
                                 var: var.clone(),
@@ -460,10 +482,17 @@ impl Operator for SetPropertyOp {
                             });
                         }
                         SetAssignment::Replace { var, properties } => {
+                            // Property values are now `Expr`. Evaluate
+                            // each against the current row + params and
+                            // convert via the shared helper, which
+                            // surfaces InvalidSetValue for Node/Edge.
                             let props = properties
                                 .iter()
-                                .map(|(k, lit)| (k.clone(), literal_to_property(lit)))
-                                .collect();
+                                .map(|(k, expr)| {
+                                    let v = eval_expr(expr, &row, ctx.params)?;
+                                    Ok((k.clone(), value_to_property(v)?))
+                                })
+                                .collect::<Result<Vec<(String, Property)>>>()?;
                             actions.push(Action::Replace {
                                 var: var.clone(),
                                 props,
@@ -472,8 +501,11 @@ impl Operator for SetPropertyOp {
                         SetAssignment::Merge { var, properties } => {
                             let props = properties
                                 .iter()
-                                .map(|(k, lit)| (k.clone(), literal_to_property(lit)))
-                                .collect();
+                                .map(|(k, expr)| {
+                                    let v = eval_expr(expr, &row, ctx.params)?;
+                                    Ok((k.clone(), value_to_property(v)?))
+                                })
+                                .collect::<Result<Vec<(String, Property)>>>()?;
                             actions.push(Action::Merge {
                                 var: var.clone(),
                                 props,
@@ -653,11 +685,11 @@ fn has_all_labels(node: &Node, labels: &[String]) -> bool {
     labels.iter().all(|l| node.labels.contains(l))
 }
 
-fn matches_pattern_props(node: &Node, props: &[(String, Literal)]) -> bool {
+fn matches_pattern_props(node: &Node, props: &[(String, Property)]) -> bool {
     props.iter().all(|(k, v)| {
         node.properties
             .get(k)
-            .map(|stored| *stored == literal_to_property(v))
+            .map(|stored| stored == v)
             .unwrap_or(false)
     })
 }
@@ -665,25 +697,48 @@ fn matches_pattern_props(node: &Node, props: &[(String, Literal)]) -> bool {
 struct MergeNodeOp {
     var: String,
     labels: Vec<String>,
-    properties: Vec<(String, Literal)>,
+    /// Pattern property expressions as they came from the planner. These
+    /// stay as `Expr` because evaluation needs `ExecCtx::params`, which
+    /// isn't available until `next()` is called.
+    properties: Vec<(String, Expr)>,
     initialized: bool,
     matched: Vec<Node>,
+    /// Resolved property values stashed by `scan()` so the create
+    /// branch in `next()` doesn't have to re-evaluate the expressions.
+    resolved_for_create: Option<Vec<(String, Property)>>,
     cursor: usize,
 }
 
 impl MergeNodeOp {
-    fn new(var: String, labels: Vec<String>, properties: Vec<(String, Literal)>) -> Self {
+    fn new(var: String, labels: Vec<String>, properties: Vec<(String, Expr)>) -> Self {
         Self {
             var,
             labels,
             properties,
             initialized: false,
             matched: Vec::new(),
+            resolved_for_create: None,
             cursor: 0,
         }
     }
 
     fn scan(&mut self, ctx: &ExecCtx) -> Result<()> {
+        // Evaluate the pattern property expressions (literals or
+        // parameters) once against an empty row + the per-query param
+        // map. The grammar guarantees no row references in pattern
+        // values, so an empty row is sufficient. `value_to_property`
+        // surfaces InvalidSetValue for Node/Edge values — a clear error
+        // when a caller tries to MERGE on a graph-typed parameter.
+        let empty = Row::new();
+        let resolved_props: Vec<(String, Property)> = self
+            .properties
+            .iter()
+            .map(|(k, expr)| {
+                let v = eval_expr(expr, &empty, ctx.params)?;
+                Ok((k.clone(), value_to_property(v)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         // Pick a candidate set: by-label index when one is given, else
         // a full node scan. Any extra labels beyond the first get filtered
         // per-node, mirroring NodeScanByLabelsOp.
@@ -695,12 +750,16 @@ impl MergeNodeOp {
         for id in candidate_ids {
             if let Some(node) = ctx.store.get_node(id)? {
                 if has_all_labels(&node, &self.labels)
-                    && matches_pattern_props(&node, &self.properties)
+                    && matches_pattern_props(&node, &resolved_props)
                 {
                     self.matched.push(node);
                 }
             }
         }
+
+        // Stash the resolved properties so the create branch in `next`
+        // doesn't have to re-evaluate them.
+        self.resolved_for_create = Some(resolved_props);
         Ok(())
     }
 }
@@ -719,8 +778,12 @@ impl Operator for MergeNodeOp {
                 for label in &self.labels {
                     node.labels.push(label.clone());
                 }
-                for (k, v) in &self.properties {
-                    node.properties.insert(k.clone(), literal_to_property(v));
+                let resolved = self
+                    .resolved_for_create
+                    .take()
+                    .expect("scan() populates resolved_for_create");
+                for (k, prop) in resolved {
+                    node.properties.insert(k, prop);
                 }
                 ctx.writer.put_node(&node)?;
                 self.matched.push(node);
@@ -1022,7 +1085,7 @@ impl FilterOp {
 impl Operator for FilterOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         while let Some(row) = self.input.next(ctx)? {
-            let v = eval_expr(&self.predicate, &row)?;
+            let v = eval_expr(&self.predicate, &row, ctx.params)?;
             if to_bool(&v)? {
                 return Ok(Some(row));
             }
@@ -1052,7 +1115,7 @@ impl Operator for ProjectOp {
                         .alias
                         .clone()
                         .unwrap_or_else(|| default_name(&item.expr, i));
-                    let value = eval_expr(&item.expr, &row)?;
+                    let value = eval_expr(&item.expr, &row, ctx.params)?;
                     out.insert(name, value);
                 }
                 Ok(Some(out))
@@ -1125,7 +1188,7 @@ impl Operator for OrderByOp {
             for row in rows {
                 let mut keys = Vec::with_capacity(self.sort_items.len());
                 for item in &self.sort_items {
-                    keys.push(eval_expr(&item.expr, &row)?);
+                    keys.push(eval_expr(&item.expr, &row, ctx.params)?);
                 }
                 keyed.push((keys, row));
             }
@@ -1188,7 +1251,7 @@ impl AggregateOp {
             saw_any = true;
             let mut key_values = Vec::with_capacity(self.group_keys.len());
             for item in &self.group_keys {
-                key_values.push(eval_expr(&item.expr, &row)?);
+                key_values.push(eval_expr(&item.expr, &row, ctx.params)?);
             }
             let mut hash_key = String::new();
             for v in &key_values {
@@ -1209,7 +1272,7 @@ impl AggregateOp {
             });
             for (i, spec) in self.aggregates.iter().enumerate() {
                 if let AggregateArg::DistinctExpr(expr) = &spec.arg {
-                    let v = eval_expr(expr, &row)?;
+                    let v = eval_expr(expr, &row, ctx.params)?;
                     if matches!(v, Value::Null) {
                         continue;
                     }
@@ -1219,7 +1282,7 @@ impl AggregateOp {
                         continue;
                     }
                 }
-                entry.agg_states[i].update(&spec.arg, &row)?;
+                entry.agg_states[i].update(&spec.arg, &row, ctx.params)?;
             }
         }
 
@@ -1313,12 +1376,12 @@ impl AggState {
         }
     }
 
-    fn update(&mut self, arg: &AggregateArg, row: &Row) -> Result<()> {
+    fn update(&mut self, arg: &AggregateArg, row: &Row, params: &ParamMap) -> Result<()> {
         match self {
             AggState::Count(c) => match arg {
                 AggregateArg::Star => *c += 1,
                 AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => {
-                    if !matches!(eval_expr(e, row)?, Value::Null) {
+                    if !matches!(eval_expr(e, row, params)?, Value::Null) {
                         *c += 1;
                     }
                 }
@@ -1328,7 +1391,7 @@ impl AggState {
                 float_part,
                 is_float,
             } => {
-                let v = expr_arg_value(arg, row)?;
+                let v = expr_arg_value(arg, row, params)?;
                 match v {
                     Value::Null => {}
                     Value::Property(Property::Int64(i)) => *int_part += i,
@@ -1340,7 +1403,7 @@ impl AggState {
                 }
             }
             AggState::Avg { total, count } => {
-                let v = expr_arg_value(arg, row)?;
+                let v = expr_arg_value(arg, row, params)?;
                 match v {
                     Value::Null => {}
                     Value::Property(Property::Int64(i)) => {
@@ -1355,7 +1418,7 @@ impl AggState {
                 }
             }
             AggState::Min(slot) => {
-                let v = expr_arg_value(arg, row)?;
+                let v = expr_arg_value(arg, row, params)?;
                 if let Value::Property(p) = v {
                     match slot {
                         None => *slot = Some(p),
@@ -1372,7 +1435,7 @@ impl AggState {
                 }
             }
             AggState::Max(slot) => {
-                let v = expr_arg_value(arg, row)?;
+                let v = expr_arg_value(arg, row, params)?;
                 if let Value::Property(p) = v {
                     match slot {
                         None => *slot = Some(p),
@@ -1389,7 +1452,7 @@ impl AggState {
                 }
             }
             AggState::Collect(items) => {
-                let v = expr_arg_value(arg, row)?;
+                let v = expr_arg_value(arg, row, params)?;
                 if !matches!(v, Value::Null) {
                     items.push(v);
                 }
@@ -1428,10 +1491,10 @@ impl AggState {
     }
 }
 
-fn expr_arg_value(arg: &AggregateArg, row: &Row) -> Result<Value> {
+fn expr_arg_value(arg: &AggregateArg, row: &Row, params: &ParamMap) -> Result<Value> {
     match arg {
         AggregateArg::Star => Err(Error::AggregateTypeError),
-        AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => eval_expr(e, row),
+        AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => eval_expr(e, row, params),
     }
 }
 

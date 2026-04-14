@@ -15,7 +15,8 @@
 
 use mesh_bolt::{BoltValue, TAG_NODE, TAG_RELATIONSHIP};
 use mesh_core::{Edge, Node, NodeId, Property};
-use mesh_executor::{Row, Value};
+use mesh_executor::{ParamMap, Row, Value};
+use std::collections::HashMap;
 
 /// Convert a single executor row into the `Vec<BoltValue>` that a
 /// Bolt `RECORD` message carries. Values are emitted in `fields`
@@ -142,4 +143,110 @@ fn fold_bytes(bytes: &[u8; 16]) -> i64 {
     i64::from_be_bytes([
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
     ])
+}
+
+/// Errors produced by the Bolt → executor value converters. Always
+/// surfaced to clients as `Mesh.ClientError.InvalidArgument` Bolt
+/// FAILUREs (or the equivalent gRPC `Status::invalid_argument`) since
+/// every variant indicates a bug in the driver-supplied params blob.
+#[derive(Debug, thiserror::Error)]
+pub enum ParamConversionError {
+    #[error("Bolt RUN params must be a Map, got {0}")]
+    NotAMap(&'static str),
+
+    #[error("parameter values cannot carry graph types ({0})")]
+    GraphValue(&'static str),
+
+    #[error("parameter values cannot carry raw bytes")]
+    Bytes,
+
+    #[error("nested map values must be primitives or lists, got node/edge")]
+    NestedGraphInMap,
+}
+
+/// Decode the `params: BoltValue` field from a Bolt `RUN` message into
+/// the executor's `ParamMap`. Rejects anything that isn't a top-level
+/// Map and surfaces conversion errors with a clear cause so driver
+/// authors can debug their bindings.
+pub fn bolt_params_to_param_map(params: &BoltValue) -> Result<ParamMap, ParamConversionError> {
+    let entries = match params {
+        BoltValue::Map(entries) => entries,
+        BoltValue::Null => return Ok(HashMap::new()),
+        BoltValue::Bool(_) => return Err(ParamConversionError::NotAMap("Bool")),
+        BoltValue::Int(_) => return Err(ParamConversionError::NotAMap("Int")),
+        BoltValue::Float(_) => return Err(ParamConversionError::NotAMap("Float")),
+        BoltValue::String(_) => return Err(ParamConversionError::NotAMap("String")),
+        BoltValue::Bytes(_) => return Err(ParamConversionError::NotAMap("Bytes")),
+        BoltValue::List(_) => return Err(ParamConversionError::NotAMap("List")),
+        BoltValue::Struct { .. } => return Err(ParamConversionError::NotAMap("Struct")),
+    };
+    let mut map = HashMap::with_capacity(entries.len());
+    for (k, v) in entries {
+        map.insert(k.clone(), bolt_value_to_value(v)?);
+    }
+    Ok(map)
+}
+
+/// Convert a single `BoltValue` into an executor `Value`. Lists become
+/// `Value::List`, primitive scalars become `Value::Property(...)`,
+/// nested maps become `Value::Property(Property::Map(...))` (because
+/// `Property::Map` is the only graph-shaped Property value). Bytes and
+/// graph structs are rejected — drivers should never send them as
+/// params.
+pub fn bolt_value_to_value(bv: &BoltValue) -> Result<Value, ParamConversionError> {
+    match bv {
+        BoltValue::Null => Ok(Value::Null),
+        BoltValue::Bool(b) => Ok(Value::Property(Property::Bool(*b))),
+        BoltValue::Int(i) => Ok(Value::Property(Property::Int64(*i))),
+        BoltValue::Float(f) => Ok(Value::Property(Property::Float64(*f))),
+        BoltValue::String(s) => Ok(Value::Property(Property::String(s.clone()))),
+        BoltValue::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(bolt_value_to_value(item)?);
+            }
+            Ok(Value::List(out))
+        }
+        BoltValue::Map(entries) => {
+            // Nested maps must collapse onto Property::Map, which only
+            // accepts Property values. Convert each entry through the
+            // Property-only converter to surface graph-shaped nesting.
+            let mut nested = HashMap::with_capacity(entries.len());
+            for (k, v) in entries {
+                nested.insert(k.clone(), bolt_value_to_property(v)?);
+            }
+            Ok(Value::Property(Property::Map(nested)))
+        }
+        BoltValue::Bytes(_) => Err(ParamConversionError::Bytes),
+        BoltValue::Struct { .. } => Err(ParamConversionError::GraphValue("Struct")),
+    }
+}
+
+/// Convert a `BoltValue` directly to a `Property`. Used for nested
+/// values inside `Property::Map`, where the map's value type is
+/// `Property` not `Value`. Rejects nested graph types.
+pub fn bolt_value_to_property(bv: &BoltValue) -> Result<Property, ParamConversionError> {
+    match bv {
+        BoltValue::Null => Ok(Property::Null),
+        BoltValue::Bool(b) => Ok(Property::Bool(*b)),
+        BoltValue::Int(i) => Ok(Property::Int64(*i)),
+        BoltValue::Float(f) => Ok(Property::Float64(*f)),
+        BoltValue::String(s) => Ok(Property::String(s.clone())),
+        BoltValue::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(bolt_value_to_property(item)?);
+            }
+            Ok(Property::List(out))
+        }
+        BoltValue::Map(entries) => {
+            let mut nested = HashMap::with_capacity(entries.len());
+            for (k, v) in entries {
+                nested.insert(k.clone(), bolt_value_to_property(v)?);
+            }
+            Ok(Property::Map(nested))
+        }
+        BoltValue::Bytes(_) => Err(ParamConversionError::Bytes),
+        BoltValue::Struct { .. } => Err(ParamConversionError::NestedGraphInMap),
+    }
 }

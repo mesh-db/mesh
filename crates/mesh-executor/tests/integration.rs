@@ -1,6 +1,6 @@
 use mesh_core::{Edge, Node, NodeId, Property};
 use mesh_cypher::{parse, plan};
-use mesh_executor::{execute, Row, Value};
+use mesh_executor::{execute, execute_with_reader, GraphReader, GraphWriter, ParamMap, Row, Value};
 use mesh_storage::Store;
 use tempfile::TempDir;
 
@@ -14,6 +14,21 @@ fn run(store: &Store, q: &str) -> Vec<Row> {
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
     let plan = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
     execute(&plan, store).unwrap_or_else(|e| panic!("exec {q}: {e}"))
+}
+
+/// Same as `run` but threads a `ParamMap` through to the executor —
+/// used by the `$param` tests below. The store acts as both the read
+/// source and the write sink.
+fn run_with_params(store: &Store, q: &str, params: &ParamMap) -> Vec<Row> {
+    let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+    let plan = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+    execute_with_reader(
+        &plan,
+        store as &dyn GraphReader,
+        store as &dyn GraphWriter,
+        params,
+    )
+    .unwrap_or_else(|e| panic!("exec {q}: {e}"))
 }
 
 fn str_prop(row: &Row, key: &str) -> String {
@@ -1760,4 +1775,151 @@ fn float_comparison_works() {
         Some(Value::Property(Property::Float64(f))) => assert!((*f - 3.14).abs() < 1e-9),
         other => panic!("{other:?}"),
     }
+}
+
+// --- Parameter execution -----------------------------------------------
+
+#[test]
+fn param_in_where_filter_only_returns_matches_above_min() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada', age: 20})");
+    run(&store, "CREATE (n:Person {name: 'Alan', age: 45})");
+    run(&store, "CREATE (n:Person {name: 'Grace', age: 85})");
+
+    let mut params = ParamMap::new();
+    params.insert("min".into(), Value::Property(Property::Int64(40)));
+
+    let rows = run_with_params(
+        &store,
+        "MATCH (n:Person) WHERE n.age > $min RETURN n.name AS name ORDER BY name",
+        &params,
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Alan", "Grace"]);
+}
+
+#[test]
+fn param_in_create_pattern_property() {
+    let (store, _d) = open_store();
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".into(),
+        Value::Property(Property::String("Ada".into())),
+    );
+    params.insert("age".into(), Value::Property(Property::Int64(37)));
+
+    run_with_params(
+        &store,
+        "CREATE (n:Person {name: $name, age: $age})",
+        &params,
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) RETURN n.name AS name, n.age AS age",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+    assert_eq!(int_prop(&rows[0], "age"), 37);
+}
+
+#[test]
+fn param_in_set_property_value() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada', age: 20})");
+
+    let mut params = ParamMap::new();
+    params.insert("new_age".into(), Value::Property(Property::Int64(99)));
+
+    run_with_params(
+        &store,
+        "MATCH (n:Person) SET n.age = $new_age RETURN n",
+        &params,
+    );
+
+    let rows = run(&store, "MATCH (n:Person) RETURN n.age AS age");
+    assert_eq!(int_prop(&rows[0], "age"), 99);
+}
+
+#[test]
+fn param_in_merge_pattern_match_branch() {
+    // Pre-create the node, then MERGE with the same param values —
+    // should return the existing node and not create a duplicate.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:User {handle: 'ada'})");
+
+    let mut params = ParamMap::new();
+    params.insert("h".into(), Value::Property(Property::String("ada".into())));
+
+    run_with_params(&store, "MERGE (n:User {handle: $h}) RETURN n", &params);
+
+    let rows = run(&store, "MATCH (n:User) RETURN n.handle AS h");
+    assert_eq!(rows.len(), 1, "MERGE must not create a duplicate");
+    assert_eq!(str_prop(&rows[0], "h"), "ada");
+}
+
+#[test]
+fn param_in_merge_pattern_create_branch() {
+    // Empty store — MERGE should mint a new node using the
+    // parameter's value as the property.
+    let (store, _d) = open_store();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "h".into(),
+        Value::Property(Property::String("grace".into())),
+    );
+
+    run_with_params(&store, "MERGE (n:User {handle: $h}) RETURN n", &params);
+
+    let rows = run(&store, "MATCH (n:User) RETURN n.handle AS h");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "h"), "grace");
+}
+
+#[test]
+fn unwind_param_list_returns_one_row_per_element() {
+    // Canonical batch-fan-out idiom. UNWIND'd row variables can't be
+    // used inside node-pattern property positions (the grammar
+    // restricts those to literal | parameter), so the row variable
+    // here is just RETURNed and the test asserts the executor binds
+    // each list element to it correctly.
+    let (store, _d) = open_store();
+
+    let items = Value::List(vec![
+        Value::Property(Property::Int64(1)),
+        Value::Property(Property::Int64(2)),
+        Value::Property(Property::Int64(3)),
+    ]);
+    let mut params = ParamMap::new();
+    params.insert("items".into(), items);
+
+    let rows = run_with_params(&store, "UNWIND $items AS x RETURN x ORDER BY x", &params);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(int_prop(&rows[0], "x"), 1);
+    assert_eq!(int_prop(&rows[1], "x"), 2);
+    assert_eq!(int_prop(&rows[2], "x"), 3);
+}
+
+#[test]
+fn unbound_parameter_errors_at_execute_time() {
+    // UNWIND with a $-reference forces eval_expr to run before any
+    // input is consumed, so the unbound-parameter error fires
+    // regardless of store state.
+    let (store, _d) = open_store();
+    let stmt = parse("UNWIND $missing AS x RETURN x").unwrap();
+    let plan = plan(&stmt).unwrap();
+    let empty = ParamMap::new();
+    let err = execute_with_reader(
+        &plan,
+        &store as &dyn GraphReader,
+        &store as &dyn GraphWriter,
+        &empty,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unbound parameter") && msg.contains("missing"),
+        "expected UnboundParameter error, got: {msg}"
+    );
 }

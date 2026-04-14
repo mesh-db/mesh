@@ -18,7 +18,7 @@
 //!     *         ──GOODBYE──> <close>
 //! ```
 
-use crate::value_conv::{field_names_from_rows, row_to_bolt_fields};
+use crate::value_conv::{bolt_params_to_param_map, field_names_from_rows, row_to_bolt_fields};
 use mesh_bolt::{
     perform_server_handshake, read_message, write_message, BoltError, BoltMessage, BoltValue,
     BOLT_4_4,
@@ -146,8 +146,25 @@ where
             }
 
             // -- Ready phase -------------------------------------------
-            (Phase::Ready, BoltMessage::Run { query, .. }) => {
-                match service.execute_cypher_local(query).await {
+            (Phase::Ready, BoltMessage::Run { query, params, .. }) => {
+                // Convert the driver-supplied params blob from Bolt's
+                // BoltValue tree into the executor's `ParamMap`. A
+                // malformed params blob (wrong shape, unsupported type)
+                // surfaces as a client-side FAILURE so the driver can
+                // report the bug clearly.
+                let param_map = match bolt_params_to_param_map(&params) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &failure("Mesh.ClientError.InvalidArgument", &e.to_string()),
+                        )
+                        .await?;
+                        phase = Phase::Failed;
+                        continue;
+                    }
+                };
+                match service.execute_cypher_local(query, param_map).await {
                     Ok(rows) => {
                         let fields = field_names_from_rows(&rows);
                         let success = BoltMessage::Success {

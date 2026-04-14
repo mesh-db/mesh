@@ -12,3 +12,8 @@ pub enum Value {
 }
 
 pub type Row = HashMap<String, Value>;
+
+/// Per-query parameter bindings, e.g. `$name → "Ada"`. Built once per
+/// `execute_with_reader` call and threaded through every `eval_expr`
+/// invocation so `Expr::Parameter(name)` resolves to a concrete value.
+pub type ParamMap = HashMap<String, Value>;

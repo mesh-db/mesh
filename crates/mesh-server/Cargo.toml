@@ -21,6 +21,7 @@ mesh-rpc = { path = "../mesh-rpc" }
 mesh-bolt = { path = "../mesh-bolt" }
 mesh-executor = { path = "../mesh-executor" }
 anyhow = "1"
+thiserror = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 toml = "0.8"

@@ -1,18 +1,22 @@
 use crate::{
     error::{Error, Result},
-    value::{Row, Value},
+    value::{ParamMap, Row, Value},
 };
 use mesh_core::Property;
 use mesh_cypher::{CallArgs, CompareOp, Expr, Literal};
 use std::cmp::Ordering;
 
-pub(crate) fn eval_expr(expr: &Expr, row: &Row) -> Result<Value> {
+pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Value> {
     match expr {
         Expr::Literal(lit) => Ok(literal_to_value(lit)),
         Expr::Identifier(name) => row
             .get(name)
             .cloned()
             .ok_or_else(|| Error::UnboundVariable(name.clone())),
+        Expr::Parameter(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::UnboundParameter(name.clone())),
         Expr::Property { var, key } => {
             let bound = row
                 .get(var)
@@ -34,35 +38,35 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row) -> Result<Value> {
             }
         }
         Expr::Not(inner) => {
-            let v = eval_expr(inner, row)?;
+            let v = eval_expr(inner, row, params)?;
             Ok(Value::Property(Property::Bool(!to_bool(&v)?)))
         }
         Expr::And(a, b) => {
-            let va = to_bool(&eval_expr(a, row)?)?;
+            let va = to_bool(&eval_expr(a, row, params)?)?;
             if !va {
                 return Ok(Value::Property(Property::Bool(false)));
             }
-            let vb = to_bool(&eval_expr(b, row)?)?;
+            let vb = to_bool(&eval_expr(b, row, params)?)?;
             Ok(Value::Property(Property::Bool(vb)))
         }
         Expr::Or(a, b) => {
-            let va = to_bool(&eval_expr(a, row)?)?;
+            let va = to_bool(&eval_expr(a, row, params)?)?;
             if va {
                 return Ok(Value::Property(Property::Bool(true)));
             }
-            let vb = to_bool(&eval_expr(b, row)?)?;
+            let vb = to_bool(&eval_expr(b, row, params)?)?;
             Ok(Value::Property(Property::Bool(vb)))
         }
         Expr::Compare { op, left, right } => {
-            let vl = eval_expr(left, row)?;
-            let vr = eval_expr(right, row)?;
+            let vl = eval_expr(left, row, params)?;
+            let vr = eval_expr(right, row, params)?;
             Ok(Value::Property(Property::Bool(compare(*op, &vl, &vr)?)))
         }
-        Expr::Call { name, args } => call_scalar(name, args, row),
+        Expr::Call { name, args } => call_scalar(name, args, row, params),
         Expr::List(items) => {
             let mut out = Vec::with_capacity(items.len());
             for e in items {
-                out.push(eval_expr(e, row)?);
+                out.push(eval_expr(e, row, params)?);
             }
             Ok(Value::List(out))
         }
@@ -72,21 +76,21 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row) -> Result<Value> {
             else_expr,
         } => {
             let scrutinee_val = match scrutinee {
-                Some(e) => Some(eval_expr(e, row)?),
+                Some(e) => Some(eval_expr(e, row, params)?),
                 None => None,
             };
             for (cond, result) in branches {
-                let cond_val = eval_expr(cond, row)?;
+                let cond_val = eval_expr(cond, row, params)?;
                 let matched = match &scrutinee_val {
                     Some(sv) => case_equals(sv, &cond_val),
                     None => to_bool(&cond_val).unwrap_or(false),
                 };
                 if matched {
-                    return eval_expr(result, row);
+                    return eval_expr(result, row, params);
                 }
             }
             match else_expr {
-                Some(e) => eval_expr(e, row),
+                Some(e) => eval_expr(e, row, params),
                 None => Ok(Value::Null),
             }
         }
@@ -96,7 +100,7 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row) -> Result<Value> {
             predicate,
             projection,
         } => {
-            let source_val = eval_expr(source, row)?;
+            let source_val = eval_expr(source, row, params)?;
             let items = match source_val {
                 Value::List(items) => items,
                 Value::Property(Property::List(props)) => {
@@ -112,13 +116,13 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row) -> Result<Value> {
             for item in items {
                 scratch.insert(var.clone(), item);
                 if let Some(pred) = predicate {
-                    let pv = eval_expr(pred, &scratch)?;
+                    let pv = eval_expr(pred, &scratch, params)?;
                     if !to_bool(&pv).unwrap_or(false) {
                         continue;
                     }
                 }
                 let projected = match projection {
-                    Some(p) => eval_expr(p, &scratch)?,
+                    Some(p) => eval_expr(p, &scratch, params)?,
                     None => scratch.get(var).cloned().unwrap_or(Value::Null),
                 };
                 out.push(projected);
@@ -143,7 +147,7 @@ fn case_equals(a: &Value, b: &Value) -> bool {
     a == b
 }
 
-fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
+fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Result<Value> {
     let arg_exprs = match args {
         CallArgs::Star => return Err(Error::UnknownScalarFunction(format!("{}(*)", name))),
         CallArgs::Exprs(e) => e.as_slice(),
@@ -156,7 +160,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
     };
     match name.to_ascii_lowercase().as_str() {
         "size" | "length" => {
-            let v = single_arg(name, arg_exprs, row)?;
+            let v = single_arg(name, arg_exprs, row, params)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::List(items) => Ok(Value::Property(Property::Int64(items.len() as i64))),
@@ -170,7 +174,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             }
         }
         "labels" => {
-            let v = single_arg(name, arg_exprs, row)?;
+            let v = single_arg(name, arg_exprs, row, params)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Node(n) => Ok(Value::List(
@@ -183,7 +187,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             }
         }
         "keys" => {
-            let v = single_arg(name, arg_exprs, row)?;
+            let v = single_arg(name, arg_exprs, row, params)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Node(n) => {
@@ -208,7 +212,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             }
         }
         "type" => {
-            let v = single_arg(name, arg_exprs, row)?;
+            let v = single_arg(name, arg_exprs, row, params)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Edge(e) => Ok(Value::Property(Property::String(e.edge_type))),
@@ -216,7 +220,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             }
         }
         "tolower" => {
-            let v = single_arg(name, arg_exprs, row)?;
+            let v = single_arg(name, arg_exprs, row, params)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::String(s)) => {
@@ -226,7 +230,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             }
         }
         "toupper" => {
-            let v = single_arg(name, arg_exprs, row)?;
+            let v = single_arg(name, arg_exprs, row, params)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::String(s)) => {
@@ -236,11 +240,11 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
             }
         }
         "tostring" => {
-            let v = single_arg(name, arg_exprs, row)?;
+            let v = single_arg(name, arg_exprs, row, params)?;
             Ok(value_to_string(v))
         }
         "tointeger" => {
-            let v = single_arg(name, arg_exprs, row)?;
+            let v = single_arg(name, arg_exprs, row, params)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::Int64(i)) => Ok(Value::Property(Property::Int64(i))),
@@ -264,7 +268,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
                 ));
             }
             for e in arg_exprs {
-                let v = eval_expr(e, row)?;
+                let v = eval_expr(e, row, params)?;
                 let is_null = matches!(v, Value::Null | Value::Property(Property::Null));
                 if !is_null {
                     return Ok(v);
@@ -276,7 +280,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row) -> Result<Value> {
     }
 }
 
-fn single_arg(name: &str, args: &[Expr], row: &Row) -> Result<Value> {
+fn single_arg(name: &str, args: &[Expr], row: &Row, params: &ParamMap) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::UnknownScalarFunction(format!(
             "{} expects 1 argument, got {}",
@@ -284,7 +288,7 @@ fn single_arg(name: &str, args: &[Expr], row: &Row) -> Result<Value> {
             args.len()
         )));
     }
-    eval_expr(&args[0], row)
+    eval_expr(&args[0], row, params)
 }
 
 fn value_to_string(v: Value) -> Value {
@@ -393,16 +397,6 @@ fn literal_to_value(lit: &Literal) -> Value {
         Literal::Float(f) => Value::Property(Property::Float64(*f)),
         Literal::Boolean(b) => Value::Property(Property::Bool(*b)),
         Literal::Null => Value::Null,
-    }
-}
-
-pub(crate) fn literal_to_property(lit: &Literal) -> Property {
-    match lit {
-        Literal::String(s) => Property::String(s.clone()),
-        Literal::Integer(i) => Property::Int64(*i),
-        Literal::Float(f) => Property::Float64(*f),
-        Literal::Boolean(b) => Property::Bool(*b),
-        Literal::Null => Property::Null,
     }
 }
 

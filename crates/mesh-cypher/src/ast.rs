@@ -71,11 +71,11 @@ pub enum SetItem {
     },
     Replace {
         var: String,
-        properties: Vec<(String, Literal)>,
+        properties: Vec<(String, Expr)>,
     },
     Merge {
         var: String,
-        properties: Vec<(String, Literal)>,
+        properties: Vec<(String, Expr)>,
     },
 }
 
@@ -122,7 +122,11 @@ pub enum Direction {
 pub struct NodePattern {
     pub var: Option<String>,
     pub labels: Vec<String>,
-    pub properties: Vec<(String, Literal)>,
+    /// Property entries from the pattern's `{key: value}` map. The
+    /// grammar restricts `value` to literals or parameters (see
+    /// `property_value` in cypher.pest), so every Expr here is either
+    /// `Expr::Literal` or `Expr::Parameter`.
+    pub properties: Vec<(String, Expr)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +139,9 @@ pub struct ReturnItem {
 pub enum Expr {
     Literal(Literal),
     Identifier(String),
+    /// `$name` or `$0` — value is bound at execute time from the
+    /// per-query parameter map.
+    Parameter(String),
     Property {
         var: String,
         key: String,

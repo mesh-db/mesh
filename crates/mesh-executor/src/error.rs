@@ -8,6 +8,9 @@ pub enum Error {
     #[error("unbound variable: {0}")]
     UnboundVariable(String),
 
+    #[error("unbound parameter: ${0}")]
+    UnboundParameter(String),
+
     #[error("expected boolean value")]
     NotBoolean,
 
