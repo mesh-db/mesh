@@ -31,6 +31,14 @@ pub struct ServerConfig {
     /// single-node (empty peers) deployments.
     #[serde(default)]
     pub bootstrap: bool,
+
+    /// Optional address for the Bolt protocol listener (e.g.
+    /// `127.0.0.1:7687`). When present, the server additionally binds a
+    /// Bolt 4.4-speaking listener on this address alongside the gRPC
+    /// one, so Neo4j drivers and cypher-shell can connect directly.
+    /// Omit or set to `None` to disable Bolt entirely.
+    #[serde(default)]
+    pub bolt_address: Option<String>,
 }
 
 fn default_num_partitions() -> u32 {

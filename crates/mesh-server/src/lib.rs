@@ -1,4 +1,6 @@
+pub mod bolt;
 pub mod config;
+pub mod value_conv;
 
 use anyhow::{anyhow, Context, Result};
 use config::ServerConfig;
@@ -168,6 +170,26 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         raft_service,
     } = components;
 
+    // Optional Bolt listener. Binds before we start the gRPC server so
+    // that a port-in-use error at startup is immediately fatal rather
+    // than surfacing only on the first Bolt client connection.
+    let service_arc = Arc::new(service.clone());
+    let bolt_task = if let Some(bolt_addr) = config.bolt_address.as_ref() {
+        let bolt_listener = TcpListener::bind(bolt_addr)
+            .await
+            .with_context(|| format!("binding bolt {}", bolt_addr))?;
+        let bolt_local = bolt_listener.local_addr()?;
+        tracing::info!(addr = %bolt_local, "mesh-server bolt listening");
+        let bolt_service = service_arc.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = bolt::run_listener(bolt_listener, bolt_service).await {
+                tracing::error!(error = %e, "bolt listener exited");
+            }
+        }))
+    } else {
+        None
+    };
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let server_task = tokio::spawn(async move {
@@ -207,6 +229,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
 
     tokio::signal::ctrl_c().await.ok();
     let _ = shutdown_tx.send(());
+
+    if let Some(handle) = bolt_task {
+        handle.abort();
+        let _ = handle.await;
+    }
 
     match server_task.await {
         Ok(result) => result?,
