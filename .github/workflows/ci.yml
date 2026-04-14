@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs when a new commit lands on the same branch / PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on any compiler warning. The workspace is currently
+  # warning-clean; flip this off if a dependency update introduces noise
+  # you want to land before fixing.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        # rust-rocksdb uses bindgen, which needs libclang at build time.
+        # protoc is vendored through `protoc-bin-vendored` in mesh-rpc's
+        # build.rs, so we deliberately don't install protoc here.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        # Caches ~/.cargo/{registry,git} and target/ keyed on the
+        # Cargo.toml + Cargo.lock hashes. Cuts cold-build time from
+        # minutes to seconds on subsequent runs.
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (including tests)
+        run: cargo build --workspace --all-targets
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets
