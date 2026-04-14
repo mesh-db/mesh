@@ -11,7 +11,7 @@ mesh-storage = { path = "../mesh-storage" }
 mesh-cypher = { path = "../mesh-cypher" }
 mesh-executor = { path = "../mesh-executor" }
 mesh-cluster = { path = "../mesh-cluster" }
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.9", features = ["serde", "loosen-follower-log-revert"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tonic = "0.12"

@@ -972,6 +972,240 @@ async fn cypher_create_replicates_through_raft_to_follower() {
 }
 
 #[tokio::test]
+async fn wiped_follower_catches_up_via_install_snapshot() {
+    // The end-to-end snapshot catch-up payoff: a follower can be wiped
+    // entirely (data_dir gone — no log, no vote, no state machine state,
+    // no graph data) and rejoin the cluster purely through an InstallSnapshot
+    // RPC from the leader. Locks in:
+    //   - leader auto-snapshots fire and compact older log entries
+    //   - the snapshot wire format (PersistedSnapshot) carries graph data
+    //   - StoreGraphApplier::restore wipes + repopulates the local store
+    //   - the wiped follower's metrics show a received snapshot AND it
+    //     serves correct reads for nodes created before the wipe
+
+    struct RunningPeer {
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        join: tokio::task::JoinHandle<()>,
+    }
+    fn spawn_peer(listener: TcpListener, components: ServerComponents) -> RunningPeer {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let ServerComponents {
+            service,
+            raft: _,
+            raft_service,
+        } = components;
+        let raft_service = raft_service.unwrap();
+        let join = tokio::spawn(async move {
+            let shutdown = async {
+                let _ = shutdown_rx.await;
+            };
+            Server::builder()
+                .add_service(service.clone().into_query_server())
+                .add_service(service.into_write_server())
+                .add_service(raft_service.into_server())
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    shutdown,
+                )
+                .await
+                .unwrap();
+        });
+        RunningPeer {
+            shutdown: shutdown_tx,
+            join,
+        }
+    }
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b1 = TempDir::new().unwrap();
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        PeerConfig {
+            id: 1,
+            address: addr_a.to_string(),
+        },
+        PeerConfig {
+            id: 2,
+            address: addr_b.to_string(),
+        },
+    ];
+    let config_a = ServerConfig {
+        self_id: 1,
+        listen_address: addr_a.to_string(),
+        data_dir: dir_a.path().to_path_buf(),
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap: true,
+    };
+    let config_b1 = ServerConfig {
+        self_id: 2,
+        listen_address: addr_b.to_string(),
+        data_dir: dir_b1.path().to_path_buf(),
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap: false,
+    };
+
+    let components_a = mesh_server::build_components(&config_a).await.unwrap();
+    let components_b = mesh_server::build_components(&config_b1).await.unwrap();
+    let raft_a = components_a.raft.clone().unwrap();
+    let raft_b1 = components_b.raft.clone().unwrap();
+
+    let _peer_a = spawn_peer(listener_a, components_a);
+    let peer_b1 = spawn_peer(listener_b, components_b);
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    mesh_server::initialize_if_seed(&config_a, &raft_a)
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if raft_a.raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+
+    // Pre-wipe writes: 25 nodes via Cypher. Tagged with a label so we can
+    // count them post-restore via nodes_by_label, plus we capture the
+    // first node's id to verify a specific entity round-trips.
+    let mut query_a = MeshQueryClient::connect(format!("http://{}", addr_a))
+        .await
+        .unwrap();
+    let mut writer_a = MeshWriteClient::connect(format!("http://{}", addr_a))
+        .await
+        .unwrap();
+
+    // Use a direct PutNode for the first one so we know its id (the
+    // executor mints fresh ids that we'd have to parse out of returned
+    // rows otherwise).
+    let pinned = Node::new()
+        .with_label("Marker")
+        .with_property("name", "pinned");
+    let pinned_id = pinned.id;
+    writer_a
+        .put_node(PutNodeRequest {
+            node: Some(node_to_proto(&pinned).unwrap()),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+
+    for i in 0..24 {
+        query_a
+            .execute_cypher(ExecuteCypherRequest {
+                query: format!("CREATE (n:Marker {{idx: {i}}}) RETURN n"),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Wait until the leader has built an auto-snapshot. With
+    // snapshot_policy = LogsSinceLast(16) and ~25 commits this fires once.
+    let mut leader_snapshot = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(snap) = raft_a.raft.metrics().borrow().snapshot {
+            leader_snapshot = Some(snap);
+            break;
+        }
+    }
+    assert!(
+        leader_snapshot.is_some(),
+        "leader should auto-snapshot before wiping the follower"
+    );
+
+    // Shut down peer B fully so its rocksdb file lock is released.
+    raft_b1.raft.shutdown().await.unwrap();
+    peer_b1.shutdown.send(()).unwrap();
+    peer_b1.join.await.unwrap();
+    drop(raft_b1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Wipe: drop the old data_dir, allocate a brand-new one. Restart B
+    // against the new (empty) directory but the same listen address so
+    // peer A's GrpcNetwork channel reconnects transparently.
+    drop(dir_b1);
+    let dir_b2 = TempDir::new().unwrap();
+    let config_b2 = ServerConfig {
+        self_id: 2,
+        listen_address: addr_b.to_string(),
+        data_dir: dir_b2.path().to_path_buf(),
+        num_partitions: 4,
+        peers,
+        bootstrap: false,
+    };
+
+    let listener_b2 = TcpListener::bind(addr_b).await.unwrap();
+    let components_b2 = mesh_server::build_components(&config_b2).await.unwrap();
+    let raft_b2 = components_b2.raft.clone().unwrap();
+    let _peer_b2 = spawn_peer(listener_b2, components_b2);
+
+    // The restarted B starts with an empty log. The leader's next
+    // AppendEntries hits a follower whose next_index is below A's
+    // purged log range, so openraft falls back to InstallSnapshot. Wait
+    // for B's metrics to reflect a received snapshot — that's the
+    // mechanism we're locking in.
+    let mut received_snapshot = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if raft_b2.raft.metrics().borrow().snapshot.is_some() {
+            received_snapshot = true;
+            break;
+        }
+    }
+    assert!(
+        received_snapshot,
+        "wiped follower should receive an InstallSnapshot from the leader"
+    );
+
+    // The pinned node from before the wipe should now be visible on B
+    // via a local GetNode — proving applier.restore wiped + repopulated
+    // the graph store with the snapshot's payload.
+    let mut query_b = MeshQueryClient::connect(format!("http://{}", addr_b))
+        .await
+        .unwrap();
+    let mut found_pinned = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let resp = query_b
+            .get_node(GetNodeRequest {
+                id: Some(uuid_to_proto(pinned_id.as_uuid())),
+            })
+            .await
+            .unwrap();
+        if resp.into_inner().found {
+            found_pinned = true;
+            break;
+        }
+    }
+    assert!(
+        found_pinned,
+        "wiped follower should serve the pinned node after snapshot install"
+    );
+
+    // And a Cypher MATCH should see most of the Markers (some may have
+    // been written after the snapshot and replayed via AppendEntries).
+    let resp = query_b
+        .execute_cypher(ExecuteCypherRequest {
+            query: "MATCH (n:Marker) RETURN n".into(),
+        })
+        .await
+        .unwrap();
+    let rows: serde_json::Value =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    let count = rows.as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(
+        count >= 20,
+        "wiped follower should rebuild most of the graph from snapshot + tail-of-log replay, got {count}"
+    );
+}
+
+#[tokio::test]
 async fn auto_snapshot_fires_and_persists_graph_data() {
     // Helper local to this test — spawns the server with a shutdown
     // channel so we can fully release the rocksdb file lock and reopen

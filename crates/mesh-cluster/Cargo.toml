@@ -7,7 +7,7 @@ description = "Cluster membership and partitioning for Mesh"
 
 [dependencies]
 mesh-core = { path = "../mesh-core" }
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.9", features = ["serde", "loosen-follower-log-revert"] }
 rocksdb = "0.23"
 async-trait = "0.1"
 serde = { workspace = true }
