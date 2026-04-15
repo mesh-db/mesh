@@ -400,63 +400,128 @@ fn pattern_exists(pattern: &Pattern, ctx: &EvalCtx) -> Result<bool> {
 /// Check whether `EXISTS { MATCH pattern [WHERE expr] }` has
 /// any satisfying assignment given the outer row's bindings.
 ///
-/// Structurally a correlated subquery: walk the pattern
-/// collecting candidate `(edge, target)` pairs at each hop,
-/// materialize each complete binding as a scratch row (outer
-/// row plus the inner pattern bindings), and evaluate the
-/// optional `where_clause` against it. Returns `true` on the
-/// first assignment where the pattern matches and the WHERE
-/// evaluates truthy.
+/// Structurally a correlated-or-uncorrelated subquery:
+/// 1. Resolve the set of start-node candidates. If the pattern's
+///    start var is already bound in the outer row, there's
+///    exactly one candidate. Otherwise enumerate the graph
+///    (via a label index when available, else a full scan).
+/// 2. For each candidate, walk the pattern collecting
+///    `(edge, target)` pairs at each hop, materialize each
+///    complete binding as a scratch row, and evaluate the
+///    optional `where_clause` against it.
+/// 3. Return `true` on the first candidate × binding where the
+///    pattern matches and the WHERE evaluates truthy.
+///
+/// Uncorrelated EXISTS fires when the start var is `None` (the
+/// pattern has an anonymous start node) or when the named start
+/// var isn't present in the outer row. That's the
+/// `EXISTS { MATCH (:Person) }` and
+/// `EXISTS { MATCH (a:Person)-[:KNOWS]->(b) }` shapes — uses
+/// that don't reference any outer binding.
 ///
 /// Compared to [`pattern_exists`], this version can't early-
-/// stop on the first complete walk — it needs to hold each
-/// candidate's full binding state long enough to evaluate
-/// WHERE. The frontier therefore carries `(node, scratch_row)`
-/// pairs instead of just node ids.
+/// stop on the first complete walk per candidate — it needs to
+/// hold each candidate's full binding state long enough to
+/// evaluate WHERE. The frontier therefore carries
+/// `(node, scratch_row)` pairs instead of just node ids.
 fn exists_subquery_matches(
     pattern: &Pattern,
     where_clause: Option<&Expr>,
     ctx: &EvalCtx,
 ) -> Result<bool> {
-    let start_var = pattern
-        .start
-        .var
-        .as_ref()
-        .expect("planner guarantees bound start var for exists subqueries");
-    let start_node = match ctx.row.get(start_var) {
-        Some(Value::Node(n)) => n.clone(),
-        _ => return Ok(false),
-    };
-    if !start_node_matches(&start_node, &pattern.start, ctx)? {
-        return Ok(false);
-    }
+    let start_candidates = resolve_exists_start_candidates(&pattern.start, ctx)?;
+    for start_node in start_candidates {
+        if !start_node_matches(&start_node, &pattern.start, ctx)? {
+            continue;
+        }
 
-    // Zero-hop patterns: no frontier to walk; run the WHERE
-    // (if any) against the outer row alone.
-    if pattern.hops.is_empty() {
-        return match where_clause {
-            None => Ok(true),
-            Some(w) => {
-                let v = eval_expr(w, ctx)?;
-                Ok(to_bool(&v).unwrap_or(false))
-            }
-        };
-    }
-
-    // Seed frontier: one entry carrying the start node and a
-    // scratch row cloned from the outer row. Each hop extends
-    // both the frontier nodes and the bindings visible to the
-    // WHERE clause.
-    let mut frontier: Vec<(mesh_core::Node, Row)> = Vec::new();
-    {
+        // Build the seed scratch row, binding the start var if
+        // the pattern names one. Uncorrelated anonymous-start
+        // patterns don't leak any new binding into the row.
         let mut seed = ctx.row.clone();
-        seed.insert(start_var.clone(), Value::Node(start_node.clone()));
-        frontier.push((start_node, seed));
-    }
+        if let Some(start_var) = &pattern.start.var {
+            seed.insert(start_var.clone(), Value::Node(start_node.clone()));
+        }
 
+        // Zero-hop patterns: no frontier to walk. With no WHERE
+        // the mere existence of a matching start node is enough;
+        // with a WHERE we evaluate it against the seed.
+        if pattern.hops.is_empty() {
+            match where_clause {
+                None => return Ok(true),
+                Some(w) => {
+                    let sub_ctx = ctx.with_row(&seed);
+                    let v = eval_expr(w, &sub_ctx)?;
+                    if to_bool(&v).unwrap_or(false) {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Multi-hop: walk the frontier from this candidate,
+        // collecting every complete binding that matches the
+        // pattern shape, then check each against WHERE.
+        let mut frontier: Vec<(mesh_core::Node, Row)> = vec![(start_node.clone(), seed)];
+        if walk_exists_hops(pattern, where_clause, &mut frontier, ctx)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Compute the list of candidate start nodes for an
+/// `EXISTS { ... }` subquery. Correlated case (start var
+/// bound in outer row) returns a singleton; uncorrelated case
+/// enumerates the graph — preferring a label index when the
+/// pattern carries a label, otherwise falling back to
+/// `all_node_ids`.
+fn resolve_exists_start_candidates(
+    start: &NodePattern,
+    ctx: &EvalCtx,
+) -> Result<Vec<mesh_core::Node>> {
+    // Correlated: the outer row already has this variable
+    // bound to a Node. Return it as the sole candidate so the
+    // walk downstream sees the correlation constraint.
+    if let Some(var) = &start.var {
+        if let Some(Value::Node(n)) = ctx.row.get(var) {
+            return Ok(vec![n.clone()]);
+        }
+    }
+    // Uncorrelated: enumerate from the graph. Prefer a label
+    // index when available — most real EXISTS patterns carry a
+    // label and this is much cheaper than a full scan. The
+    // per-node `start_node_matches` check in the caller handles
+    // pattern properties and any additional labels.
+    let ids = match start.labels.first() {
+        Some(label) => ctx.reader.nodes_by_label(label)?,
+        None => ctx.reader.all_node_ids()?,
+    };
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(n) = ctx.reader.get_node(id)? {
+            out.push(n);
+        }
+    }
+    Ok(out)
+}
+
+/// Walk the hops of a subquery pattern from a single seeded
+/// frontier entry. Returns `true` on the first complete binding
+/// where `where_clause` (or `None`) evaluates truthy; returns
+/// `false` otherwise. Used only by `exists_subquery_matches` —
+/// extracted so the outer loop can iterate start candidates
+/// without duplicating the frontier-walk logic.
+fn walk_exists_hops(
+    pattern: &Pattern,
+    where_clause: Option<&Expr>,
+    frontier: &mut Vec<(mesh_core::Node, Row)>,
+    ctx: &EvalCtx,
+) -> Result<bool> {
     for hop in &pattern.hops {
         let mut next: Vec<(mesh_core::Node, Row)> = Vec::new();
-        for (node, row) in &frontier {
+        for (node, row) in frontier.iter() {
             let neighbors = match hop.rel.direction {
                 Direction::Outgoing => ctx.reader.outgoing(node.id)?,
                 Direction::Incoming => ctx.reader.incoming(node.id)?,
@@ -543,7 +608,7 @@ fn exists_subquery_matches(
         if next.is_empty() {
             return Ok(false);
         }
-        frontier = next;
+        *frontier = next;
     }
 
     // Every frontier entry now represents a complete walk
@@ -553,7 +618,7 @@ fn exists_subquery_matches(
     match where_clause {
         None => Ok(true),
         Some(w) => {
-            for (_, row) in &frontier {
+            for (_, row) in frontier.iter() {
                 let sub_ctx = ctx.with_row(row);
                 let v = eval_expr(w, &sub_ctx)?;
                 if to_bool(&v).unwrap_or(false) {

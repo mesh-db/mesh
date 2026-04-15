@@ -368,7 +368,7 @@ fn validate_pattern_predicates(plan: &LogicalPlan) -> Result<()> {
                 validate_pattern_predicate(pattern)?;
             }
             if let Expr::ExistsSubquery { pattern, .. } = e {
-                validate_pattern_predicate(pattern)?;
+                validate_exists_pattern(pattern)?;
             }
             Ok(())
         })
@@ -395,6 +395,36 @@ fn validate_pattern_predicate(pattern: &Pattern) -> Result<()> {
         if hop.rel.var_length.is_some() {
             return Err(Error::Plan(
                 "variable-length hops (`*`) are not supported inside pattern predicates".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Looser version of [`validate_pattern_predicate`] for
+/// `EXISTS { ... }` subqueries. Relaxes two restrictions that
+/// apply to pattern predicates but aren't required by EXISTS:
+///
+/// - **Start var may be unnamed or unbound.** Uncorrelated
+///   `EXISTS { MATCH (:Person) }` is valid — the evaluator
+///   enumerates start candidates via the graph reader.
+/// - **Zero-hop patterns are allowed.** `EXISTS { MATCH (:Person) }`
+///   reduces to "does any Person node exist?"; there's no hop
+///   to walk.
+///
+/// Everything else (no path variables, no variable-length hops)
+/// is still rejected — those are v1 evaluator limitations
+/// rather than semantic restrictions.
+fn validate_exists_pattern(pattern: &Pattern) -> Result<()> {
+    if pattern.path_var.is_some() {
+        return Err(Error::Plan(
+            "path variable binding is not allowed inside EXISTS { ... }".into(),
+        ));
+    }
+    for hop in &pattern.hops {
+        if hop.rel.var_length.is_some() {
+            return Err(Error::Plan(
+                "variable-length hops (`*`) are not supported inside EXISTS { ... }".into(),
             ));
         }
     }

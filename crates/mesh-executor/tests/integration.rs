@@ -4714,3 +4714,148 @@ fn duration_bare_p_errors() {
     let err = mesh_executor::execute(&plan, &store).unwrap_err();
     assert!(format!("{err}").contains("ISO 8601"));
 }
+
+// ---- Uncorrelated EXISTS { ... } ----
+
+#[test]
+fn uncorrelated_exists_zero_hop_label_match() {
+    // `EXISTS { MATCH (:Person) }` — does any Person exist?
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Company {name: 'Acme'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (c:Company) WHERE EXISTS { MATCH (:Person) } RETURN c.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Acme");
+}
+
+#[test]
+fn uncorrelated_exists_zero_hop_no_match() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Company {name: 'Acme'})");
+    // No Persons in the graph.
+    let rows = run(
+        &store,
+        "MATCH (c:Company) WHERE EXISTS { MATCH (:Person) } RETURN c.name AS name",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn uncorrelated_exists_with_property_filter() {
+    // `EXISTS { MATCH (:Person {name: 'Ada'}) }` — does a Person
+    // named Ada exist? Uses the pattern-property filter, which
+    // the evaluator applies to each candidate via
+    // `start_node_matches`.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Bob'}), (:Company {name: 'Acme'})",
+    );
+    // Ada doesn't exist → EXISTS is false → no rows.
+    let rows = run(
+        &store,
+        "MATCH (c:Company) WHERE EXISTS { MATCH (:Person {name: 'Ada'}) } RETURN c.name AS name",
+    );
+    assert!(rows.is_empty());
+
+    // After adding Ada, EXISTS is true.
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (c:Company) WHERE EXISTS { MATCH (:Person {name: 'Ada'}) } RETURN c.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn uncorrelated_exists_multi_hop() {
+    // Pattern starts with an unbound var `a` but walks into a
+    // multi-hop chain. The evaluator enumerates Person
+    // candidates and tries to walk each through the hops.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    // A Company row is used as the outer scope; the EXISTS
+    // subquery doesn't reference anything from the outer row.
+    run(&store, "CREATE (:Company {name: 'Acme'})");
+    let rows = run(
+        &store,
+        "MATCH (c:Company) \
+         WHERE EXISTS { MATCH (a:Person)-[:KNOWS]->(b:Person) } \
+         RETURN c.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Acme");
+}
+
+#[test]
+fn uncorrelated_not_exists_excludes_when_match_present() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Company {name: 'Acme'})",
+    );
+    // `NOT EXISTS { MATCH (:Person) }` — no rows because a Person exists.
+    let rows = run(
+        &store,
+        "MATCH (c:Company) WHERE NOT EXISTS { MATCH (:Person) } RETURN c.name AS name",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn uncorrelated_exists_with_inner_where() {
+    // Pattern has no outer-row correlation but the inner WHERE
+    // references the enumerated start binding. Verifies the
+    // scratch row picks up the start var when it's named.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada', age: 17}), (:Person {name: 'Bob', age: 42}), (:Company {name: 'Acme'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (c:Company) \
+         WHERE EXISTS { MATCH (p:Person) WHERE p.age >= 30 } \
+         RETURN c.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Acme");
+}
+
+#[test]
+fn uncorrelated_exists_inner_where_no_match() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada', age: 17}), (:Person {name: 'Bob', age: 20}), (:Company {name: 'Acme'})",
+    );
+    // Nobody's 30+ → EXISTS false → no rows.
+    let rows = run(
+        &store,
+        "MATCH (c:Company) \
+         WHERE EXISTS { MATCH (p:Person) WHERE p.age >= 30 } \
+         RETURN c.name AS name",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn zero_hop_exists_was_previously_rejected_now_allowed() {
+    // Regression assertion: the pre-uncorrelated validator
+    // required `hops.len() >= 1`. After the split, zero-hop
+    // EXISTS patterns plan successfully.
+    let parsed = mesh_cypher::parse("MATCH (c) WHERE EXISTS { MATCH (:Person) } RETURN c").unwrap();
+    let _plan = mesh_cypher::plan(&parsed).expect("zero-hop EXISTS should now plan");
+}
