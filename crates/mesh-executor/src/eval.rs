@@ -432,7 +432,214 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
                 _ => Err(Error::TypeMismatch),
             }
         }
+
+        // --------------------------------------------------------
+        // List scalar functions
+        // --------------------------------------------------------
+        "range" => {
+            // `range(start, end)` → [start, start+1, …, end]
+            // `range(start, end, step)` → same with custom step.
+            // Both endpoints are **inclusive**, matching
+            // openCypher. Step defaults to 1. A zero step is
+            // rejected (would loop forever); a negative step is
+            // allowed for descending ranges.
+            if arg_exprs.len() != 2 && arg_exprs.len() != 3 {
+                return Err(Error::UnknownScalarFunction(
+                    "range expects 2 or 3 arguments".into(),
+                ));
+            }
+            let sv = eval_expr(&arg_exprs[0], row, params)?;
+            let ev = eval_expr(&arg_exprs[1], row, params)?;
+            let step_v = if arg_exprs.len() == 3 {
+                Some(eval_expr(&arg_exprs[2], row, params)?)
+            } else {
+                None
+            };
+            if matches!(sv, Value::Null)
+                || matches!(ev, Value::Null)
+                || matches!(step_v, Some(Value::Null))
+            {
+                return Ok(Value::Null);
+            }
+            let start = match sv {
+                Value::Property(Property::Int64(i)) => i,
+                _ => return Err(Error::TypeMismatch),
+            };
+            let end = match ev {
+                Value::Property(Property::Int64(i)) => i,
+                _ => return Err(Error::TypeMismatch),
+            };
+            let step = match step_v {
+                Some(Value::Property(Property::Int64(i))) => i,
+                None => 1,
+                _ => return Err(Error::TypeMismatch),
+            };
+            if step == 0 {
+                return Err(Error::UnknownScalarFunction(
+                    "range step must not be zero".into(),
+                ));
+            }
+            let mut out: Vec<Value> = Vec::new();
+            let mut cur = start;
+            if step > 0 {
+                while cur <= end {
+                    out.push(Value::Property(Property::Int64(cur)));
+                    cur += step;
+                }
+            } else {
+                while cur >= end {
+                    out.push(Value::Property(Property::Int64(cur)));
+                    cur += step;
+                }
+            }
+            Ok(Value::List(out))
+        }
+        "head" => {
+            // First element of a list, or Null on empty / Null.
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::List(items) => Ok(items.into_iter().next().unwrap_or(Value::Null)),
+                Value::Property(Property::List(items)) => Ok(items
+                    .into_iter()
+                    .next()
+                    .map(Value::Property)
+                    .unwrap_or(Value::Null)),
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "last" => {
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::List(items) => Ok(items.into_iter().last().unwrap_or(Value::Null)),
+                Value::Property(Property::List(items)) => Ok(items
+                    .into_iter()
+                    .last()
+                    .map(Value::Property)
+                    .unwrap_or(Value::Null)),
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "tail" => {
+            // Everything except the first element. Empty list
+            // or single-element list → empty list.
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::List(mut items) => {
+                    if items.is_empty() {
+                        Ok(Value::List(Vec::new()))
+                    } else {
+                        items.remove(0);
+                        Ok(Value::List(items))
+                    }
+                }
+                Value::Property(Property::List(mut items)) => {
+                    if items.is_empty() {
+                        Ok(Value::List(Vec::new()))
+                    } else {
+                        items.remove(0);
+                        Ok(Value::List(
+                            items.into_iter().map(Value::Property).collect(),
+                        ))
+                    }
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "reverse" => {
+            // Works on lists *and* strings. Length functions
+            // in openCypher similarly overload on both; the
+            // string form is pretty common.
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::List(items) => Ok(Value::List(items.into_iter().rev().collect())),
+                Value::Property(Property::List(items)) => Ok(Value::List(
+                    items.into_iter().rev().map(Value::Property).collect(),
+                )),
+                Value::Property(Property::String(s)) => {
+                    Ok(Value::Property(Property::String(s.chars().rev().collect())))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+
+        // --------------------------------------------------------
+        // Math scalar functions
+        // --------------------------------------------------------
+        "abs" => {
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Property(Property::Int64(i)) => {
+                    // Use saturating_abs so `abs(i64::MIN)`
+                    // doesn't panic in debug builds.
+                    Ok(Value::Property(Property::Int64(i.saturating_abs())))
+                }
+                Value::Property(Property::Float64(f)) => {
+                    Ok(Value::Property(Property::Float64(f.abs())))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "ceil" => math_unary(name, arg_exprs, row, params, |f| f.ceil()),
+        "floor" => math_unary(name, arg_exprs, row, params, |f| f.floor()),
+        "round" => math_unary(name, arg_exprs, row, params, |f| f.round()),
+        "sqrt" => math_unary(name, arg_exprs, row, params, |f| f.sqrt()),
+        "sign" => {
+            // Returns -1, 0, or 1 as Int64 regardless of
+            // whether the input was int or float. NaN maps to
+            // 0 to stay total; callers who care can test for
+            // NaN via `n <> n` first.
+            let v = single_arg(name, arg_exprs, row, params)?;
+            let s: i64 = match v {
+                Value::Null => return Ok(Value::Null),
+                Value::Property(Property::Int64(i)) => i.signum(),
+                Value::Property(Property::Float64(f)) => {
+                    if f > 0.0 {
+                        1
+                    } else if f < 0.0 {
+                        -1
+                    } else {
+                        0
+                    }
+                }
+                _ => return Err(Error::TypeMismatch),
+            };
+            Ok(Value::Property(Property::Int64(s)))
+        }
+        "pi" => {
+            if !arg_exprs.is_empty() {
+                return Err(Error::UnknownScalarFunction(
+                    "pi() takes no arguments".into(),
+                ));
+            }
+            Ok(Value::Property(Property::Float64(std::f64::consts::PI)))
+        }
+
         _ => Err(Error::UnknownScalarFunction(name.to_string())),
+    }
+}
+
+/// Shared single-argument math helper: evaluate the one
+/// argument, null-propagate on Null, accept Int64 (implicit
+/// cast to f64) or Float64, apply `f`, return a Float64. Used
+/// by `ceil` / `floor` / `round` / `sqrt`.
+fn math_unary(
+    name: &str,
+    arg_exprs: &[Expr],
+    row: &Row,
+    params: &ParamMap,
+    f: impl FnOnce(f64) -> f64,
+) -> Result<Value> {
+    let v = single_arg(name, arg_exprs, row, params)?;
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Property(Property::Int64(i)) => Ok(Value::Property(Property::Float64(f(i as f64)))),
+        Value::Property(Property::Float64(x)) => Ok(Value::Property(Property::Float64(f(x)))),
+        _ => Err(Error::TypeMismatch),
     }
 }
 

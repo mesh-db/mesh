@@ -3161,3 +3161,164 @@ fn cross_stage_rebind_second_var_also_bound_rejected() {
         "expected 'only start var' error, got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------
+// List + math scalar functions
+// ---------------------------------------------------------------
+
+fn list_len(row: &Row, key: &str) -> usize {
+    match row.get(key) {
+        Some(Value::List(items)) => items.len(),
+        other => panic!("expected list at {key}, got {other:?}"),
+    }
+}
+
+fn list_of_ints(row: &Row, key: &str) -> Vec<i64> {
+    match row.get(key) {
+        Some(Value::List(items)) => items
+            .iter()
+            .map(|v| match v {
+                Value::Property(Property::Int64(i)) => *i,
+                other => panic!("expected int in list, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected list at {key}, got {other:?}"),
+    }
+}
+
+fn float_prop(row: &Row, key: &str) -> f64 {
+    match row.get(key) {
+        Some(Value::Property(Property::Float64(f))) => *f,
+        other => panic!("expected float at {key}, got {other:?}"),
+    }
+}
+
+#[test]
+fn range_two_arg_builds_inclusive_sequence() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN range(1, 5) AS xs");
+    assert_eq!(list_of_ints(&rows[0], "xs"), vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn range_three_arg_respects_step() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN range(0, 10, 2) AS xs");
+    assert_eq!(list_of_ints(&rows[0], "xs"), vec![0, 2, 4, 6, 8, 10]);
+}
+
+#[test]
+fn range_descending_with_negative_step() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN range(5, 1, -1) AS xs");
+    assert_eq!(list_of_ints(&rows[0], "xs"), vec![5, 4, 3, 2, 1]);
+}
+
+#[test]
+fn head_and_last_pick_bounds() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN head(range(1, 5)) AS h, last(range(1, 5)) AS l",
+    );
+    assert_eq!(int_prop(&rows[0], "h"), 1);
+    assert_eq!(int_prop(&rows[0], "l"), 5);
+}
+
+#[test]
+fn head_of_empty_list_is_null() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN head(range(1, 0)) AS h");
+    assert!(matches!(
+        rows[0].get("h"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
+
+#[test]
+fn tail_drops_first_element() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN tail(range(1, 4)) AS xs");
+    assert_eq!(list_of_ints(&rows[0], "xs"), vec![2, 3, 4]);
+}
+
+#[test]
+fn tail_of_empty_list_is_empty() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN tail(range(1, 0)) AS xs");
+    assert_eq!(list_len(&rows[0], "xs"), 0);
+}
+
+#[test]
+fn reverse_list_and_string() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN reverse(range(1, 3)) AS xs, reverse('abc') AS s",
+    );
+    assert_eq!(list_of_ints(&rows[0], "xs"), vec![3, 2, 1]);
+    assert_eq!(str_prop(&rows[0], "s"), "cba");
+}
+
+#[test]
+fn abs_on_negative_int_and_float() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN abs(-7) AS i, abs(-3.14) AS f");
+    assert_eq!(int_prop(&rows[0], "i"), 7);
+    assert!((float_prop(&rows[0], "f") - 3.14).abs() < 1e-9);
+}
+
+#[test]
+fn ceil_floor_round_on_fractional() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN ceil(2.3) AS c, floor(2.7) AS f, round(2.5) AS r",
+    );
+    assert_eq!(float_prop(&rows[0], "c"), 3.0);
+    assert_eq!(float_prop(&rows[0], "f"), 2.0);
+    // Rust's f64::round is half-away-from-zero; 2.5 → 3.0.
+    assert_eq!(float_prop(&rows[0], "r"), 3.0);
+}
+
+#[test]
+fn sqrt_of_square_returns_root() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN sqrt(16) AS s");
+    assert_eq!(float_prop(&rows[0], "s"), 4.0);
+}
+
+#[test]
+fn sign_returns_minus_zero_or_plus_one() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN sign(-3) AS n, sign(0) AS z, sign(5) AS p");
+    assert_eq!(int_prop(&rows[0], "n"), -1);
+    assert_eq!(int_prop(&rows[0], "z"), 0);
+    assert_eq!(int_prop(&rows[0], "p"), 1);
+}
+
+#[test]
+fn pi_returns_the_constant() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN pi() AS p");
+    assert!((float_prop(&rows[0], "p") - std::f64::consts::PI).abs() < 1e-12);
+}
+
+#[test]
+fn math_functions_null_propagate() {
+    let (store, _d) = open_store();
+    // Force a Null input to abs via coalesce-of-null, which
+    // short-circuits to Null.
+    let rows = run(
+        &store,
+        "RETURN abs(coalesce(null)) AS a, ceil(coalesce(null)) AS c",
+    );
+    assert!(matches!(
+        rows[0].get("a"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+    assert!(matches!(
+        rows[0].get("c"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
