@@ -254,6 +254,7 @@ pub enum LogicalPlan {
         edge_type: Option<String>,
         direction: Direction,
         max_hops: u64,
+        kind: ShortestKind,
     },
 }
 
@@ -1041,13 +1042,6 @@ fn plan_shortest_path(
     pattern: &Pattern,
     kind: ShortestKind,
 ) -> Result<LogicalPlan> {
-    if kind == ShortestKind::AllShortest {
-        return Err(Error::Plan(
-            "allShortestPaths(...) is not supported yet; use shortestPath(...) \
-             or multiple MATCH clauses to collect alternate paths"
-                .into(),
-        ));
-    }
     let path_var = pattern.path_var.clone().ok_or_else(|| {
         Error::Plan(
             "shortestPath(...) must bind a path variable (e.g. `p = shortestPath(...)`)".into(),
@@ -1111,6 +1105,7 @@ fn plan_shortest_path(
         path_var,
         edge_type: hop.rel.edge_type.clone(),
         direction: hop.rel.direction,
+        kind,
         max_hops: var_length.max,
     })
 }

@@ -5063,19 +5063,206 @@ fn shortest_path_src_equals_dst_returns_empty_path() {
 }
 
 #[test]
-fn all_shortest_paths_rejected_at_plan_time() {
-    let parsed = mesh_cypher::parse(
-        "MATCH (a:Person), (b:Person) \
-         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(b)) \
-         RETURN p",
-    )
-    .unwrap();
-    let err = mesh_cypher::plan(&parsed).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("allShortestPaths") && msg.contains("not supported"),
-        "got: {msg}"
+fn all_shortest_paths_single_unique_path() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Person {name: 'Cara'})",
     );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Cara'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(c)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 2);
+}
+
+#[test]
+fn all_shortest_paths_diamond_yields_two_paths() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), \
+                 (:Person {name: 'C'}), (:Person {name: 'D'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}), (d:Person {name: 'D'}) \
+         CREATE (b)-[:KNOWS]->(d)",
+    );
+    run(
+        &store,
+        "MATCH (c:Person {name: 'C'}), (d:Person {name: 'D'}) \
+         CREATE (c)-[:KNOWS]->(d)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (d:Person {name: 'D'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(d)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        assert_eq!(int_prop(r, "len"), 2);
+    }
+}
+
+#[test]
+fn all_shortest_paths_three_way_split() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'X'}), \
+                 (:Person {name: 'Y'}), (:Person {name: 'Z'}), (:Person {name: 'B'})",
+    );
+    for mid in ["X", "Y", "Z"] {
+        run(
+            &store,
+            &format!(
+                "MATCH (a:Person {{name: 'A'}}), (m:Person {{name: '{mid}'}}) \
+                 CREATE (a)-[:KNOWS]->(m)"
+            ),
+        );
+        run(
+            &store,
+            &format!(
+                "MATCH (m:Person {{name: '{mid}'}}), (b:Person {{name: 'B'}}) \
+                 CREATE (m)-[:KNOWS]->(b)"
+            ),
+        );
+    }
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(b)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 3);
+    for r in &rows {
+        assert_eq!(int_prop(r, "len"), 2);
+    }
+}
+
+#[test]
+fn all_shortest_paths_prefers_shorter_over_longer() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), \
+                 (:Person {name: 'M'}), (:Person {name: 'N'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (m:Person {name: 'M'}) \
+         CREATE (a)-[:KNOWS]->(m)",
+    );
+    run(
+        &store,
+        "MATCH (m:Person {name: 'M'}), (n:Person {name: 'N'}) \
+         CREATE (m)-[:KNOWS]->(n)",
+    );
+    run(
+        &store,
+        "MATCH (n:Person {name: 'N'}), (b:Person {name: 'B'}) \
+         CREATE (n)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(b)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 1);
+}
+
+#[test]
+fn all_shortest_paths_src_equals_dst_returns_zero_hop() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Ada'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(b)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 0);
+}
+
+#[test]
+fn all_shortest_paths_no_path_drops_row() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Zed'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (z:Person {name: 'Zed'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(z)) \
+         RETURN length(p) AS len",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn all_shortest_paths_respects_max_hops() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), \
+                 (:Person {name: 'C'}), (:Person {name: 'D'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}), (c:Person {name: 'C'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (c:Person {name: 'C'}), (d:Person {name: 'D'}) \
+         CREATE (c)-[:KNOWS]->(d)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (d:Person {name: 'D'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..2]->(d)) \
+         RETURN length(p) AS len",
+    );
+    assert!(rows.is_empty());
 }
 
 #[test]

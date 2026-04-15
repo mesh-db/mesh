@@ -342,6 +342,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             edge_type,
             direction,
             max_hops,
+            kind,
         } => Box::new(ShortestPathOp::new(
             build_op(input),
             src_var.clone(),
@@ -350,6 +351,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             edge_type.clone(),
             *direction,
             *max_hops,
+            *kind,
         )),
         LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
@@ -2018,6 +2020,14 @@ struct ShortestPathOp {
     edge_type: Option<String>,
     direction: mesh_cypher::Direction,
     max_hops: u64,
+    kind: mesh_cypher::ShortestKind,
+    /// Buffered `(base_row, path)` pairs from the current
+    /// input row, used only by `AllShortest` mode where a
+    /// single input can expand into multiple shortest paths
+    /// of the same length. Each call to `next` drains one
+    /// entry before pulling a fresh input row; in `Shortest`
+    /// mode the buffer is always empty or has one element.
+    pending: std::collections::VecDeque<(Row, Value)>,
 }
 
 impl ShortestPathOp {
@@ -2030,6 +2040,7 @@ impl ShortestPathOp {
         edge_type: Option<String>,
         direction: mesh_cypher::Direction,
         max_hops: u64,
+        kind: mesh_cypher::ShortestKind,
     ) -> Self {
         Self {
             input,
@@ -2039,6 +2050,8 @@ impl ShortestPathOp {
             edge_type,
             direction,
             max_hops,
+            kind,
+            pending: std::collections::VecDeque::new(),
         }
     }
 }
@@ -2046,7 +2059,15 @@ impl ShortestPathOp {
 impl Operator for ShortestPathOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         loop {
-            let Some(mut row) = self.input.next(ctx)? else {
+            // Drain buffered paths from a prior input row
+            // before pulling the next one. Only reachable in
+            // `AllShortest` mode; `Shortest` mode's buffer
+            // never accumulates more than one entry.
+            if let Some((mut row, path)) = self.pending.pop_front() {
+                row.insert(self.path_var.clone(), path);
+                return Ok(Some(row));
+            }
+            let Some(row) = self.input.next(ctx)? else {
                 return Ok(None);
             };
             let src = match row.get(&self.src_var) {
@@ -2057,58 +2078,76 @@ impl Operator for ShortestPathOp {
                 Some(Value::Node(n)) => n.clone(),
                 _ => continue,
             };
-            if let Some(path) = bfs_shortest_path(
+            let paths = bfs_shortest_paths(
                 &src,
                 &dst,
                 self.edge_type.as_deref(),
                 self.direction,
                 self.max_hops,
+                self.kind,
                 ctx.store,
-            )? {
-                row.insert(self.path_var.clone(), path);
-                return Ok(Some(row));
+            )?;
+            if paths.is_empty() {
+                // No path of length ≤ max_hops — drop the row.
+                continue;
             }
-            // No path of length ≤ max_hops — drop the row.
+            for path in paths {
+                self.pending.push_back((row.clone(), path));
+            }
         }
     }
 }
 
-/// Breadth-first search from `src` to `dst`, constrained by
-/// edge type, direction, and max hop count. Returns
-/// `Some(Value::Path)` on success, `None` if no path is found
-/// within `max_hops` steps.
+/// Layered breadth-first search from `src` toward `dst`,
+/// constrained by edge type, direction, and max hop count.
+/// Returns every path of minimum length when `kind` is
+/// `AllShortest`, or just the first discovered shortest path
+/// when `kind` is `Shortest`. An empty vector means no path
+/// of length ≤ `max_hops` exists.
 ///
-/// `src == dst` is a special case: the zero-length path
-/// containing just the source node is valid regardless of the
-/// `max_hops` constraint (any hop count ≥ 0 satisfies it).
-fn bfs_shortest_path(
+/// `src == dst` is a zero-hop special case that always
+/// returns a singleton path regardless of `max_hops`.
+///
+/// The algorithm builds a parent DAG as it expands each
+/// level: every node that was first reached at depth `d+1`
+/// records every `(parent, edge)` pair from frontier[d] that
+/// reaches it, not just the first one. This lets the
+/// reconstruction walk enumerate all source-to-target paths
+/// of the discovered shortest length. For `Shortest` mode
+/// the reconstruction short-circuits on the first complete
+/// path.
+fn bfs_shortest_paths(
     src: &Node,
     dst: &Node,
     edge_type: Option<&str>,
     direction: mesh_cypher::Direction,
     max_hops: u64,
+    kind: mesh_cypher::ShortestKind,
     reader: &dyn crate::reader::GraphReader,
-) -> Result<Option<Value>> {
+) -> Result<Vec<Value>> {
     use mesh_cypher::Direction;
 
-    // Self-reference: the zero-hop path is trivially
-    // satisfying.
     if src.id == dst.id {
-        return Ok(Some(Value::Path {
+        return Ok(vec![Value::Path {
             nodes: vec![src.clone()],
             edges: vec![],
-        }));
+        }]);
     }
 
-    // BFS frontier + parent pointers. `visited` maps each
-    // reached node id to the `(parent_id, edge_id)` that
-    // first visited it; the source node is inserted with a
-    // sentinel because it has no parent.
-    let mut visited: HashMap<NodeId, (NodeId, EdgeId)> = HashMap::new();
+    // `dist` tracks the shortest distance from `src` to each
+    // reached node. `parents` maps each reached node id to
+    // every `(parent_id, edge_id)` pair that reached it at
+    // that shortest distance — a node may have multiple
+    // parents in the parent DAG for `AllShortest`.
+    let mut dist: HashMap<NodeId, u64> = HashMap::new();
+    dist.insert(src.id, 0);
+    let mut parents: HashMap<NodeId, Vec<(NodeId, EdgeId)>> = HashMap::new();
+
     let mut frontier: Vec<NodeId> = vec![src.id];
     let mut depth: u64 = 0;
+    let mut found = false;
 
-    while !frontier.is_empty() && depth < max_hops {
+    while !frontier.is_empty() && depth < max_hops && !found {
         let mut next_frontier: Vec<NodeId> = Vec::new();
         for node_id in &frontier {
             let neighbors = match direction {
@@ -2121,14 +2160,6 @@ fn bfs_shortest_path(
                 }
             };
             for (edge_id, neighbor_id) in neighbors {
-                // Skip if we've already visited this neighbor
-                // at an equal-or-shorter depth — BFS guarantees
-                // the first visit is the shortest, so later
-                // visits can be dropped without losing
-                // correctness.
-                if neighbor_id == src.id || visited.contains_key(&neighbor_id) {
-                    continue;
-                }
                 // Edge-type filter. Only fetch the edge record
                 // when a type constraint is present.
                 if let Some(t) = edge_type {
@@ -2140,60 +2171,134 @@ fn bfs_shortest_path(
                         continue;
                     }
                 }
-                visited.insert(neighbor_id, (*node_id, edge_id));
-                if neighbor_id == dst.id {
-                    // Target reached: reconstruct the path by
-                    // walking parent pointers from dst back to
-                    // src, then reversing.
-                    return Ok(Some(reconstruct_bfs_path(src, dst, &visited, reader)?));
+                match dist.get(&neighbor_id) {
+                    Some(&d) if d == depth + 1 => {
+                        // Alternate parent at the same
+                        // shortest-path level — record the
+                        // additional edge so the reconstruction
+                        // can enumerate it, but don't re-add to
+                        // the next frontier.
+                        parents
+                            .entry(neighbor_id)
+                            .or_default()
+                            .push((*node_id, edge_id));
+                    }
+                    Some(_) => {
+                        // Already reached at a strictly shorter
+                        // depth; this edge isn't on a shortest
+                        // path.
+                    }
+                    None => {
+                        dist.insert(neighbor_id, depth + 1);
+                        parents
+                            .entry(neighbor_id)
+                            .or_default()
+                            .push((*node_id, edge_id));
+                        if neighbor_id == dst.id {
+                            found = true;
+                        } else {
+                            next_frontier.push(neighbor_id);
+                        }
+                    }
                 }
-                next_frontier.push(neighbor_id);
             }
         }
-        frontier = next_frontier;
         depth += 1;
+        if !found {
+            frontier = next_frontier;
+        }
     }
-    Ok(None)
+
+    if !found {
+        return Ok(Vec::new());
+    }
+
+    // Enumerate all shortest paths from the parent DAG.
+    // `Shortest` mode short-circuits after the first complete
+    // walk; `AllShortest` collects every distinct path.
+    let mut out: Vec<Value> = Vec::new();
+    let mut nodes_rev: Vec<Node> = Vec::new();
+    let mut edges_rev: Vec<Edge> = Vec::new();
+    let only_first = matches!(kind, mesh_cypher::ShortestKind::Shortest);
+    collect_shortest_paths(
+        src,
+        dst,
+        &parents,
+        reader,
+        &mut nodes_rev,
+        &mut edges_rev,
+        &mut out,
+        only_first,
+    )?;
+    Ok(out)
 }
 
-/// Reconstruct a forward-order path from a BFS parent map.
-/// Starts at `dst`, walks backwards via `visited[node_id]`
-/// until reaching `src`, collecting `(parent, edge)` pairs
-/// along the way, then reverses the accumulated lists to
-/// produce a source-to-target traversal.
-fn reconstruct_bfs_path(
+/// Depth-first walk through the parent DAG built by
+/// `bfs_shortest_paths`, collecting every source-to-target
+/// path of the BFS-determined shortest length. The recursion
+/// carries two scratch stacks (`nodes_rev`, `edges_rev`)
+/// representing the partially-reconstructed path in reverse
+/// order; on reaching `src` we copy the reversed accumulators
+/// into a forward-order `Value::Path` and push it into `out`.
+///
+/// `only_first = true` short-circuits after the first
+/// complete path, giving `Shortest` mode the optimal-case
+/// early exit.
+#[allow(clippy::too_many_arguments)]
+fn collect_shortest_paths(
     src: &Node,
-    dst: &Node,
-    visited: &HashMap<NodeId, (NodeId, EdgeId)>,
+    current: &Node,
+    parents: &HashMap<NodeId, Vec<(NodeId, EdgeId)>>,
     reader: &dyn crate::reader::GraphReader,
-) -> Result<Value> {
-    let mut nodes_rev: Vec<Node> = vec![dst.clone()];
-    let mut edges_rev: Vec<Edge> = Vec::new();
-    let mut current = dst.id;
-    while current != src.id {
-        let (parent_id, edge_id) = *visited
-            .get(&current)
-            .expect("visited must contain every non-source node on the reconstructed path");
-        let edge = reader
-            .get_edge(edge_id)?
-            .expect("BFS inserted this edge id; it must still exist");
-        edges_rev.push(edge);
-        if parent_id == src.id {
-            nodes_rev.push(src.clone());
-            break;
-        }
-        let parent_node = reader
-            .get_node(parent_id)?
-            .expect("BFS visited this node id; it must still exist");
-        nodes_rev.push(parent_node);
-        current = parent_id;
+    nodes_rev: &mut Vec<Node>,
+    edges_rev: &mut Vec<Edge>,
+    out: &mut Vec<Value>,
+    only_first: bool,
+) -> Result<()> {
+    if current.id == src.id {
+        // Complete walk: `nodes_rev` holds dst, ..., (last
+        // node before src) in reverse; prepend src and
+        // reverse to produce the forward-order node list.
+        // Edges are similarly reversed.
+        let mut nodes: Vec<Node> = Vec::with_capacity(nodes_rev.len() + 1);
+        nodes.push(src.clone());
+        nodes.extend(nodes_rev.iter().rev().cloned());
+        let edges: Vec<Edge> = edges_rev.iter().rev().cloned().collect();
+        out.push(Value::Path { nodes, edges });
+        return Ok(());
     }
-    nodes_rev.reverse();
-    edges_rev.reverse();
-    Ok(Value::Path {
-        nodes: nodes_rev,
-        edges: edges_rev,
-    })
+    let Some(parent_edges) = parents.get(&current.id) else {
+        // Unreachable in normal flow — BFS only inserts dst
+        // into `parents` when it found at least one incoming
+        // edge — but handled defensively.
+        return Ok(());
+    };
+    for (parent_id, edge_id) in parent_edges {
+        if only_first && !out.is_empty() {
+            return Ok(());
+        }
+        let edge = reader
+            .get_edge(*edge_id)?
+            .expect("BFS inserted this edge id; it must still exist");
+        let parent_node = reader
+            .get_node(*parent_id)?
+            .expect("BFS visited this node id; it must still exist");
+        nodes_rev.push(current.clone());
+        edges_rev.push(edge);
+        collect_shortest_paths(
+            src,
+            &parent_node,
+            parents,
+            reader,
+            nodes_rev,
+            edges_rev,
+            out,
+            only_first,
+        )?;
+        nodes_rev.pop();
+        edges_rev.pop();
+    }
+    Ok(())
 }
 
 /// `UNION` / `UNION ALL`. Drains each branch in order, streaming
