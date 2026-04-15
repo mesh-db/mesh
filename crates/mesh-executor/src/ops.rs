@@ -334,6 +334,23 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             node_vars.clone(),
             edge_vars.clone(),
         )),
+        LogicalPlan::ShortestPath {
+            input,
+            src_var,
+            dst_var,
+            path_var,
+            edge_type,
+            direction,
+            max_hops,
+        } => Box::new(ShortestPathOp::new(
+            build_op(input),
+            src_var.clone(),
+            dst_var.clone(),
+            path_var.clone(),
+            edge_type.clone(),
+            *direction,
+            *max_hops,
+        )),
         LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
         | LogicalPlan::ShowPropertyIndexes => {
@@ -1973,6 +1990,210 @@ impl Operator for BindPathOp {
         }
         Ok(Some(row))
     }
+}
+
+/// `MATCH p = shortestPath((a)-[:R*..N]->(b))`. For each input
+/// row (which must already bind both `src_var` and `dst_var`
+/// to `Value::Node`), runs a breadth-first search from the
+/// source node toward the target, filtering edges by
+/// `edge_type` and walking up to `max_hops` steps. Emits one
+/// row per successful search with `path_var` set to a
+/// `Value::Path` carrying the traversed node/edge sequence;
+/// rows where BFS finds no path are dropped entirely (matching
+/// Cypher's `MATCH` semantics for an unsatisfiable pattern).
+///
+/// The BFS uses classic parent-pointer reconstruction: each
+/// visited node's `(parent_node_id, edge_id)` pair is stored
+/// in a hashmap, and once the target is reached we walk back
+/// to the source, reversing the accumulated edges to produce
+/// a forward-order path. Cycle detection is a side-effect of
+/// the visited set — the first time BFS sees a node is
+/// necessarily via a shortest path, so later visits are
+/// ignored.
+struct ShortestPathOp {
+    input: Box<dyn Operator>,
+    src_var: String,
+    dst_var: String,
+    path_var: String,
+    edge_type: Option<String>,
+    direction: mesh_cypher::Direction,
+    max_hops: u64,
+}
+
+impl ShortestPathOp {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        input: Box<dyn Operator>,
+        src_var: String,
+        dst_var: String,
+        path_var: String,
+        edge_type: Option<String>,
+        direction: mesh_cypher::Direction,
+        max_hops: u64,
+    ) -> Self {
+        Self {
+            input,
+            src_var,
+            dst_var,
+            path_var,
+            edge_type,
+            direction,
+            max_hops,
+        }
+    }
+}
+
+impl Operator for ShortestPathOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            let Some(mut row) = self.input.next(ctx)? else {
+                return Ok(None);
+            };
+            let src = match row.get(&self.src_var) {
+                Some(Value::Node(n)) => n.clone(),
+                _ => continue,
+            };
+            let dst = match row.get(&self.dst_var) {
+                Some(Value::Node(n)) => n.clone(),
+                _ => continue,
+            };
+            if let Some(path) = bfs_shortest_path(
+                &src,
+                &dst,
+                self.edge_type.as_deref(),
+                self.direction,
+                self.max_hops,
+                ctx.store,
+            )? {
+                row.insert(self.path_var.clone(), path);
+                return Ok(Some(row));
+            }
+            // No path of length ≤ max_hops — drop the row.
+        }
+    }
+}
+
+/// Breadth-first search from `src` to `dst`, constrained by
+/// edge type, direction, and max hop count. Returns
+/// `Some(Value::Path)` on success, `None` if no path is found
+/// within `max_hops` steps.
+///
+/// `src == dst` is a special case: the zero-length path
+/// containing just the source node is valid regardless of the
+/// `max_hops` constraint (any hop count ≥ 0 satisfies it).
+fn bfs_shortest_path(
+    src: &Node,
+    dst: &Node,
+    edge_type: Option<&str>,
+    direction: mesh_cypher::Direction,
+    max_hops: u64,
+    reader: &dyn crate::reader::GraphReader,
+) -> Result<Option<Value>> {
+    use mesh_cypher::Direction;
+
+    // Self-reference: the zero-hop path is trivially
+    // satisfying.
+    if src.id == dst.id {
+        return Ok(Some(Value::Path {
+            nodes: vec![src.clone()],
+            edges: vec![],
+        }));
+    }
+
+    // BFS frontier + parent pointers. `visited` maps each
+    // reached node id to the `(parent_id, edge_id)` that
+    // first visited it; the source node is inserted with a
+    // sentinel because it has no parent.
+    let mut visited: HashMap<NodeId, (NodeId, EdgeId)> = HashMap::new();
+    let mut frontier: Vec<NodeId> = vec![src.id];
+    let mut depth: u64 = 0;
+
+    while !frontier.is_empty() && depth < max_hops {
+        let mut next_frontier: Vec<NodeId> = Vec::new();
+        for node_id in &frontier {
+            let neighbors = match direction {
+                Direction::Outgoing => reader.outgoing(*node_id)?,
+                Direction::Incoming => reader.incoming(*node_id)?,
+                Direction::Both => {
+                    let mut out = reader.outgoing(*node_id)?;
+                    out.extend(reader.incoming(*node_id)?);
+                    out
+                }
+            };
+            for (edge_id, neighbor_id) in neighbors {
+                // Skip if we've already visited this neighbor
+                // at an equal-or-shorter depth — BFS guarantees
+                // the first visit is the shortest, so later
+                // visits can be dropped without losing
+                // correctness.
+                if neighbor_id == src.id || visited.contains_key(&neighbor_id) {
+                    continue;
+                }
+                // Edge-type filter. Only fetch the edge record
+                // when a type constraint is present.
+                if let Some(t) = edge_type {
+                    let edge = match reader.get_edge(edge_id)? {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    if edge.edge_type != t {
+                        continue;
+                    }
+                }
+                visited.insert(neighbor_id, (*node_id, edge_id));
+                if neighbor_id == dst.id {
+                    // Target reached: reconstruct the path by
+                    // walking parent pointers from dst back to
+                    // src, then reversing.
+                    return Ok(Some(reconstruct_bfs_path(src, dst, &visited, reader)?));
+                }
+                next_frontier.push(neighbor_id);
+            }
+        }
+        frontier = next_frontier;
+        depth += 1;
+    }
+    Ok(None)
+}
+
+/// Reconstruct a forward-order path from a BFS parent map.
+/// Starts at `dst`, walks backwards via `visited[node_id]`
+/// until reaching `src`, collecting `(parent, edge)` pairs
+/// along the way, then reverses the accumulated lists to
+/// produce a source-to-target traversal.
+fn reconstruct_bfs_path(
+    src: &Node,
+    dst: &Node,
+    visited: &HashMap<NodeId, (NodeId, EdgeId)>,
+    reader: &dyn crate::reader::GraphReader,
+) -> Result<Value> {
+    let mut nodes_rev: Vec<Node> = vec![dst.clone()];
+    let mut edges_rev: Vec<Edge> = Vec::new();
+    let mut current = dst.id;
+    while current != src.id {
+        let (parent_id, edge_id) = *visited
+            .get(&current)
+            .expect("visited must contain every non-source node on the reconstructed path");
+        let edge = reader
+            .get_edge(edge_id)?
+            .expect("BFS inserted this edge id; it must still exist");
+        edges_rev.push(edge);
+        if parent_id == src.id {
+            nodes_rev.push(src.clone());
+            break;
+        }
+        let parent_node = reader
+            .get_node(parent_id)?
+            .expect("BFS visited this node id; it must still exist");
+        nodes_rev.push(parent_node);
+        current = parent_id;
+    }
+    nodes_rev.reverse();
+    edges_rev.reverse();
+    Ok(Value::Path {
+        nodes: nodes_rev,
+        edges: edges_rev,
+    })
 }
 
 /// `UNION` / `UNION ALL`. Drains each branch in order, streaming

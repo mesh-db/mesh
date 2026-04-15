@@ -4859,3 +4859,245 @@ fn zero_hop_exists_was_previously_rejected_now_allowed() {
     let parsed = mesh_cypher::parse("MATCH (c) WHERE EXISTS { MATCH (:Person) } RETURN c").unwrap();
     let _plan = mesh_cypher::plan(&parsed).expect("zero-hop EXISTS should now plan");
 }
+
+// ---- shortestPath(...) ----
+
+#[test]
+fn shortest_path_direct_edge() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]->(b)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 1);
+}
+
+#[test]
+fn shortest_path_two_hop_chain() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Cara'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]->(c)) \
+         RETURN length(p) AS len, nodes(p) AS ns",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 2);
+    let ns = match rows[0].get("ns") {
+        Some(Value::List(items)) => items,
+        other => panic!("expected list, got {other:?}"),
+    };
+    assert_eq!(ns.len(), 3);
+    let names: Vec<String> = ns
+        .iter()
+        .filter_map(|v| match v {
+            Value::Node(n) => n.properties.get("name").and_then(|p| match p {
+                Property::String(s) => Some(s.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Ada".to_string(), "Bob".to_string(), "Cara".to_string()]
+    );
+}
+
+#[test]
+fn shortest_path_picks_shorter_of_alternatives() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), \
+                 (:Person {name: 'Cara'}), (:Person {name: 'Dex'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Cara'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (c:Person {name: 'Cara'}), (d:Person {name: 'Dex'}) \
+         CREATE (c)-[:KNOWS]->(d)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (d:Person {name: 'Dex'}) \
+         CREATE (a)-[:KNOWS]->(d)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (d:Person {name: 'Dex'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]->(d)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 1);
+}
+
+#[test]
+fn shortest_path_no_path_drops_row() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Zed'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (z:Person {name: 'Zed'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]->(z)) \
+         RETURN length(p) AS len",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn shortest_path_respects_max_hop_bound() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), \
+                 (:Person {name: 'C'}), (:Person {name: 'D'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}), (c:Person {name: 'C'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (c:Person {name: 'C'}), (d:Person {name: 'D'}) \
+         CREATE (c)-[:KNOWS]->(d)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (d:Person {name: 'D'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..2]->(d)) \
+         RETURN length(p) AS len",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn shortest_path_with_edge_type_filter_ignores_other_types() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) \
+         CREATE (a)-[:BLOCKED]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (c:Person {name: 'Cara'}), (b:Person {name: 'Bob'}) \
+         CREATE (c)-[:BLOCKED]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]->(b)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 1);
+}
+
+#[test]
+fn shortest_path_src_equals_dst_returns_empty_path() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Ada'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]->(b)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 0);
+}
+
+#[test]
+fn all_shortest_paths_rejected_at_plan_time() {
+    let parsed = mesh_cypher::parse(
+        "MATCH (a:Person), (b:Person) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(b)) \
+         RETURN p",
+    )
+    .unwrap();
+    let err = mesh_cypher::plan(&parsed).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("allShortestPaths") && msg.contains("not supported"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn shortest_path_without_upper_bound_rejected() {
+    let parsed = mesh_cypher::parse(
+        "MATCH (a:Person), (b:Person) \
+         MATCH p = shortestPath((a)-[:KNOWS*]->(b)) \
+         RETURN p",
+    )
+    .unwrap();
+    let err = mesh_cypher::plan(&parsed).unwrap_err();
+    assert!(format!("{err}").contains("explicit upper bound"));
+}
+
+#[test]
+fn shortest_path_without_path_variable_rejected() {
+    let parsed = mesh_cypher::parse(
+        "MATCH (a:Person), (b:Person) \
+         MATCH shortestPath((a)-[:KNOWS*..5]->(b)) \
+         RETURN a, b",
+    )
+    .unwrap();
+    let err = mesh_cypher::plan(&parsed).unwrap_err();
+    assert!(format!("{err}").contains("path variable"));
+}

@@ -1,6 +1,6 @@
 use crate::ast::{
     CallArgs, CreateStmt, Direction, Expr, IndexDdl, Literal, MatchStmt, NodePattern, Pattern,
-    ReturnItem, ReturnStmt, SortItem, Statement, UnionStmt, UnwindStmt,
+    ReturnItem, ReturnStmt, ShortestKind, SortItem, Statement, UnionStmt, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -232,6 +232,28 @@ pub enum LogicalPlan {
         path_var: String,
         node_vars: Vec<String>,
         edge_vars: Vec<String>,
+    },
+    /// `MATCH p = shortestPath((src)-[:R*..N]->(dst))`. BFS
+    /// from the (already-bound) `src_var` node to the
+    /// (already-bound) `dst_var` node, filtering edges by
+    /// `edge_type` and walking up to `max_hops` steps. Emits
+    /// a row per input binding with `path_var` set to a
+    /// `Value::Path` carrying the traversed node/edge
+    /// sequence. Input rows where BFS finds no path are
+    /// dropped — matching Cypher's `MATCH` semantics for an
+    /// unsatisfiable pattern.
+    ///
+    /// v1 restriction: both endpoints must be bound in the
+    /// input plan, only one edge type (or none) is accepted,
+    /// and `max_hops` is required (no unbounded `*`).
+    ShortestPath {
+        input: Box<LogicalPlan>,
+        src_var: String,
+        dst_var: String,
+        path_var: String,
+        edge_type: Option<String>,
+        direction: Direction,
+        max_hops: u64,
     },
 }
 
@@ -498,7 +520,8 @@ where
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Delete { input, .. }
         | LogicalPlan::MergeEdge { input, .. }
-        | LogicalPlan::BindPath { input, .. } => walk_plan_exprs(input, visit),
+        | LogicalPlan::BindPath { input, .. }
+        | LogicalPlan::ShortestPath { input, .. } => walk_plan_exprs(input, visit),
         LogicalPlan::CartesianProduct { left, right } => {
             walk_plan_exprs(left, visit)?;
             walk_plan_exprs(right, visit)
@@ -920,6 +943,16 @@ fn plan_pattern(
     pattern_idx: usize,
     ctx: &PlannerContext,
 ) -> Result<LogicalPlan> {
+    if pattern.shortest.is_some() {
+        return Err(Error::Plan(
+            "shortestPath(...) requires both endpoints to be bound \
+             by a preceding MATCH clause; standalone \
+             `MATCH p = shortestPath((a)-[:R*..N]->(b))` without \
+             prior bindings for a and b is not supported"
+                .into(),
+        ));
+    }
+
     // Clone + pre-fill synthetic names for unnamed edges/targets
     // when the pattern has a path variable, so every hop binds a
     // named node and edge that `BindPath` can pull out of the row.
@@ -973,6 +1006,14 @@ fn plan_pattern_from_bound(
         "plan_pattern_from_bound requires a pure-reference start; \
          the caller must validate this before dispatching"
     );
+    // shortestPath wrapping is lowered to a dedicated operator
+    // here because this is the only context where both
+    // endpoints are guaranteed to be bound in the input plan.
+    // `plan_pattern` (fresh-scan path) rejects the wrapping
+    // up front.
+    if let Some(kind) = pattern.shortest {
+        return plan_shortest_path(input, pattern, kind);
+    }
     let start_var = pattern
         .start
         .var
@@ -984,6 +1025,94 @@ fn plan_pattern_from_bound(
     }
     let plan = chain_hops(input, &working, &start_var, pattern_idx)?;
     Ok(wrap_with_bind_path(plan, &working, &start_var))
+}
+
+/// Lower a `shortestPath((a)-[:R*..N]->(b))` pattern to a
+/// `LogicalPlan::ShortestPath` operator. Enforces the v1
+/// restrictions: the start must be a bound variable, the
+/// pattern must have exactly one hop with a variable-length
+/// spec (`[*..N]` or `[*M..N]`), that spec must carry an
+/// upper bound, the target must be a bound variable, no
+/// path-less hops (would be covered by a plain expand), and
+/// `allShortestPaths` is rejected outright since v1 only
+/// implements `shortestPath`.
+fn plan_shortest_path(
+    input: LogicalPlan,
+    pattern: &Pattern,
+    kind: ShortestKind,
+) -> Result<LogicalPlan> {
+    if kind == ShortestKind::AllShortest {
+        return Err(Error::Plan(
+            "allShortestPaths(...) is not supported yet; use shortestPath(...) \
+             or multiple MATCH clauses to collect alternate paths"
+                .into(),
+        ));
+    }
+    let path_var = pattern.path_var.clone().ok_or_else(|| {
+        Error::Plan(
+            "shortestPath(...) must bind a path variable (e.g. `p = shortestPath(...)`)".into(),
+        )
+    })?;
+    let src_var = pattern.start.var.clone().ok_or_else(|| {
+        Error::Plan(
+            "shortestPath(...) requires the start node to be a bound variable reference".into(),
+        )
+    })?;
+    if !pattern.start.labels.is_empty() || !pattern.start.properties.is_empty() {
+        return Err(Error::Plan(
+            "shortestPath(...) start node may not carry additional labels or \
+             pattern properties; apply them in a preceding MATCH"
+                .into(),
+        ));
+    }
+    if pattern.hops.len() != 1 {
+        return Err(Error::Plan(format!(
+            "shortestPath(...) supports exactly one relationship specifier, got {}",
+            pattern.hops.len()
+        )));
+    }
+    let hop = &pattern.hops[0];
+    let dst_var = hop.target.var.clone().ok_or_else(|| {
+        Error::Plan(
+            "shortestPath(...) requires the end node to be a bound variable reference".into(),
+        )
+    })?;
+    if !hop.target.labels.is_empty() || !hop.target.properties.is_empty() {
+        return Err(Error::Plan(
+            "shortestPath(...) end node may not carry additional labels or \
+             pattern properties; apply them in a preceding MATCH"
+                .into(),
+        ));
+    }
+    let var_length = hop.rel.var_length.ok_or_else(|| {
+        Error::Plan(
+            "shortestPath(...) requires a variable-length relationship \
+             (e.g. `[:KNOWS*..5]`)"
+                .into(),
+        )
+    })?;
+    if var_length.max == u64::MAX {
+        return Err(Error::Plan(
+            "shortestPath(...) requires an explicit upper bound on hop count \
+             to guard against unbounded BFS; use `[:R*..N]` form"
+                .into(),
+        ));
+    }
+    if var_length.min > var_length.max {
+        return Err(Error::Plan(format!(
+            "shortestPath(...) variable-length range min ({}) > max ({})",
+            var_length.min, var_length.max
+        )));
+    }
+    Ok(LogicalPlan::ShortestPath {
+        input: Box::new(input),
+        src_var,
+        dst_var,
+        path_var,
+        edge_type: hop.rel.edge_type.clone(),
+        direction: hop.rel.direction,
+        max_hops: var_length.max,
+    })
 }
 
 /// Pre-fill synthetic names for unnamed edges and target nodes
@@ -1405,6 +1534,19 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // — still surfaces as a clear plan-time error.
                 let mut this_clause_vars: HashSet<String> = HashSet::new();
                 for pattern in &m.patterns {
+                    // `shortestPath(...)` patterns are validated
+                    // entirely inside `plan_shortest_path` at
+                    // lowering time — both endpoints are
+                    // required to be pre-bound, and the
+                    // cross-stage rebind check here would reject
+                    // the valid shape because the target var is
+                    // also in `bound_vars`. Skip this pattern's
+                    // per-var validation and let the lowering
+                    // path produce an actionable error.
+                    if pattern.shortest.is_some() {
+                        collect_pattern_vars(pattern, &mut this_clause_vars);
+                        continue;
+                    }
                     let start_var_name = pattern.start.var.as_deref();
                     let start_is_pure_reference =
                         pattern.start.labels.is_empty() && pattern.start.properties.is_empty();

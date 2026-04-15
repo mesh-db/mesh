@@ -181,7 +181,19 @@ delete_items = { identifier ~ ("," ~ identifier)* }
 // planner for variable-length patterns — `VarLengthExpand`
 // doesn't currently track intermediate nodes along the expanded
 // walk, and a Path requires them.
-pattern = { path_var_binding? ~ node_pattern ~ hop* }
+//
+// The pattern body can optionally be wrapped in
+// `shortestPath(...)` or `allShortestPaths(...)` to request
+// graph BFS instead of a full expand. Only one wrapping
+// keyword is accepted per pattern; the planner rejects the
+// wrapping form in CREATE contexts and rejects
+// `allShortestPaths` (v1 only implements `shortestPath`).
+pattern = { path_var_binding? ~ (shortest_path_form | raw_pattern) }
+raw_pattern = { node_pattern ~ hop* }
+shortest_path_form = {
+    (kw_shortest_path | kw_all_shortest_paths) ~
+    "(" ~ node_pattern ~ hop+ ~ ")"
+}
 path_var_binding = { identifier ~ "=" }
 hop = { rel_pattern ~ node_pattern }
 
@@ -420,3 +432,5 @@ kw_union = @{ ^"union" ~ !id_cont }
 kw_all = @{ ^"all" ~ !id_cont }
 kw_reduce = @{ ^"reduce" ~ !id_cont }
 kw_exists = @{ ^"exists" ~ !id_cont }
+kw_shortest_path = @{ ^"shortestPath" ~ !id_cont }
+kw_all_shortest_paths = @{ ^"allShortestPaths" ~ !id_cont }

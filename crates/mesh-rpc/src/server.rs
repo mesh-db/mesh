@@ -843,7 +843,7 @@ fn count_index_seeks(plan: &mesh_cypher::LogicalPlan) -> u64 {
         | P::MergeEdge { input, .. } => count_index_seeks(input),
         P::CartesianProduct { left, right } => count_index_seeks(left) + count_index_seeks(right),
         P::Union { branches, .. } => branches.iter().map(count_index_seeks).sum(),
-        P::BindPath { input, .. } => count_index_seeks(input),
+        P::BindPath { input, .. } | P::ShortestPath { input, .. } => count_index_seeks(input),
         P::CreatePath { input, .. } => input.as_deref().map(count_index_seeks).unwrap_or(0),
         P::MergeNode { input, .. } => input.as_deref().map(count_index_seeks).unwrap_or(0),
         P::NodeScanAll { .. }

@@ -232,6 +232,28 @@ pub struct Pattern {
     /// `BindPath` operator that assembles the traversed
     /// node/edge sequence into a `Value::Path` bound to `p`.
     pub path_var: Option<String>,
+    /// `Some(kind)` when the pattern body was wrapped in
+    /// `shortestPath(...)` or `allShortestPaths(...)`. The
+    /// planner dispatches wrapped patterns to a BFS operator
+    /// instead of the usual expand chain, and rejects the
+    /// wrapping in contexts where it doesn't make sense
+    /// (CREATE, zero-hop). `None` for plain patterns.
+    pub shortest: Option<ShortestKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortestKind {
+    /// `shortestPath(...)` — returns one shortest path per
+    /// candidate `(src, dst)` pair from the upstream row
+    /// stream. If multiple paths of minimum length exist, one
+    /// is returned arbitrarily (whichever the BFS finds
+    /// first). The BFS-visited ordering is deterministic on a
+    /// given RocksDB snapshot.
+    Shortest,
+    /// `allShortestPaths(...)` — returns every path of the
+    /// minimum length. v1 rejects this at plan time; listed
+    /// here so the grammar and AST can still represent it.
+    AllShortest,
 }
 
 #[derive(Debug, Clone, PartialEq)]

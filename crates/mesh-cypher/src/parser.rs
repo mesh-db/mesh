@@ -695,32 +695,82 @@ fn build_pattern(pair: Pair<Rule>) -> Result<Pattern> {
 
     // Optional `identifier =` prefix that binds the whole
     // traversal as a Path. When present, the next pair in the
-    // iterator is the real start `node_pattern`.
-    let (path_var, start_pair) = if first.as_rule() == Rule::path_var_binding {
+    // iterator is the pattern body (either a `shortest_path_form`
+    // wrapper or a bare `raw_pattern`).
+    let (path_var, body) = if first.as_rule() == Rule::path_var_binding {
         let name = first
             .into_inner()
             .next()
             .ok_or_else(|| Error::Parse("empty path_var_binding".into()))?
             .as_str()
             .to_string();
-        let node = inner
+        let body = inner
             .next()
-            .ok_or_else(|| Error::Parse("path_var_binding not followed by node_pattern".into()))?;
-        (Some(name), node)
+            .ok_or_else(|| Error::Parse("path_var_binding not followed by pattern body".into()))?;
+        (Some(name), body)
     } else {
         (None, first)
     };
+
+    match body.as_rule() {
+        Rule::raw_pattern => {
+            let (start, hops) = build_raw_pattern(body)?;
+            Ok(Pattern {
+                start,
+                hops,
+                path_var,
+                shortest: None,
+            })
+        }
+        Rule::shortest_path_form => {
+            // `shortestPath(...)` or `allShortestPaths(...)`.
+            // Inner children: the `kw_*` keyword followed by a
+            // `node_pattern` and at least one `hop`. The grammar
+            // already enforces `hop+` so a zero-hop wrapper is
+            // impossible by construction.
+            let mut kind = None;
+            let mut start: Option<NodePattern> = None;
+            let mut hops: Vec<Hop> = Vec::new();
+            for p in body.into_inner() {
+                match p.as_rule() {
+                    Rule::kw_shortest_path => kind = Some(ShortestKind::Shortest),
+                    Rule::kw_all_shortest_paths => kind = Some(ShortestKind::AllShortest),
+                    Rule::node_pattern => start = Some(build_node_pattern(p)?),
+                    Rule::hop => hops.push(build_hop(p)?),
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rule in shortest_path_form: {r:?}"
+                        )))
+                    }
+                }
+            }
+            let start = start
+                .ok_or_else(|| Error::Parse("shortest_path_form missing start node".into()))?;
+            let kind =
+                kind.ok_or_else(|| Error::Parse("shortest_path_form missing keyword".into()))?;
+            Ok(Pattern {
+                start,
+                hops,
+                path_var,
+                shortest: Some(kind),
+            })
+        }
+        r => Err(Error::Parse(format!("unexpected pattern body rule: {r:?}"))),
+    }
+}
+
+fn build_raw_pattern(pair: Pair<Rule>) -> Result<(NodePattern, Vec<Hop>)> {
+    let mut inner = pair.into_inner();
+    let start_pair = inner
+        .next()
+        .ok_or_else(|| Error::Parse("raw_pattern missing node_pattern".into()))?;
     let start = build_node_pattern(start_pair)?;
     let mut hops = Vec::new();
     for hop_pair in inner {
         debug_assert_eq!(hop_pair.as_rule(), Rule::hop);
         hops.push(build_hop(hop_pair)?);
     }
-    Ok(Pattern {
-        start,
-        hops,
-        path_var,
-    })
+    Ok((start, hops))
 }
 
 fn build_hop(pair: Pair<Rule>) -> Result<Hop> {
@@ -1332,25 +1382,23 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             })
         }
         Rule::pattern_predicate => {
-            // `pattern_predicate` has the same inner structure as
-            // `pattern` (minus the optional `path_var_binding`
-            // prefix and with `hop+` instead of `hop*`), so we
-            // reuse `build_pattern` which handles both forms.
-            let pat = build_pattern(pair)?;
-            if pat.path_var.is_some() {
-                return Err(Error::Parse(
-                    "path variable binding is not allowed inside a pattern predicate".into(),
-                ));
-            }
-            // Grammar guarantees `hop+`; belt-and-suspenders check
-            // against a future grammar relaxation that might
-            // accidentally accept zero hops.
-            if pat.hops.is_empty() {
+            // `pattern_predicate` has a simpler inner structure
+            // than the top-level `pattern` rule (no
+            // `path_var_binding`, no shortestPath wrapper — just
+            // `node_pattern ~ hop+`). Build it as a raw pattern
+            // and wrap with the zero-state Pattern fields.
+            let (start, hops) = build_raw_pattern(pair)?;
+            if hops.is_empty() {
                 return Err(Error::Parse(
                     "pattern predicates must have at least one relationship hop".into(),
                 ));
             }
-            Ok(Expr::PatternExists(pat))
+            Ok(Expr::PatternExists(Pattern {
+                start,
+                hops,
+                path_var: None,
+                shortest: None,
+            }))
         }
         r => Err(Error::Parse(format!(
             "unexpected rule in expression: {:?}",
