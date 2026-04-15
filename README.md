@@ -182,10 +182,58 @@ and `UNWIND $list` — the full driver-facing surface as of today.
 
 ---
 
+## Bolt authentication
+
+By default the Bolt listener accepts any credentials — convenient for
+local dev but **don't expose that on an untrusted network**. To require
+authentication, add a `[[bolt_auth.users]]` section to your config:
+
+```toml
+[[bolt_auth.users]]
+username = "neo4j"
+password = "plaintext-works-for-dev"
+```
+
+Plain-text passwords are fine for local setups where the config file is
+the source of truth. For anything shared, store a **bcrypt hash** instead
+— Mesh recognizes the canonical `$2a$` / `$2b$` / `$2y$` / `$2x$`
+prefixes and routes them through `bcrypt::verify`:
+
+```toml
+[[bolt_auth.users]]
+username = "neo4j"
+password = "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+```
+
+Generate a hash with any standard tool — Python's `bcrypt` package
+works well:
+
+```sh
+python -c 'import bcrypt; print(bcrypt.hashpw(b"my-password", bcrypt.gensalt(rounds=12)).decode())'
+```
+
+or `htpasswd`:
+
+```sh
+htpasswd -bnBC 12 "" my-password | tr -d ':\n'
+```
+
+Mixed tables are allowed — a user can migrate from plain text to bcrypt
+one row at a time.
+
+Connect with `auth=(username, password)`:
+
+```python
+driver = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "my-password"))
+```
+
+A mismatch returns `Neo.ClientError.Security.Unauthorized` and closes the
+connection, which driver SDKs translate into an `AuthError`.
+
+---
+
 ## Known limitations
 
-- **Bolt auth is accepted-but-ignored.** Don't expose the Bolt port on an
-  untrusted network.
 - **No read-after-write inside an explicit transaction.** A `MATCH` after
   a `CREATE` in the same `BEGIN`/`COMMIT` block sees the store as it was at
   `BEGIN` time and will *not* observe the buffered write. Auto-commit RUNs
@@ -198,8 +246,9 @@ and `UNWIND $list` — the full driver-facing surface as of today.
   and tests; will not scale to large datasets without a streaming
   checkpoint API.
 - **No TLS** on either the Bolt or gRPC listener.
-- **Some deferred Cypher features**: `WITH`, list/string/temporal function
-  libraries beyond the small set above, APOC procedures.
+- **Some deferred Cypher features**: chained `WITH` / multi-MATCH
+  pipelines, `CALL` procedures, regex (`=~`), temporal functions, APOC
+  procedures.
 
 ---
 

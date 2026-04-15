@@ -110,10 +110,19 @@ pub struct PeerConfig {
 /// `[[bolt_auth.users]]` entries. Absent → unauthenticated
 /// (accept-any), which matches the pre-auth behavior.
 ///
-/// Passwords are stored in plain text on disk for v1 — callers
-/// should protect the config file with filesystem permissions and
-/// treat it like any other secrets file. Bcrypt / scrypt hashing
-/// is a follow-up.
+/// The `password` field accepts either:
+///
+///   * A bcrypt hash — any string starting with `$2a$`, `$2b$`,
+///     `$2y$`, or `$2x$`. Verified with [`bcrypt::verify`]. This
+///     is the recommended form for anything beyond local dev.
+///   * Plain text — any string that doesn't match a bcrypt
+///     prefix. Compared directly. Fine for local dev, not safe
+///     for shared infrastructure since the config file holds
+///     the credential.
+///
+/// Both forms are supported so existing dev configs keep working
+/// and operators can migrate a single user at a time without a
+/// big-bang rewrite.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoltAuthConfig {
@@ -130,12 +139,118 @@ pub struct BoltUser {
 
 impl BoltAuthConfig {
     /// Returns `true` when `username` / `password` matches any
-    /// configured user exactly. Plain-text comparison — if/when
-    /// we move to hashing, this grows a constant-time compare.
+    /// configured user. Routes to [`bcrypt::verify`] when the
+    /// stored password looks like a bcrypt hash, or plain-text
+    /// equality otherwise.
     pub fn verify(&self, username: &str, password: &str) -> bool {
         self.users
             .iter()
-            .any(|u| u.username == username && u.password == password)
+            .any(|u| u.username == username && password_matches(&u.password, password))
+    }
+}
+
+/// True when `provided` matches `stored`. Sniffs bcrypt hashes
+/// by their canonical 4-character prefix (`$2a$` / `$2b$` /
+/// `$2y$` / `$2x$`) — anything else is treated as plain text.
+/// A malformed bcrypt hash produces `false` rather than
+/// panicking so a typo in the config file can't crash the
+/// server on the first login attempt.
+fn password_matches(stored: &str, provided: &str) -> bool {
+    if is_bcrypt_hash(stored) {
+        bcrypt::verify(provided, stored).unwrap_or(false)
+    } else {
+        stored == provided
+    }
+}
+
+fn is_bcrypt_hash(s: &str) -> bool {
+    matches!(
+        s.get(..4),
+        Some("$2a$") | Some("$2b$") | Some("$2y$") | Some("$2x$")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bcrypt at its minimum valid cost (4) — fast enough for
+    /// tests to generate a fresh hash per run without slowing
+    /// down `cargo test`.
+    fn hash(pw: &str) -> String {
+        bcrypt::hash(pw, 4).expect("bcrypt hash")
+    }
+
+    #[test]
+    fn verify_accepts_plaintext_password() {
+        let cfg = BoltAuthConfig {
+            users: vec![BoltUser {
+                username: "ada".into(),
+                password: "secret".into(),
+            }],
+        };
+        assert!(cfg.verify("ada", "secret"));
+        assert!(!cfg.verify("ada", "wrong"));
+        assert!(!cfg.verify("bob", "secret"));
+    }
+
+    #[test]
+    fn verify_accepts_bcrypt_hashed_password() {
+        let cfg = BoltAuthConfig {
+            users: vec![BoltUser {
+                username: "ada".into(),
+                password: hash("secret"),
+            }],
+        };
+        assert!(cfg.verify("ada", "secret"));
+        assert!(!cfg.verify("ada", "wrong"));
+    }
+
+    #[test]
+    fn verify_handles_malformed_bcrypt_hash_gracefully() {
+        // Starts with `$2a$` so the sniffer routes to bcrypt,
+        // but the rest is garbage. Should return false, not
+        // panic.
+        let cfg = BoltAuthConfig {
+            users: vec![BoltUser {
+                username: "ada".into(),
+                password: "$2a$not-a-real-hash".into(),
+            }],
+        };
+        assert!(!cfg.verify("ada", "anything"));
+    }
+
+    #[test]
+    fn verify_mixes_plain_and_bcrypt_users() {
+        // Operators can migrate users one at a time. Both
+        // forms live in the same table and work independently.
+        let cfg = BoltAuthConfig {
+            users: vec![
+                BoltUser {
+                    username: "ada".into(),
+                    password: "plain".into(),
+                },
+                BoltUser {
+                    username: "bob".into(),
+                    password: hash("hashed"),
+                },
+            ],
+        };
+        assert!(cfg.verify("ada", "plain"));
+        assert!(cfg.verify("bob", "hashed"));
+        assert!(!cfg.verify("ada", "hashed"));
+        assert!(!cfg.verify("bob", "plain"));
+    }
+
+    #[test]
+    fn is_bcrypt_hash_recognizes_all_canonical_prefixes() {
+        assert!(is_bcrypt_hash("$2a$10$abc"));
+        assert!(is_bcrypt_hash("$2b$10$abc"));
+        assert!(is_bcrypt_hash("$2y$10$abc"));
+        assert!(is_bcrypt_hash("$2x$10$abc"));
+        assert!(!is_bcrypt_hash("plaintext"));
+        assert!(!is_bcrypt_hash("$1$md5-ish"));
+        assert!(!is_bcrypt_hash(""));
     }
 }
 

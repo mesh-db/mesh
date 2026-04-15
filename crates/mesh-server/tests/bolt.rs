@@ -968,3 +968,59 @@ async fn bolt_no_auth_accepts_any_hello() {
     let reply = connect_and_hello_with(&addr, "basic", Some("anyone"), Some("anything")).await;
     assert!(matches!(reply, BoltMessage::Success { .. }));
 }
+
+/// Spawn a Bolt listener whose user table holds a bcrypt-hashed
+/// password. Uses cost 4 (the minimum valid bcrypt cost) so the
+/// hash takes ~1ms to compute and doesn't slow the test suite.
+async fn spawn_bolt_server_with_bcrypt_auth(
+    username: &str,
+    password_plaintext: &str,
+) -> (String, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let service = Arc::new(MeshService::new(store));
+    let hash = bcrypt::hash(password_plaintext, 4).unwrap();
+    let auth = Arc::new(mesh_server::config::BoltAuthConfig {
+        users: vec![mesh_server::config::BoltUser {
+            username: username.to_string(),
+            password: hash,
+        }],
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = run_listener(listener, service, Some(auth)).await;
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    (addr.to_string(), dir)
+}
+
+#[tokio::test]
+async fn bolt_auth_accepts_bcrypt_hashed_password() {
+    // The same HELLO flow as the plain-text test, but the
+    // stored credential is a bcrypt hash. verify() routes
+    // through bcrypt::verify transparently.
+    let (addr, _dir) = spawn_bolt_server_with_bcrypt_auth("neo4j", "correct-horse").await;
+    let reply = connect_and_hello_with(&addr, "basic", Some("neo4j"), Some("correct-horse")).await;
+    assert!(
+        matches!(reply, BoltMessage::Success { .. }),
+        "expected SUCCESS against a bcrypt-hashed user, got {:?}",
+        reply
+    );
+}
+
+#[tokio::test]
+async fn bolt_auth_rejects_wrong_password_against_bcrypt_hash() {
+    let (addr, _dir) = spawn_bolt_server_with_bcrypt_auth("neo4j", "correct-horse").await;
+    let reply = connect_and_hello_with(&addr, "basic", Some("neo4j"), Some("wrong-horse")).await;
+    match reply {
+        BoltMessage::Failure { metadata } => {
+            let code = metadata
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            assert_eq!(code, "Neo.ClientError.Security.Unauthorized");
+        }
+        other => panic!("expected FAILURE, got {:?}", other),
+    }
+}
