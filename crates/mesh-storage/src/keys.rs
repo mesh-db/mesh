@@ -13,6 +13,8 @@ const LEN_PREFIX: usize = 2;
 pub(crate) const INDEX_VALUE_STRING: u8 = 0x01;
 pub(crate) const INDEX_VALUE_INT: u8 = 0x02;
 pub(crate) const INDEX_VALUE_BOOL: u8 = 0x03;
+pub(crate) const INDEX_VALUE_DATETIME: u8 = 0x04;
+pub(crate) const INDEX_VALUE_DATE: u8 = 0x05;
 
 pub(crate) fn adj_key(node: NodeId, edge: EdgeId) -> [u8; ADJ_KEY_LEN] {
     let mut key = [0u8; ADJ_KEY_LEN];
@@ -124,6 +126,25 @@ pub(crate) fn encode_index_value(value: &Property) -> Option<Vec<u8>> {
             Some(out)
         }
         Property::Bool(b) => Some(vec![INDEX_VALUE_BOOL, u8::from(*b)]),
+        Property::DateTime(ms) => {
+            // Big-endian epoch-millis so lexicographic byte order
+            // matches temporal order. The type tag keeps DateTimes
+            // disjoint from Int64s even though both are i64-shaped.
+            let mut out = Vec::with_capacity(1 + 8);
+            out.push(INDEX_VALUE_DATETIME);
+            out.extend_from_slice(&ms.to_be_bytes());
+            Some(out)
+        }
+        Property::Date(days) => {
+            let mut out = Vec::with_capacity(1 + 4);
+            out.push(INDEX_VALUE_DATE);
+            out.extend_from_slice(&days.to_be_bytes());
+            Some(out)
+        }
+        // Duration has no total ordering (3 months = ? days, depends
+        // on the reference date), so we refuse to index it — matches
+        // how Neo4j treats `Duration` in schema indexes.
+        Property::Duration(_) => None,
         Property::Float64(_) | Property::List(_) | Property::Map(_) | Property::Null => None,
     }
 }

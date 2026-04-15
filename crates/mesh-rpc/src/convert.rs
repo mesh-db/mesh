@@ -35,7 +35,16 @@ pub fn property_to_proto(p: &Property) -> Result<proto::Property, ConvertError> 
         Property::Int64(i) => Kind::IntVal(*i),
         Property::Float64(f) => Kind::FloatVal(*f),
         Property::Bool(b) => Kind::BoolVal(*b),
-        Property::List(_) | Property::Map(_) => return Err(ConvertError::UnsupportedProperty),
+        // Temporal types aren't wired through gRPC convert yet —
+        // the routing-mode protobuf schema only carries scalars.
+        // Drivers that use temporal properties today go through
+        // Bolt, which has native wire support. Cross-peer
+        // replication of temporal property values is a follow-up.
+        Property::List(_)
+        | Property::Map(_)
+        | Property::DateTime(_)
+        | Property::Date(_)
+        | Property::Duration(_) => return Err(ConvertError::UnsupportedProperty),
     };
     Ok(proto::Property { kind: Some(kind) })
 }

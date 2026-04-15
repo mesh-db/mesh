@@ -49,6 +49,18 @@ pub const TAG_UNBOUND_RELATIONSHIP: u8 = 0x72;
 /// and rels. `value_conv::path_to_bolt` in mesh-server packs our
 /// `Value::Path` into this shape.
 pub const TAG_PATH: u8 = 0x50;
+/// Bolt 4.4 Date struct. Single field `[days: Int]` — days
+/// since the UNIX epoch (1970-01-01), UTC.
+pub const TAG_DATE: u8 = 0x44;
+/// Bolt 4.4 LocalDateTime struct. Fields `[seconds: Int, nanos: Int]`
+/// — nanosecond-precision timestamp since the UNIX epoch without
+/// timezone information. We always emit this UTC-only form in v1;
+/// the timezone-aware `DateTime` variants (`0x46` / `0x66`) are
+/// follow-ups.
+pub const TAG_LOCAL_DATE_TIME: u8 = 0x64;
+/// Bolt 4.4 Duration struct. Fields
+/// `[months: Int, days: Int, seconds: Int, nanos: Int]`.
+pub const TAG_DURATION: u8 = 0x45;
 
 /// One logical Bolt message. The coarse-grained variants are carried as
 /// `BoltValue::Map`s rather than typed structs so the library stays

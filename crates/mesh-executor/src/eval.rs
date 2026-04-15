@@ -474,6 +474,14 @@ pub(crate) fn eval_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<
         }
     }
 
+    // Temporal arithmetic: DateTime/Date/Duration combinations.
+    // Handled here before numeric coercion because these types
+    // aren't captured by `to_number` and we don't want them
+    // silently coerced to meaningless floats.
+    if let Some(v) = eval_temporal_binary_op(op, &left, &right) {
+        return v;
+    }
+
     // Fall through to numeric arithmetic. Extract i64 / f64
     // from either `Value::Property(Int64/Float64)` directly,
     // erroring on anything else (Node, Edge, List, Map, etc.).
@@ -565,6 +573,139 @@ fn to_number(v: &Value) -> Result<Num> {
         Value::Property(Property::Int64(i)) => Ok(Num::Int(*i)),
         Value::Property(Property::Float64(f)) => Ok(Num::Float(*f)),
         _ => Err(Error::TypeMismatch),
+    }
+}
+
+/// Wall-clock epoch milliseconds. Isolated in a single helper
+/// so tests can eventually mock it (e.g. via a trait injected
+/// into `EvalCtx`) without scattering `SystemTime::now()` calls
+/// across the temporal scalar implementations.
+fn now_epoch_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // `as_millis` returns u128. Saturating cast is fine — the
+    // realistic range (current year through year 292 million)
+    // fits well within i64::MAX, and pre-1970 timestamps would
+    // return a zero duration from the `unwrap_or_default` above.
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Try the temporal combinations of `left op right` and return
+/// `Some(result)` if a temporal rule fires, `None` otherwise (so
+/// the caller falls through to plain numeric arithmetic).
+///
+/// Rules:
+/// - `DateTime + Duration` → `DateTime` (adds months/days/seconds/nanos)
+/// - `Duration + DateTime` → same, order doesn't matter for `+`
+/// - `DateTime - Duration` → `DateTime` (negate the duration then add)
+/// - `DateTime - DateTime` → `Duration` of exact-seconds only
+///   (months/days are `0` because real calendar diff needs a
+///   reference; v1 reports the exact-millisecond delta)
+/// - `Date + Duration` → `Date` (months/days only; seconds ignored
+///   and reported as a `TypeMismatch` if non-zero so drivers
+///   don't silently drop precision)
+/// - `Date - Date` → `Duration` with `days = (left - right)`
+/// - `Duration + Duration` → `Duration` (component-wise add)
+/// - `Duration - Duration` → `Duration` (component-wise sub)
+///
+/// Unsupported temporal combinations return `None` which flows
+/// through to `to_number` and errors as `TypeMismatch`.
+fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<Result<Value>> {
+    use Property::{Date, DateTime, Duration as Dur};
+    let l = match left {
+        Value::Property(p) => p,
+        _ => return None,
+    };
+    let r = match right {
+        Value::Property(p) => p,
+        _ => return None,
+    };
+    match (op, l, r) {
+        (BinaryOp::Add, DateTime(ms), Dur(d)) | (BinaryOp::Add, Dur(d), DateTime(ms)) => Some(Ok(
+            Value::Property(DateTime(datetime_add_duration(*ms, *d))),
+        )),
+        (BinaryOp::Sub, DateTime(ms), Dur(d)) => Some(Ok(Value::Property(DateTime(
+            datetime_add_duration(*ms, negate_duration(*d)),
+        )))),
+        (BinaryOp::Sub, DateTime(a), DateTime(b)) => {
+            let diff_ms = a.wrapping_sub(*b);
+            Some(Ok(Value::Property(Dur(mesh_core::Duration {
+                months: 0,
+                days: 0,
+                seconds: diff_ms.div_euclid(1000),
+                nanos: (diff_ms.rem_euclid(1000) * 1_000_000) as i32,
+            }))))
+        }
+        (BinaryOp::Add, Date(days), Dur(d)) | (BinaryOp::Add, Dur(d), Date(days)) => {
+            Some(date_add_duration(*days, *d))
+        }
+        (BinaryOp::Sub, Date(days), Dur(d)) => Some(date_add_duration(*days, negate_duration(*d))),
+        (BinaryOp::Sub, Date(a), Date(b)) => Some(Ok(Value::Property(Dur(mesh_core::Duration {
+            months: 0,
+            days: (*a - *b) as i64,
+            seconds: 0,
+            nanos: 0,
+        })))),
+        (BinaryOp::Add, Dur(a), Dur(b)) => Some(Ok(Value::Property(Dur(add_durations(*a, *b))))),
+        (BinaryOp::Sub, Dur(a), Dur(b)) => Some(Ok(Value::Property(Dur(add_durations(
+            *a,
+            negate_duration(*b),
+        ))))),
+        _ => None,
+    }
+}
+
+/// Add a [`Duration`] to an epoch-millisecond `DateTime`. Month
+/// and day components are approximated because real calendar
+/// arithmetic needs timezone + leap-year state that v1 doesn't
+/// track: a month is 30 days, a day is 86_400 seconds. Callers
+/// who need strict calendar semantics should use the component
+/// fields on `Duration` directly and apply their own math.
+fn datetime_add_duration(ms: i64, d: mesh_core::Duration) -> i64 {
+    let approx_day_ms: i64 = 86_400_000;
+    let approx_month_ms: i64 = 30 * approx_day_ms;
+    let nanos_as_ms = (d.nanos as i64) / 1_000_000;
+    ms.wrapping_add(d.months.wrapping_mul(approx_month_ms))
+        .wrapping_add(d.days.wrapping_mul(approx_day_ms))
+        .wrapping_add(d.seconds.wrapping_mul(1_000))
+        .wrapping_add(nanos_as_ms)
+}
+
+/// Add a [`Duration`] to a day-count `Date`. Only the `months`
+/// and `days` components contribute — sub-day precision is lost
+/// because `Date` doesn't carry it. If the duration has a
+/// non-zero `seconds` or `nanos` field, we return a type error
+/// so drivers can't silently drop a time-of-day component they
+/// meant to apply.
+fn date_add_duration(days: i32, d: mesh_core::Duration) -> Result<Value> {
+    if d.seconds != 0 || d.nanos != 0 {
+        return Err(Error::TypeMismatch);
+    }
+    let month_days: i64 = 30;
+    let new_days = (days as i64)
+        .wrapping_add(d.months.wrapping_mul(month_days))
+        .wrapping_add(d.days);
+    let clamped = i32::try_from(new_days).map_err(|_| Error::TypeMismatch)?;
+    Ok(Value::Property(Property::Date(clamped)))
+}
+
+fn negate_duration(d: mesh_core::Duration) -> mesh_core::Duration {
+    mesh_core::Duration {
+        months: d.months.wrapping_neg(),
+        days: d.days.wrapping_neg(),
+        seconds: d.seconds.wrapping_neg(),
+        nanos: d.nanos.wrapping_neg(),
+    }
+}
+
+fn add_durations(a: mesh_core::Duration, b: mesh_core::Duration) -> mesh_core::Duration {
+    mesh_core::Duration {
+        months: a.months.wrapping_add(b.months),
+        days: a.days.wrapping_add(b.days),
+        seconds: a.seconds.wrapping_add(b.seconds),
+        nanos: a.nanos.wrapping_add(b.nanos),
     }
 }
 
@@ -1066,6 +1207,125 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             Ok(Value::Property(Property::Float64(std::f64::consts::PI)))
         }
 
+        // --- Temporal constructors ---
+        //
+        // `datetime()`, `date()`, and `timestamp()` with no args
+        // return the current wall-clock time. `datetime()` → epoch
+        // millis wrapped as Property::DateTime; `date()` → today
+        // as Property::Date (days since 1970-01-01 UTC);
+        // `timestamp()` → epoch millis as a plain Int64 (matches
+        // Neo4j's `timestamp()` signature, which returns an
+        // integer, not a DateTime).
+        //
+        // None of these accept arguments in v1 — string parsing
+        // and timezone conversions are deferred. Drivers that
+        // need to build a specific DateTime from components should
+        // send it as a Bolt parameter, which goes through the
+        // wire-format path (Bolt LocalDateTime struct).
+        "datetime" => {
+            if !arg_exprs.is_empty() {
+                return Err(Error::UnknownScalarFunction(
+                    "datetime() with arguments is not supported yet; \
+                     pass a Bolt LocalDateTime struct as a parameter instead"
+                        .into(),
+                ));
+            }
+            Ok(Value::Property(Property::DateTime(now_epoch_millis())))
+        }
+        "date" => {
+            if !arg_exprs.is_empty() {
+                return Err(Error::UnknownScalarFunction(
+                    "date() with arguments is not supported yet; \
+                     pass a Bolt Date struct as a parameter instead"
+                        .into(),
+                ));
+            }
+            let days = now_epoch_millis().div_euclid(86_400_000);
+            let clamped = i32::try_from(days).map_err(|_| {
+                Error::UnknownScalarFunction(format!("date() overflowed i32 days: {days}"))
+            })?;
+            Ok(Value::Property(Property::Date(clamped)))
+        }
+        "timestamp" => {
+            if !arg_exprs.is_empty() {
+                return Err(Error::UnknownScalarFunction(
+                    "timestamp() takes no arguments".into(),
+                ));
+            }
+            Ok(Value::Property(Property::Int64(now_epoch_millis())))
+        }
+        "duration" => {
+            // `duration({months: 1, days: 2, seconds: 30, nanos: 0})`.
+            // Takes a single map-literal argument. Unknown keys
+            // are rejected so typos don't silently produce zero
+            // durations. Missing components default to 0.
+            if arg_exprs.len() != 1 {
+                return Err(Error::UnknownScalarFunction(
+                    "duration() expects a single map argument".into(),
+                ));
+            }
+            let arg = eval_expr(&arg_exprs[0], ctx)?;
+            let entries = match arg {
+                Value::Property(Property::Map(m)) => m,
+                _ => return Err(Error::TypeMismatch),
+            };
+            let mut months = 0_i64;
+            let mut days = 0_i64;
+            let mut seconds = 0_i64;
+            let mut nanos = 0_i32;
+            for (k, v) in &entries {
+                let as_i64 = match v {
+                    Property::Int64(i) => *i,
+                    Property::Null => continue,
+                    _ => return Err(Error::TypeMismatch),
+                };
+                match k.as_str() {
+                    "years" => {
+                        months = months.wrapping_add(as_i64.wrapping_mul(12));
+                    }
+                    "months" => {
+                        months = months.wrapping_add(as_i64);
+                    }
+                    "weeks" => {
+                        days = days.wrapping_add(as_i64.wrapping_mul(7));
+                    }
+                    "days" => {
+                        days = days.wrapping_add(as_i64);
+                    }
+                    "hours" => {
+                        seconds = seconds.wrapping_add(as_i64.wrapping_mul(3600));
+                    }
+                    "minutes" => {
+                        seconds = seconds.wrapping_add(as_i64.wrapping_mul(60));
+                    }
+                    "seconds" => {
+                        seconds = seconds.wrapping_add(as_i64);
+                    }
+                    "milliseconds" => {
+                        seconds = seconds.wrapping_add(as_i64 / 1000);
+                        nanos = nanos.wrapping_add(((as_i64 % 1000) as i32) * 1_000_000);
+                    }
+                    "microseconds" => {
+                        nanos = nanos.wrapping_add((as_i64 as i32).wrapping_mul(1000));
+                    }
+                    "nanoseconds" => {
+                        nanos = nanos.wrapping_add(as_i64 as i32);
+                    }
+                    other => {
+                        return Err(Error::UnknownScalarFunction(format!(
+                            "duration() does not recognise component `{other}`"
+                        )))
+                    }
+                }
+            }
+            Ok(Value::Property(Property::Duration(mesh_core::Duration {
+                months,
+                days,
+                seconds,
+                nanos,
+            })))
+        }
+
         _ => Err(Error::UnknownScalarFunction(name.to_string())),
     }
 }
@@ -1134,6 +1394,13 @@ fn compare_props(a: &Property, b: &Property) -> Ordering {
         (Property::Float64(a), Property::Int64(b)) => {
             a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
         }
+        // Temporal ordering: DateTime by epoch millis, Date by
+        // day count. Duration has no total order in general (3
+        // months vs 90 days depends on the reference date) so it
+        // just compares equal — queries that need a deterministic
+        // order over durations should project a specific field.
+        (Property::DateTime(a), Property::DateTime(b)) => a.cmp(b),
+        (Property::Date(a), Property::Date(b)) => a.cmp(b),
         _ => Ordering::Equal,
     }
 }
@@ -1167,6 +1434,11 @@ pub(crate) fn value_key(v: &Value) -> String {
             }
             out.push('}');
             out
+        }
+        Value::Property(Property::DateTime(ms)) => format!("dt:{}", ms),
+        Value::Property(Property::Date(days)) => format!("d:{}", days),
+        Value::Property(Property::Duration(d)) => {
+            format!("dur:{},{},{},{}", d.months, d.days, d.seconds, d.nanos)
         }
         Value::Node(n) => format!("N:{}", n.id),
         Value::Edge(e) => format!("E:{}", e.id),
@@ -1277,6 +1549,19 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
             a.partial_cmp(&(*b as f64)).ok_or(Error::TypeMismatch)?
         }
         (Property::Bool(a), Property::Bool(b)) => {
+            return match op {
+                CompareOp::Eq => Ok(a == b),
+                CompareOp::Ne => Ok(a != b),
+                _ => Err(Error::UnsupportedComparison),
+            };
+        }
+        // Temporal comparisons — DateTime and Date carry total
+        // orderings by their epoch-offset components. Duration
+        // only supports equality because component ordering
+        // isn't well-defined (months-vs-days).
+        (Property::DateTime(a), Property::DateTime(b)) => a.cmp(b),
+        (Property::Date(a), Property::Date(b)) => a.cmp(b),
+        (Property::Duration(a), Property::Duration(b)) => {
             return match op {
                 CompareOp::Eq => Ok(a == b),
                 CompareOp::Ne => Ok(a != b),

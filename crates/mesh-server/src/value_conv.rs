@@ -13,8 +13,11 @@
 //! long-term stability (Bolt 5+) should use `element_id`, which we
 //! set to the full UUID string.
 
-use mesh_bolt::{BoltValue, TAG_NODE, TAG_PATH, TAG_RELATIONSHIP, TAG_UNBOUND_RELATIONSHIP};
-use mesh_core::{Edge, Node, NodeId, Property};
+use mesh_bolt::{
+    BoltValue, TAG_DATE, TAG_DURATION, TAG_LOCAL_DATE_TIME, TAG_NODE, TAG_PATH, TAG_RELATIONSHIP,
+    TAG_UNBOUND_RELATIONSHIP,
+};
+use mesh_core::{Duration, Edge, Node, NodeId, Property};
 use mesh_executor::{ParamMap, Row, Value};
 use std::collections::HashMap;
 
@@ -162,6 +165,37 @@ fn property_to_bolt(p: &Property) -> BoltValue {
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             BoltValue::Map(pairs)
         }
+        Property::DateTime(ms) => datetime_to_bolt(*ms),
+        Property::Date(days) => BoltValue::Struct {
+            tag: TAG_DATE,
+            fields: vec![BoltValue::Int(*days as i64)],
+        },
+        Property::Duration(d) => duration_to_bolt(*d),
+    }
+}
+
+/// Encode a UTC epoch-millis `DateTime` as a Bolt 4.4
+/// `LocalDateTime` struct. Splits the millis into `(seconds,
+/// nanos)` — Bolt's `LocalDateTime` field layout — with the
+/// nanos field carrying the sub-second remainder.
+fn datetime_to_bolt(ms: i64) -> BoltValue {
+    let seconds = ms.div_euclid(1000);
+    let nanos = (ms.rem_euclid(1000) as i32) * 1_000_000;
+    BoltValue::Struct {
+        tag: TAG_LOCAL_DATE_TIME,
+        fields: vec![BoltValue::Int(seconds), BoltValue::Int(nanos as i64)],
+    }
+}
+
+fn duration_to_bolt(d: Duration) -> BoltValue {
+    BoltValue::Struct {
+        tag: TAG_DURATION,
+        fields: vec![
+            BoltValue::Int(d.months),
+            BoltValue::Int(d.days),
+            BoltValue::Int(d.seconds),
+            BoltValue::Int(d.nanos as i64),
+        ],
     }
 }
 
@@ -247,6 +281,9 @@ pub enum ParamConversionError {
 
     #[error("nested map values must be primitives or lists, got node/edge")]
     NestedGraphInMap,
+
+    #[error("malformed Bolt temporal struct (tag {tag:#x}): {reason}")]
+    MalformedTemporal { tag: u8, reason: &'static str },
 }
 
 /// Decode the `params: BoltValue` field from a Bolt `RUN` message into
@@ -303,7 +340,96 @@ pub fn bolt_value_to_value(bv: &BoltValue) -> Result<Value, ParamConversionError
             Ok(Value::Property(Property::Map(nested)))
         }
         BoltValue::Bytes(_) => Err(ParamConversionError::Bytes),
-        BoltValue::Struct { .. } => Err(ParamConversionError::GraphValue("Struct")),
+        BoltValue::Struct { tag, fields } => {
+            // Bolt 4.4 temporal structs are the only Struct variants
+            // we accept as RUN params today. Graph structs (Node,
+            // Relationship, Path) never appear as parameter inputs —
+            // drivers send them only as response RECORDs.
+            bolt_temporal_struct(*tag, fields).map(Value::Property)
+        }
+    }
+}
+
+/// Decode a Bolt temporal struct (`LocalDateTime`, `Date`, or
+/// `Duration`) into a [`Property`]. Any other struct tag is
+/// rejected with `GraphValue` since we don't accept Node /
+/// Relationship / Path as parameters.
+fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, ParamConversionError> {
+    match tag {
+        TAG_LOCAL_DATE_TIME => {
+            let seconds = temporal_int(fields, 0, tag, "LocalDateTime seconds")?;
+            let nanos = temporal_int(fields, 1, tag, "LocalDateTime nanos")?;
+            if fields.len() != 2 {
+                return Err(ParamConversionError::MalformedTemporal {
+                    tag,
+                    reason: "expected 2 fields",
+                });
+            }
+            // Collapse (seconds, nanos) back into epoch millis.
+            // Truncates sub-millisecond precision — the Property
+            // type carries millis, so any finer resolution from
+            // the driver is dropped silently. Round toward zero
+            // so the result stays monotonic with the input.
+            let ms = seconds
+                .checked_mul(1000)
+                .and_then(|s_ms| s_ms.checked_add(nanos / 1_000_000))
+                .ok_or(ParamConversionError::MalformedTemporal {
+                    tag,
+                    reason: "datetime overflows i64 milliseconds",
+                })?;
+            Ok(Property::DateTime(ms))
+        }
+        TAG_DATE => {
+            if fields.len() != 1 {
+                return Err(ParamConversionError::MalformedTemporal {
+                    tag,
+                    reason: "expected 1 field",
+                });
+            }
+            let days = temporal_int(fields, 0, tag, "Date days")?;
+            let days_i32 =
+                i32::try_from(days).map_err(|_| ParamConversionError::MalformedTemporal {
+                    tag,
+                    reason: "date days out of i32 range",
+                })?;
+            Ok(Property::Date(days_i32))
+        }
+        TAG_DURATION => {
+            if fields.len() != 4 {
+                return Err(ParamConversionError::MalformedTemporal {
+                    tag,
+                    reason: "expected 4 fields",
+                });
+            }
+            let months = temporal_int(fields, 0, tag, "Duration months")?;
+            let days = temporal_int(fields, 1, tag, "Duration days")?;
+            let seconds = temporal_int(fields, 2, tag, "Duration seconds")?;
+            let nanos = temporal_int(fields, 3, tag, "Duration nanos")?;
+            let nanos_i32 =
+                i32::try_from(nanos).map_err(|_| ParamConversionError::MalformedTemporal {
+                    tag,
+                    reason: "duration nanos out of i32 range",
+                })?;
+            Ok(Property::Duration(Duration {
+                months,
+                days,
+                seconds,
+                nanos: nanos_i32,
+            }))
+        }
+        _ => Err(ParamConversionError::GraphValue("Struct")),
+    }
+}
+
+fn temporal_int(
+    fields: &[BoltValue],
+    idx: usize,
+    tag: u8,
+    reason: &'static str,
+) -> Result<i64, ParamConversionError> {
+    match fields.get(idx) {
+        Some(BoltValue::Int(i)) => Ok(*i),
+        _ => Err(ParamConversionError::MalformedTemporal { tag, reason }),
     }
 }
 
@@ -332,6 +458,6 @@ pub fn bolt_value_to_property(bv: &BoltValue) -> Result<Property, ParamConversio
             Ok(Property::Map(nested))
         }
         BoltValue::Bytes(_) => Err(ParamConversionError::Bytes),
-        BoltValue::Struct { .. } => Err(ParamConversionError::NestedGraphInMap),
+        BoltValue::Struct { tag, fields } => bolt_temporal_struct(*tag, fields),
     }
 }

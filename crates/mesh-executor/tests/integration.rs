@@ -4021,3 +4021,176 @@ fn where_pattern_predicate_missing_edge_returns_empty() {
     );
     assert!(rows.is_empty());
 }
+
+#[test]
+fn datetime_now_returns_recent_epoch_millis() {
+    let (store, _d) = open_store();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let rows = run(&store, "RETURN datetime() AS now");
+    let got = match rows[0].get("now") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(
+        got >= before && got <= after,
+        "datetime() {got} out of range [{before}, {after}]"
+    );
+}
+
+#[test]
+fn date_now_returns_today_as_days_since_epoch() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN date() AS today");
+    let days = match rows[0].get("today") {
+        Some(Value::Property(Property::Date(d))) => *d,
+        other => panic!("expected Date, got {other:?}"),
+    };
+    assert!(days > 19_000 && days < 100_000, "days = {days}");
+}
+
+#[test]
+fn timestamp_returns_int_epoch_millis() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN timestamp() AS t");
+    let t = int_prop(&rows[0], "t");
+    assert!(t > 1_600_000_000_000, "timestamp() = {t}");
+}
+
+#[test]
+fn duration_constructor_builds_from_map() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN duration({months: 2, days: 3, hours: 4, minutes: 5, seconds: 6}) AS d",
+    );
+    let d = match rows[0].get("d") {
+        Some(Value::Property(Property::Duration(d))) => *d,
+        other => panic!("expected Duration, got {other:?}"),
+    };
+    assert_eq!(d.months, 2);
+    assert_eq!(d.days, 3);
+    assert_eq!(d.seconds, 4 * 3600 + 5 * 60 + 6);
+    assert_eq!(d.nanos, 0);
+}
+
+#[test]
+fn duration_constructor_years_weeks_folded() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN duration({years: 1, weeks: 2, seconds: 10}) AS d",
+    );
+    let d = match rows[0].get("d") {
+        Some(Value::Property(Property::Duration(d))) => *d,
+        other => panic!("expected Duration, got {other:?}"),
+    };
+    assert_eq!(d.months, 12);
+    assert_eq!(d.days, 14);
+    assert_eq!(d.seconds, 10);
+}
+
+#[test]
+fn duration_constructor_rejects_unknown_key() {
+    let (store, _d) = open_store();
+    let plan = mesh_cypher::plan(&mesh_cypher::parse("RETURN duration({bogus: 1}) AS d").unwrap())
+        .unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    assert!(format!("{err}").contains("bogus"));
+}
+
+#[test]
+fn datetime_plus_duration_advances_datetime() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN datetime() + duration({seconds: 60}) AS plus_minute, \
+                 datetime() AS base",
+    );
+    let plus = match rows[0].get("plus_minute") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    let base = match rows[0].get("base") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    let delta = plus - base;
+    assert!(
+        (60_000..60_050).contains(&delta),
+        "delta = {delta}, expected ~60000"
+    );
+}
+
+#[test]
+fn date_plus_duration_days_only() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN date() + duration({days: 7}) AS next_week, date() AS today",
+    );
+    let next = match rows[0].get("next_week") {
+        Some(Value::Property(Property::Date(d))) => *d,
+        other => panic!("expected Date, got {other:?}"),
+    };
+    let today = match rows[0].get("today") {
+        Some(Value::Property(Property::Date(d))) => *d,
+        other => panic!("expected Date, got {other:?}"),
+    };
+    assert_eq!(next - today, 7);
+}
+
+#[test]
+fn date_plus_duration_with_seconds_errors() {
+    let (store, _d) = open_store();
+    let plan = mesh_cypher::plan(
+        &mesh_cypher::parse("RETURN date() + duration({seconds: 10}) AS d").unwrap(),
+    )
+    .unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    assert!(matches!(err, mesh_executor::Error::TypeMismatch));
+}
+
+#[test]
+fn datetime_ordering_works_in_where() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "UNWIND [datetime() - duration({days: 1}), datetime() + duration({days: 1})] AS ts \
+         WHERE ts < datetime() \
+         RETURN ts",
+    );
+    assert_eq!(rows.len(), 1);
+    let ts = match rows[0].get("ts") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(ts < now);
+}
+
+#[test]
+fn duration_plus_duration_adds_component_wise() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN duration({months: 1, days: 2, seconds: 30}) + \
+                 duration({months: 3, days: 4, seconds: 60}) AS sum",
+    );
+    let sum = match rows[0].get("sum") {
+        Some(Value::Property(Property::Duration(d))) => *d,
+        other => panic!("expected Duration, got {other:?}"),
+    };
+    assert_eq!(sum.months, 4);
+    assert_eq!(sum.days, 6);
+    assert_eq!(sum.seconds, 90);
+}
