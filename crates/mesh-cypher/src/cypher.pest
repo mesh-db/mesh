@@ -273,10 +273,25 @@ primary = {
     parameter |
     literal |
     function_call |
+    pattern_predicate |
     property_access |
     identifier |
     ("(" ~ expression ~ ")")
 }
+
+// A `pattern` used as a boolean expression — `(a)-[:KNOWS]->(b)`
+// in a WHERE clause. Distinct from the top-level `pattern` rule
+// by requiring at least one `hop`: a zero-hop pattern `(a)` is
+// indistinguishable from a parenthesized identifier, and the
+// latter is what drivers actually write, so we let `(a)` fall
+// through the alternation to `("(" ~ expression ~ ")")`.
+//
+// PEG ordered choice tries this rule before
+// `("(" ~ expression ~ ")")`, so `(x)-[:R]->(y)` is committed as
+// a pattern predicate and `(x + 1)` falls through to a
+// parenthesized expression because `node_pattern`'s internal
+// structure won't match `x + 1`.
+pattern_predicate = { node_pattern ~ hop+ }
 
 // `reduce(acc = init, x IN source | body)`. A left fold with its
 // own binding scope — `acc` holds the running accumulator, `x`

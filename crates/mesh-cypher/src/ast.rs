@@ -350,6 +350,18 @@ pub enum Expr {
         source: Box<Expr>,
         body: Box<Expr>,
     },
+    /// Pattern used as a boolean predicate — `(a)-[:KNOWS]->(b)`
+    /// in a WHERE clause. Evaluates to `true` iff the pattern
+    /// has at least one match in the graph given the current
+    /// row's bindings. The start node's variable must be bound
+    /// in the outer row; unbound intermediate/target variables
+    /// are existentially quantified (we return true on first
+    /// match and never leak new bindings out of the predicate).
+    ///
+    /// v1 restrictions enforced by the parser/planner: no
+    /// variable-length hops, no path variables, and the pattern
+    /// must carry at least one hop.
+    PatternExists(Pattern),
     /// Binary arithmetic — `+`, `-`, `*`, `/`, `%`. Evaluated
     /// with numeric coercion (Int + Int = Int; any Float operand
     /// widens to Float) and null propagation. `+` additionally

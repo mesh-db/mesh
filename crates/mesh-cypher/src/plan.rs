@@ -327,23 +327,268 @@ pub fn plan(statement: &Statement) -> Result<LogicalPlan> {
 /// `Statement::CreateIndex` / `DropIndex` / `ShowIndexes` lower
 /// directly to the DDL plan variants.
 pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<LogicalPlan> {
-    match statement {
-        Statement::Create(c) => plan_create(c),
-        Statement::Match(m) => plan_match(m, ctx),
-        Statement::Unwind(u) => plan_unwind(u),
-        Statement::Return(r) => plan_return_only(r),
-        Statement::CreateIndex(IndexDdl { label, property }) => {
-            Ok(LogicalPlan::CreatePropertyIndex {
-                label: label.clone(),
-                property: property.clone(),
-            })
-        }
-        Statement::DropIndex(IndexDdl { label, property }) => Ok(LogicalPlan::DropPropertyIndex {
+    let plan = match statement {
+        Statement::Create(c) => plan_create(c)?,
+        Statement::Match(m) => plan_match(m, ctx)?,
+        Statement::Unwind(u) => plan_unwind(u)?,
+        Statement::Return(r) => plan_return_only(r)?,
+        Statement::CreateIndex(IndexDdl { label, property }) => LogicalPlan::CreatePropertyIndex {
             label: label.clone(),
             property: property.clone(),
-        }),
-        Statement::ShowIndexes => Ok(LogicalPlan::ShowPropertyIndexes),
-        Statement::Union(u) => plan_union(u, ctx),
+        },
+        Statement::DropIndex(IndexDdl { label, property }) => LogicalPlan::DropPropertyIndex {
+            label: label.clone(),
+            property: property.clone(),
+        },
+        Statement::ShowIndexes => LogicalPlan::ShowPropertyIndexes,
+        Statement::Union(u) => plan_union(u, ctx)?,
+    };
+    validate_pattern_predicates(&plan)?;
+    Ok(plan)
+}
+
+/// Walk the lowered plan and check every `Expr::PatternExists`
+/// subexpression against the v1 pattern-predicate restrictions:
+///
+/// - Start variable must be named (bound by the outer row).
+/// - Pattern must carry at least one hop (the parser enforces
+///   this too, but a plan-time belt-and-suspenders check
+///   catches any future grammar relaxation).
+/// - No `path_var` on the pattern.
+/// - No variable-length hops.
+///
+/// Violations produce `Error::Plan` with a message pointing
+/// at the specific restriction, so driver errors are
+/// actionable rather than a generic "pattern predicate
+/// rejected".
+fn validate_pattern_predicates(plan: &LogicalPlan) -> Result<()> {
+    walk_plan_exprs(plan, &mut |expr| {
+        walk_expr(expr, &mut |e| {
+            if let Expr::PatternExists(pattern) = e {
+                validate_pattern_predicate(pattern)?;
+            }
+            Ok(())
+        })
+    })
+}
+
+fn validate_pattern_predicate(pattern: &Pattern) -> Result<()> {
+    if pattern.path_var.is_some() {
+        return Err(Error::Plan(
+            "path variable binding is not allowed inside a pattern predicate".into(),
+        ));
+    }
+    if pattern.hops.is_empty() {
+        return Err(Error::Plan(
+            "pattern predicates must have at least one relationship hop".into(),
+        ));
+    }
+    if pattern.start.var.is_none() {
+        return Err(Error::Plan(
+            "pattern predicate's start node must reference a bound variable".into(),
+        ));
+    }
+    for hop in &pattern.hops {
+        if hop.rel.var_length.is_some() {
+            return Err(Error::Plan(
+                "variable-length hops (`*`) are not supported inside pattern predicates".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Walk every `Expr` that appears in `plan` — predicates on
+/// `Filter`, projection expressions on `Project` / `Aggregate`,
+/// set-assignment values on `SetProperty`, etc. — and invoke
+/// `visit` on each one. Used by `validate_pattern_predicates`
+/// to find every place a pattern predicate could be hiding.
+fn walk_plan_exprs<F>(plan: &LogicalPlan, visit: &mut F) -> Result<()>
+where
+    F: FnMut(&Expr) -> Result<()>,
+{
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            visit(predicate)?;
+            walk_plan_exprs(input, visit)
+        }
+        LogicalPlan::Project { input, items } => {
+            for item in items {
+                visit(&item.expr)?;
+            }
+            walk_plan_exprs(input, visit)
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_keys,
+            aggregates,
+        } => {
+            for item in group_keys {
+                visit(&item.expr)?;
+            }
+            for agg in aggregates {
+                match &agg.arg {
+                    AggregateArg::Star => {}
+                    AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => visit(e)?,
+                }
+            }
+            walk_plan_exprs(input, visit)
+        }
+        LogicalPlan::SetProperty { input, assignments } => {
+            for a in assignments {
+                match a {
+                    SetAssignment::Property { value, .. } => visit(value)?,
+                    SetAssignment::Merge { properties, .. }
+                    | SetAssignment::Replace { properties, .. } => {
+                        for (_, e) in properties {
+                            visit(e)?;
+                        }
+                    }
+                    SetAssignment::Labels { .. } => {}
+                }
+            }
+            walk_plan_exprs(input, visit)
+        }
+        LogicalPlan::OrderBy { input, sort_items } => {
+            for item in sort_items {
+                visit(&item.expr)?;
+            }
+            walk_plan_exprs(input, visit)
+        }
+        LogicalPlan::IndexSeek { value, .. } => visit(value),
+        LogicalPlan::Unwind { expr, .. } => visit(expr),
+        LogicalPlan::EdgeExpand { input, .. }
+        | LogicalPlan::OptionalEdgeExpand { input, .. }
+        | LogicalPlan::VarLengthExpand { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Skip { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Delete { input, .. }
+        | LogicalPlan::MergeEdge { input, .. }
+        | LogicalPlan::BindPath { input, .. } => walk_plan_exprs(input, visit),
+        LogicalPlan::CartesianProduct { left, right } => {
+            walk_plan_exprs(left, visit)?;
+            walk_plan_exprs(right, visit)
+        }
+        LogicalPlan::Union { branches, .. } => {
+            for b in branches {
+                walk_plan_exprs(b, visit)?;
+            }
+            Ok(())
+        }
+        LogicalPlan::CreatePath { input, .. } => match input {
+            Some(i) => walk_plan_exprs(i, visit),
+            None => Ok(()),
+        },
+        LogicalPlan::MergeNode { input, .. } => match input {
+            Some(i) => walk_plan_exprs(i, visit),
+            None => Ok(()),
+        },
+        LogicalPlan::NodeScanAll { .. }
+        | LogicalPlan::NodeScanByLabels { .. }
+        | LogicalPlan::CreatePropertyIndex { .. }
+        | LogicalPlan::DropPropertyIndex { .. }
+        | LogicalPlan::ShowPropertyIndexes => Ok(()),
+    }
+}
+
+/// Walk every sub-expression of `expr` (recursively) invoking
+/// `visit` on each. Used to find `Expr::PatternExists` nodes
+/// buried inside boolean trees, CASE branches, list
+/// comprehensions, reduce bodies, map literal values, etc.
+fn walk_expr<F>(expr: &Expr, visit: &mut F) -> Result<()>
+where
+    F: FnMut(&Expr) -> Result<()>,
+{
+    visit(expr)?;
+    match expr {
+        Expr::Literal(_) | Expr::Identifier(_) | Expr::Parameter(_) | Expr::Property { .. } => {
+            Ok(())
+        }
+        Expr::Not(e) => walk_expr(e, visit),
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            walk_expr(a, visit)?;
+            walk_expr(b, visit)
+        }
+        Expr::Compare { left, right, .. } => {
+            walk_expr(left, visit)?;
+            walk_expr(right, visit)
+        }
+        Expr::IsNull { inner, .. } => walk_expr(inner, visit),
+        Expr::Call { args, .. } => match args {
+            CallArgs::Star => Ok(()),
+            CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) => {
+                for e in es {
+                    walk_expr(e, visit)?;
+                }
+                Ok(())
+            }
+        },
+        Expr::List(items) => {
+            for e in items {
+                walk_expr(e, visit)?;
+            }
+            Ok(())
+        }
+        Expr::Map(entries) => {
+            for (_, e) in entries {
+                walk_expr(e, visit)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            if let Some(s) = scrutinee {
+                walk_expr(s, visit)?;
+            }
+            for (cond, result) in branches {
+                walk_expr(cond, visit)?;
+                walk_expr(result, visit)?;
+            }
+            if let Some(e) = else_expr {
+                walk_expr(e, visit)?;
+            }
+            Ok(())
+        }
+        Expr::ListComprehension {
+            source,
+            predicate,
+            projection,
+            ..
+        } => {
+            walk_expr(source, visit)?;
+            if let Some(p) = predicate {
+                walk_expr(p, visit)?;
+            }
+            if let Some(p) = projection {
+                walk_expr(p, visit)?;
+            }
+            Ok(())
+        }
+        Expr::Reduce {
+            acc_init,
+            source,
+            body,
+            ..
+        } => {
+            walk_expr(acc_init, visit)?;
+            walk_expr(source, visit)?;
+            walk_expr(body, visit)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            walk_expr(left, visit)?;
+            walk_expr(right, visit)
+        }
+        Expr::UnaryOp { operand, .. } => walk_expr(operand, visit),
+        // `Expr::PatternExists` itself is also walked into: the
+        // outer visit already saw it via the caller, so there's
+        // no sub-expressions inside the pattern worth inspecting
+        // (pattern-property values are restricted to literals
+        // and parameters, which the walker doesn't care about).
+        Expr::PatternExists(_) => Ok(()),
     }
 }
 

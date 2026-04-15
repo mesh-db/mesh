@@ -3806,3 +3806,218 @@ fn reduce_concatenates_strings() {
     );
     assert_eq!(str_prop(&rows[0], "joined"), "foobarbaz");
 }
+
+#[test]
+fn where_pattern_predicate_filters_nodes_with_edge() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), \
+                 (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE (p)-[:KNOWS]->(:Person) RETURN p.name AS name",
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Ada".to_string()]);
+}
+
+#[test]
+fn where_not_pattern_predicate_excludes_nodes_with_edge() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), \
+                 (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE NOT (p)-[:KNOWS]->(:Person) RETURN p.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Bob".to_string(), "Cara".to_string()]);
+}
+
+#[test]
+fn where_pattern_predicate_with_target_label_filter() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:User {name: 'Ada'}), (:Company {name: 'Acme'}), (:User {name: 'Bob'})",
+    );
+    run(
+        &store,
+        "MATCH (u:User {name: 'Ada'}), (c:Company {name: 'Acme'}) \
+         CREATE (u)-[:OWNS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p) WHERE (p)-[:OWNS]->(:Company) RETURN p.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn where_pattern_predicate_with_both_endpoints_bound() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person), (q:Person) WHERE (p)-[:KNOWS]->(q) \
+         RETURN p.name AS p_name, q.name AS q_name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "p_name"), "Ada");
+    assert_eq!(str_prop(&rows[0], "q_name"), "Bob");
+}
+
+#[test]
+fn where_pattern_predicate_multi_hop() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), \
+                 (:Person {name: 'Cara'}), (:Person {name: 'Dex'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Cara'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    // Ada has a 2-hop KNOWS path. Dex doesn't. Bob has a 1-hop
+    // path but a 2-hop path requires Bob→Cara→x which doesn't exist.
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE (p)-[:KNOWS]->(:Person)-[:KNOWS]->(:Person) \
+         RETURN p.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn where_pattern_predicate_with_target_property_filter() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Cara'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE (p)-[:KNOWS]->(:Person {name: 'Cara'}) \
+         RETURN p.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string(), "Bob".to_string()]);
+}
+
+#[test]
+fn where_pattern_predicate_combined_with_scalar_predicate_and() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada', age: 36}), \
+                 (:Person {name: 'Bob', age: 17}), \
+                 (:Person {name: 'Cara', age: 42})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) \
+         CREATE (a)-[:KNOWS]->(c), (c)-[:KNOWS]->(a)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE p.age >= 18 AND (p)-[:KNOWS]->(:Person) \
+         RETURN p.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string(), "Cara".to_string()]);
+}
+
+#[test]
+fn where_pattern_predicate_combined_with_scalar_predicate_or() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada', age: 36}), \
+                 (:Person {name: 'Bob', age: 17}), \
+                 (:Person {name: 'Cara', age: 42})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE p.age < 18 OR (p)-[:KNOWS]->(:Person) \
+         RETURN p.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string(), "Bob".to_string()]);
+}
+
+#[test]
+fn where_pattern_predicate_var_length_errors() {
+    let parsed =
+        mesh_cypher::parse("MATCH (p:Person) WHERE (p)-[:KNOWS*1..3]->(:Person) RETURN p").unwrap();
+    let err = mesh_cypher::plan(&parsed).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("variable-length") && msg.contains("pattern predicate"),
+        "expected var-length rejection message, got: {msg}"
+    );
+}
+
+#[test]
+fn where_pattern_predicate_missing_edge_returns_empty() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE (p)-[:KNOWS]->(:Person) RETURN p.name AS name",
+    );
+    assert!(rows.is_empty());
+}

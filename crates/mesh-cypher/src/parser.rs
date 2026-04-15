@@ -1293,6 +1293,27 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
         }
         Rule::list_comp => build_list_comp(pair),
         Rule::reduce_expr => build_reduce_expr(pair),
+        Rule::pattern_predicate => {
+            // `pattern_predicate` has the same inner structure as
+            // `pattern` (minus the optional `path_var_binding`
+            // prefix and with `hop+` instead of `hop*`), so we
+            // reuse `build_pattern` which handles both forms.
+            let pat = build_pattern(pair)?;
+            if pat.path_var.is_some() {
+                return Err(Error::Parse(
+                    "path variable binding is not allowed inside a pattern predicate".into(),
+                ));
+            }
+            // Grammar guarantees `hop+`; belt-and-suspenders check
+            // against a future grammar relaxation that might
+            // accidentally accept zero hops.
+            if pat.hops.is_empty() {
+                return Err(Error::Parse(
+                    "pattern predicates must have at least one relationship hop".into(),
+                ));
+            }
+            Ok(Expr::PatternExists(pat))
+        }
         r => Err(Error::Parse(format!(
             "unexpected rule in expression: {:?}",
             r

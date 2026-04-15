@@ -1868,3 +1868,72 @@ fn reduce_with_property_source_parses() {
         Expr::Reduce { .. }
     ));
 }
+
+#[test]
+fn pattern_predicate_parses_as_expr_pattern_exists() {
+    let s = parse("MATCH (a:Person) WHERE (a)-[:KNOWS]->(b) RETURN a").unwrap();
+    let m = unwrap_match(s);
+    let Expr::PatternExists(pat) = first_match(&m).where_clause.clone().unwrap() else {
+        panic!("expected Expr::PatternExists");
+    };
+    assert_eq!(pat.start.var.as_deref(), Some("a"));
+    assert_eq!(pat.hops.len(), 1);
+    assert_eq!(pat.hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
+}
+
+#[test]
+fn pattern_predicate_with_not_parses() {
+    let s = parse("MATCH (a:Person) WHERE NOT (a)-[:BLOCKED]->(b) RETURN a").unwrap();
+    let m = unwrap_match(s);
+    let Expr::Not(inner) = first_match(&m).where_clause.clone().unwrap() else {
+        panic!("expected Not");
+    };
+    assert!(matches!(inner.as_ref(), Expr::PatternExists(_)));
+}
+
+#[test]
+fn pattern_predicate_in_boolean_and_tree_parses() {
+    let s = parse(
+        "MATCH (a:Person) \
+         WHERE a.age > 30 AND (a)-[:KNOWS]->(b) \
+         RETURN a",
+    )
+    .unwrap();
+    let m = unwrap_match(s);
+    let Expr::And(lhs, rhs) = first_match(&m).where_clause.clone().unwrap() else {
+        panic!("expected And");
+    };
+    assert!(matches!(lhs.as_ref(), Expr::Compare { .. }));
+    assert!(matches!(rhs.as_ref(), Expr::PatternExists(_)));
+}
+
+#[test]
+fn pattern_predicate_rejects_var_length_at_plan_time() {
+    // Parser accepts the shape (var-length hops are valid inside
+    // a pattern in general); the planner rejects.
+    let s = parse("MATCH (a:Person) WHERE (a)-[:KNOWS*1..3]->(b) RETURN a").unwrap();
+    let err = plan(&s).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("variable-length") && msg.contains("pattern predicate"),
+        "expected var-length rejection message, got: {msg}"
+    );
+}
+
+#[test]
+fn parenthesized_arithmetic_still_parses_as_expression() {
+    // Make sure the `pattern_predicate` addition to `primary`
+    // doesn't steal `(a + 1)` — that must still fall through to
+    // the parenthesized-expression alternative.
+    let s = parse("RETURN (1 + 2) * 3 AS r").unwrap();
+    let Statement::Return(r) = s else {
+        panic!("expected Return");
+    };
+    assert!(matches!(
+        r.return_items[0].expr,
+        Expr::BinaryOp {
+            op: BinaryOp::Mul,
+            ..
+        }
+    ));
+}

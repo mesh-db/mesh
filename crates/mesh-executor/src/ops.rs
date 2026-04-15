@@ -1,6 +1,6 @@
 use crate::{
     error::{Error, Result},
-    eval::{compare_values, eval_expr, row_key, to_bool, value_key},
+    eval::{compare_values, eval_expr, row_key, to_bool, value_key, EvalCtx},
     reader::GraphReader,
     value::{ParamMap, Row, Value},
     writer::GraphWriter,
@@ -22,6 +22,24 @@ pub struct ExecCtx<'a> {
     /// driver-supplied params on the Bolt path. Threaded into every
     /// `eval_expr` call so `Expr::Parameter("name")` resolves.
     pub params: &'a ParamMap,
+}
+
+impl<'a> ExecCtx<'a> {
+    /// Build an `EvalCtx` wrapping the given row alongside this
+    /// exec context's params and reader. Used by operators to
+    /// bridge the per-operator context into the expression
+    /// evaluator without repeating the field list at every
+    /// `eval_expr` call site.
+    pub(crate) fn eval_ctx<'b>(&self, row: &'b Row) -> EvalCtx<'b>
+    where
+        'a: 'b,
+    {
+        EvalCtx {
+            row,
+            params: self.params,
+            reader: self.store,
+        }
+    }
 }
 
 pub trait Operator {
@@ -346,7 +364,12 @@ impl Operator for UnwindOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         if self.items.is_none() {
             let empty = Row::new();
-            let val = eval_expr(&self.expr, &empty, ctx.params)?;
+            let ectx = EvalCtx {
+                row: &empty,
+                params: ctx.params,
+                reader: ctx.store,
+            };
+            let val = eval_expr(&self.expr, &ectx)?;
             let items = match val {
                 Value::List(items) => items,
                 Value::Property(Property::List(props)) => {
@@ -414,7 +437,7 @@ impl CreatePathOp {
                     // + params and convert to a stored Property via the
                     // existing helper, which rejects Node/Edge values.
                     for (k, expr) in properties {
-                        let value = eval_expr(expr, row, ctx.params)?;
+                        let value = eval_expr(expr, &ctx.eval_ctx(row))?;
                         let prop = value_to_property(value)?;
                         node.properties.insert(k.clone(), prop);
                     }
@@ -617,7 +640,7 @@ impl Operator for SetPropertyOp {
                 for a in &self.assignments {
                     match a {
                         SetAssignment::Property { var, key, value } => {
-                            let evaluated = eval_expr(value, &row, ctx.params)?;
+                            let evaluated = eval_expr(value, &ctx.eval_ctx(&row))?;
                             let prop = value_to_property(evaluated)?;
                             actions.push(Action::SetKey {
                                 var: var.clone(),
@@ -639,7 +662,7 @@ impl Operator for SetPropertyOp {
                             let props = properties
                                 .iter()
                                 .map(|(k, expr)| {
-                                    let v = eval_expr(expr, &row, ctx.params)?;
+                                    let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
                                     Ok((k.clone(), value_to_property(v)?))
                                 })
                                 .collect::<Result<Vec<(String, Property)>>>()?;
@@ -652,7 +675,7 @@ impl Operator for SetPropertyOp {
                             let props = properties
                                 .iter()
                                 .map(|(k, expr)| {
-                                    let v = eval_expr(expr, &row, ctx.params)?;
+                                    let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
                                     Ok((k.clone(), value_to_property(v)?))
                                 })
                                 .collect::<Result<Vec<(String, Property)>>>()?;
@@ -874,7 +897,7 @@ impl Operator for IndexSeekOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         if self.results.is_none() {
             let empty = Row::new();
-            let value = eval_expr(&self.value_expr, &empty, ctx.params)?;
+            let value = eval_expr(&self.value_expr, &ctx.eval_ctx(&empty))?;
             let property = match value {
                 Value::Property(p) => p,
                 Value::Null => Property::Null,
@@ -993,7 +1016,7 @@ impl MergeNodeOp {
             .properties
             .iter()
             .map(|(k, expr)| {
-                let v = eval_expr(expr, &empty, ctx.params)?;
+                let v = eval_expr(expr, &ctx.eval_ctx(&empty))?;
                 Ok((k.clone(), value_to_property(v)?))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1026,7 +1049,7 @@ impl MergeNodeOp {
             for (k, prop) in resolved_props {
                 node.properties.insert(k, prop);
             }
-            apply_merge_actions(&mut node, &self.on_create, &self.var, ctx.params)?;
+            apply_merge_actions(&mut node, &self.on_create, &self.var, ctx)?;
             ctx.writer.put_node(&node)?;
             self.merged_nodes.push(node);
         } else if !self.on_match.is_empty() {
@@ -1034,7 +1057,7 @@ impl MergeNodeOp {
             // matched node and persist each. The outer `if !is_empty`
             // skips the loop in the common no-ON-MATCH case.
             for node in self.merged_nodes.iter_mut() {
-                apply_merge_actions(node, &self.on_match, &self.var, ctx.params)?;
+                apply_merge_actions(node, &self.on_match, &self.var, ctx)?;
                 ctx.writer.put_node(node)?;
             }
         }
@@ -1178,12 +1201,7 @@ impl Operator for MergeEdgeOp {
                 // Match branch: apply ON MATCH SET (if any)
                 // and persist if we touched anything.
                 if !self.on_match.is_empty() {
-                    apply_merge_edge_actions(
-                        &mut existing,
-                        &self.on_match,
-                        &self.edge_var,
-                        ctx.params,
-                    )?;
+                    apply_merge_edge_actions(&mut existing, &self.on_match, &self.edge_var, ctx)?;
                     ctx.writer.put_edge(&existing)?;
                 }
                 existing
@@ -1191,12 +1209,7 @@ impl Operator for MergeEdgeOp {
                 // Create branch: synthesize a new edge, apply
                 // ON CREATE SET, persist.
                 let mut new_edge = Edge::new(&self.edge_type, src_node.id, dst_node.id);
-                apply_merge_edge_actions(
-                    &mut new_edge,
-                    &self.on_create,
-                    &self.edge_var,
-                    ctx.params,
-                )?;
+                apply_merge_edge_actions(&mut new_edge, &self.on_create, &self.edge_var, ctx)?;
                 ctx.writer.put_edge(&new_edge)?;
                 new_edge
             };
@@ -1218,7 +1231,7 @@ fn apply_merge_edge_actions(
     edge: &mut Edge,
     actions: &[SetAssignment],
     var: &str,
-    params: &ParamMap,
+    exec_ctx: &ExecCtx,
 ) -> Result<()> {
     if actions.is_empty() {
         return Ok(());
@@ -1226,6 +1239,7 @@ fn apply_merge_edge_actions(
     let mut row = Row::new();
     row.insert(var.to_string(), Value::Edge(edge.clone()));
     for action in actions {
+        let sub_ctx = exec_ctx.eval_ctx(&row);
         match action {
             SetAssignment::Property {
                 var: target,
@@ -1235,7 +1249,7 @@ fn apply_merge_edge_actions(
                 if target != var {
                     return Err(Error::UnboundVariable(target.clone()));
                 }
-                let evaluated = eval_expr(value, &row, params)?;
+                let evaluated = eval_expr(value, &sub_ctx)?;
                 let prop = value_to_property(evaluated)?;
                 edge.properties.insert(key.clone(), prop);
                 row.insert(var.to_string(), Value::Edge(edge.clone()));
@@ -1250,7 +1264,7 @@ fn apply_merge_edge_actions(
                 let resolved: Vec<(String, Property)> = properties
                     .iter()
                     .map(|(k, expr)| {
-                        let v = eval_expr(expr, &row, params)?;
+                        let v = eval_expr(expr, &sub_ctx)?;
                         Ok((k.clone(), value_to_property(v)?))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1269,7 +1283,7 @@ fn apply_merge_edge_actions(
                 let resolved: Vec<(String, Property)> = properties
                     .iter()
                     .map(|(k, expr)| {
-                        let v = eval_expr(expr, &row, params)?;
+                        let v = eval_expr(expr, &sub_ctx)?;
                         Ok((k.clone(), value_to_property(v)?))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1300,7 +1314,7 @@ fn apply_merge_actions(
     node: &mut Node,
     actions: &[SetAssignment],
     var: &str,
-    params: &ParamMap,
+    exec_ctx: &ExecCtx,
 ) -> Result<()> {
     if actions.is_empty() {
         return Ok(());
@@ -1308,6 +1322,7 @@ fn apply_merge_actions(
     let mut row = Row::new();
     row.insert(var.to_string(), Value::Node(node.clone()));
     for action in actions {
+        let sub_ctx = exec_ctx.eval_ctx(&row);
         match action {
             SetAssignment::Property {
                 var: target,
@@ -1317,7 +1332,7 @@ fn apply_merge_actions(
                 if target != var {
                     return Err(Error::UnboundVariable(target.clone()));
                 }
-                let evaluated = eval_expr(value, &row, params)?;
+                let evaluated = eval_expr(value, &sub_ctx)?;
                 let prop = value_to_property(evaluated)?;
                 node.properties.insert(key.clone(), prop);
                 row.insert(var.to_string(), Value::Node(node.clone()));
@@ -1346,7 +1361,7 @@ fn apply_merge_actions(
                 let resolved: Vec<(String, Property)> = properties
                     .iter()
                     .map(|(k, expr)| {
-                        let v = eval_expr(expr, &row, params)?;
+                        let v = eval_expr(expr, &sub_ctx)?;
                         Ok((k.clone(), value_to_property(v)?))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1366,7 +1381,7 @@ fn apply_merge_actions(
                 let resolved: Vec<(String, Property)> = properties
                     .iter()
                     .map(|(k, expr)| {
-                        let v = eval_expr(expr, &row, params)?;
+                        let v = eval_expr(expr, &sub_ctx)?;
                         Ok((k.clone(), value_to_property(v)?))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1808,7 +1823,7 @@ impl FilterOp {
 impl Operator for FilterOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         while let Some(row) = self.input.next(ctx)? {
-            let v = eval_expr(&self.predicate, &row, ctx.params)?;
+            let v = eval_expr(&self.predicate, &ctx.eval_ctx(&row))?;
             if to_bool(&v)? {
                 return Ok(Some(row));
             }
@@ -1838,7 +1853,7 @@ impl Operator for ProjectOp {
                         .alias
                         .clone()
                         .unwrap_or_else(|| default_name(&item.expr, i));
-                    let value = eval_expr(&item.expr, &row, ctx.params)?;
+                    let value = eval_expr(&item.expr, &ctx.eval_ctx(&row))?;
                     out.insert(name, value);
                 }
                 Ok(Some(out))
@@ -2035,7 +2050,7 @@ impl Operator for OrderByOp {
             for row in rows {
                 let mut keys = Vec::with_capacity(self.sort_items.len());
                 for item in &self.sort_items {
-                    keys.push(eval_expr(&item.expr, &row, ctx.params)?);
+                    keys.push(eval_expr(&item.expr, &ctx.eval_ctx(&row))?);
                 }
                 keyed.push((keys, row));
             }
@@ -2098,7 +2113,7 @@ impl AggregateOp {
             saw_any = true;
             let mut key_values = Vec::with_capacity(self.group_keys.len());
             for item in &self.group_keys {
-                key_values.push(eval_expr(&item.expr, &row, ctx.params)?);
+                key_values.push(eval_expr(&item.expr, &ctx.eval_ctx(&row))?);
             }
             let mut hash_key = String::new();
             for v in &key_values {
@@ -2119,7 +2134,7 @@ impl AggregateOp {
             });
             for (i, spec) in self.aggregates.iter().enumerate() {
                 if let AggregateArg::DistinctExpr(expr) = &spec.arg {
-                    let v = eval_expr(expr, &row, ctx.params)?;
+                    let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
                     if matches!(v, Value::Null) {
                         continue;
                     }
@@ -2129,7 +2144,7 @@ impl AggregateOp {
                         continue;
                     }
                 }
-                entry.agg_states[i].update(&spec.arg, &row, ctx.params)?;
+                entry.agg_states[i].update(&spec.arg, &ctx.eval_ctx(&row))?;
             }
         }
 
@@ -2223,12 +2238,12 @@ impl AggState {
         }
     }
 
-    fn update(&mut self, arg: &AggregateArg, row: &Row, params: &ParamMap) -> Result<()> {
+    fn update(&mut self, arg: &AggregateArg, ctx: &EvalCtx) -> Result<()> {
         match self {
             AggState::Count(c) => match arg {
                 AggregateArg::Star => *c += 1,
                 AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => {
-                    if !matches!(eval_expr(e, row, params)?, Value::Null) {
+                    if !matches!(eval_expr(e, ctx)?, Value::Null) {
                         *c += 1;
                     }
                 }
@@ -2238,7 +2253,7 @@ impl AggState {
                 float_part,
                 is_float,
             } => {
-                let v = expr_arg_value(arg, row, params)?;
+                let v = expr_arg_value(arg, ctx)?;
                 match v {
                     Value::Null => {}
                     Value::Property(Property::Int64(i)) => *int_part += i,
@@ -2250,7 +2265,7 @@ impl AggState {
                 }
             }
             AggState::Avg { total, count } => {
-                let v = expr_arg_value(arg, row, params)?;
+                let v = expr_arg_value(arg, ctx)?;
                 match v {
                     Value::Null => {}
                     Value::Property(Property::Int64(i)) => {
@@ -2265,7 +2280,7 @@ impl AggState {
                 }
             }
             AggState::Min(slot) => {
-                let v = expr_arg_value(arg, row, params)?;
+                let v = expr_arg_value(arg, ctx)?;
                 if let Value::Property(p) = v {
                     match slot {
                         None => *slot = Some(p),
@@ -2282,7 +2297,7 @@ impl AggState {
                 }
             }
             AggState::Max(slot) => {
-                let v = expr_arg_value(arg, row, params)?;
+                let v = expr_arg_value(arg, ctx)?;
                 if let Value::Property(p) = v {
                     match slot {
                         None => *slot = Some(p),
@@ -2299,7 +2314,7 @@ impl AggState {
                 }
             }
             AggState::Collect(items) => {
-                let v = expr_arg_value(arg, row, params)?;
+                let v = expr_arg_value(arg, ctx)?;
                 if !matches!(v, Value::Null) {
                     items.push(v);
                 }
@@ -2338,10 +2353,10 @@ impl AggState {
     }
 }
 
-fn expr_arg_value(arg: &AggregateArg, row: &Row, params: &ParamMap) -> Result<Value> {
+fn expr_arg_value(arg: &AggregateArg, ctx: &EvalCtx) -> Result<Value> {
     match arg {
         AggregateArg::Star => Err(Error::AggregateTypeError),
-        AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => eval_expr(e, row, params),
+        AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => eval_expr(e, ctx),
     }
 }
 

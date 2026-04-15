@@ -1,24 +1,59 @@
 use crate::{
     error::{Error, Result},
+    reader::GraphReader,
     value::{ParamMap, Row, Value},
 };
-use mesh_core::Property;
-use mesh_cypher::{BinaryOp, CallArgs, CompareOp, Expr, Literal, UnaryOp};
+use mesh_core::{NodeId, Property};
+use mesh_cypher::{
+    BinaryOp, CallArgs, CompareOp, Direction, Expr, Literal, NodePattern, Pattern, UnaryOp,
+};
 use std::cmp::Ordering;
 
-pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Value> {
+/// Per-evaluation context threaded through every `eval_expr`
+/// call. Holds the current row, the query parameters, and a
+/// reference to the graph reader so expression variants that
+/// need to touch the graph (e.g. `Expr::PatternExists`) can
+/// do so without widening the call signature. Scratch-row
+/// iteration (`reduce`, list comprehensions) constructs a
+/// derived ctx via [`EvalCtx::with_row`] so the params +
+/// reader are inherited for free.
+#[derive(Clone, Copy)]
+pub(crate) struct EvalCtx<'a> {
+    pub row: &'a Row,
+    pub params: &'a ParamMap,
+    pub reader: &'a dyn GraphReader,
+}
+
+impl<'a> EvalCtx<'a> {
+    /// Build a fresh ctx that swaps only the row, preserving
+    /// params and reader. Used by iteration primitives that
+    /// evaluate sub-expressions against a scratch row (list
+    /// comprehensions, reduce).
+    pub(crate) fn with_row(&self, new_row: &'a Row) -> EvalCtx<'a> {
+        EvalCtx {
+            row: new_row,
+            params: self.params,
+            reader: self.reader,
+        }
+    }
+}
+
+pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
         Expr::Literal(lit) => Ok(literal_to_value(lit)),
-        Expr::Identifier(name) => row
+        Expr::Identifier(name) => ctx
+            .row
             .get(name)
             .cloned()
             .ok_or_else(|| Error::UnboundVariable(name.clone())),
-        Expr::Parameter(name) => params
+        Expr::Parameter(name) => ctx
+            .params
             .get(name)
             .cloned()
             .ok_or_else(|| Error::UnboundParameter(name.clone())),
         Expr::Property { var, key } => {
-            let bound = row
+            let bound = ctx
+                .row
                 .get(var)
                 .ok_or_else(|| Error::UnboundVariable(var.clone()))?;
             match bound {
@@ -44,32 +79,32 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             }
         }
         Expr::Not(inner) => {
-            let v = eval_expr(inner, row, params)?;
+            let v = eval_expr(inner, ctx)?;
             Ok(Value::Property(Property::Bool(!to_bool(&v)?)))
         }
         Expr::And(a, b) => {
-            let va = to_bool(&eval_expr(a, row, params)?)?;
+            let va = to_bool(&eval_expr(a, ctx)?)?;
             if !va {
                 return Ok(Value::Property(Property::Bool(false)));
             }
-            let vb = to_bool(&eval_expr(b, row, params)?)?;
+            let vb = to_bool(&eval_expr(b, ctx)?)?;
             Ok(Value::Property(Property::Bool(vb)))
         }
         Expr::Or(a, b) => {
-            let va = to_bool(&eval_expr(a, row, params)?)?;
+            let va = to_bool(&eval_expr(a, ctx)?)?;
             if va {
                 return Ok(Value::Property(Property::Bool(true)));
             }
-            let vb = to_bool(&eval_expr(b, row, params)?)?;
+            let vb = to_bool(&eval_expr(b, ctx)?)?;
             Ok(Value::Property(Property::Bool(vb)))
         }
         Expr::Compare { op, left, right } => {
-            let vl = eval_expr(left, row, params)?;
-            let vr = eval_expr(right, row, params)?;
+            let vl = eval_expr(left, ctx)?;
+            let vr = eval_expr(right, ctx)?;
             Ok(Value::Property(Property::Bool(compare(*op, &vl, &vr)?)))
         }
         Expr::IsNull { negated, inner } => {
-            let v = eval_expr(inner, row, params)?;
+            let v = eval_expr(inner, ctx)?;
             let is_null = matches!(v, Value::Null | Value::Property(Property::Null));
             Ok(Value::Property(Property::Bool(if *negated {
                 !is_null
@@ -77,11 +112,11 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
                 is_null
             })))
         }
-        Expr::Call { name, args } => call_scalar(name, args, row, params),
+        Expr::Call { name, args } => call_scalar(name, args, ctx),
         Expr::List(items) => {
             let mut out = Vec::with_capacity(items.len());
             for e in items {
-                out.push(eval_expr(e, row, params)?);
+                out.push(eval_expr(e, ctx)?);
             }
             Ok(Value::List(out))
         }
@@ -95,7 +130,7 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             // returns `{name: null}` as a 1-key map.
             let mut out = std::collections::HashMap::with_capacity(entries.len());
             for (key, expr) in entries {
-                let v = eval_expr(expr, row, params)?;
+                let v = eval_expr(expr, ctx)?;
                 let prop = match v {
                     Value::Property(p) => p,
                     Value::Null => Property::Null,
@@ -128,21 +163,21 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             else_expr,
         } => {
             let scrutinee_val = match scrutinee {
-                Some(e) => Some(eval_expr(e, row, params)?),
+                Some(e) => Some(eval_expr(e, ctx)?),
                 None => None,
             };
             for (cond, result) in branches {
-                let cond_val = eval_expr(cond, row, params)?;
+                let cond_val = eval_expr(cond, ctx)?;
                 let matched = match &scrutinee_val {
                     Some(sv) => case_equals(sv, &cond_val),
                     None => to_bool(&cond_val).unwrap_or(false),
                 };
                 if matched {
-                    return eval_expr(result, row, params);
+                    return eval_expr(result, ctx);
                 }
             }
             match else_expr {
-                Some(e) => eval_expr(e, row, params),
+                Some(e) => eval_expr(e, ctx),
                 None => Ok(Value::Null),
             }
         }
@@ -152,7 +187,7 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             predicate,
             projection,
         } => {
-            let source_val = eval_expr(source, row, params)?;
+            let source_val = eval_expr(source, ctx)?;
             let items = match source_val {
                 Value::List(items) => items,
                 Value::Property(Property::List(props)) => {
@@ -161,20 +196,21 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
                 Value::Null => return Ok(Value::Null),
                 _ => return Err(Error::TypeMismatch),
             };
-            let mut scratch = row.clone();
+            let mut scratch = ctx.row.clone();
             let had_prev = scratch.contains_key(var);
             let prev = scratch.get(var).cloned();
             let mut out = Vec::with_capacity(items.len());
             for item in items {
                 scratch.insert(var.clone(), item);
+                let sub_ctx = ctx.with_row(&scratch);
                 if let Some(pred) = predicate {
-                    let pv = eval_expr(pred, &scratch, params)?;
+                    let pv = eval_expr(pred, &sub_ctx)?;
                     if !to_bool(&pv).unwrap_or(false) {
                         continue;
                     }
                 }
                 let projected = match projection {
-                    Some(p) => eval_expr(p, &scratch, params)?,
+                    Some(p) => eval_expr(p, &sub_ctx)?,
                     None => scratch.get(var).cloned().unwrap_or(Value::Null),
                 };
                 out.push(projected);
@@ -198,7 +234,7 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             // evaluate body to get the next acc. Empty source
             // returns the init value unchanged. Null source
             // propagates as in every other collection primitive.
-            let source_val = eval_expr(source, row, params)?;
+            let source_val = eval_expr(source, ctx)?;
             let items = match source_val {
                 Value::List(items) => items,
                 Value::Property(Property::List(props)) => {
@@ -208,8 +244,8 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
                 Value::Property(Property::Null) => return Ok(Value::Null),
                 _ => return Err(Error::TypeMismatch),
             };
-            let mut acc = eval_expr(acc_init, row, params)?;
-            let mut scratch = row.clone();
+            let mut acc = eval_expr(acc_init, ctx)?;
+            let mut scratch = ctx.row.clone();
             // Save any prior bindings under the two iteration
             // variables so reduce's scope doesn't leak into
             // sibling expressions in the same row — Cypher's
@@ -219,7 +255,8 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             for item in items {
                 scratch.insert(acc_var.clone(), acc);
                 scratch.insert(elem_var.clone(), item);
-                acc = eval_expr(body, &scratch, params)?;
+                let sub_ctx = ctx.with_row(&scratch);
+                acc = eval_expr(body, &sub_ctx)?;
             }
             match prev_acc {
                 Some(v) => {
@@ -240,15 +277,159 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             Ok(acc)
         }
         Expr::BinaryOp { op, left, right } => {
-            let l = eval_expr(left, row, params)?;
-            let r = eval_expr(right, row, params)?;
+            let l = eval_expr(left, ctx)?;
+            let r = eval_expr(right, ctx)?;
             eval_binary_op(*op, l, r)
         }
         Expr::UnaryOp { op, operand } => {
-            let v = eval_expr(operand, row, params)?;
+            let v = eval_expr(operand, ctx)?;
             eval_unary_op(*op, v)
         }
+        Expr::PatternExists(pattern) => {
+            let b = pattern_exists(pattern, ctx)?;
+            Ok(Value::Property(Property::Bool(b)))
+        }
     }
+}
+
+/// Check whether a fixed-hop pattern has at least one match in the
+/// graph given the outer row's bindings. Walks a BFS-style frontier
+/// from the (bound) start node through each hop, filtering by edge
+/// type, direction, and target label/property constraints. Returns
+/// `true` on the first complete walk; returns `false` if any hop
+/// produces an empty frontier or if the start variable isn't bound
+/// to a `Value::Node` in the outer row.
+///
+/// v1 invariants (the parser and planner enforce these):
+/// - `pattern.path_var` is `None`
+/// - `pattern.hops` is non-empty
+/// - `pattern.start.var` is `Some(_)`
+/// - No `hop.rel.var_length` is set
+fn pattern_exists(pattern: &Pattern, ctx: &EvalCtx) -> Result<bool> {
+    let start_var = pattern
+        .start
+        .var
+        .as_ref()
+        .expect("planner guarantees bound start var for pattern predicates");
+    let start_node = match ctx.row.get(start_var) {
+        Some(Value::Node(n)) => n.clone(),
+        // If the start variable isn't a Node (unbound, Null from an
+        // OPTIONAL MATCH, something else entirely), the pattern
+        // can't possibly match — behave like Neo4j and return false.
+        _ => return Ok(false),
+    };
+    // Start-node label constraint: every label on the start pattern
+    // must be present on the bound node. Pattern properties on the
+    // start node are also checked so `(a:Person {name: 'Ada'})` as a
+    // predicate filters on the name even when `a` was bound by an
+    // earlier MATCH without that constraint.
+    if !start_node_matches(&start_node, &pattern.start, ctx)? {
+        return Ok(false);
+    }
+
+    let mut frontier: Vec<NodeId> = vec![start_node.id];
+    for hop in &pattern.hops {
+        let mut next: Vec<NodeId> = Vec::new();
+        for node_id in &frontier {
+            let neighbors = match hop.rel.direction {
+                Direction::Outgoing => ctx.reader.outgoing(*node_id)?,
+                Direction::Incoming => ctx.reader.incoming(*node_id)?,
+                Direction::Both => {
+                    let mut out = ctx.reader.outgoing(*node_id)?;
+                    out.extend(ctx.reader.incoming(*node_id)?);
+                    out
+                }
+            };
+            for (edge_id, neighbor_id) in neighbors {
+                // Edge-type filter. Only pull the edge record when
+                // a type constraint is present; adjacency already
+                // encodes the neighbor, so unconstrained hops skip
+                // the extra lookup.
+                if let Some(t) = &hop.rel.edge_type {
+                    let edge = match ctx.reader.get_edge(edge_id)? {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    if &edge.edge_type != t {
+                        continue;
+                    }
+                }
+                // Target-side label + pattern-property filter. When
+                // the target pattern carries no constraints we skip
+                // the node lookup entirely and accept any neighbor.
+                if !hop.target.labels.is_empty() || !hop.target.properties.is_empty() {
+                    let neighbor = match ctx.reader.get_node(neighbor_id)? {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    if !node_pattern_matches(&neighbor, &hop.target, ctx)? {
+                        continue;
+                    }
+                }
+                // Correlated lookup: if the target has a variable
+                // that's already bound in the outer row, require
+                // the walked neighbor to BE that bound node. This
+                // lets `WHERE (a)-[:KNOWS]->(b)` check a specific
+                // edge between two outer-row nodes rather than
+                // wandering into unrelated neighbors.
+                if let Some(target_var) = &hop.target.var {
+                    if let Some(Value::Node(bound)) = ctx.row.get(target_var) {
+                        if bound.id != neighbor_id {
+                            continue;
+                        }
+                    }
+                }
+                next.push(neighbor_id);
+            }
+        }
+        if next.is_empty() {
+            return Ok(false);
+        }
+        frontier = next;
+    }
+    Ok(!frontier.is_empty())
+}
+
+/// Check whether the bound start node satisfies its pattern's
+/// label and property constraints. Pattern properties on a start
+/// node are `Expr::Literal` / `Expr::Parameter` per the grammar's
+/// `property_value` rule, so evaluation is cheap and side-effect
+/// free.
+fn start_node_matches(
+    node: &mesh_core::Node,
+    pattern: &NodePattern,
+    ctx: &EvalCtx,
+) -> Result<bool> {
+    for required in &pattern.labels {
+        if !node.labels.contains(required) {
+            return Ok(false);
+        }
+    }
+    for (key, expr) in &pattern.properties {
+        let expected = eval_expr(expr, ctx)?;
+        let actual = node
+            .properties
+            .get(key)
+            .cloned()
+            .map(Value::Property)
+            .unwrap_or(Value::Null);
+        if !case_equals(&expected, &actual) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Same as [`start_node_matches`] but for target nodes on a hop's
+/// far end. Separate function for symmetry; the logic is identical
+/// today but the two sides may diverge in future (e.g. if target
+/// patterns gain constraints the start side can't express).
+fn node_pattern_matches(
+    node: &mesh_core::Node,
+    pattern: &NodePattern,
+    ctx: &EvalCtx,
+) -> Result<bool> {
+    start_node_matches(node, pattern, ctx)
 }
 
 /// Apply a binary arithmetic operator to two already-evaluated
@@ -397,7 +578,7 @@ fn case_equals(a: &Value, b: &Value) -> bool {
     a == b
 }
 
-fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Result<Value> {
+fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
     let arg_exprs = match args {
         CallArgs::Star => return Err(Error::UnknownScalarFunction(format!("{}(*)", name))),
         CallArgs::Exprs(e) => e.as_slice(),
@@ -410,7 +591,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
     };
     match name.to_ascii_lowercase().as_str() {
         "size" | "length" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::List(items) => Ok(Value::Property(Property::Int64(items.len() as i64))),
@@ -433,7 +614,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
         "nodes" => {
             // `nodes(p)` returns the ordered list of nodes in a
             // path. Null-propagating: `nodes(null)` → null.
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Path { nodes, .. } => {
@@ -445,7 +626,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
         "relationships" => {
             // `relationships(p)` returns the ordered list of edges
             // in a path. Null-propagating.
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Path { edges, .. } => {
@@ -455,7 +636,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             }
         }
         "labels" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Node(n) => Ok(Value::List(
@@ -468,7 +649,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             }
         }
         "keys" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Node(n) => {
@@ -493,7 +674,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             }
         }
         "type" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Edge(e) => Ok(Value::Property(Property::String(e.edge_type))),
@@ -501,7 +682,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             }
         }
         "tolower" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::String(s)) => {
@@ -511,7 +692,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             }
         }
         "toupper" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::String(s)) => {
@@ -521,11 +702,11 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             }
         }
         "tostring" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             Ok(value_to_string(v))
         }
         "tointeger" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::Int64(i)) => Ok(Value::Property(Property::Int64(i))),
@@ -549,7 +730,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
                 ));
             }
             for e in arg_exprs {
-                let v = eval_expr(e, row, params)?;
+                let v = eval_expr(e, ctx)?;
                 let is_null = matches!(v, Value::Null | Value::Property(Property::Null));
                 if !is_null {
                     return Ok(v);
@@ -566,8 +747,8 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
                     "substring expects 2 or 3 arguments".into(),
                 ));
             }
-            let sv = eval_expr(&arg_exprs[0], row, params)?;
-            let start_v = eval_expr(&arg_exprs[1], row, params)?;
+            let sv = eval_expr(&arg_exprs[0], ctx)?;
+            let start_v = eval_expr(&arg_exprs[1], ctx)?;
             if matches!(sv, Value::Null) || matches!(start_v, Value::Null) {
                 return Ok(Value::Null);
             }
@@ -584,7 +765,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             let chars: Vec<char> = s.chars().collect();
             let start = start.min(chars.len());
             let end = if arg_exprs.len() == 3 {
-                let len_v = eval_expr(&arg_exprs[2], row, params)?;
+                let len_v = eval_expr(&arg_exprs[2], ctx)?;
                 if matches!(len_v, Value::Null) {
                     return Ok(Value::Null);
                 }
@@ -600,7 +781,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             Ok(Value::Property(Property::String(result)))
         }
         "trim" | "ltrim" | "rtrim" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::String(s)) => {
@@ -621,9 +802,9 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
                     "replace expects 3 arguments (str, search, replacement)".into(),
                 ));
             }
-            let sv = eval_expr(&arg_exprs[0], row, params)?;
-            let fv = eval_expr(&arg_exprs[1], row, params)?;
-            let tv = eval_expr(&arg_exprs[2], row, params)?;
+            let sv = eval_expr(&arg_exprs[0], ctx)?;
+            let fv = eval_expr(&arg_exprs[1], ctx)?;
+            let tv = eval_expr(&arg_exprs[2], ctx)?;
             if matches!(sv, Value::Null) || matches!(fv, Value::Null) || matches!(tv, Value::Null) {
                 return Ok(Value::Null);
             }
@@ -646,8 +827,8 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
                     "split expects 2 arguments (str, delimiter)".into(),
                 ));
             }
-            let sv = eval_expr(&arg_exprs[0], row, params)?;
-            let dv = eval_expr(&arg_exprs[1], row, params)?;
+            let sv = eval_expr(&arg_exprs[0], ctx)?;
+            let dv = eval_expr(&arg_exprs[1], ctx)?;
             if matches!(sv, Value::Null) || matches!(dv, Value::Null) {
                 return Ok(Value::Null);
             }
@@ -669,7 +850,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             Ok(Value::List(items))
         }
         "tofloat" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::Float64(f)) => Ok(Value::Property(Property::Float64(f))),
@@ -684,7 +865,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             }
         }
         "toboolean" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::Bool(b)) => Ok(Value::Property(Property::Bool(b))),
@@ -714,10 +895,10 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
                     "range expects 2 or 3 arguments".into(),
                 ));
             }
-            let sv = eval_expr(&arg_exprs[0], row, params)?;
-            let ev = eval_expr(&arg_exprs[1], row, params)?;
+            let sv = eval_expr(&arg_exprs[0], ctx)?;
+            let ev = eval_expr(&arg_exprs[1], ctx)?;
             let step_v = if arg_exprs.len() == 3 {
-                Some(eval_expr(&arg_exprs[2], row, params)?)
+                Some(eval_expr(&arg_exprs[2], ctx)?)
             } else {
                 None
             };
@@ -762,7 +943,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
         }
         "head" => {
             // First element of a list, or Null on empty / Null.
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::List(items) => Ok(items.into_iter().next().unwrap_or(Value::Null)),
@@ -775,7 +956,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             }
         }
         "last" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::List(items) => Ok(items.into_iter().last().unwrap_or(Value::Null)),
@@ -790,7 +971,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
         "tail" => {
             // Everything except the first element. Empty list
             // or single-element list → empty list.
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::List(mut items) => {
@@ -818,7 +999,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             // Works on lists *and* strings. Length functions
             // in openCypher similarly overload on both; the
             // string form is pretty common.
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::List(items) => Ok(Value::List(items.into_iter().rev().collect())),
@@ -836,7 +1017,7 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
         // Math scalar functions
         // --------------------------------------------------------
         "abs" => {
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
                 Value::Property(Property::Int64(i)) => {
@@ -850,16 +1031,16 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
                 _ => Err(Error::TypeMismatch),
             }
         }
-        "ceil" => math_unary(name, arg_exprs, row, params, |f| f.ceil()),
-        "floor" => math_unary(name, arg_exprs, row, params, |f| f.floor()),
-        "round" => math_unary(name, arg_exprs, row, params, |f| f.round()),
-        "sqrt" => math_unary(name, arg_exprs, row, params, |f| f.sqrt()),
+        "ceil" => math_unary(name, arg_exprs, ctx, |f| f.ceil()),
+        "floor" => math_unary(name, arg_exprs, ctx, |f| f.floor()),
+        "round" => math_unary(name, arg_exprs, ctx, |f| f.round()),
+        "sqrt" => math_unary(name, arg_exprs, ctx, |f| f.sqrt()),
         "sign" => {
             // Returns -1, 0, or 1 as Int64 regardless of
             // whether the input was int or float. NaN maps to
             // 0 to stay total; callers who care can test for
             // NaN via `n <> n` first.
-            let v = single_arg(name, arg_exprs, row, params)?;
+            let v = single_arg(name, arg_exprs, ctx)?;
             let s: i64 = match v {
                 Value::Null => return Ok(Value::Null),
                 Value::Property(Property::Int64(i)) => i.signum(),
@@ -896,11 +1077,10 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
 fn math_unary(
     name: &str,
     arg_exprs: &[Expr],
-    row: &Row,
-    params: &ParamMap,
+    ctx: &EvalCtx,
     f: impl FnOnce(f64) -> f64,
 ) -> Result<Value> {
-    let v = single_arg(name, arg_exprs, row, params)?;
+    let v = single_arg(name, arg_exprs, ctx)?;
     match v {
         Value::Null => Ok(Value::Null),
         Value::Property(Property::Int64(i)) => Ok(Value::Property(Property::Float64(f(i as f64)))),
@@ -909,7 +1089,7 @@ fn math_unary(
     }
 }
 
-fn single_arg(name: &str, args: &[Expr], row: &Row, params: &ParamMap) -> Result<Value> {
+fn single_arg(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::UnknownScalarFunction(format!(
             "{} expects 1 argument, got {}",
@@ -917,7 +1097,7 @@ fn single_arg(name: &str, args: &[Expr], row: &Row, params: &ParamMap) -> Result
             args.len()
         )));
     }
-    eval_expr(&args[0], row, params)
+    eval_expr(&args[0], ctx)
 }
 
 fn value_to_string(v: Value) -> Value {
