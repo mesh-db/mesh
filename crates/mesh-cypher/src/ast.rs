@@ -79,6 +79,12 @@ pub struct CreateStmt {
 pub struct MatchStmt {
     pub patterns: Vec<Pattern>,
     pub where_clause: Option<Expr>,
+    /// Zero or more `OPTIONAL MATCH` clauses that extend the
+    /// row stream with left-join semantics. Each clause runs
+    /// against the current bindings; rows that don't match
+    /// the optional pattern are preserved with the optional
+    /// variables set to `Null`.
+    pub optional_matches: Vec<OptionalMatchClause>,
     /// Optional intermediate `WITH` projection between the MATCH
     /// pattern and the final `RETURN`. When present, the plan
     /// tree is `MATCH → [pre-WHERE] → WITH(items, WHERE, ORDER,
@@ -95,6 +101,19 @@ pub struct MatchStmt {
     pub set_items: Vec<SetItem>,
     pub delete: Option<DeleteClause>,
     pub create_patterns: Vec<Pattern>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionalMatchClause {
+    /// Patterns to attempt. v1 restricts this to a single
+    /// pattern with exactly one hop whose start node is
+    /// already bound from a prior MATCH — violations surface
+    /// at plan time with a clear error.
+    pub patterns: Vec<Pattern>,
+    /// Optional WHERE filter applied to the rows after the
+    /// optional expansion. Rows that fail the predicate are
+    /// dropped (not Null-bound); matching Neo4j's behavior.
+    pub where_clause: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

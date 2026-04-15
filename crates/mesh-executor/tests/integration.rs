@@ -2209,6 +2209,112 @@ fn bare_return_with_parameter() {
 }
 
 #[test]
+fn optional_match_yields_null_when_no_neighbor() {
+    // Ada has a KNOWS edge, Bob has none, Cid has none. All
+    // three rows must survive; Bob's and Cid's `friend` must be
+    // Null.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cid'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cid'}) CREATE (a)-[:KNOWS]->(c)",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f) \
+         RETURN p.name AS name, f.name AS friend",
+    );
+    assert_eq!(rows.len(), 3);
+    let mut pairs: Vec<(String, Option<String>)> = rows
+        .iter()
+        .map(|r| {
+            let name = str_prop(r, "name");
+            let friend = match r.get("friend") {
+                Some(Value::Property(Property::String(s))) => Some(s.clone()),
+                Some(Value::Null) | Some(Value::Property(Property::Null)) => None,
+                other => panic!("unexpected friend value: {other:?}"),
+            };
+            (name, friend)
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Ada".to_string(), Some("Cid".to_string())),
+            ("Bob".to_string(), None),
+            ("Cid".to_string(), None),
+        ]
+    );
+}
+
+#[test]
+fn optional_match_preserves_row_count_with_no_matches_anywhere() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f) RETURN p.name AS n",
+    );
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn optional_match_with_label_filter_on_target() {
+    // Ada KNOWS Bob (Person) and Cid (Robot). The :Person
+    // label filter should narrow the optional match to Bob.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Robot {name: 'Cid'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Robot {name: 'Cid'}) CREATE (a)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}) OPTIONAL MATCH (a)-[:KNOWS]->(f:Person) \
+         RETURN f.name AS friend",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "friend"), "Bob");
+}
+
+#[test]
+fn chained_optional_match_clauses() {
+    // Ada has a friend but no employer. Both optional clauses
+    // run; f should resolve to Cid, c should be Null.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Cid'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cid'}) CREATE (a)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) \
+         OPTIONAL MATCH (p)-[:KNOWS]->(f) \
+         OPTIONAL MATCH (p)-[:WORKS_AT]->(c) \
+         RETURN f.name AS friend, c.name AS company",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "friend"), "Cid");
+    assert!(matches!(
+        rows[0].get("company"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
+
+#[test]
 fn with_clause_rebinds_variables_for_return() {
     let (store, _d) = open_store();
     run(&store, "CREATE (:Person {name: 'Ada', age: 37})");

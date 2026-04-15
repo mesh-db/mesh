@@ -34,6 +34,12 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
                     .cloned()
                     .map(Value::Property)
                     .unwrap_or(Value::Null)),
+                // Null-propagate property access so OPTIONAL MATCH
+                // patterns like `f.name` return Null when `f`
+                // itself is Null (i.e. the optional pattern
+                // didn't match). Matches SQL / openCypher
+                // left-join semantics.
+                Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                 _ => Err(Error::NotNodeOrEdge),
             }
         }

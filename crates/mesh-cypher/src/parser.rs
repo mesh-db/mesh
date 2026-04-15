@@ -347,6 +347,7 @@ fn build_pattern_list(pair: Pair<Rule>) -> Result<Vec<Pattern>> {
 fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     let mut patterns: Vec<Pattern> = Vec::new();
     let mut where_clause = None;
+    let mut optional_matches: Vec<crate::ast::OptionalMatchClause> = Vec::new();
     let mut with_clause: Option<crate::ast::WithClause> = None;
     let mut return_items = Vec::new();
     let mut distinct = false;
@@ -373,6 +374,9 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                     .next()
                     .ok_or_else(|| Error::Parse("empty where".into()))?;
                 where_clause = Some(build_expression(expr_pair)?);
+            }
+            Rule::optional_match_clause => {
+                optional_matches.push(build_optional_match(p)?);
             }
             Rule::with_tail => {
                 with_clause = Some(build_with_tail(p)?);
@@ -433,6 +437,7 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     Ok(MatchStmt {
         patterns,
         where_clause,
+        optional_matches,
         with_clause,
         return_items,
         distinct,
@@ -442,6 +447,39 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         set_items,
         delete,
         create_patterns,
+    })
+}
+
+/// Parse one `OPTIONAL MATCH <patterns> [WHERE ...]` clause into
+/// its AST form. The `kw_optional` and `kw_match` atomic keywords
+/// show up as visible pairs — just skip them.
+fn build_optional_match(pair: Pair<Rule>) -> Result<crate::ast::OptionalMatchClause> {
+    let mut patterns: Vec<Pattern> = Vec::new();
+    let mut where_clause: Option<Expr> = None;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            // kw_optional is atomic so it shows up as a visible
+            // pair; kw_match is silent and won't appear here.
+            Rule::kw_optional => {}
+            Rule::pattern_list => patterns = build_pattern_list(inner)?,
+            Rule::where_clause => {
+                let expr_pair = inner
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty where in OPTIONAL MATCH".into()))?;
+                where_clause = Some(build_expression(expr_pair)?);
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in OPTIONAL MATCH: {:?}",
+                    r
+                )));
+            }
+        }
+    }
+    Ok(crate::ast::OptionalMatchClause {
+        patterns,
+        where_clause,
     })
 }
 

@@ -1076,6 +1076,64 @@ fn match_without_with_still_parses() {
 }
 
 #[test]
+fn optional_match_parses_single_clause() {
+    let m = unwrap_match(
+        parse("MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f) RETURN p, f").unwrap(),
+    );
+    assert_eq!(m.optional_matches.len(), 1);
+    assert_eq!(m.optional_matches[0].patterns.len(), 1);
+    assert!(m.optional_matches[0].where_clause.is_none());
+}
+
+#[test]
+fn optional_match_with_where_parses() {
+    let m = unwrap_match(
+        parse("MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f) WHERE f.age > 20 RETURN p, f")
+            .unwrap(),
+    );
+    assert_eq!(m.optional_matches.len(), 1);
+    assert!(m.optional_matches[0].where_clause.is_some());
+}
+
+#[test]
+fn multiple_optional_match_clauses_parse() {
+    let m = unwrap_match(
+        parse(
+            "MATCH (p:Person) \
+             OPTIONAL MATCH (p)-[:KNOWS]->(f) \
+             OPTIONAL MATCH (p)-[:WORKS_AT]->(c) \
+             RETURN p, f, c",
+        )
+        .unwrap(),
+    );
+    assert_eq!(m.optional_matches.len(), 2);
+}
+
+#[test]
+fn optional_match_multi_hop_rejected_at_plan_time() {
+    use mesh_cypher::plan;
+    let stmt = parse("MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f)-[:WORKS_AT]->(c) RETURN p")
+        .unwrap();
+    let err = plan(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("single-hop"),
+        "expected single-hop error, got: {err}"
+    );
+}
+
+#[test]
+fn optional_match_unbound_start_rejected_at_plan_time() {
+    use mesh_cypher::plan;
+    let stmt =
+        parse("MATCH (p:Person) OPTIONAL MATCH (other:Person)-[:KNOWS]->(f) RETURN p").unwrap();
+    let err = plan(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("must be bound"),
+        "expected unbound-start error, got: {err}"
+    );
+}
+
+#[test]
 fn merge_on_create_set_parses() {
     let stmt =
         parse("MERGE (p:Person {email: 'a@b'}) ON CREATE SET p.name = 'Ada' RETURN p").unwrap();

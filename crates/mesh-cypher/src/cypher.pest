@@ -53,8 +53,16 @@ unwind_stmt = {
 match_stmt = {
     kw_match ~ pattern_list ~
     where_clause? ~
+    optional_match_clause* ~
     (with_tail ~ return_tail | return_tail | ((set_tail | delete_tail | create_tail) ~ return_tail?))
 }
+
+// `OPTIONAL MATCH <pattern> [WHERE ...]` — left-join semantics.
+// Sits between the required MATCH and the RETURN / WITH / SET /
+// DELETE tail. Multiple clauses chain. Restricted at plan time
+// to single-hop patterns whose start node is already bound by a
+// prior MATCH; richer forms land in a follow-up phase.
+optional_match_clause = { kw_optional ~ kw_match ~ pattern_list ~ where_clause? }
 
 // Intermediate projection / filter stage. Behaves like a
 // `return_tail` with a WHERE slot, and is lowered to the same
@@ -205,7 +213,7 @@ reserved = @{
      ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc" |
      ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind" |
      ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on" |
-     ^"with")
+     ^"with" | ^"optional")
     ~ !id_cont
 }
 
@@ -242,3 +250,4 @@ kw_show = @{ ^"show" ~ !id_cont }
 kw_for = @{ ^"for" ~ !id_cont }
 kw_on = @{ ^"on" ~ !id_cont }
 kw_with = @{ ^"with" ~ !id_cont }
+kw_optional = @{ ^"optional" ~ !id_cont }

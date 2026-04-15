@@ -193,6 +193,23 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             edge_type.clone(),
             *direction,
         )),
+        LogicalPlan::OptionalEdgeExpand {
+            input,
+            src_var,
+            edge_var,
+            dst_var,
+            dst_labels,
+            edge_type,
+            direction,
+        } => Box::new(OptionalEdgeExpandOp::new(
+            build_op(input),
+            src_var.clone(),
+            edge_var.clone(),
+            dst_var.clone(),
+            dst_labels.clone(),
+            edge_type.clone(),
+            *direction,
+        )),
         LogicalPlan::VarLengthExpand {
             input,
             src_var,
@@ -1180,6 +1197,151 @@ impl Operator for EdgeExpandOp {
                         }
                     };
                     self.pending_idx = 0;
+                    self.current_row = Some(row);
+                }
+            }
+        }
+    }
+}
+
+/// Left-join variant of [`EdgeExpandOp`]. For each input row,
+/// expands the adjacency in the configured direction and
+/// filters by `edge_type` / `dst_labels` — if **any** neighbor
+/// survives the filters, emits rows exactly like
+/// `EdgeExpandOp`. If **zero** neighbors survive, emits one row
+/// that carries the input row's bindings plus `edge_var` /
+/// `dst_var` set to `Value::Null`, preserving the input row in
+/// the output stream. This is the left-outer-join semantics
+/// OPTIONAL MATCH needs.
+///
+/// Tracks per-input-row whether any output was produced so the
+/// fallback Null row is only emitted after the pending buffer
+/// drains without yielding anything. The `yielded_for_current`
+/// flag is reset whenever a new input row is pulled.
+struct OptionalEdgeExpandOp {
+    input: Box<dyn Operator>,
+    src_var: String,
+    edge_var: Option<String>,
+    dst_var: String,
+    dst_labels: Vec<String>,
+    edge_type: Option<String>,
+    direction: Direction,
+    current_row: Option<Row>,
+    pending: Vec<(EdgeId, NodeId)>,
+    pending_idx: usize,
+    yielded_for_current: bool,
+}
+
+impl OptionalEdgeExpandOp {
+    fn new(
+        input: Box<dyn Operator>,
+        src_var: String,
+        edge_var: Option<String>,
+        dst_var: String,
+        dst_labels: Vec<String>,
+        edge_type: Option<String>,
+        direction: Direction,
+    ) -> Self {
+        Self {
+            input,
+            src_var,
+            edge_var,
+            dst_var,
+            dst_labels,
+            edge_type,
+            direction,
+            current_row: None,
+            pending: Vec::new(),
+            pending_idx: 0,
+            yielded_for_current: false,
+        }
+    }
+}
+
+impl Operator for OptionalEdgeExpandOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            while self.pending_idx < self.pending.len() {
+                let (edge_id, neighbor_id) = self.pending[self.pending_idx];
+                self.pending_idx += 1;
+
+                let edge = match ctx.store.get_edge(edge_id)? {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if let Some(t) = &self.edge_type {
+                    if &edge.edge_type != t {
+                        continue;
+                    }
+                }
+
+                let neighbor = match ctx.store.get_node(neighbor_id)? {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if !has_all_labels(&neighbor, &self.dst_labels) {
+                    continue;
+                }
+
+                let base = self
+                    .current_row
+                    .as_ref()
+                    .expect("pending edges without source row");
+                let mut out = base.clone();
+                if let Some(ev) = &self.edge_var {
+                    out.insert(ev.clone(), Value::Edge(edge));
+                }
+                out.insert(self.dst_var.clone(), Value::Node(neighbor));
+                self.yielded_for_current = true;
+                return Ok(Some(out));
+            }
+
+            // Pending drained for the current row. If nothing was
+            // yielded, emit the left-join fallback: preserve the
+            // input row with the optional variables set to Null.
+            if let Some(base) = self.current_row.take() {
+                if !self.yielded_for_current {
+                    let mut out = base;
+                    if let Some(ev) = &self.edge_var {
+                        out.insert(ev.clone(), Value::Null);
+                    }
+                    out.insert(self.dst_var.clone(), Value::Null);
+                    self.yielded_for_current = true;
+                    return Ok(Some(out));
+                }
+            }
+
+            match self.input.next(ctx)? {
+                None => return Ok(None),
+                Some(row) => {
+                    let src_id = match row.get(&self.src_var) {
+                        Some(Value::Node(n)) => n.id,
+                        // src_var is Null (because a prior
+                        // OPTIONAL MATCH chained before this one
+                        // Null-bound it). Skip adjacency entirely
+                        // and fall through to the fallback Null
+                        // row so downstream clauses see the
+                        // preserved input.
+                        Some(Value::Null) => {
+                            self.pending = Vec::new();
+                            self.pending_idx = 0;
+                            self.yielded_for_current = false;
+                            self.current_row = Some(row);
+                            continue;
+                        }
+                        _ => return Err(Error::UnboundVariable(self.src_var.clone())),
+                    };
+                    self.pending = match self.direction {
+                        Direction::Outgoing => ctx.store.outgoing(src_id)?,
+                        Direction::Incoming => ctx.store.incoming(src_id)?,
+                        Direction::Both => {
+                            let mut all = ctx.store.outgoing(src_id)?;
+                            all.extend(ctx.store.incoming(src_id)?);
+                            all
+                        }
+                    };
+                    self.pending_idx = 0;
+                    self.yielded_for_current = false;
                     self.current_row = Some(row);
                 }
             }

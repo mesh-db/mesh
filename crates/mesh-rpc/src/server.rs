@@ -836,6 +836,7 @@ fn count_index_seeks(plan: &mesh_cypher::LogicalPlan) -> u64 {
         | P::Delete { input, .. }
         | P::SetProperty { input, .. }
         | P::EdgeExpand { input, .. }
+        | P::OptionalEdgeExpand { input, .. }
         | P::VarLengthExpand { input, .. } => count_index_seeks(input),
         P::CartesianProduct { left, right } => count_index_seeks(left) + count_index_seeks(right),
         P::CreatePath { input, .. } => input.as_deref().map(count_index_seeks).unwrap_or(0),

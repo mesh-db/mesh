@@ -45,6 +45,22 @@ pub enum LogicalPlan {
         edge_type: Option<String>,
         direction: Direction,
     },
+    /// Left-join expand. Behaves like `EdgeExpand` for input
+    /// rows that have at least one matching neighbor, but for
+    /// input rows with zero matches it yields a single row with
+    /// `edge_var` / `dst_var` bound to `Null`. Emitted by
+    /// `plan_match` for each `OPTIONAL MATCH` clause; v1 only
+    /// supports single-hop patterns whose start variable was
+    /// already bound by a prior MATCH.
+    OptionalEdgeExpand {
+        input: Box<LogicalPlan>,
+        src_var: String,
+        edge_var: Option<String>,
+        dst_var: String,
+        dst_labels: Vec<String>,
+        edge_type: Option<String>,
+        direction: Direction,
+    },
     VarLengthExpand {
         input: Box<LogicalPlan>,
         src_var: String,
@@ -831,6 +847,20 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     // `(n:L {nonindexed: ...}) WHERE n.indexed = ...`.
     plan = optimize_filter_chain_to_index_seek(plan, ctx);
 
+    // OPTIONAL MATCH clauses sit between the main MATCH's
+    // post-WHERE row stream and the WITH/RETURN tail. Each one
+    // left-joins its single-hop pattern onto the current plan,
+    // yielding Null-bound rows for inputs that don't match.
+    // Bindings collected so far drive the v1 restriction check:
+    // the optional pattern's start node must already be bound.
+    let mut bound_vars: HashSet<String> = HashSet::new();
+    for p in &stmt.patterns {
+        collect_pattern_vars(p, &mut bound_vars);
+    }
+    for optional in &stmt.optional_matches {
+        plan = apply_optional_match(plan, optional, &mut bound_vars)?;
+    }
+
     // Optional `WITH` stage between the MATCH pattern and the
     // final RETURN: projects the row stream, applies an optional
     // post-projection WHERE, then order / skip / limit. Pattern
@@ -936,6 +966,105 @@ fn apply_return_pipeline(
         plan = LogicalPlan::Limit {
             input: Box::new(plan),
             count: n,
+        };
+    }
+
+    Ok(plan)
+}
+
+/// Lower one `OPTIONAL MATCH` clause onto `plan`, producing an
+/// `OptionalEdgeExpand` node that left-joins the optional
+/// pattern's adjacency step onto the current row stream.
+///
+/// v1 restrictions, enforced here so the executor can stay
+/// simple:
+///   * exactly one pattern in the clause
+///   * the pattern must have exactly one hop (no bare node,
+///     no multi-hop chains, no variable-length)
+///   * the pattern's start node variable must already be in
+///     `bound_vars` (i.e. bound by a prior MATCH clause), so
+///     the left-join runs against existing row bindings
+///
+/// The clause's optional WHERE filter runs *after* the join —
+/// matching Neo4j, it drops rows rather than Null-ing them.
+fn apply_optional_match(
+    plan: LogicalPlan,
+    clause: &crate::ast::OptionalMatchClause,
+    bound_vars: &mut HashSet<String>,
+) -> Result<LogicalPlan> {
+    if clause.patterns.len() != 1 {
+        return Err(Error::Plan(
+            "OPTIONAL MATCH with multiple comma-separated patterns is not yet supported".into(),
+        ));
+    }
+    let pattern = &clause.patterns[0];
+    if pattern.hops.len() != 1 {
+        return Err(Error::Plan(
+            "OPTIONAL MATCH currently supports only single-hop patterns — \
+             (bound)-[:T]->(new)"
+                .into(),
+        ));
+    }
+    let start_var = pattern
+        .start
+        .var
+        .as_ref()
+        .ok_or_else(|| {
+            Error::Plan("OPTIONAL MATCH start node must name an already-bound variable".into())
+        })?
+        .clone();
+    if !bound_vars.contains(&start_var) {
+        return Err(Error::Plan(format!(
+            "OPTIONAL MATCH start variable `{}` must be bound by a prior MATCH",
+            start_var
+        )));
+    }
+    let hop = &pattern.hops[0];
+    if hop.rel.var_length.is_some() {
+        return Err(Error::Plan(
+            "OPTIONAL MATCH does not yet support variable-length relationships".into(),
+        ));
+    }
+    let dst_var = hop
+        .target
+        .var
+        .clone()
+        .unwrap_or_else(|| format!("__opt_dst_{}", bound_vars.len()));
+
+    let mut plan = LogicalPlan::OptionalEdgeExpand {
+        input: Box::new(plan),
+        src_var: start_var,
+        edge_var: hop.rel.var.clone(),
+        dst_var: dst_var.clone(),
+        dst_labels: hop.target.labels.clone(),
+        edge_type: hop.rel.edge_type.clone(),
+        direction: hop.rel.direction,
+    };
+
+    // Register the newly-introduced bindings so downstream
+    // OPTIONAL MATCH clauses can reference them.
+    bound_vars.insert(dst_var);
+    if let Some(ev) = &hop.rel.var {
+        bound_vars.insert(ev.clone());
+    }
+
+    // Any pattern properties on the target node become a Filter
+    // above the optional expand — but applying them here would
+    // drop the Null-bound rows the caller expects. For v1 we
+    // reject pattern-property filters on the optional target to
+    // avoid that subtlety.
+    if !hop.target.properties.is_empty() {
+        return Err(Error::Plan(
+            "OPTIONAL MATCH with target-pattern properties is not yet supported — \
+             move the equality into a WHERE clause"
+                .into(),
+        ));
+    }
+
+    if let Some(predicate) = &clause.where_clause {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: predicate.clone(),
         };
     }
 
