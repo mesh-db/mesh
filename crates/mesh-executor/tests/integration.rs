@@ -2747,21 +2747,207 @@ fn chained_with_progressive_filters() {
     assert_eq!(qs, vec![3, 4, 5, 6]);
 }
 
+// ---------------------------------------------------------------
+// Cross-stage variable re-reference: MATCH (a) WITH a MATCH (a)-[...]->(b)
+// ---------------------------------------------------------------
+
 #[test]
-fn cross_stage_var_reuse_fails_at_plan_time() {
-    // `MATCH (a) WITH a MATCH (a)-[:X]->(b)` is a v1
-    // restriction: the planner rejects because `a` is
-    // already bound. The executor helper asserts on a
-    // successful run, so this test bypasses it and calls
-    // the planner directly.
+fn cross_stage_rebind_single_hop() {
+    // Ada→Bob and Ada→Cid. After WITH a, re-MATCH from `a`
+    // to walk each KNOWS edge. Should produce exactly two
+    // rows regardless of which peer we probe, matching what
+    // a fresh `MATCH (a)-[:KNOWS]->(b)` would return.
     let (store, _d) = open_store();
     run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cid'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cid'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (a:Person) \
+         WITH a \
+         MATCH (a)-[:KNOWS]->(b) \
+         RETURN a.name AS knower, b.name AS known",
+    );
+    assert_eq!(rows.len(), 2);
+    let mut pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "knower"), str_prop(r, "known")))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Ada".to_string(), "Bob".to_string()),
+            ("Ada".to_string(), "Cid".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn cross_stage_rebind_multi_hop() {
+    // Only `a` is rebound; `f` and `c` are fresh. chain_hops
+    // handles both "first hop expands from rebind" and "second
+    // hop expands from first hop's destination" uniformly.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Company {name: 'Acme'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Company {name: 'Acme'}) \
+         CREATE (b)-[:WORKS_AT]->(c)",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (a:Person) \
+         WITH a \
+         MATCH (a)-[:KNOWS]->(f)-[:WORKS_AT]->(c) \
+         RETURN a.name AS who, f.name AS friend, c.name AS company",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "who"), "Ada");
+    assert_eq!(str_prop(&rows[0], "friend"), "Bob");
+    assert_eq!(str_prop(&rows[0], "company"), "Acme");
+}
+
+#[test]
+fn cross_stage_rebind_after_aggregate() {
+    // The canonical analytical shape: pre-aggregate on one
+    // relationship, filter the aggregate, then expand along a
+    // *different* relationship from the retained row. Only
+    // people with at least one friend should appear in the
+    // final rows.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cid'})");
+    run(&store, "CREATE (:Company {name: 'Acme'})");
+    // Ada has two friends, Bob has one, Cid has none.
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cid'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Cid'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    // Ada and Bob both work at Acme; Cid is unemployed.
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Company {name: 'Acme'}) \
+         CREATE (a)-[:WORKS_AT]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Company {name: 'Acme'}) \
+         CREATE (b)-[:WORKS_AT]->(c)",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person)-[:KNOWS]->(f) \
+         WITH p, count(f) AS n WHERE n >= 2 \
+         MATCH (p)-[:WORKS_AT]->(c) \
+         RETURN p.name AS person, c.name AS company, n",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "person"), "Ada");
+    assert_eq!(str_prop(&rows[0], "company"), "Acme");
+    assert_eq!(int_prop(&rows[0], "n"), 2);
+}
+
+#[test]
+fn cross_stage_rebind_with_optional_match_regression() {
+    // OPTIONAL MATCH already allowed a bound start before
+    // this change shipped; make sure the regular-MATCH rebind
+    // doesn't accidentally break the OPTIONAL MATCH path.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         WITH p \
+         OPTIONAL MATCH (p)-[:KNOWS]->(f) \
+         RETURN p.name AS person, f.name AS friend",
+    );
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn cross_stage_rebind_label_reassertion_rejected() {
+    // Re-asserting a label on the bound start var is a v1
+    // deferral — the planner errors with a clear message
+    // pointing at the WHERE workaround.
     let stmt =
-        mesh_cypher::parse("MATCH (a:Person) WITH a MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
+        mesh_cypher::parse("MATCH (a:Person) WITH a MATCH (a:Person)-[:KNOWS]->(b) RETURN a, b")
+            .unwrap();
     let err = mesh_cypher::plan(&stmt).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("already bound"),
-        "expected cross-stage rebinding error, got: {msg}"
+        msg.contains("pure-reference"),
+        "expected pure-reference rebind error, got: {msg}"
+    );
+}
+
+#[test]
+fn cross_stage_rebind_property_reassertion_rejected() {
+    let stmt = mesh_cypher::parse(
+        "MATCH (a:Person) WITH a MATCH (a {name: 'Ada'})-[:KNOWS]->(b) RETURN a, b",
+    )
+    .unwrap();
+    let err = mesh_cypher::plan(&stmt).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("pure-reference"),
+        "expected pure-reference rebind error, got: {msg}"
+    );
+}
+
+#[test]
+fn cross_stage_rebind_second_var_also_bound_rejected() {
+    // `b` is bound by the first MATCH, then the second MATCH
+    // references both `a` and `b`. Only the start variable
+    // is allowed to carry across; a pre-bound hop destination
+    // (path-existence check) needs a different operator and
+    // is deferred.
+    let stmt = mesh_cypher::parse(
+        "MATCH (a:Person), (b:Person) WITH a, b MATCH (a)-[:KNOWS]->(b) RETURN a, b",
+    )
+    .unwrap();
+    let err = mesh_cypher::plan(&stmt).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("only the pattern's start variable"),
+        "expected 'only start var' error, got: {msg}"
     );
 }

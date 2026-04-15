@@ -1219,16 +1219,54 @@ fn match_without_with_still_parses_as_single_clause() {
 }
 
 #[test]
-fn cross_stage_var_reuse_rejected_at_plan_time() {
-    // `a` is bound by the first MATCH; the second MATCH
-    // references it as a pattern variable, which v1 rejects.
+fn cross_stage_rebind_emits_edge_expand_directly_on_with_output() {
+    // Structural check: MATCH (a:Person) WITH a MATCH (a)-[:KNOWS]->(b)
+    // should lower to an EdgeExpand whose src_var is `a` and
+    // whose input is the WITH's Project output — NOT a
+    // CartesianProduct with a fresh NodeScan. This test is the
+    // load-bearing one; it proves the rewrite structurally.
     let stmt = parse("MATCH (a:Person) WITH a MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
-    let err = plan(&stmt).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("already bound"),
-        "expected cross-stage rebinding error, got: {msg}"
-    );
+    let p = plan(&stmt).unwrap();
+    // Walk down through the outer RETURN pipeline (Project)
+    // until we hit the EdgeExpand we care about.
+    let mut cur = &p;
+    loop {
+        match cur {
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input }
+            | LogicalPlan::OrderBy { input, .. }
+            | LogicalPlan::Skip { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Filter { input, .. } => {
+                cur = input;
+            }
+            LogicalPlan::EdgeExpand { src_var, input, .. } => {
+                assert_eq!(src_var, "a");
+                // The expand's input must be the WITH's
+                // projection (which sits directly on top of
+                // the first MATCH's NodeScanByLabels). It must
+                // NOT be a CartesianProduct — that would mean
+                // the rebind didn't fire and we cross-joined a
+                // fresh scan.
+                assert!(
+                    !matches!(**input, LogicalPlan::CartesianProduct { .. }),
+                    "EdgeExpand input should be the WITH's projection, \
+                     not a CartesianProduct: {input:?}"
+                );
+                // And it must not be a fresh scan on `a`.
+                assert!(
+                    !matches!(
+                        **input,
+                        LogicalPlan::NodeScanAll { .. } | LogicalPlan::NodeScanByLabels { .. }
+                    ),
+                    "EdgeExpand input should not be a fresh scan: {input:?}"
+                );
+                break;
+            }
+            other => panic!("expected EdgeExpand somewhere in the plan tree, got {other:?}"),
+        }
+    }
 }
 
 #[test]

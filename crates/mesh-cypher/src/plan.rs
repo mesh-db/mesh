@@ -511,7 +511,60 @@ fn plan_pattern(
     // filter so the executor actually enforces them.
     plan = wrap_with_pattern_prop_filter(plan, &start_var, &remaining_props);
 
-    let mut current_var = start_var;
+    chain_hops(plan, pattern, &start_var, pattern_idx)
+}
+
+/// Lower a pattern that starts from an already-bound row-stream
+/// variable. Used by `plan_match` when a chained MATCH references
+/// a variable introduced by an earlier reading clause — the
+/// pattern's start doesn't need a fresh scan because `input` is
+/// already producing rows where the start var is bound.
+///
+/// v1 requires the start node to be a pure reference (no labels
+/// and no properties). Labels would need a `HasLabel`-style
+/// filter on top of the input, and properties would need an
+/// equivalent property-equality filter; both are tractable but
+/// deferred to keep the rebind path small and obviously correct.
+/// The dispatcher in `plan_match` checks these preconditions
+/// before calling here, so the function just asserts them.
+fn plan_pattern_from_bound(
+    input: LogicalPlan,
+    pattern: &Pattern,
+    pattern_idx: usize,
+) -> Result<LogicalPlan> {
+    debug_assert!(
+        pattern.start.labels.is_empty() && pattern.start.properties.is_empty(),
+        "plan_pattern_from_bound requires a pure-reference start; \
+         the caller must validate this before dispatching"
+    );
+    let start_var = pattern
+        .start
+        .var
+        .clone()
+        .expect("plan_pattern_from_bound requires a named start variable");
+    chain_hops(input, pattern, &start_var, pattern_idx)
+}
+
+/// Chain `EdgeExpand` / `VarLengthExpand` operators for every
+/// hop in `pattern`, starting from whatever plan `plan` is
+/// currently producing (with `start_var` bound in its output
+/// rows). Each hop's target pattern properties lower to a
+/// wrapping `Filter` via [`wrap_with_pattern_prop_filter`],
+/// matching the pre-rebind behavior of `plan_pattern`.
+///
+/// Shared between the fresh-scan path (`plan_pattern`) and the
+/// cross-stage rebind path (`plan_pattern_from_bound`). Neither
+/// caller cares about where the start binding came from — the
+/// expand operators pull `src_var` out of the row, so
+/// "just-scanned" and "already in the row from a prior stage"
+/// are semantically identical.
+fn chain_hops(
+    mut plan: LogicalPlan,
+    pattern: &Pattern,
+    start_var: &str,
+    pattern_idx: usize,
+) -> Result<LogicalPlan> {
+    let mut current_var = start_var.to_string();
     for (i, hop) in pattern.hops.iter().enumerate() {
         let dst_var = hop
             .target
@@ -829,29 +882,50 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     for clause in &stmt.clauses {
         match clause {
             ReadingClause::Match(m) => {
-                // Reject patterns that would re-bind a
-                // variable that's already in scope — either
-                // from an earlier reading clause (cross-stage
-                // re-reference) or from an earlier pattern
-                // within the same comma-separated MATCH
-                // (duplicate within the same stage). The
-                // executor can't yet treat an existing
-                // binding as an expand source, so we surface
-                // a clear plan-time error instead of silently
-                // shadowing.
+                // Reject patterns that would bind a variable
+                // that's already in scope — with one carve-out
+                // for the cross-stage rebind case: a pattern's
+                // *start* variable is allowed to reference an
+                // already-bound name from an earlier reading
+                // clause, as long as the start node is a pure
+                // reference (no labels, no properties). That
+                // turns `MATCH (a) WITH a MATCH (a)-[:X]->(b)`
+                // into an expand from the existing row stream
+                // instead of a fresh scan + cartesian join.
+                //
+                // Everything else — rebinding a hop destination,
+                // rebinding inside the same comma-separated
+                // MATCH, or rebinding with a labelled start node
+                // — still surfaces as a clear plan-time error.
                 let mut this_clause_vars: HashSet<String> = HashSet::new();
                 for pattern in &m.patterns {
+                    let start_var_name = pattern.start.var.as_deref();
+                    let start_is_pure_reference =
+                        pattern.start.labels.is_empty() && pattern.start.properties.is_empty();
+
                     let mut this_pattern_vars: HashSet<String> = HashSet::new();
                     collect_pattern_vars(pattern, &mut this_pattern_vars);
                     for var in &this_pattern_vars {
-                        if bound_vars.contains(var) {
+                        let is_bound_start =
+                            start_var_name == Some(var.as_str()) && bound_vars.contains(var);
+                        if is_bound_start && !start_is_pure_reference {
                             return Err(Error::Plan(format!(
-                                "variable '{}' is already bound by an earlier clause; \
-                                 cross-stage variable re-reference is not yet supported",
+                                "re-referencing already-bound variable '{}' in a \
+                                 chained MATCH requires a pure-reference start node \
+                                 (no labels, no properties); \
+                                 move the label / property assertion into a WHERE clause",
                                 var
                             )));
                         }
-                        if !this_clause_vars.insert(var.clone()) {
+                        if bound_vars.contains(var) && !is_bound_start {
+                            return Err(Error::Plan(format!(
+                                "variable '{}' is already bound by an earlier clause; \
+                                 only the pattern's start variable may be re-referenced \
+                                 across stages",
+                                var
+                            )));
+                        }
+                        if !is_bound_start && !this_clause_vars.insert(var.clone()) {
                             return Err(Error::Plan(format!(
                                 "variable '{}' appears in multiple MATCH patterns; \
                                  not yet supported",
@@ -861,21 +935,37 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     }
                 }
 
-                // Lower each pattern and join with the current
-                // row stream. The first pattern of the first
-                // clause becomes the root of the plan tree; every
-                // later pattern — within the same stage or across
-                // stages — lands as the right side of a
-                // `CartesianProduct`.
+                // Lower each pattern. A pattern whose start var
+                // is already bound by an earlier clause is
+                // lowered *directly onto the current plan* via
+                // `plan_pattern_from_bound` — the hops become
+                // `EdgeExpand` nodes rooted at the existing row
+                // stream, with no fresh scan and no
+                // `CartesianProduct`. Every other pattern goes
+                // through the original fresh-scan path and gets
+                // cartesian-joined with the current plan.
                 for (i, pattern) in m.patterns.iter().enumerate() {
-                    let rhs = plan_pattern(pattern, stage_pattern_offset + i, ctx)?;
-                    plan = Some(match plan.take() {
-                        None => rhs,
-                        Some(lhs) => LogicalPlan::CartesianProduct {
-                            left: Box::new(lhs),
-                            right: Box::new(rhs),
-                        },
-                    });
+                    let pattern_offset = stage_pattern_offset + i;
+                    let start_var_name = pattern.start.var.as_deref();
+                    let is_rebind = start_var_name
+                        .map(|v| bound_vars.contains(v))
+                        .unwrap_or(false);
+
+                    plan = if is_rebind {
+                        let current = plan
+                            .take()
+                            .expect("is_rebind implies an earlier clause populated the plan");
+                        Some(plan_pattern_from_bound(current, pattern, pattern_offset)?)
+                    } else {
+                        let rhs = plan_pattern(pattern, pattern_offset, ctx)?;
+                        Some(match plan.take() {
+                            None => rhs,
+                            Some(lhs) => LogicalPlan::CartesianProduct {
+                                left: Box::new(lhs),
+                                right: Box::new(rhs),
+                            },
+                        })
+                    };
                     collect_pattern_vars(pattern, &mut bound_vars);
                 }
                 stage_pattern_offset += m.patterns.len();
