@@ -100,8 +100,18 @@ match_stmt = {
 // query can't start with OPTIONAL MATCH or WITH without
 // something to pull rows from first.
 reading_clause = {
-    match_clause | optional_match_clause | with_tail | merge_clause
+    match_clause | optional_match_clause | with_tail | merge_clause | unwind_clause
 }
+
+// `UNWIND expression AS alias` as a mid-query reading clause —
+// expands the current row stream by cross-joining each row with
+// the elements of the list expression. Distinct from `unwind_stmt`,
+// which requires a terminal `return_tail` and only works as a
+// top-level producer. The clause form composes with MATCH / WITH
+// / MERGE so queries like `MATCH (n) UNWIND n.tags AS t RETURN t`
+// and `UNWIND $ids AS id MATCH (u {id: id}) RETURN u` lower
+// through the same reading-clause loop as everything else.
+unwind_clause = { kw_unwind ~ expression ~ kw_as ~ identifier }
 
 // A single `MATCH pattern_list [WHERE expr]` — the producer
 // form that scans the store for pattern matches. Extracted

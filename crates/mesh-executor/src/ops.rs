@@ -304,6 +304,11 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             on_match.clone(),
         )),
         LogicalPlan::Unwind { var, expr } => Box::new(UnwindOp::new(var.clone(), expr.clone())),
+        LogicalPlan::UnwindChain { input, var, expr } => Box::new(UnwindChainOp::new(
+            build_op(input),
+            var.clone(),
+            expr.clone(),
+        )),
         LogicalPlan::IndexSeek {
             var,
             label,
@@ -389,15 +394,7 @@ impl Operator for UnwindOp {
                 reader: ctx.store,
             };
             let val = eval_expr(&self.expr, &ectx)?;
-            let items = match val {
-                Value::List(items) => items,
-                Value::Property(Property::List(props)) => {
-                    props.into_iter().map(Value::Property).collect()
-                }
-                Value::Null => Vec::new(),
-                _ => return Err(Error::TypeMismatch),
-            };
-            self.items = Some(items);
+            self.items = Some(coerce_unwind_list(val)?);
         }
         let items = self.items.as_ref().unwrap();
         if self.cursor < items.len() {
@@ -409,6 +406,79 @@ impl Operator for UnwindOp {
         } else {
             Ok(None)
         }
+    }
+}
+
+/// Per-row UNWIND: pulls one input row, evaluates `expr` against it
+/// to produce a list, and emits one output row per list element.
+/// Each output row inherits every binding from the input row plus
+/// a new `var` binding. Empty / null lists drop the input row and
+/// the operator immediately pulls the next input row.
+struct UnwindChainOp {
+    input: Box<dyn Operator>,
+    var: String,
+    expr: Expr,
+    current_row: Option<Row>,
+    items: Vec<Value>,
+    cursor: usize,
+}
+
+impl UnwindChainOp {
+    fn new(input: Box<dyn Operator>, var: String, expr: Expr) -> Self {
+        Self {
+            input,
+            var,
+            expr,
+            current_row: None,
+            items: Vec::new(),
+            cursor: 0,
+        }
+    }
+}
+
+impl Operator for UnwindChainOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            if let Some(base) = &self.current_row {
+                if self.cursor < self.items.len() {
+                    let v = self.items[self.cursor].clone();
+                    self.cursor += 1;
+                    let mut row = base.clone();
+                    row.insert(self.var.clone(), v);
+                    return Ok(Some(row));
+                }
+                self.current_row = None;
+                self.items.clear();
+                self.cursor = 0;
+            }
+            let base = match self.input.next(ctx)? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            let ectx = EvalCtx {
+                row: &base,
+                params: ctx.params,
+                reader: ctx.store,
+            };
+            let val = eval_expr(&self.expr, &ectx)?;
+            self.items = coerce_unwind_list(val)?;
+            self.current_row = Some(base);
+        }
+    }
+}
+
+/// Shared list-coercion used by both UNWIND operators. Accepts a
+/// native executor `Value::List`, a property-list
+/// `Property::List`, or `Null` (treated as an empty list). Any
+/// other shape is a type error — UNWIND is defined over lists.
+fn coerce_unwind_list(val: Value) -> Result<Vec<Value>> {
+    match val {
+        Value::List(items) => Ok(items),
+        Value::Property(Property::List(props)) => {
+            Ok(props.into_iter().map(Value::Property).collect())
+        }
+        Value::Null => Ok(Vec::new()),
+        _ => Err(Error::TypeMismatch),
     }
 }
 

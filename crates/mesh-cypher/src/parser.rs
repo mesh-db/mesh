@@ -233,6 +233,32 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
     })
 }
 
+fn build_unwind_clause(pair: Pair<Rule>) -> Result<crate::ast::UnwindClause> {
+    debug_assert_eq!(pair.as_rule(), Rule::unwind_clause);
+    let mut expr: Option<Expr> = None;
+    let mut alias: Option<String> = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::expression if expr.is_none() => {
+                expr = Some(build_expression(p)?);
+            }
+            Rule::identifier if alias.is_none() => {
+                alias = Some(p.as_str().to_string());
+            }
+            Rule::kw_unwind | Rule::kw_as => {}
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in unwind_clause: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+    let expr = expr.ok_or_else(|| Error::Parse("UNWIND requires a source expression".into()))?;
+    let alias = alias.ok_or_else(|| Error::Parse("UNWIND requires an AS alias".into()))?;
+    Ok(crate::ast::UnwindClause { expr, alias })
+}
+
 /// Parse a `merge_clause` pair — the `MERGE` keyword, the
 /// pattern (a node or a single-hop edge path), and any
 /// `ON CREATE SET` / `ON MATCH SET` actions — into a
@@ -422,6 +448,9 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                     Rule::merge_clause => {
                         clauses.push(ReadingClause::Merge(build_merge_clause(inner)?));
                     }
+                    Rule::unwind_clause => {
+                        clauses.push(ReadingClause::Unwind(build_unwind_clause(inner)?));
+                    }
                     r => {
                         return Err(Error::Parse(format!(
                             "unexpected rule inside reading_clause: {:?}",
@@ -448,14 +477,17 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         ));
     }
     // A query must start with a producer — MATCH pulls rows
-    // from the store, MERGE either matches or creates them.
-    // OPTIONAL MATCH and WITH both depend on an existing row
-    // stream, so they can't be the first clause.
+    // from the store, MERGE either matches or creates them, and
+    // UNWIND expands a list (evaluated against an empty row) into
+    // a row stream. OPTIONAL MATCH and WITH both depend on an
+    // existing row stream, so they can't be the first clause.
     match &clauses[0] {
-        ReadingClause::Match(_) | ReadingClause::Merge(_) => {}
+        ReadingClause::Match(_) | ReadingClause::Merge(_) | ReadingClause::Unwind(_) => {}
         ReadingClause::OptionalMatch(_) | ReadingClause::With(_) => {
             return Err(Error::Parse(
-                "OPTIONAL MATCH and WITH can only appear after an initial MATCH or MERGE".into(),
+                "OPTIONAL MATCH and WITH can only appear after an initial producer \
+                 (MATCH, MERGE, or UNWIND)"
+                    .into(),
             ));
         }
     }

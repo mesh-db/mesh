@@ -1764,6 +1764,140 @@ fn unwind_aggregate_counts_elements() {
 }
 
 #[test]
+fn chained_unwind_after_match_expands_per_row_list() {
+    // Per-row UNWIND where the list comes from a property on the
+    // matched node. Parens around `p.tags` work around a pre-existing
+    // parser limitation that rejects bare property-access expressions
+    // in UNWIND position. Lists are seeded via parameters because
+    // list literals aren't accepted in pattern-property position.
+    let (store, _d) = open_store();
+    let mut ps = ParamMap::new();
+    ps.insert(
+        "a".into(),
+        Value::Property(Property::List(vec![
+            Property::String("rust".into()),
+            Property::String("db".into()),
+        ])),
+    );
+    run_with_params(&store, "CREATE (:Post {title: 'A', tags: $a})", &ps);
+    let mut ps = ParamMap::new();
+    ps.insert(
+        "b".into(),
+        Value::Property(Property::List(vec![Property::String("graph".into())])),
+    );
+    run_with_params(&store, "CREATE (:Post {title: 'B', tags: $b})", &ps);
+    let rows = run(
+        &store,
+        "MATCH (p:Post) UNWIND (p.tags) AS tag \
+         RETURN p.title AS title, tag ORDER BY title, tag",
+    );
+    let got: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "title"), str_prop(r, "tag")))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("A".into(), "db".into()),
+            ("A".into(), "rust".into()),
+            ("B".into(), "graph".into()),
+        ]
+    );
+}
+
+#[test]
+fn unwind_first_then_match_correlates_on_param() {
+    // Classic batch-fan-out: UNWIND a parameter list, then for
+    // each element do a correlated MATCH. The correlation goes
+    // through a WHERE clause because pattern-property syntax only
+    // accepts literals and parameters on the right-hand side, not
+    // row-bound identifiers introduced by an earlier UNWIND.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:User {id: 1, name: 'Ada'})");
+    run(&store, "CREATE (:User {id: 2, name: 'Bob'})");
+    run(&store, "CREATE (:User {id: 3, name: 'Cara'})");
+    let mut params = ParamMap::new();
+    params.insert(
+        "ids".into(),
+        Value::Property(Property::List(vec![Property::Int64(1), Property::Int64(3)])),
+    );
+    let rows = run_with_params(
+        &store,
+        "UNWIND $ids AS id \
+         MATCH (u:User) WHERE u.id = id \
+         RETURN u.name AS name ORDER BY name",
+        &params,
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Ada".to_string(), "Cara".to_string()]);
+}
+
+#[test]
+fn nested_chained_unwind_cross_products_both_lists() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "UNWIND [1, 2] AS a \
+         UNWIND [10, 20] AS b \
+         RETURN a, b ORDER BY a, b",
+    );
+    let pairs: Vec<(i64, i64)> = rows
+        .iter()
+        .map(|r| (int_prop(r, "a"), int_prop(r, "b")))
+        .collect();
+    assert_eq!(pairs, vec![(1, 10), (1, 20), (2, 10), (2, 20)]);
+}
+
+#[test]
+fn chained_unwind_empty_list_drops_input_row() {
+    // Input rows whose UNWIND expression evaluates to an empty or
+    // null list are silently dropped — the operator pulls the next
+    // input row. Post 'B' has no `tags` property, so the property
+    // access returns Null and is coerced to an empty list.
+    let (store, _d) = open_store();
+    let mut ps = ParamMap::new();
+    ps.insert(
+        "a".into(),
+        Value::Property(Property::List(vec![Property::String("x".into())])),
+    );
+    run_with_params(&store, "CREATE (:Post {title: 'A', tags: $a})", &ps);
+    run(&store, "CREATE (:Post {title: 'B'})");
+    let mut ps = ParamMap::new();
+    ps.insert(
+        "c".into(),
+        Value::Property(Property::List(vec![
+            Property::String("y".into()),
+            Property::String("z".into()),
+        ])),
+    );
+    run_with_params(&store, "CREATE (:Post {title: 'C', tags: $c})", &ps);
+    let rows = run(
+        &store,
+        "MATCH (p:Post) UNWIND (p.tags) AS tag \
+         RETURN p.title AS title, tag ORDER BY title, tag",
+    );
+    let got: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "title"), str_prop(r, "tag")))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("A".into(), "x".into()),
+            ("C".into(), "y".into()),
+            ("C".into(), "z".into()),
+        ]
+    );
+}
+
+#[test]
+fn chained_unwind_rejects_alias_collision() {
+    let parsed = mesh_cypher::parse("MATCH (x) UNWIND [1, 2] AS x RETURN x").unwrap();
+    let err = mesh_cypher::plan(&parsed).unwrap_err();
+    assert!(format!("{err}").contains("already bound"), "got: {err}");
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");

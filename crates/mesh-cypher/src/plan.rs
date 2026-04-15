@@ -173,8 +173,21 @@ pub enum LogicalPlan {
     },
     /// Evaluate `expr` once, cast it to a list, and emit one row per element
     /// binding the element to `var`. The expression is evaluated against an
-    /// empty row — UNWIND is a top-level producer, not yet chained after MATCH.
+    /// empty row — this is the top-level UNWIND producer, used when UNWIND
+    /// is the query's first clause. Chained UNWINDs use [`LogicalPlan::UnwindChain`]
+    /// instead so the expression can reference earlier bindings.
     Unwind {
+        var: String,
+        expr: Expr,
+    },
+    /// Per-row UNWIND: for each input row, evaluate `expr` against that
+    /// row, expect a list, and emit one output row per element — each
+    /// output row inherits every binding from the input row plus a new
+    /// binding of `var` to the element. Empty / null lists drop the
+    /// input row. Emitted when `UNWIND` appears as a mid-query reading
+    /// clause after MATCH / WITH / MERGE / another UNWIND.
+    UnwindChain {
+        input: Box<LogicalPlan>,
         var: String,
         expr: Expr,
     },
@@ -513,6 +526,10 @@ where
         }
         LogicalPlan::IndexSeek { value, .. } => visit(value),
         LogicalPlan::Unwind { expr, .. } => visit(expr),
+        LogicalPlan::UnwindChain { input, expr, .. } => {
+            visit(expr)?;
+            walk_plan_exprs(input, visit)
+        }
         LogicalPlan::EdgeExpand { input, .. }
         | LogicalPlan::OptionalEdgeExpand { input, .. }
         | LogicalPlan::VarLengthExpand { input, .. }
@@ -1787,11 +1804,41 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 }
                 stage_pattern_offset += 1;
             }
+            ReadingClause::Unwind(u) => {
+                // A mid-query UNWIND wraps the current row stream.
+                // When it's the first clause (plan is None), the
+                // top-level producer form is used so the expression
+                // evaluates against an empty row — identical to a
+                // standalone `UNWIND ... RETURN` query. In the
+                // chained case, each input row cross-products with
+                // the list the expression produces, binding `alias`
+                // per element.
+                if bound_vars.contains(&u.alias) {
+                    return Err(Error::Plan(format!(
+                        "variable '{}' is already bound; UNWIND cannot rebind \
+                         an existing variable",
+                        u.alias
+                    )));
+                }
+                plan = Some(match plan.take() {
+                    None => LogicalPlan::Unwind {
+                        var: u.alias.clone(),
+                        expr: u.expr.clone(),
+                    },
+                    Some(current) => LogicalPlan::UnwindChain {
+                        input: Box::new(current),
+                        var: u.alias.clone(),
+                        expr: u.expr.clone(),
+                    },
+                });
+                bound_vars.insert(u.alias.clone());
+            }
         }
     }
 
-    let mut plan = plan
-        .ok_or_else(|| Error::Plan("match_stmt must contain at least one MATCH clause".into()))?;
+    let mut plan = plan.ok_or_else(|| {
+        Error::Plan("match_stmt must contain at least one producer clause".into())
+    })?;
 
     let terminal = &stmt.terminal;
 

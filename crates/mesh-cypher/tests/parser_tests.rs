@@ -1213,6 +1213,7 @@ fn three_match_stages_parse() {
             ReadingClause::With(_) => "W",
             ReadingClause::OptionalMatch(_) => "O",
             ReadingClause::Merge(_) => "G",
+            ReadingClause::Unwind(_) => "U",
         })
         .collect();
     assert_eq!(kinds, vec!["M", "W", "M", "W", "M"]);

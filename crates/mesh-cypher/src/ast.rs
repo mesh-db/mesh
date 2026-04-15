@@ -111,6 +111,20 @@ pub enum ReadingClause {
     OptionalMatch(OptionalMatchClause),
     With(WithClause),
     Merge(MergeClause),
+    Unwind(UnwindClause),
+}
+
+/// A mid-query `UNWIND expression AS alias`. Evaluates the
+/// expression against each input row, expects the result to be a
+/// list, and emits one output row per element with `alias` bound
+/// to that element plus every existing binding from the input
+/// row. Empty lists drop the input row; null / missing values
+/// behave the same as an empty list. Distinct from [`UnwindStmt`],
+/// which is the top-level `UNWIND ... RETURN` producer form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwindClause {
+    pub expr: Expr,
+    pub alias: String,
 }
 
 /// A single `MERGE (pattern) [ON CREATE SET ...] [ON MATCH SET
