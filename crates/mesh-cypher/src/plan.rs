@@ -1,6 +1,6 @@
 use crate::ast::{
     CallArgs, CreateStmt, Direction, Expr, IndexDdl, Literal, MatchStmt, NodePattern, Pattern,
-    ReturnItem, ReturnStmt, SortItem, Statement, UnwindStmt,
+    ReturnItem, ReturnStmt, SortItem, Statement, UnionStmt, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -209,6 +209,16 @@ pub enum LogicalPlan {
     /// describing `(label, property)`. The executor builds the rows
     /// from `Store::list_property_indexes`.
     ShowPropertyIndexes,
+    /// Concatenate row streams from multiple sub-plans, optionally
+    /// deduping across the union. Each branch is planned
+    /// independently and must project the same set of columns
+    /// (name + order) as the first branch. `all = true` corresponds
+    /// to `UNION ALL` and skips the dedup; `all = false` does a
+    /// row-key dedup across the entire combined stream.
+    Union {
+        branches: Vec<LogicalPlan>,
+        all: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -319,6 +329,115 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
             property: property.clone(),
         }),
         Statement::ShowIndexes => Ok(LogicalPlan::ShowPropertyIndexes),
+        Statement::Union(u) => plan_union(u, ctx),
+    }
+}
+
+/// Plan a `UNION` / `UNION ALL`. Every branch is lowered
+/// independently, then the planner validates that all branches
+/// agree on the RETURN column list (name + order) — same
+/// invariant Neo4j enforces. Branches that don't end in a
+/// readable projection (e.g. a `MATCH ... DELETE` with no final
+/// `RETURN`) are rejected because UNION has to produce rows, not
+/// side effects.
+fn plan_union(u: &UnionStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
+    if u.branches.len() < 2 {
+        return Err(Error::Plan("UNION requires at least two branches".into()));
+    }
+
+    let expected_columns = union_branch_columns(&u.branches[0])?;
+    for (i, branch) in u.branches.iter().enumerate().skip(1) {
+        let cols = union_branch_columns(branch)?;
+        if cols != expected_columns {
+            return Err(Error::Plan(format!(
+                "UNION branch {i} has columns {cols:?}, expected {expected_columns:?} \
+                 (all branches must project the same columns in the same order)"
+            )));
+        }
+    }
+
+    let branches: Vec<LogicalPlan> = u
+        .branches
+        .iter()
+        .map(|b| plan_with_context(b, ctx))
+        .collect::<Result<_>>()?;
+    Ok(LogicalPlan::Union {
+        branches,
+        all: u.all,
+    })
+}
+
+/// Return the ordered list of output column names for a UNION
+/// branch. Only accepts read-producing statements — any branch
+/// that doesn't carry a `RETURN` (e.g. pure SET/DELETE) fails,
+/// and DDL statements are rejected outright because UNION is a
+/// row-stream construct.
+fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
+    match stmt {
+        Statement::Match(m) => {
+            if m.terminal.return_items.is_empty() {
+                return Err(Error::Plan(
+                    "UNION branches must end with RETURN; a bare effectful \
+                     MATCH tail has no projected columns"
+                        .into(),
+                ));
+            }
+            Ok(m.terminal
+                .return_items
+                .iter()
+                .map(return_item_column_name)
+                .collect())
+        }
+        Statement::Unwind(u) => Ok(u.return_items.iter().map(return_item_column_name).collect()),
+        Statement::Return(r) => Ok(r.return_items.iter().map(return_item_column_name).collect()),
+        Statement::Union(u) => {
+            // Nested UNION is flattened by the parser, but in
+            // principle a plan-mode construction could hand us
+            // one — inherit the column list from the first
+            // branch.
+            u.branches
+                .first()
+                .map(union_branch_columns)
+                .unwrap_or_else(|| Err(Error::Plan("empty nested UNION".into())))
+        }
+        Statement::Create(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)
+        | Statement::ShowIndexes => Err(Error::Plan(
+            "UNION branches must be read queries (MATCH / UNWIND / RETURN); \
+             DDL and CREATE-only statements are not allowed"
+                .into(),
+        )),
+    }
+}
+
+/// Canonical column name for a `RETURN` item. Uses the explicit
+/// alias when present, otherwise falls back to a stable rendering
+/// of the expression — matching what the executor's `ProjectOp`
+/// uses as the row's key.
+fn return_item_column_name(item: &ReturnItem) -> String {
+    if let Some(alias) = &item.alias {
+        return alias.clone();
+    }
+    render_expr_key(&item.expr)
+}
+
+/// Best-effort string rendering of an expression for use as a
+/// column name when no `AS` alias is given. Mirrors the key
+/// strings the executor builds in `ProjectOp` so UNION column
+/// matching stays consistent end to end.
+fn render_expr_key(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(name) => name.clone(),
+        Expr::Property { var, key } => format!("{var}.{key}"),
+        Expr::Parameter(name) => format!("${name}"),
+        Expr::Literal(Literal::String(s)) => format!("'{s}'"),
+        Expr::Literal(Literal::Integer(i)) => i.to_string(),
+        Expr::Literal(Literal::Float(f)) => f.to_string(),
+        Expr::Literal(Literal::Boolean(b)) => b.to_string(),
+        Expr::Literal(Literal::Null) => "NULL".into(),
+        Expr::Call { name, .. } => format!("{name}(...)"),
+        _ => format!("{expr:?}"),
     }
 }
 

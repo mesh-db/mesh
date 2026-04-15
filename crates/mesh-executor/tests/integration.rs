@@ -3322,3 +3322,99 @@ fn math_functions_null_propagate() {
         Some(Value::Null) | Some(Value::Property(Property::Null))
     ));
 }
+
+#[test]
+fn union_combines_two_branches_and_dedupes() {
+    // Seed a Person named "Ada" and a Company named "Ada" so the
+    // name appears in both branches — plain UNION must emit it
+    // exactly once.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Company {name: 'Ada'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person) RETURN a.name AS name \
+         UNION \
+         MATCH (c:Company) RETURN c.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string(), "Bob".to_string()]);
+}
+
+#[test]
+fn union_all_preserves_duplicates_across_branches() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Company {name: 'Ada'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person) RETURN a.name AS name \
+         UNION ALL \
+         MATCH (c:Company) RETURN c.name AS name",
+    );
+    assert_eq!(rows.len(), 2);
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string(), "Ada".to_string()]);
+}
+
+#[test]
+fn union_all_preserves_within_branch_duplicates() {
+    let (store, _d) = open_store();
+    // Two people with the same name — plain UNION should still
+    // dedupe them because its semantics are "set union across the
+    // combined stream", not just across branches.
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Ada'})",
+    );
+    let deduped = run(
+        &store,
+        "MATCH (a:Person) RETURN a.name AS name \
+         UNION \
+         MATCH (a:Person) RETURN a.name AS name",
+    );
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(str_prop(&deduped[0], "name"), "Ada");
+
+    let all_rows = run(
+        &store,
+        "MATCH (a:Person) RETURN a.name AS name \
+         UNION ALL \
+         MATCH (a:Person) RETURN a.name AS name",
+    );
+    assert_eq!(all_rows.len(), 4);
+}
+
+#[test]
+fn union_three_way_chain_streams_all_branches() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN 1 AS x UNION RETURN 2 AS x UNION RETURN 3 AS x",
+    );
+    let mut xs: Vec<i64> = rows.iter().map(|r| int_prop(r, "x")).collect();
+    xs.sort();
+    assert_eq!(xs, vec![1, 2, 3]);
+}
+
+#[test]
+fn union_with_bare_return_branches_as_literal_set() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN 'Ada' AS name UNION ALL RETURN 'Bob' AS name UNION ALL RETURN 'Ada' AS name",
+    );
+    assert_eq!(rows.len(), 3);
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Ada".to_string(), "Ada".to_string(), "Bob".to_string()]
+    );
+}

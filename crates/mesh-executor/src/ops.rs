@@ -301,6 +301,10 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
         // operator pipeline is built, so they should never reach
         // this point. An assertion here catches any future
         // refactor that forgets to gate them.
+        LogicalPlan::Union { branches, all } => {
+            let branch_ops: Vec<Box<dyn Operator>> = branches.iter().map(build_op).collect();
+            Box::new(UnionOp::new(branch_ops, *all))
+        }
         LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
         | LogicalPlan::ShowPropertyIndexes => {
@@ -1859,6 +1863,52 @@ impl Operator for DistinctOp {
             let key = row_key(&row);
             if self.seen.insert(key) {
                 return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// `UNION` / `UNION ALL`. Drains each branch in order, streaming
+/// its rows through. For plain `UNION` (`all = false`) we
+/// deduplicate across the combined stream using the same
+/// `row_key` the `DistinctOp` uses, so the semantics match
+/// Neo4j's "set union" shape regardless of whether duplicates
+/// sit inside a single branch or straddle branches. For
+/// `UNION ALL` the `seen` set stays `None` and every produced
+/// row is forwarded as-is.
+struct UnionOp {
+    branches: Vec<Box<dyn Operator>>,
+    current: usize,
+    seen: Option<HashSet<String>>,
+}
+
+impl UnionOp {
+    fn new(branches: Vec<Box<dyn Operator>>, all: bool) -> Self {
+        Self {
+            branches,
+            current: 0,
+            seen: if all { None } else { Some(HashSet::new()) },
+        }
+    }
+}
+
+impl Operator for UnionOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        while self.current < self.branches.len() {
+            match self.branches[self.current].next(ctx)? {
+                Some(row) => {
+                    if let Some(seen) = self.seen.as_mut() {
+                        let key = row_key(&row);
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                    }
+                    return Ok(Some(row));
+                }
+                None => {
+                    self.current += 1;
+                }
             }
         }
         Ok(None)

@@ -1547,3 +1547,94 @@ fn is_not_null_operator_parses() {
     };
     assert!(negated);
 }
+
+#[test]
+fn union_two_branches_parses_as_dedup() {
+    let s = parse(
+        "MATCH (a:Person) RETURN a.name AS name \
+         UNION \
+         MATCH (c:Company) RETURN c.name AS name",
+    )
+    .unwrap();
+    let Statement::Union(u) = s else {
+        panic!("expected Statement::Union");
+    };
+    assert_eq!(u.branches.len(), 2);
+    assert!(!u.all);
+    assert!(matches!(u.branches[0], Statement::Match(_)));
+    assert!(matches!(u.branches[1], Statement::Match(_)));
+}
+
+#[test]
+fn union_all_preserves_duplicates_flag() {
+    let s = parse(
+        "MATCH (a:Person) RETURN a.name AS name \
+         UNION ALL \
+         MATCH (c:Company) RETURN c.name AS name",
+    )
+    .unwrap();
+    let Statement::Union(u) = s else {
+        panic!("expected Statement::Union");
+    };
+    assert!(u.all);
+}
+
+#[test]
+fn union_chain_of_three_flattens_to_single_union() {
+    let s = parse(
+        "RETURN 1 AS x \
+         UNION \
+         RETURN 2 AS x \
+         UNION \
+         RETURN 3 AS x",
+    )
+    .unwrap();
+    let Statement::Union(u) = s else {
+        panic!("expected Statement::Union");
+    };
+    assert_eq!(u.branches.len(), 3);
+    assert!(!u.all);
+}
+
+#[test]
+fn union_mixed_with_all_is_rejected() {
+    let err = parse(
+        "RETURN 1 AS x \
+         UNION \
+         RETURN 2 AS x \
+         UNION ALL \
+         RETURN 3 AS x",
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("mix UNION and UNION ALL"),
+        "expected mix-rejection message, got: {msg}"
+    );
+}
+
+#[test]
+fn single_read_query_without_union_is_not_wrapped() {
+    // The grammar flows even a single-branch read query through
+    // `union_query`; confirm the parser unwraps it back to the
+    // inner statement instead of producing a trivial Union.
+    let s = parse("MATCH (n) RETURN n").unwrap();
+    assert!(matches!(s, Statement::Match(_)));
+}
+
+#[test]
+fn union_column_mismatch_fails_at_plan_time() {
+    // Parser accepts it; planner rejects because columns don't match.
+    let s = parse(
+        "MATCH (a:Person) RETURN a.name AS name \
+         UNION \
+         MATCH (c:Company) RETURN c.founded AS year",
+    )
+    .unwrap();
+    let err = plan(&s).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("UNION branch") && msg.contains("must project the same columns"),
+        "expected column-mismatch message, got: {msg}"
+    );
+}

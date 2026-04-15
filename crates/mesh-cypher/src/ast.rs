@@ -19,6 +19,27 @@ pub enum Statement {
     CreateIndex(IndexDdl),
     DropIndex(IndexDdl),
     ShowIndexes,
+    /// Multiple read statements joined by `UNION` / `UNION ALL`.
+    /// Flat: a chain `a UNION b UNION c` produces a single
+    /// `Union` with three branches. Mixing `UNION` and
+    /// `UNION ALL` in the same chain is rejected at parse time.
+    Union(UnionStmt),
+}
+
+/// `query1 UNION [ALL] query2 [UNION [ALL] query3 ...]`. Each
+/// branch must be a read statement — `MATCH`/`MERGE`-initiated,
+/// `UNWIND`-initiated, or bare `RETURN`. The planner additionally
+/// requires every branch to project the same column list (name +
+/// order) so the combined row stream has a single well-defined
+/// shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionStmt {
+    /// Ordered list of branches. Always length ≥ 2 after parsing;
+    /// a single branch is flattened back into its inner statement.
+    pub branches: Vec<Statement>,
+    /// `true` for `UNION ALL` (preserve duplicates), `false` for
+    /// plain `UNION` (deduplicate across all branches).
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

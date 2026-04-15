@@ -1,10 +1,36 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
-query = { SOI ~ statement ~ EOI }
+query = { SOI ~ query_body ~ EOI }
 
-statement = {
+// Top-level query: either a standalone non-read statement (DDL,
+// CREATE), or a read query optionally stitched with UNION / UNION
+// ALL into a stream of same-shape branches. UNION branches must be
+// read statements — DDL and CREATE-only statements don't produce
+// unionable row streams and are rejected at parse time.
+query_body = {
     create_index_stmt | drop_index_stmt | show_indexes_stmt |
-    unwind_stmt | create_stmt | match_stmt | return_only_stmt
+    create_stmt |
+    union_query
+}
+
+// A read query, possibly composed of multiple branches joined by
+// UNION / UNION ALL. The grammar allows zero joiners (one branch →
+// a plain read query) and the parser flattens same-kind chains.
+// Mixing UNION and UNION ALL in the same chain is rejected at
+// build time — Neo4j doesn't allow it and the set semantics would
+// be ambiguous.
+union_query = {
+    read_stmt ~ (kw_union ~ kw_all? ~ read_stmt)*
+}
+
+// Read-query branches allowed inside a `union_query`. Mirrors the
+// read-only subset of `statement` — MATCH/MERGE-initiated,
+// UNWIND-initiated, and bare RETURN. A `match_stmt` whose terminal
+// tail carries SET/DELETE/CREATE still passes here because the
+// grammar doesn't distinguish — the planner enforces that UNION
+// branches only carry read-producing terminals.
+read_stmt = {
+    unwind_stmt | match_stmt | return_only_stmt
 }
 
 // Bare `RETURN <expr> AS alias` with no producer clause — Neo4j's
@@ -306,3 +332,5 @@ kw_for = @{ ^"for" ~ !id_cont }
 kw_on = @{ ^"on" ~ !id_cont }
 kw_with = @{ ^"with" ~ !id_cont }
 kw_optional = @{ ^"optional" ~ !id_cont }
+kw_union = @{ ^"union" ~ !id_cont }
+kw_all = @{ ^"all" ~ !id_cont }

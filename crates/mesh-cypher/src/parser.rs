@@ -16,27 +16,90 @@ pub fn parse(input: &str) -> Result<Statement> {
     let query = pairs
         .next()
         .ok_or_else(|| Error::Parse("empty input".into()))?;
-    let statement = query
+    let body = query
         .into_inner()
-        .find(|p| p.as_rule() == Rule::statement)
-        .ok_or_else(|| Error::Parse("missing statement".into()))?;
-    build_statement(statement)
+        .find(|p| p.as_rule() == Rule::query_body)
+        .ok_or_else(|| Error::Parse("missing query_body".into()))?;
+    build_query_body(body)
 }
 
-fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
+fn build_query_body(pair: Pair<Rule>) -> Result<Statement> {
     let inner = pair
         .into_inner()
         .next()
-        .ok_or_else(|| Error::Parse("empty statement".into()))?;
+        .ok_or_else(|| Error::Parse("empty query_body".into()))?;
     match inner.as_rule() {
         Rule::create_stmt => Ok(Statement::Create(build_create(inner)?)),
-        Rule::match_stmt => Ok(Statement::Match(build_match(inner)?)),
-        Rule::unwind_stmt => Ok(Statement::Unwind(build_unwind(inner)?)),
-        Rule::return_only_stmt => Ok(Statement::Return(build_return_only(inner)?)),
         Rule::create_index_stmt => Ok(Statement::CreateIndex(build_index_ddl(inner)?)),
         Rule::drop_index_stmt => Ok(Statement::DropIndex(build_index_ddl(inner)?)),
         Rule::show_indexes_stmt => Ok(Statement::ShowIndexes),
+        Rule::union_query => build_union_query(inner),
         r => Err(Error::Parse(format!("unexpected rule: {:?}", r))),
+    }
+}
+
+/// Parse a `union_query` production: one or more `read_stmt`
+/// branches joined by optional `UNION` / `UNION ALL` separators.
+/// Collapses to the branch's inner statement when there's only
+/// one branch (no UNION keywords seen), otherwise builds a
+/// `Statement::Union`. Mixing `UNION` and `UNION ALL` in the same
+/// chain is rejected — Neo4j doesn't allow it and the dedup
+/// semantics would be ambiguous.
+fn build_union_query(pair: Pair<Rule>) -> Result<Statement> {
+    let mut branches: Vec<Statement> = Vec::new();
+    // Per separator: `true` when the corresponding `UNION` was
+    // followed by `ALL`, `false` for plain `UNION`. Length = branches - 1
+    // after the first branch is pushed.
+    let mut separators: Vec<bool> = Vec::new();
+    let mut pending_union = false;
+    let mut pending_all = false;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::read_stmt => {
+                branches.push(build_read_stmt(child)?);
+                if pending_union {
+                    separators.push(pending_all);
+                    pending_union = false;
+                    pending_all = false;
+                }
+            }
+            Rule::kw_union => {
+                pending_union = true;
+            }
+            Rule::kw_all => {
+                pending_all = true;
+            }
+            r => return Err(Error::Parse(format!("unexpected union_query child: {r:?}"))),
+        }
+    }
+    if branches.is_empty() {
+        return Err(Error::Parse("union_query produced no branches".into()));
+    }
+    if separators.is_empty() {
+        // No UNION at all — unwrap the single branch.
+        return Ok(branches.pop().unwrap());
+    }
+    let all = separators[0];
+    if separators.iter().any(|s| *s != all) {
+        return Err(Error::Parse(
+            "cannot mix UNION and UNION ALL in the same query; \
+             all separators must be the same kind"
+                .into(),
+        ));
+    }
+    Ok(Statement::Union(UnionStmt { branches, all }))
+}
+
+fn build_read_stmt(pair: Pair<Rule>) -> Result<Statement> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty read_stmt".into()))?;
+    match inner.as_rule() {
+        Rule::match_stmt => Ok(Statement::Match(build_match(inner)?)),
+        Rule::unwind_stmt => Ok(Statement::Unwind(build_unwind(inner)?)),
+        Rule::return_only_stmt => Ok(Statement::Return(build_return_only(inner)?)),
+        r => Err(Error::Parse(format!("unexpected read_stmt child: {r:?}"))),
     }
 }
 
