@@ -26,6 +26,11 @@ tracing = "0.1"
 tokio = { version = "1", features = ["full"] }
 prometheus = { version = "0.13", default-features = false }
 bcrypt = { version = "0.15", default-features = false, features = ["std"] }
+# chrono: only pulled in for ISO 8601 / RFC 3339 string parsing in
+# the mesh-executor temporal scalar functions (`datetime(string)`,
+# `date(string)`). Storage and wire formats use raw epoch counts, so
+# chrono never touches the persistence path.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = "thin"

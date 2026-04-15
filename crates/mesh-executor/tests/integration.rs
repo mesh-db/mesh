@@ -4194,3 +4194,144 @@ fn duration_plus_duration_adds_component_wise() {
     assert_eq!(sum.days, 6);
     assert_eq!(sum.seconds, 90);
 }
+
+#[test]
+fn datetime_parses_rfc3339_with_z() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN datetime('2025-01-01T00:00:00Z') AS dt");
+    let ms = match rows[0].get("dt") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    // 2025-01-01T00:00:00Z = 1735689600 seconds since epoch
+    assert_eq!(ms, 1_735_689_600_000);
+}
+
+#[test]
+fn datetime_parses_with_offset() {
+    let (store, _d) = open_store();
+    // 2025-01-01T05:00:00+05:00 == 2025-01-01T00:00:00Z
+    let rows = run(&store, "RETURN datetime('2025-01-01T05:00:00+05:00') AS dt");
+    let ms = match rows[0].get("dt") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    assert_eq!(ms, 1_735_689_600_000);
+}
+
+#[test]
+fn datetime_parses_naive_as_utc() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN datetime('2025-01-01T00:00:00') AS dt");
+    let ms = match rows[0].get("dt") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    assert_eq!(ms, 1_735_689_600_000);
+}
+
+#[test]
+fn datetime_parses_with_fractional_seconds() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN datetime('2025-01-01T00:00:00.500Z') AS dt");
+    let ms = match rows[0].get("dt") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    assert_eq!(ms, 1_735_689_600_500);
+}
+
+#[test]
+fn datetime_parses_space_separator() {
+    let (store, _d) = open_store();
+    // Common relaxation — sqlite/postgres use a space.
+    let rows = run(&store, "RETURN datetime('2025-01-01 00:00:00') AS dt");
+    let ms = match rows[0].get("dt") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    assert_eq!(ms, 1_735_689_600_000);
+}
+
+#[test]
+fn datetime_null_string_propagates() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN datetime(coalesce(null)) AS dt");
+    assert!(matches!(
+        rows[0].get("dt"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
+
+#[test]
+fn datetime_bad_string_errors() {
+    let (store, _d) = open_store();
+    let plan =
+        mesh_cypher::plan(&mesh_cypher::parse("RETURN datetime('not a date') AS dt").unwrap())
+            .unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("datetime()") && msg.contains("ISO 8601"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn date_parses_iso_string() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN date('2025-01-01') AS d");
+    let days = match rows[0].get("d") {
+        Some(Value::Property(Property::Date(d))) => *d,
+        other => panic!("expected Date, got {other:?}"),
+    };
+    // 2025-01-01 is 20089 days after 1970-01-01.
+    assert_eq!(days, 20089);
+}
+
+#[test]
+fn date_parses_string_and_arithmetic() {
+    // Full pipeline: parse a date string, add a duration, compare days.
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN date('2025-01-01') + duration({days: 30}) AS d, \
+                date('2025-01-31') AS expected",
+    );
+    let d = match rows[0].get("d") {
+        Some(Value::Property(Property::Date(d))) => *d,
+        other => panic!("expected Date, got {other:?}"),
+    };
+    let expected = match rows[0].get("expected") {
+        Some(Value::Property(Property::Date(d))) => *d,
+        other => panic!("expected Date, got {other:?}"),
+    };
+    assert_eq!(d, expected);
+}
+
+#[test]
+fn date_bad_string_errors() {
+    let (store, _d) = open_store();
+    let plan =
+        mesh_cypher::plan(&mesh_cypher::parse("RETURN date('2025/01/01') AS d").unwrap()).unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("date()") && msg.contains("YYYY-MM-DD"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn datetime_parsed_string_roundtrips_comparison() {
+    let (store, _d) = open_store();
+    // Parse two datetimes and compare them.
+    let rows = run(
+        &store,
+        "RETURN datetime('2025-01-01T00:00:00Z') < datetime('2025-06-01T00:00:00Z') AS before",
+    );
+    match rows[0].get("before") {
+        Some(Value::Property(Property::Bool(b))) => assert!(*b),
+        other => panic!("expected Bool, got {other:?}"),
+    }
+}

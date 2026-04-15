@@ -592,6 +592,62 @@ fn now_epoch_millis() -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
+/// Parse an ISO 8601 / RFC 3339 datetime string into UTC epoch
+/// milliseconds. Accepts a few common forms:
+///
+/// - `2025-01-01T00:00:00Z` — RFC 3339 with explicit UTC
+/// - `2025-01-01T00:00:00+05:00` — RFC 3339 with offset
+/// - `2025-01-01T00:00:00` — ISO 8601 naive, treated as UTC
+/// - `2025-01-01T00:00:00.123` — with fractional seconds
+/// - `2025-01-01 00:00:00` — space instead of `T` (common relaxation)
+///
+/// Anything else is rejected with a clean parse error. Sub-
+/// millisecond precision is truncated toward zero since our
+/// on-the-wire DateTime is millis-resolution.
+fn parse_datetime(s: &str) -> Result<i64> {
+    use chrono::{DateTime, FixedOffset, NaiveDateTime};
+    let trimmed = s.trim();
+    // Try RFC 3339 first (fastest path for the canonical form
+    // drivers emit). Chrono's `DateTime::parse_from_rfc3339`
+    // accepts both `Z` and explicit offsets.
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(trimmed) {
+        return Ok(dt.timestamp_millis());
+    }
+    // Fall back to a few naive forms. Each is interpreted as
+    // UTC. Formats are tried in descending specificity so a
+    // string with a sub-second component doesn't get truncated
+    // by a coarser format.
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Ok(ndt.and_utc().timestamp_millis());
+        }
+    }
+    Err(Error::UnknownScalarFunction(format!(
+        "datetime() could not parse {s:?} as ISO 8601 / RFC 3339"
+    )))
+}
+
+/// Parse an ISO 8601 calendar date (`YYYY-MM-DD`) into days
+/// since the UNIX epoch. Any other form is rejected.
+fn parse_date(s: &str) -> Result<i32> {
+    use chrono::NaiveDate;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid calendar date");
+    let parsed = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").map_err(|_| {
+        Error::UnknownScalarFunction(format!("date() could not parse {s:?} as YYYY-MM-DD"))
+    })?;
+    let days = parsed.signed_duration_since(epoch).num_days();
+    i32::try_from(days).map_err(|_| {
+        Error::UnknownScalarFunction(format!(
+            "date() {s:?} is outside the representable i32 day range"
+        ))
+    })
+}
+
 /// Try the temporal combinations of `left op right` and return
 /// `Some(result)` if a temporal rule fires, `None` otherwise (so
 /// the caller falls through to plain numeric arithmetic).
@@ -1223,28 +1279,54 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         // send it as a Bolt parameter, which goes through the
         // wire-format path (Bolt LocalDateTime struct).
         "datetime" => {
-            if !arg_exprs.is_empty() {
-                return Err(Error::UnknownScalarFunction(
-                    "datetime() with arguments is not supported yet; \
-                     pass a Bolt LocalDateTime struct as a parameter instead"
-                        .into(),
-                ));
+            // Zero args → current UTC epoch millis.
+            // One string arg → parse ISO 8601 / RFC 3339 and convert
+            // to UTC epoch millis. Timezone offsets are respected
+            // during conversion; naive strings (no `Z` or offset)
+            // are interpreted as UTC, matching the rest of the
+            // temporal surface's UTC-only v1.
+            match arg_exprs.len() {
+                0 => Ok(Value::Property(Property::DateTime(now_epoch_millis()))),
+                1 => {
+                    let v = eval_expr(&arg_exprs[0], ctx)?;
+                    match v {
+                        Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                        Value::Property(Property::String(s)) => {
+                            Ok(Value::Property(Property::DateTime(parse_datetime(&s)?)))
+                        }
+                        _ => Err(Error::TypeMismatch),
+                    }
+                }
+                _ => Err(Error::UnknownScalarFunction(
+                    "datetime() takes zero or one argument".into(),
+                )),
             }
-            Ok(Value::Property(Property::DateTime(now_epoch_millis())))
         }
         "date" => {
-            if !arg_exprs.is_empty() {
-                return Err(Error::UnknownScalarFunction(
-                    "date() with arguments is not supported yet; \
-                     pass a Bolt Date struct as a parameter instead"
-                        .into(),
-                ));
+            // Zero args → today (UTC). One string arg → parse
+            // `YYYY-MM-DD` into days-since-epoch.
+            match arg_exprs.len() {
+                0 => {
+                    let days = now_epoch_millis().div_euclid(86_400_000);
+                    let clamped = i32::try_from(days).map_err(|_| {
+                        Error::UnknownScalarFunction(format!("date() overflowed i32 days: {days}"))
+                    })?;
+                    Ok(Value::Property(Property::Date(clamped)))
+                }
+                1 => {
+                    let v = eval_expr(&arg_exprs[0], ctx)?;
+                    match v {
+                        Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                        Value::Property(Property::String(s)) => {
+                            Ok(Value::Property(Property::Date(parse_date(&s)?)))
+                        }
+                        _ => Err(Error::TypeMismatch),
+                    }
+                }
+                _ => Err(Error::UnknownScalarFunction(
+                    "date() takes zero or one argument".into(),
+                )),
             }
-            let days = now_epoch_millis().div_euclid(86_400_000);
-            let clamped = i32::try_from(days).map_err(|_| {
-                Error::UnknownScalarFunction(format!("date() overflowed i32 days: {days}"))
-            })?;
-            Ok(Value::Property(Property::Date(clamped)))
         }
         "timestamp" => {
             if !arg_exprs.is_empty() {
