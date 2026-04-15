@@ -823,6 +823,177 @@ fn parse_date(s: &str) -> Result<i32> {
     })
 }
 
+/// Parse an ISO 8601 duration string into a
+/// [`mesh_core::Duration`]. The grammar is
+/// `[-]P[nY][nM][nW][nD][T[nH][nM][nS]]` where each `n` is a
+/// non-negative integer and `nS` may carry a fractional part
+/// (up to nanosecond precision). An optional leading `-`
+/// negates every component of the parsed result.
+///
+/// Reuses chrono's date/time types for neither parsing nor
+/// storage: chrono's `Duration` is exact-seconds-only and
+/// doesn't carry months/years, which Cypher durations do. The
+/// hand-rolled state machine below handles each unit in order
+/// and disambiguates `M` (months in the date part, minutes in
+/// the time part) via the required `T` separator.
+fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
+    let trimmed = s.trim();
+    let bad = || {
+        Error::UnknownScalarFunction(format!(
+            "duration() could not parse {s:?} as ISO 8601 \
+             (expected P[nY][nM][nW][nD][T[nH][nM][nS]])"
+        ))
+    };
+
+    // Strip optional leading sign.
+    let (negative, rest) = match trimmed.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, trimmed),
+    };
+    // Designator: must begin with `P`.
+    let rest = rest.strip_prefix('P').ok_or_else(bad)?;
+    // Split into date part (before `T`) and time part (after).
+    let (date_part, time_part) = match rest.split_once('T') {
+        Some((d, t)) => (d, Some(t)),
+        None => (rest, None),
+    };
+    // A duration string has to carry at least one unit. `P`
+    // alone or `PT` alone is a parse error — trying to be
+    // permissive here masks driver bugs.
+    if date_part.is_empty() && time_part.map(str::is_empty).unwrap_or(true) {
+        return Err(bad());
+    }
+
+    let mut months = 0_i64;
+    let mut days = 0_i64;
+    let mut seconds = 0_i64;
+    let mut nanos = 0_i32;
+
+    // Date-part segments: Y (years), M (months), W (weeks), D
+    // (days). Each is `<digits><letter>`. Order isn't enforced
+    // by the grammar — the standard requires it but real-world
+    // inputs are lenient, so we accept any order.
+    let mut cursor = date_part;
+    while !cursor.is_empty() {
+        let (n, unit, rest) = consume_segment(cursor).ok_or_else(bad)?;
+        // Date part can't have fractional components.
+        let (whole, frac) = n;
+        if frac.is_some() {
+            return Err(bad());
+        }
+        match unit {
+            'Y' => months = months.wrapping_add(whole.wrapping_mul(12)),
+            'M' => months = months.wrapping_add(whole),
+            'W' => days = days.wrapping_add(whole.wrapping_mul(7)),
+            'D' => days = days.wrapping_add(whole),
+            _ => return Err(bad()),
+        }
+        cursor = rest;
+    }
+
+    if let Some(mut cursor) = time_part {
+        if cursor.is_empty() {
+            return Err(bad());
+        }
+        while !cursor.is_empty() {
+            let (n, unit, rest) = consume_segment(cursor).ok_or_else(bad)?;
+            let (whole, frac) = n;
+            match unit {
+                'H' => {
+                    if frac.is_some() {
+                        return Err(bad());
+                    }
+                    seconds = seconds.wrapping_add(whole.wrapping_mul(3600));
+                }
+                'M' => {
+                    if frac.is_some() {
+                        return Err(bad());
+                    }
+                    seconds = seconds.wrapping_add(whole.wrapping_mul(60));
+                }
+                'S' => {
+                    seconds = seconds.wrapping_add(whole);
+                    if let Some(fr) = frac {
+                        nanos = nanos.wrapping_add(fr);
+                    }
+                }
+                _ => return Err(bad()),
+            }
+            cursor = rest;
+        }
+    }
+
+    let mut dur = mesh_core::Duration {
+        months,
+        days,
+        seconds,
+        nanos,
+    };
+    if negative {
+        dur = mesh_core::Duration {
+            months: dur.months.wrapping_neg(),
+            days: dur.days.wrapping_neg(),
+            seconds: dur.seconds.wrapping_neg(),
+            nanos: dur.nanos.wrapping_neg(),
+        };
+    }
+    Ok(dur)
+}
+
+/// Consume one `<digits>[.<digits>]<unit>` segment from the
+/// front of `s` and return
+/// `((whole, fractional_nanos), unit, remainder)`. Returns
+/// `None` on malformed input or end-of-string.
+fn consume_segment(s: &str) -> Option<((i64, Option<i32>), char, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 {
+        return None; // no leading digits
+    }
+    let whole: i64 = s[..i].parse().ok()?;
+
+    // Optional fractional part for seconds: `.` then more digits.
+    let (frac_nanos, i) = if i < bytes.len() && bytes[i] == b'.' {
+        let frac_start = i + 1;
+        let mut j = frac_start;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == frac_start {
+            return None; // `.` with no digits after it
+        }
+        // Normalize to 9 digits (nanosecond resolution). Extra
+        // digits are truncated, missing digits zero-padded.
+        let raw = &s[frac_start..j];
+        let mut padded = String::with_capacity(9);
+        padded.push_str(raw);
+        if padded.len() > 9 {
+            padded.truncate(9);
+        } else {
+            while padded.len() < 9 {
+                padded.push('0');
+            }
+        }
+        let n: i32 = padded.parse().ok()?;
+        (Some(n), j)
+    } else {
+        (None, i)
+    };
+
+    if i >= bytes.len() {
+        return None; // no unit letter
+    }
+    let unit = s[i..].chars().next()?;
+    // Unit letter is exactly one ASCII character (Y/M/W/D/H/S)
+    // so `unit.len_utf8() == 1`. Guard against multi-byte just
+    // in case someone passes garbage.
+    let unit_len = unit.len_utf8();
+    Some(((whole, frac_nanos), unit, &s[i + unit_len..]))
+}
+
 /// Try the temporal combinations of `left op right` and return
 /// `Some(result)` if a temporal rule fires, `None` otherwise (so
 /// the caller falls through to plain numeric arithmetic).
@@ -1512,18 +1683,23 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             Ok(Value::Property(Property::Int64(now_epoch_millis())))
         }
         "duration" => {
-            // `duration({months: 1, days: 2, seconds: 30, nanos: 0})`.
-            // Takes a single map-literal argument. Unknown keys
-            // are rejected so typos don't silently produce zero
-            // durations. Missing components default to 0.
+            // `duration({months: 1, days: 2, seconds: 30, nanos: 0})`
+            // or `duration("PT1H30M")`. Takes a single argument —
+            // either a map (component form) or a string (ISO 8601).
+            // Unknown map keys are rejected; malformed ISO strings
+            // surface a parse error naming the expected shape.
             if arg_exprs.len() != 1 {
                 return Err(Error::UnknownScalarFunction(
-                    "duration() expects a single map argument".into(),
+                    "duration() expects a single argument (map or ISO 8601 string)".into(),
                 ));
             }
             let arg = eval_expr(&arg_exprs[0], ctx)?;
             let entries = match arg {
                 Value::Property(Property::Map(m)) => m,
+                Value::Property(Property::String(s)) => {
+                    return Ok(Value::Property(Property::Duration(parse_iso_duration(&s)?)));
+                }
+                Value::Null | Value::Property(Property::Null) => return Ok(Value::Null),
                 _ => return Err(Error::TypeMismatch),
             };
             let mut months = 0_i64;

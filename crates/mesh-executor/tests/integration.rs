@@ -4560,3 +4560,157 @@ fn exists_subquery_binds_edge_variable_in_where() {
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "name"), "Ada");
 }
+
+// ---- duration() ISO 8601 string parsing ----
+
+fn unwrap_duration(v: Option<&Value>) -> mesh_core::Duration {
+    match v {
+        Some(Value::Property(Property::Duration(d))) => *d,
+        other => panic!("expected Duration, got {other:?}"),
+    }
+}
+
+#[test]
+fn duration_parses_full_iso8601_form() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN duration('P1Y2M3DT4H5M6S') AS d");
+    let d = unwrap_duration(rows[0].get("d"));
+    assert_eq!(d.months, 14); // 1 year + 2 months
+    assert_eq!(d.days, 3);
+    assert_eq!(d.seconds, 4 * 3600 + 5 * 60 + 6);
+    assert_eq!(d.nanos, 0);
+}
+
+#[test]
+fn duration_parses_time_only() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN duration('PT1H30M') AS d");
+    let d = unwrap_duration(rows[0].get("d"));
+    assert_eq!(d.months, 0);
+    assert_eq!(d.days, 0);
+    assert_eq!(d.seconds, 3600 + 30 * 60);
+}
+
+#[test]
+fn duration_parses_date_only() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN duration('P1W') AS d");
+    let d = unwrap_duration(rows[0].get("d"));
+    assert_eq!(d.days, 7);
+    assert_eq!(d.months, 0);
+    assert_eq!(d.seconds, 0);
+}
+
+#[test]
+fn duration_parses_single_day() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN duration('P1D') AS d");
+    let d = unwrap_duration(rows[0].get("d"));
+    assert_eq!(d.days, 1);
+    assert_eq!(d.months, 0);
+    assert_eq!(d.seconds, 0);
+}
+
+#[test]
+fn duration_parses_fractional_seconds() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN duration('PT1.5S') AS d");
+    let d = unwrap_duration(rows[0].get("d"));
+    assert_eq!(d.seconds, 1);
+    assert_eq!(d.nanos, 500_000_000);
+}
+
+#[test]
+fn duration_parses_high_precision_fractional_seconds() {
+    let (store, _d) = open_store();
+    // 9-digit nanosecond precision fully survives.
+    let rows = run(&store, "RETURN duration('PT0.123456789S') AS d");
+    let d = unwrap_duration(rows[0].get("d"));
+    assert_eq!(d.seconds, 0);
+    assert_eq!(d.nanos, 123_456_789);
+}
+
+#[test]
+fn duration_parses_negative_string() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN duration('-PT1H') AS d");
+    let d = unwrap_duration(rows[0].get("d"));
+    assert_eq!(d.seconds, -3600);
+}
+
+#[test]
+fn duration_disambiguates_month_vs_minute_via_t() {
+    // `P1M` = 1 month. `PT1M` = 1 minute. The T separator is
+    // the only way to tell the two apart.
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN duration('P1M') AS month, duration('PT1M') AS minute",
+    );
+    let month = unwrap_duration(rows[0].get("month"));
+    let minute = unwrap_duration(rows[0].get("minute"));
+    assert_eq!(month.months, 1);
+    assert_eq!(month.seconds, 0);
+    assert_eq!(minute.months, 0);
+    assert_eq!(minute.seconds, 60);
+}
+
+#[test]
+fn duration_string_plus_datetime_advances() {
+    // Round trip: parse an ISO duration and apply it to a datetime.
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN datetime('2025-01-01T00:00:00Z') + duration('PT1H') AS later",
+    );
+    let ms = match rows[0].get("later") {
+        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        other => panic!("expected DateTime, got {other:?}"),
+    };
+    assert_eq!(ms, 1_735_689_600_000 + 3_600_000);
+}
+
+#[test]
+fn duration_null_string_propagates() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN duration(coalesce(null)) AS d");
+    assert!(matches!(
+        rows[0].get("d"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
+
+#[test]
+fn duration_bad_string_errors() {
+    let (store, _d) = open_store();
+    let plan =
+        mesh_cypher::plan(&mesh_cypher::parse("RETURN duration('not a duration') AS d").unwrap())
+            .unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("duration()") && msg.contains("ISO 8601"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn duration_missing_p_prefix_errors() {
+    let (store, _d) = open_store();
+    let plan =
+        mesh_cypher::plan(&mesh_cypher::parse("RETURN duration('T1H') AS d").unwrap()).unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    assert!(format!("{err}").contains("ISO 8601"));
+}
+
+#[test]
+fn duration_bare_p_errors() {
+    // `P` alone carries no components — must be rejected so
+    // driver typos surface instead of silently producing a
+    // zero duration.
+    let (store, _d) = open_store();
+    let plan =
+        mesh_cypher::plan(&mesh_cypher::parse("RETURN duration('P') AS d").unwrap()).unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    assert!(format!("{err}").contains("ISO 8601"));
+}
