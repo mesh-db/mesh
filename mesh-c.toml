@@ -18,4 +18,6 @@ address = "127.0.0.1:7003"
 
 [[bolt_auth.users]]
 username = "neo4j"
-password = "password"
+# bcrypt hash of "password" (cost 12). Regenerate with:
+#   python -c 'import bcrypt; print(bcrypt.hashpw(b"password", bcrypt.gensalt(rounds=12)).decode())'
+password = "$2b$12$z0kUeQpqxdgNXValdY9pxODCxMBIcrszBd55SvRVBhmD9kZRFENxO"

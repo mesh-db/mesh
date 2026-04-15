@@ -443,8 +443,27 @@ fn sample_toml_configs_at_repo_root_parse_with_bolt_auth() {
         let path = repo_root.join(name);
         let cfg = ServerConfig::from_path(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
         cfg.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
-        let users = cfg.bolt_auth.as_ref().map(|a| a.users.len()).unwrap_or(0);
-        assert!(users >= 1, "{name}: expected at least one bolt_auth user");
+        let auth = cfg
+            .bolt_auth
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: expected bolt_auth section"));
+        assert!(
+            !auth.users.is_empty(),
+            "{name}: expected at least one bolt_auth user"
+        );
+        // End-to-end credential check: whatever's on disk —
+        // plaintext or bcrypt — must verify the canonical dev
+        // credentials `neo4j` / `password` so the sample
+        // configs can actually be used against the README
+        // quickstart without a hand-edit.
+        assert!(
+            auth.verify("neo4j", "password"),
+            "{name}: neo4j/password should verify against the configured hash"
+        );
+        assert!(
+            !auth.verify("neo4j", "wrong"),
+            "{name}: wrong password must not verify"
+        );
     }
 }
 

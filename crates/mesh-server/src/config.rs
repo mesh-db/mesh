@@ -243,6 +243,19 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn print_hash_for_password_literal() {
+        // Manual helper: run with `cargo test --lib \
+        // print_hash_for_password_literal -- --ignored --nocapture`
+        // to dump a freshly-salted bcrypt hash for the literal
+        // string "password". Used to seed the sample configs in
+        // the repo root; left `#[ignore]` so the regular suite
+        // isn't slowed down.
+        let hash = bcrypt::hash("password", 12).unwrap();
+        println!("HASH={}", hash);
+    }
+
+    #[test]
     fn is_bcrypt_hash_recognizes_all_canonical_prefixes() {
         assert!(is_bcrypt_hash("$2a$10$abc"));
         assert!(is_bcrypt_hash("$2b$10$abc"));
