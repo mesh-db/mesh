@@ -75,24 +75,52 @@ pub struct CreateStmt {
     pub limit: Option<i64>,
 }
 
+/// A `MATCH`-initiated query: an ordered list of reading clauses
+/// (`MATCH` / `OPTIONAL MATCH` / `WITH`) followed by a single
+/// writing/projecting terminal tail. The clause list is always
+/// non-empty and the parser guarantees the first entry is a
+/// `Match`. The planner walks the list with one uniform loop
+/// per clause kind, so chained stages (`MATCH ... WITH ... MATCH
+/// ... RETURN` etc.) lower through exactly the same code path
+/// as a single-stage query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchStmt {
+    pub clauses: Vec<ReadingClause>,
+    pub terminal: TerminalTail,
+}
+
+/// One element of a `MatchStmt`'s reading-clause list. Mirrors
+/// the openCypher clause taxonomy for reading clauses —
+/// producers (`MATCH`), left-joins (`OPTIONAL MATCH`), and
+/// re-projection stages (`WITH`). Mutating clauses (`SET`,
+/// `DELETE`, `CREATE`) live in [`TerminalTail`] because
+/// grammatically they only appear at the end.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReadingClause {
+    Match(MatchClause),
+    OptionalMatch(OptionalMatchClause),
+    With(WithClause),
+}
+
+/// A single `MATCH pattern_list [WHERE expr]` clause. This is
+/// the producer form — it introduces new pattern variables by
+/// scanning the store. Multiple `MATCH` clauses in the same
+/// query cartesian-join their row streams unless a `WITH`
+/// projects between them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchClause {
     pub patterns: Vec<Pattern>,
     pub where_clause: Option<Expr>,
-    /// Zero or more `OPTIONAL MATCH` clauses that extend the
-    /// row stream with left-join semantics. Each clause runs
-    /// against the current bindings; rows that don't match
-    /// the optional pattern are preserved with the optional
-    /// variables set to `Null`.
-    pub optional_matches: Vec<OptionalMatchClause>,
-    /// Optional intermediate `WITH` projection between the MATCH
-    /// pattern and the final `RETURN`. When present, the plan
-    /// tree is `MATCH → [pre-WHERE] → WITH(items, WHERE, ORDER,
-    /// SKIP, LIMIT) → RETURN`, and the bindings downstream of
-    /// `with_clause` are *only* the names introduced by the WITH
-    /// items — pattern variables that aren't re-projected go out
-    /// of scope.
-    pub with_clause: Option<WithClause>,
+}
+
+/// The writing / projecting tail that terminates a
+/// `MatchStmt`. Exactly one of `return_items` /
+/// `set_items` / `delete` / `create_patterns` is the "primary"
+/// action the query performs; the others sit at their
+/// defaults. `RETURN` may appear after a mutating clause as a
+/// trailing projection.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TerminalTail {
     pub return_items: Vec<ReturnItem>,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,

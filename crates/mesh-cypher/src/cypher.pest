@@ -50,18 +50,48 @@ unwind_stmt = {
     return_tail
 }
 
+// A MATCH-initiated query is a sequence of reading clauses
+// (at least one MATCH, plus any mix of OPTIONAL MATCH / WITH
+// in any order) ending in a terminal tail. Every prior shape
+// (`MATCH RETURN`, `MATCH WHERE RETURN`, `MATCH WITH RETURN`,
+// `MATCH SET RETURN?`, etc.) still parses because it's a
+// proper subset: one match_clause followed by the
+// terminal_tail is a valid reading_clause+ sequence.
 match_stmt = {
-    kw_match ~ pattern_list ~
-    where_clause? ~
-    optional_match_clause* ~
-    (with_tail ~ return_tail | return_tail | ((set_tail | delete_tail | create_tail) ~ return_tail?))
+    reading_clause+ ~ terminal_tail
+}
+
+// One reading stage. The parser enforces that the first
+// `reading_clause` in a `match_stmt` is a `match_clause` — a
+// query can't start with OPTIONAL MATCH or WITH without
+// something to pull rows from first.
+reading_clause = {
+    match_clause | optional_match_clause | with_tail
+}
+
+// A single `MATCH pattern_list [WHERE expr]` — the producer
+// form that scans the store for pattern matches. Extracted
+// from the old inline `match_stmt` body so it can appear
+// anywhere in the reading-clause sequence, not just at the
+// start.
+match_clause = {
+    kw_match ~ pattern_list ~ where_clause?
+}
+
+// Terminal / writing tail. Either a pure RETURN, or a
+// mutating clause (SET / DELETE / CREATE) optionally followed
+// by a trailing RETURN. Always the last child of a
+// `match_stmt`.
+terminal_tail = {
+    return_tail
+    | ((set_tail | delete_tail | create_tail) ~ return_tail?)
 }
 
 // `OPTIONAL MATCH <pattern> [WHERE ...]` — left-join semantics.
-// Sits between the required MATCH and the RETURN / WITH / SET /
-// DELETE tail. Multiple clauses chain. Restricted at plan time
-// to single-hop patterns whose start node is already bound by a
-// prior MATCH; richer forms land in a follow-up phase.
+// A reading clause that extends the row stream with Null
+// bindings when the optional pattern doesn't match. Restricted
+// at plan time to single-hop patterns whose start node is
+// already bound by an earlier clause.
 optional_match_clause = { kw_optional ~ kw_match ~ pattern_list ~ where_clause? }
 
 // Intermediate projection / filter stage. Behaves like a
@@ -69,9 +99,9 @@ optional_match_clause = { kw_optional ~ kw_match ~ pattern_list ~ where_clause? 
 // Project (or Aggregate) operator followed by the same
 // Distinct / OrderBy / Skip / Limit chain, plus a Filter for
 // the optional WHERE. Chained WITHs (`WITH ... WITH ... RETURN`)
-// are intentionally not supported yet — the surrounding
-// `match_stmt` only allows one `with_tail` before the final
-// `return_tail`.
+// and post-WITH reading clauses (`WITH ... MATCH ...`) work
+// naturally because each `with_tail` is just one entry in
+// the parent `reading_clause+` sequence.
 with_tail = {
     kw_with ~ kw_distinct? ~ return_items ~
     where_clause? ~

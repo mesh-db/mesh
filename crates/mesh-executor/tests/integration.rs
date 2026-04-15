@@ -2661,3 +2661,107 @@ fn tofloat_parses_numeric_string_or_returns_null() {
         Some(Value::Null) | Some(Value::Property(Property::Null))
     ));
 }
+
+// ---------------------------------------------------------------
+// Chained reading clauses (multi-stage MATCH ... WITH ... MATCH ...)
+// ---------------------------------------------------------------
+
+#[test]
+fn match_with_match_returns_cross_product() {
+    // Two disjoint label sets × one WITH pipe between them
+    // should produce the full cross-product of rows.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Company {name: 'Acme'})");
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WITH p MATCH (c:Company) RETURN p.name AS person, c.name AS company",
+    );
+    assert_eq!(rows.len(), 2);
+    let mut pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "person"), str_prop(r, "company")))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Ada".to_string(), "Acme".to_string()),
+            ("Bob".to_string(), "Acme".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn with_aggregate_then_chained_match() {
+    // Canonical aggregate-then-join pattern: count friends
+    // per person, filter, then join with a second label via
+    // a follow-up MATCH. Uses a fresh `(:Company)` label for
+    // the second MATCH so we don't trip the v1 cross-stage
+    // variable re-reference restriction.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cid'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cid'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    );
+    run(&store, "CREATE (:Company {name: 'Acme'})");
+
+    let rows = run(
+        &store,
+        "MATCH (p:Person)-[:KNOWS]->(f) \
+         WITH p, count(f) AS n \
+         WHERE n >= 1 \
+         MATCH (c:Company) \
+         RETURN p.name AS person, c.name AS company, n",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "person"), "Ada");
+    assert_eq!(str_prop(&rows[0], "company"), "Acme");
+    assert_eq!(int_prop(&rows[0], "n"), 1);
+}
+
+#[test]
+fn chained_with_progressive_filters() {
+    // Two successive WITH clauses, each with its own WHERE.
+    // Both predicates must apply — only rows in the
+    // intersection survive.
+    let (store, _d) = open_store();
+    for i in 0..10 {
+        run(&store, &format!("CREATE (:Item {{qty: {}}})", i));
+    }
+    let rows = run(
+        &store,
+        "MATCH (n:Item) WITH n, n.qty AS q WHERE q > 2 \
+         WITH n, q WHERE q < 7 \
+         RETURN q",
+    );
+    assert_eq!(rows.len(), 4);
+    let mut qs: Vec<i64> = rows.iter().map(|r| int_prop(r, "q")).collect();
+    qs.sort();
+    assert_eq!(qs, vec![3, 4, 5, 6]);
+}
+
+#[test]
+fn cross_stage_var_reuse_fails_at_plan_time() {
+    // `MATCH (a) WITH a MATCH (a)-[:X]->(b)` is a v1
+    // restriction: the planner rejects because `a` is
+    // already bound. The executor helper asserts on a
+    // successful run, so this test bypasses it and calls
+    // the planner directly.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let stmt =
+        mesh_cypher::parse("MATCH (a:Person) WITH a MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
+    let err = mesh_cypher::plan(&stmt).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already bound"),
+        "expected cross-stage rebinding error, got: {msg}"
+    );
+}

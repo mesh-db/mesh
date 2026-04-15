@@ -345,51 +345,122 @@ fn build_pattern_list(pair: Pair<Rule>) -> Result<Vec<Pattern>> {
 }
 
 fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
-    let mut patterns: Vec<Pattern> = Vec::new();
-    let mut where_clause = None;
-    let mut optional_matches: Vec<crate::ast::OptionalMatchClause> = Vec::new();
-    let mut with_clause: Option<crate::ast::WithClause> = None;
-    let mut return_items = Vec::new();
-    let mut distinct = false;
-    let mut order_by: Vec<SortItem> = Vec::new();
-    let mut skip = None;
-    let mut limit = None;
-    let mut set_items = Vec::new();
-    let mut delete = None;
-    let mut create_patterns: Vec<Pattern> = Vec::new();
+    use crate::ast::{ReadingClause, TerminalTail};
+
+    let mut clauses: Vec<ReadingClause> = Vec::new();
+    let mut terminal = TerminalTail::default();
 
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::pattern_list => patterns = build_pattern_list(p)?,
-            Rule::create_tail => {
-                let list = p
+            Rule::reading_clause => {
+                let inner = p
                     .into_inner()
                     .next()
-                    .ok_or_else(|| Error::Parse("create tail missing pattern list".into()))?;
-                create_patterns = build_pattern_list(list)?;
+                    .ok_or_else(|| Error::Parse("empty reading clause".into()))?;
+                match inner.as_rule() {
+                    Rule::match_clause => {
+                        clauses.push(ReadingClause::Match(build_match_clause(inner)?));
+                    }
+                    Rule::optional_match_clause => {
+                        clauses.push(ReadingClause::OptionalMatch(build_optional_match(inner)?));
+                    }
+                    Rule::with_tail => {
+                        clauses.push(ReadingClause::With(build_with_tail(inner)?));
+                    }
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rule inside reading_clause: {:?}",
+                            r
+                        )))
+                    }
+                }
             }
+            Rule::terminal_tail => {
+                build_terminal_tail(p, &mut terminal)?;
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in match_stmt: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+
+    if clauses.is_empty() {
+        return Err(Error::Parse(
+            "match_stmt requires at least one reading clause".into(),
+        ));
+    }
+    if !matches!(clauses[0], ReadingClause::Match(_)) {
+        return Err(Error::Parse(
+            "MATCH must be the first clause of a query — OPTIONAL MATCH and WITH \
+             can only appear after an initial MATCH"
+                .into(),
+        ));
+    }
+
+    Ok(MatchStmt { clauses, terminal })
+}
+
+/// Parse a bare `match_clause` (`MATCH pattern_list [WHERE]`)
+/// into its AST form. Called from [`build_match`] for every
+/// `reading_clause` whose inner is `match_clause`.
+fn build_match_clause(pair: Pair<Rule>) -> Result<crate::ast::MatchClause> {
+    debug_assert_eq!(pair.as_rule(), Rule::match_clause);
+    let mut patterns: Vec<Pattern> = Vec::new();
+    let mut where_clause: Option<Expr> = None;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::pattern_list => patterns = build_pattern_list(inner)?,
             Rule::where_clause => {
-                let expr_pair = p
+                let expr_pair = inner
                     .into_inner()
                     .next()
                     .ok_or_else(|| Error::Parse("empty where".into()))?;
                 where_clause = Some(build_expression(expr_pair)?);
             }
-            Rule::optional_match_clause => {
-                optional_matches.push(build_optional_match(p)?);
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in match_clause: {:?}",
+                    r
+                )))
             }
-            Rule::with_tail => {
-                with_clause = Some(build_with_tail(p)?);
-            }
+        }
+    }
+    if patterns.is_empty() {
+        return Err(Error::Parse("MATCH missing pattern list".into()));
+    }
+    Ok(crate::ast::MatchClause {
+        patterns,
+        where_clause,
+    })
+}
+
+/// Parse a `terminal_tail` pair — the `RETURN` / `SET RETURN?`
+/// / `DELETE RETURN?` / `CREATE RETURN?` suffix that ends a
+/// match_stmt — into the fields of the shared [`TerminalTail`]
+/// already owned by `build_match`.
+fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail) -> Result<()> {
+    debug_assert_eq!(pair.as_rule(), Rule::terminal_tail);
+    for p in pair.into_inner() {
+        match p.as_rule() {
             Rule::return_tail => {
                 parse_return_tail(
                     p,
-                    &mut return_items,
-                    &mut distinct,
-                    &mut order_by,
-                    &mut skip,
-                    &mut limit,
+                    &mut terminal.return_items,
+                    &mut terminal.distinct,
+                    &mut terminal.order_by,
+                    &mut terminal.skip,
+                    &mut terminal.limit,
                 )?;
+            }
+            Rule::create_tail => {
+                let list = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("create tail missing pattern list".into()))?;
+                terminal.create_patterns = build_pattern_list(list)?;
             }
             Rule::set_tail => {
                 let set_items_pair = p
@@ -402,7 +473,7 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                         .into_inner()
                         .next()
                         .ok_or_else(|| Error::Parse("empty set item".into()))?;
-                    set_items.push(build_set_item(inner)?);
+                    terminal.set_items.push(build_set_item(inner)?);
                 }
             }
             Rule::delete_tail => {
@@ -424,30 +495,17 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                         }
                     }
                 }
-                delete = Some(DeleteClause { detach, vars });
+                terminal.delete = Some(DeleteClause { detach, vars });
             }
-            r => return Err(Error::Parse(format!("unexpected rule in match: {:?}", r))),
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in terminal tail: {:?}",
+                    r
+                )))
+            }
         }
     }
-
-    if patterns.is_empty() {
-        return Err(Error::Parse("missing pattern".into()));
-    }
-
-    Ok(MatchStmt {
-        patterns,
-        where_clause,
-        optional_matches,
-        with_clause,
-        return_items,
-        distinct,
-        order_by,
-        skip,
-        limit,
-        set_items,
-        delete,
-        create_patterns,
-    })
+    Ok(())
 }
 
 /// Parse one `OPTIONAL MATCH <patterns> [WHERE ...]` clause into

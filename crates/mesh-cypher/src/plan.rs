@@ -804,92 +804,147 @@ fn collect_pattern_vars(pattern: &Pattern, out: &mut HashSet<String>) {
 }
 
 fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
-    // Validate no shared variable names across the pattern list (not yet supported).
-    let mut all_vars: HashSet<String> = HashSet::new();
-    for pattern in &stmt.patterns {
-        let mut this_vars: HashSet<String> = HashSet::new();
-        collect_pattern_vars(pattern, &mut this_vars);
-        for var in this_vars {
-            if !all_vars.insert(var.clone()) {
-                return Err(Error::Plan(format!(
-                    "variable '{}' appears in multiple MATCH patterns; not yet supported",
-                    var
-                )));
+    use crate::ast::ReadingClause;
+
+    // Walk the reading clauses in order. Each clause extends
+    // the current plan tree by its own rules:
+    //
+    //   * `Match`  — plan each pattern fresh, cartesian-join
+    //                with the current row stream, apply any
+    //                WHERE, then run the index-seek rewrite.
+    //   * `OptionalMatch` — reuse the single-hop left-join
+    //                operator; the tracker feeds its "start var
+    //                must be already bound" restriction.
+    //   * `With`   — project / aggregate / filter / order /
+    //                skip / limit; new bindings shadow the
+    //                old ones downstream.
+    //
+    // `bound_vars` accumulates across the whole loop so
+    // downstream clauses can enforce variable-scoping rules
+    // against every earlier stage.
+    let mut plan: Option<LogicalPlan> = None;
+    let mut bound_vars: HashSet<String> = HashSet::new();
+    let mut stage_pattern_offset: usize = 0;
+
+    for clause in &stmt.clauses {
+        match clause {
+            ReadingClause::Match(m) => {
+                // Reject patterns that would re-bind a
+                // variable that's already in scope — either
+                // from an earlier reading clause (cross-stage
+                // re-reference) or from an earlier pattern
+                // within the same comma-separated MATCH
+                // (duplicate within the same stage). The
+                // executor can't yet treat an existing
+                // binding as an expand source, so we surface
+                // a clear plan-time error instead of silently
+                // shadowing.
+                let mut this_clause_vars: HashSet<String> = HashSet::new();
+                for pattern in &m.patterns {
+                    let mut this_pattern_vars: HashSet<String> = HashSet::new();
+                    collect_pattern_vars(pattern, &mut this_pattern_vars);
+                    for var in &this_pattern_vars {
+                        if bound_vars.contains(var) {
+                            return Err(Error::Plan(format!(
+                                "variable '{}' is already bound by an earlier clause; \
+                                 cross-stage variable re-reference is not yet supported",
+                                var
+                            )));
+                        }
+                        if !this_clause_vars.insert(var.clone()) {
+                            return Err(Error::Plan(format!(
+                                "variable '{}' appears in multiple MATCH patterns; \
+                                 not yet supported",
+                                var
+                            )));
+                        }
+                    }
+                }
+
+                // Lower each pattern and join with the current
+                // row stream. The first pattern of the first
+                // clause becomes the root of the plan tree; every
+                // later pattern — within the same stage or across
+                // stages — lands as the right side of a
+                // `CartesianProduct`.
+                for (i, pattern) in m.patterns.iter().enumerate() {
+                    let rhs = plan_pattern(pattern, stage_pattern_offset + i, ctx)?;
+                    plan = Some(match plan.take() {
+                        None => rhs,
+                        Some(lhs) => LogicalPlan::CartesianProduct {
+                            left: Box::new(lhs),
+                            right: Box::new(rhs),
+                        },
+                    });
+                    collect_pattern_vars(pattern, &mut bound_vars);
+                }
+                stage_pattern_offset += m.patterns.len();
+
+                if let Some(predicate) = &m.where_clause {
+                    let current = plan.expect("MATCH populated plan above");
+                    plan = Some(LogicalPlan::Filter {
+                        input: Box::new(current),
+                        predicate: predicate.clone(),
+                    });
+                }
+
+                // Index-aware WHERE rewrite — runs per-stage so
+                // a later MATCH with a WHERE on an indexed
+                // property still gets the IndexSeek lowering.
+                let current = plan.expect("MATCH produced a plan");
+                plan = Some(optimize_filter_chain_to_index_seek(current, ctx));
+            }
+            ReadingClause::OptionalMatch(o) => {
+                let current = plan.ok_or_else(|| {
+                    Error::Plan("OPTIONAL MATCH requires a preceding MATCH".into())
+                })?;
+                plan = Some(apply_optional_match(current, o, &mut bound_vars)?);
+            }
+            ReadingClause::With(w) => {
+                let current = plan.ok_or_else(|| {
+                    Error::Plan("WITH requires a preceding producer clause".into())
+                })?;
+                plan = Some(apply_with_clause(current, w)?);
+                // A WITH doesn't introduce new name bindings
+                // to enforce against — downstream clauses reach
+                // the projected aliases via the row dict at
+                // runtime. Intentionally leave `bound_vars`
+                // alone so a later `OPTIONAL MATCH` that
+                // references a projected name still passes its
+                // "already bound" check on the old name.
             }
         }
     }
 
-    let mut plans: Vec<LogicalPlan> = Vec::new();
-    for (i, pattern) in stmt.patterns.iter().enumerate() {
-        plans.push(plan_pattern(pattern, i, ctx)?);
-    }
-    let mut plan = plans.remove(0);
-    for rhs in plans {
-        plan = LogicalPlan::CartesianProduct {
-            left: Box::new(plan),
-            right: Box::new(rhs),
-        };
-    }
+    let mut plan = plan
+        .ok_or_else(|| Error::Plan("match_stmt must contain at least one MATCH clause".into()))?;
 
-    if let Some(predicate) = &stmt.where_clause {
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate: predicate.clone(),
-        };
-    }
+    let terminal = &stmt.terminal;
 
-    // Index-aware WHERE rewrite: scan the Filter chain at the top
-    // of the plan and try to extract an indexed equality conjunct
-    // into an `IndexSeek` on the underlying `NodeScanByLabels`. The
-    // pattern-property rewrite handled the `(n:L {prop: ...})` form
-    // earlier; this pass handles the equivalent `WHERE n.prop = ...`
-    // shape that drivers actually emit, plus the mixed form
-    // `(n:L {nonindexed: ...}) WHERE n.indexed = ...`.
-    plan = optimize_filter_chain_to_index_seek(plan, ctx);
-
-    // OPTIONAL MATCH clauses sit between the main MATCH's
-    // post-WHERE row stream and the WITH/RETURN tail. Each one
-    // left-joins its single-hop pattern onto the current plan,
-    // yielding Null-bound rows for inputs that don't match.
-    // Bindings collected so far drive the v1 restriction check:
-    // the optional pattern's start node must already be bound.
-    let mut bound_vars: HashSet<String> = HashSet::new();
-    for p in &stmt.patterns {
-        collect_pattern_vars(p, &mut bound_vars);
-    }
-    for optional in &stmt.optional_matches {
-        plan = apply_optional_match(plan, optional, &mut bound_vars)?;
-    }
-
-    // Optional `WITH` stage between the MATCH pattern and the
-    // final RETURN: projects the row stream, applies an optional
-    // post-projection WHERE, then order / skip / limit. Pattern
-    // variables not carried through the WITH items go out of
-    // scope downstream — that's enforced implicitly by the Project
-    // operator, which only emits the named aliases.
-    if let Some(w) = &stmt.with_clause {
-        plan = apply_with_clause(plan, w)?;
-    }
-
-    // Apply at most one mutation to the pipeline (they are grammatically exclusive).
-    if let Some(delete_clause) = &stmt.delete {
+    // At most one mutation is grammatically allowed at the
+    // terminal — pick whichever the parser populated.
+    if let Some(delete_clause) = &terminal.delete {
         plan = LogicalPlan::Delete {
             input: Box::new(plan),
             detach: delete_clause.detach,
             vars: delete_clause.vars.clone(),
         };
-    } else if !stmt.set_items.is_empty() {
-        let assignments = stmt.set_items.iter().map(set_item_to_assignment).collect();
+    } else if !terminal.set_items.is_empty() {
+        let assignments = terminal
+            .set_items
+            .iter()
+            .map(set_item_to_assignment)
+            .collect();
         plan = LogicalPlan::SetProperty {
             input: Box::new(plan),
             assignments,
         };
-    } else if !stmt.create_patterns.is_empty() {
+    } else if !terminal.create_patterns.is_empty() {
         let mut nodes: Vec<CreateNodeSpec> = Vec::new();
         let mut edges: Vec<CreateEdgeSpec> = Vec::new();
         let mut var_idx: HashMap<String, usize> = HashMap::new();
-        for pattern in &stmt.create_patterns {
-            build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &all_vars)?;
+        for pattern in &terminal.create_patterns {
+            build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &bound_vars)?;
         }
         plan = LogicalPlan::CreatePath {
             input: Some(Box::new(plan)),
@@ -898,17 +953,18 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         };
     }
 
-    let has_mutation =
-        stmt.delete.is_some() || !stmt.set_items.is_empty() || !stmt.create_patterns.is_empty();
+    let has_mutation = terminal.delete.is_some()
+        || !terminal.set_items.is_empty()
+        || !terminal.create_patterns.is_empty();
 
-    if !stmt.return_items.is_empty() {
+    if !terminal.return_items.is_empty() {
         plan = apply_return_pipeline(
             plan,
-            &stmt.return_items,
-            stmt.distinct,
-            &stmt.order_by,
-            stmt.skip,
-            stmt.limit,
+            &terminal.return_items,
+            terminal.distinct,
+            &terminal.order_by,
+            terminal.skip,
+            terminal.limit,
         )?;
     } else if !has_mutation {
         return Err(Error::Plan(
