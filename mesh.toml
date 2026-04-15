@@ -2,3 +2,7 @@ self_id = 1
 listen_address = "127.0.0.1:7001"
 data_dir = "/tmp/mesh-data"
 bolt_address = "127.0.0.1:7687"
+
+[[bolt_auth.users]]
+username = "neo4j"
+password = "password"

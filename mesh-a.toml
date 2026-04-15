@@ -16,3 +16,7 @@ address = "127.0.0.1:7002"
 [[peers]]
 id = 3
 address = "127.0.0.1:7003"
+
+[[bolt_auth.users]]
+username = "neo4j"
+password = "password"

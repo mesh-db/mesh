@@ -421,6 +421,37 @@ fn config_bootstrap_flag_defaults_to_false_and_parses_when_set() {
     assert_eq!(cfg.peers.len(), 2);
 }
 
+#[test]
+fn sample_toml_configs_at_repo_root_parse_with_bolt_auth() {
+    // Regression guard for the repo-root `mesh.toml` / `mesh-a.toml` /
+    // `mesh-b.toml` / `mesh-c.toml` files referenced in the README.
+    // Parses each through `ServerConfig::from_path` (so schema
+    // changes + `deny_unknown_fields` + the optional `bolt_auth`
+    // section all get exercised end-to-end), verifies each config
+    // carries a `bolt_auth.users` entry, and runs `validate()` so
+    // mode/peer consistency stays green.
+    use std::path::PathBuf;
+    // `CARGO_MANIFEST_DIR` points at `crates/mesh-server`. The
+    // sample configs live two levels up at the repo root.
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let repo_root = PathBuf::from(manifest)
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("repo root canonicalize");
+    for name in ["mesh.toml", "mesh-a.toml", "mesh-b.toml", "mesh-c.toml"] {
+        let path = repo_root.join(name);
+        let cfg = ServerConfig::from_path(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        cfg.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
+        let users = cfg
+            .bolt_auth
+            .as_ref()
+            .map(|a| a.users.len())
+            .unwrap_or(0);
+        assert!(users >= 1, "{name}: expected at least one bolt_auth user");
+    }
+}
+
 #[tokio::test]
 async fn build_components_single_node_has_no_raft() {
     let dir = TempDir::new().unwrap();
