@@ -315,6 +315,13 @@ pub enum Expr {
     },
     /// `[e1, e2, e3]` — produces a List value of eagerly evaluated elements.
     List(Vec<Expr>),
+    /// `{k1: e1, k2: e2, ...}` — map literal in expression context.
+    /// The entries vector preserves source order so nested use in
+    /// aggregations / comparisons stays deterministic, even though
+    /// the backing `Property::Map` is a `HashMap`. Each value expr
+    /// is evaluated against the current row; v1 requires values to
+    /// evaluate to plain `Property` values (no nested Nodes / Edges).
+    Map(Vec<(String, Expr)>),
     /// `[var IN source WHERE pred | projection]`. Either `predicate` or
     /// `projection` may be absent; when both are absent the comprehension
     /// just reproduces the source list.

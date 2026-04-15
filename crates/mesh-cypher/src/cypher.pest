@@ -239,6 +239,7 @@ primary = {
     case_expr |
     list_comp |
     list_literal |
+    map_literal |
     parameter |
     literal |
     function_call |
@@ -246,6 +247,16 @@ primary = {
     identifier |
     ("(" ~ expression ~ ")")
 }
+
+// Map literal: `{k1: e1, k2: e2, ...}`. Distinct from pattern
+// property maps (`node_pattern`'s `properties` rule) which only
+// accept literals + parameters — map literals in expression
+// context take any expression on the value side and so can
+// reference row variables, call functions, etc. Keys are plain
+// identifiers; Neo4j also supports string-literal keys but the v1
+// restriction matches what driver code actually emits.
+map_literal = { "{" ~ (map_entry ~ ("," ~ map_entry)*)? ~ "}" }
+map_entry = { identifier ~ ":" ~ expression }
 
 // Compound-atomic: keeps `identifier`'s atomic semantics for the name
 // portion while disallowing whitespace between `$` and the name. Allows

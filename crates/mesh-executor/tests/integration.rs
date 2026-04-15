@@ -3418,3 +3418,75 @@ fn union_with_bare_return_branches_as_literal_set() {
         vec!["Ada".to_string(), "Ada".to_string(), "Bob".to_string()]
     );
 }
+
+#[test]
+fn map_literal_with_literal_values_returns_map() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN {name: 'Ada', age: 30} AS person");
+    assert_eq!(rows.len(), 1);
+    let m = match rows[0].get("person") {
+        Some(Value::Property(Property::Map(m))) => m,
+        other => panic!("expected Property::Map, got {other:?}"),
+    };
+    assert_eq!(m.len(), 2);
+    assert!(matches!(m.get("name"), Some(Property::String(s)) if s == "Ada"));
+    assert!(matches!(m.get("age"), Some(Property::Int64(30))));
+}
+
+#[test]
+fn map_literal_references_row_variables() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada', age: 36})");
+    let rows = run(
+        &store,
+        "MATCH (a:Person) RETURN {name: a.name, age: a.age} AS profile",
+    );
+    assert_eq!(rows.len(), 1);
+    let m = match rows[0].get("profile") {
+        Some(Value::Property(Property::Map(m))) => m,
+        other => panic!("expected Property::Map, got {other:?}"),
+    };
+    assert!(matches!(m.get("name"), Some(Property::String(s)) if s == "Ada"));
+    assert!(matches!(m.get("age"), Some(Property::Int64(36))));
+}
+
+#[test]
+fn empty_map_literal_is_empty_map() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN {} AS m");
+    let m = match rows[0].get("m") {
+        Some(Value::Property(Property::Map(m))) => m,
+        other => panic!("expected Property::Map, got {other:?}"),
+    };
+    assert!(m.is_empty());
+}
+
+#[test]
+fn map_literal_null_entry_survives_as_property_null() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN {x: null, y: 1} AS m");
+    let m = match rows[0].get("m") {
+        Some(Value::Property(Property::Map(m))) => m,
+        other => panic!("expected Property::Map, got {other:?}"),
+    };
+    assert!(matches!(m.get("x"), Some(Property::Null)));
+    assert!(matches!(m.get("y"), Some(Property::Int64(1))));
+}
+
+#[test]
+fn map_literal_rejects_node_values() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    // `{p: a}` where a is a Node — v1 restriction: map values must
+    // be Properties, not Nodes. Evaluator returns TypeMismatch.
+    let (store2, _d2) = open_store();
+    run(&store2, "CREATE (:Person {name: 'Ada'})");
+    let plan =
+        mesh_cypher::plan(&mesh_cypher::parse("MATCH (a:Person) RETURN {p: a} AS m").unwrap())
+            .unwrap();
+    let err = mesh_executor::execute(&plan, &store2).unwrap_err();
+    assert!(
+        matches!(err, mesh_executor::Error::TypeMismatch),
+        "expected TypeMismatch, got {err:?}"
+    );
+}

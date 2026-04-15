@@ -85,6 +85,41 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             }
             Ok(Value::List(out))
         }
+        Expr::Map(entries) => {
+            // Evaluate each entry value, unwrap to a Property, and
+            // stash in a HashMap. v1 restriction: map values must be
+            // Property (string, int, float, bool, list, map, null) —
+            // nested Nodes/Edges are rejected with TypeMismatch.
+            // Null values flow through as Property::Null rather than
+            // short-circuiting the whole map, matching how Neo4j
+            // returns `{name: null}` as a 1-key map.
+            let mut out = std::collections::HashMap::with_capacity(entries.len());
+            for (key, expr) in entries {
+                let v = eval_expr(expr, row, params)?;
+                let prop = match v {
+                    Value::Property(p) => p,
+                    Value::Null => Property::Null,
+                    Value::List(items) => {
+                        let mut props = Vec::with_capacity(items.len());
+                        for item in items {
+                            match item {
+                                Value::Property(p) => props.push(p),
+                                Value::Null => props.push(Property::Null),
+                                _ => return Err(Error::TypeMismatch),
+                            }
+                        }
+                        Property::List(props)
+                    }
+                    // Nodes and Edges can't nest inside a Property::Map
+                    // in the current type model. Cypher's real
+                    // semantics allow this; revisit if driver code
+                    // actually needs it.
+                    Value::Node(_) | Value::Edge(_) => return Err(Error::TypeMismatch),
+                };
+                out.insert(key.clone(), prop);
+            }
+            Ok(Value::Property(Property::Map(out)))
+        }
         Expr::Case {
             scrutinee,
             branches,

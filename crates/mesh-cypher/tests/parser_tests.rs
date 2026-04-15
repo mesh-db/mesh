@@ -1638,3 +1638,60 @@ fn union_column_mismatch_fails_at_plan_time() {
         "expected column-mismatch message, got: {msg}"
     );
 }
+
+#[test]
+fn map_literal_empty_parses() {
+    let s = parse("RETURN {} AS m").unwrap();
+    let Statement::Return(r) = s else {
+        panic!("expected Return");
+    };
+    let Expr::Map(entries) = &r.return_items[0].expr else {
+        panic!("expected Expr::Map, got {:?}", r.return_items[0].expr);
+    };
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn map_literal_with_literal_values_parses() {
+    let s = parse("RETURN {name: 'Ada', age: 30} AS person").unwrap();
+    let Statement::Return(r) = s else {
+        panic!("expected Return");
+    };
+    let Expr::Map(entries) = &r.return_items[0].expr else {
+        panic!("expected Expr::Map");
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].0, "name");
+    assert_eq!(entries[1].0, "age");
+}
+
+#[test]
+fn map_literal_preserves_source_order() {
+    let s = parse("RETURN {b: 2, a: 1, c: 3} AS m").unwrap();
+    let Statement::Return(r) = s else {
+        panic!("expected Return");
+    };
+    let Expr::Map(entries) = &r.return_items[0].expr else {
+        panic!("expected Expr::Map");
+    };
+    let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["b", "a", "c"]);
+}
+
+#[test]
+fn map_literal_with_property_reference_parses() {
+    // The value side is a full expression, so row-variable
+    // references like `a.name` should be accepted.
+    let s = parse("MATCH (a:Person) RETURN {name: a.name, id: a.id} AS p").unwrap();
+    let Statement::Match(m) = s else {
+        panic!("expected Match");
+    };
+    let Expr::Map(entries) = &m.terminal.return_items[0].expr else {
+        panic!("expected Expr::Map");
+    };
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(
+        entries[0].1,
+        Expr::Property { ref var, ref key } if var == "a" && key == "name"
+    ));
+}

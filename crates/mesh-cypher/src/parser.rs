@@ -1164,6 +1164,25 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             }
             Ok(Expr::List(items))
         }
+        Rule::map_literal => {
+            let mut entries: Vec<(String, Expr)> = Vec::new();
+            for entry in pair.into_inner() {
+                // Each `map_entry` is `identifier ~ ":" ~ expression`.
+                // The ":" is silent in the grammar so only the two
+                // inner rule pairs come through.
+                let mut inner = entry.into_inner();
+                let key_pair = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("map entry missing key".into()))?;
+                let value_pair = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("map entry missing value".into()))?;
+                let key = key_pair.as_str().to_string();
+                let value = build_expression(value_pair)?;
+                entries.push((key, value));
+            }
+            Ok(Expr::Map(entries))
+        }
         Rule::list_comp => build_list_comp(pair),
         r => Err(Error::Parse(format!(
             "unexpected rule in expression: {:?}",
