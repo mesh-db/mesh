@@ -1,5 +1,5 @@
 use mesh_core::{Edge, Node, NodeId, Property};
-use mesh_storage::{PropertyIndexSpec, Store, StoreMutation};
+use mesh_storage::{GraphMutation, PropertyIndexSpec, RocksDbStorageEngine as Store};
 use tempfile::TempDir;
 
 fn tmp_store() -> (Store, TempDir) {
@@ -256,9 +256,9 @@ fn apply_batch_commits_multi_op_atomically() {
 
     store
         .apply_batch(&[
-            StoreMutation::PutNode(a.clone()),
-            StoreMutation::PutNode(b.clone()),
-            StoreMutation::PutEdge(edge.clone()),
+            GraphMutation::PutNode(a.clone()),
+            GraphMutation::PutNode(b.clone()),
+            GraphMutation::PutEdge(edge.clone()),
         ])
         .unwrap();
 
@@ -286,8 +286,8 @@ fn apply_batch_delete_edge_is_idempotent_for_missing_target() {
     // edge already gone (live read) and skips.
     store
         .apply_batch(&[
-            StoreMutation::DeleteEdge(edge.id),
-            StoreMutation::DeleteEdge(edge.id),
+            GraphMutation::DeleteEdge(edge.id),
+            GraphMutation::DeleteEdge(edge.id),
         ])
         .unwrap();
     assert!(store.get_edge(edge.id).unwrap().is_none());
@@ -310,8 +310,8 @@ fn apply_batch_detach_delete_then_reinsert_in_one_commit() {
     };
     store
         .apply_batch(&[
-            StoreMutation::DetachDeleteNode(id),
-            StoreMutation::PutNode(replacement.clone()),
+            GraphMutation::DetachDeleteNode(id),
+            GraphMutation::PutNode(replacement.clone()),
         ])
         .unwrap();
 

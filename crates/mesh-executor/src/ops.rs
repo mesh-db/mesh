@@ -10,7 +10,7 @@ use mesh_cypher::{
     AggregateArg, AggregateFn, AggregateSpec, CreateEdgeSpec, CreateNodeSpec, Direction, Expr,
     LogicalPlan, ReturnItem, SetAssignment, SortItem,
 };
-use mesh_storage::Store;
+use mesh_storage::RocksDbStorageEngine;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -31,7 +31,7 @@ pub trait Operator {
 /// Execute a plan using the given store for both reads and writes.
 /// Equivalent to [`execute_with_reader`] with the store acting as both
 /// and an empty parameter map.
-pub fn execute(plan: &LogicalPlan, store: &Store) -> Result<Vec<Row>> {
+pub fn execute(plan: &LogicalPlan, store: &RocksDbStorageEngine) -> Result<Vec<Row>> {
     let params = ParamMap::new();
     execute_with_reader(
         plan,
@@ -41,12 +41,13 @@ pub fn execute(plan: &LogicalPlan, store: &Store) -> Result<Vec<Row>> {
     )
 }
 
-/// Execute a plan against a local [`Store`] for reads, sending mutations to
-/// a separate [`GraphWriter`]. Used by in-process setups where reads are
-/// always cheap-local (single node or full-replica Raft). No parameters.
+/// Execute a plan against a local [`RocksDbStorageEngine`] for reads,
+/// sending mutations to a separate [`GraphWriter`]. Used by in-process
+/// setups where reads are always cheap-local (single node or
+/// full-replica Raft). No parameters.
 pub fn execute_with_writer(
     plan: &LogicalPlan,
-    store: &Store,
+    store: &RocksDbStorageEngine,
     writer: &dyn GraphWriter,
 ) -> Result<Vec<Row>> {
     let params = ParamMap::new();

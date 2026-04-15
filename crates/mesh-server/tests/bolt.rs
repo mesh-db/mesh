@@ -10,7 +10,7 @@ use mesh_bolt::{
 };
 use mesh_rpc::MeshService;
 use mesh_server::bolt::run_listener;
-use mesh_storage::Store;
+use mesh_storage::{RocksDbStorageEngine as Store, StorageEngine};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 /// the RocksDB store on drop.
 async fn spawn_bolt_server() -> (String, TempDir) {
     let dir = TempDir::new().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
     let service = Arc::new(MeshService::new(store));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -860,7 +860,7 @@ async fn bolt_tx_delete_edge_hides_edge_from_traversal() {
 /// user. Returns the bound address plus a guard.
 async fn spawn_bolt_server_with_auth(username: &str, password: &str) -> (String, TempDir) {
     let dir = TempDir::new().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
     let service = Arc::new(MeshService::new(store));
     let auth = Arc::new(mesh_server::config::BoltAuthConfig {
         users: vec![mesh_server::config::BoltUser {
@@ -977,7 +977,7 @@ async fn spawn_bolt_server_with_bcrypt_auth(
     password_plaintext: &str,
 ) -> (String, TempDir) {
     let dir = TempDir::new().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
     let service = Arc::new(MeshService::new(store));
     let hash = bcrypt::hash(password_plaintext, 4).unwrap();
     let auth = Arc::new(mesh_server::config::BoltAuthConfig {

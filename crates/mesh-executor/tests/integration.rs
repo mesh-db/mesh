@@ -1,7 +1,7 @@
 use mesh_core::{Edge, Node, NodeId, Property};
 use mesh_cypher::{parse, plan, plan_with_context, PlannerContext};
 use mesh_executor::{execute, execute_with_reader, GraphReader, GraphWriter, ParamMap, Row, Value};
-use mesh_storage::Store;
+use mesh_storage::RocksDbStorageEngine as Store;
 use tempfile::TempDir;
 
 fn open_store() -> (Store, TempDir) {

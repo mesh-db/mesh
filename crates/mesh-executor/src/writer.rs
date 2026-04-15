@@ -1,6 +1,6 @@
 use crate::error::Result;
 use mesh_core::{Edge, EdgeId, Node, NodeId};
-use mesh_storage::Store;
+use mesh_storage::StorageEngine;
 
 /// Sink for mutating graph operations produced by the executor. Isolates
 /// write-side concerns from read-side traversal so we can plug in either a
@@ -19,8 +19,8 @@ pub trait GraphWriter {
 
     /// Declare a new property index. Default impl errors so remote
     /// writers (Raft, routing) that don't yet support cluster-aware
-    /// DDL surface the limitation immediately. The `Store` writer
-    /// overrides this to call the backing store directly.
+    /// DDL surface the limitation immediately. Storage-backed writers
+    /// override this via the blanket impl.
     fn create_property_index(&self, _label: &str, _property: &str) -> Result<()> {
         Err(crate::error::Error::Unsupported(
             "property-index DDL is not supported by this writer".into(),
@@ -43,41 +43,92 @@ pub trait GraphWriter {
     }
 }
 
-impl GraphWriter for Store {
+/// Blanket impl: any **sized** type that implements [`StorageEngine`]
+/// is automatically a [`GraphWriter`]. See the matching
+/// [`crate::reader::GraphReader`] blanket for rationale, and
+/// [`StorageWriterAdapter`] for the trait-object adapter.
+impl<T: StorageEngine> GraphWriter for T {
     fn put_node(&self, node: &Node) -> Result<()> {
-        Store::put_node(self, node)?;
+        StorageEngine::put_node(self, node)?;
         Ok(())
     }
 
     fn put_edge(&self, edge: &Edge) -> Result<()> {
-        Store::put_edge(self, edge)?;
+        StorageEngine::put_edge(self, edge)?;
         Ok(())
     }
 
     fn delete_edge(&self, id: EdgeId) -> Result<()> {
-        if Store::get_edge(self, id)?.is_some() {
-            Store::delete_edge(self, id)?;
+        if StorageEngine::get_edge(self, id)?.is_some() {
+            StorageEngine::delete_edge(self, id)?;
         }
         Ok(())
     }
 
     fn detach_delete_node(&self, id: NodeId) -> Result<()> {
-        Store::detach_delete_node(self, id)?;
+        StorageEngine::detach_delete_node(self, id)?;
         Ok(())
     }
 
     fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
-        Store::create_property_index(self, label, property)?;
+        StorageEngine::create_property_index(self, label, property)?;
         Ok(())
     }
 
     fn drop_property_index(&self, label: &str, property: &str) -> Result<()> {
-        Store::drop_property_index(self, label, property)?;
+        StorageEngine::drop_property_index(self, label, property)?;
         Ok(())
     }
 
     fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
-        Ok(Store::list_property_indexes(self)
+        Ok(StorageEngine::list_property_indexes(self)
+            .into_iter()
+            .map(|s| (s.label, s.property))
+            .collect())
+    }
+}
+
+/// Adapter that lets a `&dyn StorageEngine` act as a `GraphWriter`.
+/// See [`crate::reader::StorageReaderAdapter`] for the rationale.
+pub struct StorageWriterAdapter<'a>(pub &'a dyn StorageEngine);
+
+impl GraphWriter for StorageWriterAdapter<'_> {
+    fn put_node(&self, node: &Node) -> Result<()> {
+        self.0.put_node(node)?;
+        Ok(())
+    }
+
+    fn put_edge(&self, edge: &Edge) -> Result<()> {
+        self.0.put_edge(edge)?;
+        Ok(())
+    }
+
+    fn delete_edge(&self, id: EdgeId) -> Result<()> {
+        if self.0.get_edge(id)?.is_some() {
+            self.0.delete_edge(id)?;
+        }
+        Ok(())
+    }
+
+    fn detach_delete_node(&self, id: NodeId) -> Result<()> {
+        self.0.detach_delete_node(id)?;
+        Ok(())
+    }
+
+    fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
+        self.0.create_property_index(label, property)?;
+        Ok(())
+    }
+
+    fn drop_property_index(&self, label: &str, property: &str) -> Result<()> {
+        self.0.drop_property_index(label, property)?;
+        Ok(())
+    }
+
+    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .0
+            .list_property_indexes()
             .into_iter()
             .map(|s| (s.label, s.property))
             .collect())

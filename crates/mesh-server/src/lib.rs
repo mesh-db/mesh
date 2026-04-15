@@ -10,7 +10,7 @@ use mesh_cluster::{Cluster, ClusterState, Membership, PartitionMap, Peer, PeerId
 use mesh_rpc::{
     CoordinatorLog, GrpcNetwork, MeshRaftService, MeshService, Routing, StoreGraphApplier,
 };
-use mesh_storage::Store;
+use mesh_storage::{RocksDbStorageEngine, StorageEngine};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,8 +38,8 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
     config.validate().map_err(|e| anyhow!(e))?;
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
-    let store = Arc::new(
-        Store::open(&config.data_dir)
+    let store: Arc<dyn StorageEngine> = Arc::new(
+        RocksDbStorageEngine::open(&config.data_dir)
             .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
     );
 
@@ -56,7 +56,10 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
 /// and `build_components` (async). Opens the durable 2PC coordinator
 /// log under `data_dir` so recovery and rotation are wired up
 /// end-to-end regardless of which entry point the caller used.
-fn build_routing_service(config: &ServerConfig, store: Arc<Store>) -> Result<MeshService> {
+fn build_routing_service(
+    config: &ServerConfig,
+    store: Arc<dyn StorageEngine>,
+) -> Result<MeshService> {
     let peers: Vec<Peer> = config
         .peers
         .iter()
@@ -95,8 +98,8 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
     config.validate().map_err(|e| anyhow!(e))?;
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
-    let store = Arc::new(
-        Store::open(&config.data_dir)
+    let store: Arc<dyn StorageEngine> = Arc::new(
+        RocksDbStorageEngine::open(&config.data_dir)
             .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
     );
 

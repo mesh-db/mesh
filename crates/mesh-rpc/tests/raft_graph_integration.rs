@@ -9,7 +9,7 @@ use mesh_cluster::raft::{GraphStateMachine, RaftCluster};
 use mesh_cluster::{ClusterState, GraphCommand, Membership, PartitionMap, Peer, PeerId};
 use mesh_core::{Edge, Node};
 use mesh_rpc::{GrpcNetwork, MeshRaftService, StoreGraphApplier};
-use mesh_storage::Store;
+use mesh_storage::{RocksDbStorageEngine as Store, StorageEngine};
 use openraft::BasicNode;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,13 +22,13 @@ use tonic::transport::Server;
 struct GraphPeer {
     cluster: RaftCluster,
     #[allow(dead_code)]
-    store: Arc<Store>,
+    store: Arc<dyn StorageEngine>,
 }
 
 async fn spawn_graph_peer(
     id: u64,
     listener: TcpListener,
-    store: Arc<Store>,
+    store: Arc<dyn StorageEngine>,
     peer_endpoints: Vec<(u64, String)>,
     initial: ClusterState,
 ) -> GraphPeer {
@@ -55,8 +55,8 @@ async fn spawn_graph_peer(
 async fn graph_command_replicates_to_follower_store() {
     let dir_a = TempDir::new().unwrap();
     let dir_b = TempDir::new().unwrap();
-    let store_a = Arc::new(Store::open(dir_a.path()).unwrap());
-    let store_b = Arc::new(Store::open(dir_b.path()).unwrap());
+    let store_a: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_a.path()).unwrap());
+    let store_b: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_b.path()).unwrap());
 
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
@@ -148,8 +148,8 @@ async fn graph_command_replicates_to_follower_store() {
 async fn put_edge_and_delete_edge_replicate() {
     let dir_a = TempDir::new().unwrap();
     let dir_b = TempDir::new().unwrap();
-    let store_a = Arc::new(Store::open(dir_a.path()).unwrap());
-    let store_b = Arc::new(Store::open(dir_b.path()).unwrap());
+    let store_a: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_a.path()).unwrap());
+    let store_b: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_b.path()).unwrap());
 
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();

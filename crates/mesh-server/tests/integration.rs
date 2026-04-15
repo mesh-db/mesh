@@ -1865,8 +1865,8 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
     // world implementation and isn't how real production snapshots
     // are shaped anymore.
     let restored_dir = tempfile::TempDir::new().unwrap();
-    let restored_store =
-        std::sync::Arc::new(mesh_storage::Store::open(restored_dir.path()).unwrap());
+    let restored_store: std::sync::Arc<dyn mesh_storage::StorageEngine> =
+        std::sync::Arc::new(mesh_storage::RocksDbStorageEngine::open(restored_dir.path()).unwrap());
     let applier = mesh_rpc::StoreGraphApplier::new(restored_store.clone());
     use mesh_cluster::raft::GraphStateMachine;
     applier

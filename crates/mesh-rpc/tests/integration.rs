@@ -9,7 +9,7 @@ use mesh_rpc::proto::{
     NodesByLabelRequest, PutEdgeRequest, PutNodeRequest, UuidBytes,
 };
 use mesh_rpc::{CoordinatorLog, MeshService, Routing, TxLogEntry};
-use mesh_storage::Store;
+use mesh_storage::{RocksDbStorageEngine as Store, StorageEngine};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -18,14 +18,14 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 struct Harness {
-    store: Arc<Store>,
+    store: Arc<dyn StorageEngine>,
     address: String,
     _dir: TempDir,
 }
 
 async fn spawn_server() -> Harness {
     let dir = TempDir::new().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
     let service = MeshService::new(store.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -211,8 +211,8 @@ async fn get_edge_roundtrip() {
 }
 
 struct TwoPeer {
-    store_a: Arc<Store>,
-    store_b: Arc<Store>,
+    store_a: Arc<dyn StorageEngine>,
+    store_b: Arc<dyn StorageEngine>,
     cluster_a: Arc<Cluster>,
     client_addr_a: String,
     _dirs: (TempDir, TempDir),
@@ -221,8 +221,8 @@ struct TwoPeer {
 async fn spawn_two_peer() -> TwoPeer {
     let dir_a = TempDir::new().unwrap();
     let dir_b = TempDir::new().unwrap();
-    let store_a = Arc::new(Store::open(dir_a.path()).unwrap());
-    let store_b = Arc::new(Store::open(dir_b.path()).unwrap());
+    let store_a: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_a.path()).unwrap());
+    let store_b: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_b.path()).unwrap());
 
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
@@ -290,8 +290,8 @@ fn put_node_on_owner(node: &Node, h: &TwoPeer) -> PeerId {
 /// `MeshService` handle.
 struct TwoPeerWithLog {
     service_a: MeshService,
-    store_a: Arc<Store>,
-    store_b: Arc<Store>,
+    store_a: Arc<dyn StorageEngine>,
+    store_b: Arc<dyn StorageEngine>,
     cluster_a: Arc<Cluster>,
     log_a: Arc<CoordinatorLog>,
     log_a_path: std::path::PathBuf,
@@ -306,8 +306,8 @@ async fn spawn_two_peer_with_log() -> TwoPeerWithLog {
     let dir_a = TempDir::new().unwrap();
     let dir_b = TempDir::new().unwrap();
     let log_dir = TempDir::new().unwrap();
-    let store_a = Arc::new(Store::open(dir_a.path()).unwrap());
-    let store_b = Arc::new(Store::open(dir_b.path()).unwrap());
+    let store_a: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_a.path()).unwrap());
+    let store_b: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_b.path()).unwrap());
 
     let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_a = listener_a.local_addr().unwrap();
@@ -1713,7 +1713,7 @@ async fn staging_sweep_drops_stale_prepare_via_batch_write_rpc() {
     use std::time::Duration;
 
     let dir = TempDir::new().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1787,7 +1787,7 @@ async fn staging_commit_before_ttl_still_succeeds() {
     use std::time::Duration;
 
     let dir = TempDir::new().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

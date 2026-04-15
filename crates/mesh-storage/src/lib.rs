@@ -1,6 +1,8 @@
+mod engine;
 mod error;
 mod keys;
-mod store;
+mod rocksdb_engine;
 
+pub use engine::{GraphMutation, PropertyIndexSpec, StorageEngine};
 pub use error::{Error, Result};
-pub use store::{PropertyIndexSpec, Store, StoreMutation};
+pub use rocksdb_engine::RocksDbStorageEngine;

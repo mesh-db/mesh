@@ -18,7 +18,7 @@ use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::{BatchPhase, BatchWriteRequest};
 use crate::routing::Routing;
 use mesh_cluster::{GraphCommand, PeerId};
-use mesh_storage::Store;
+use mesh_storage::StorageEngine;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::transport::Channel;
@@ -26,7 +26,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 pub(crate) struct TxCoordinator<'a> {
-    local_store: &'a Store,
+    local_store: &'a dyn StorageEngine,
     local_pending: &'a Arc<crate::ParticipantStaging>,
     routing: &'a Routing,
     /// Optional durable log used to recover from a coordinator crash
@@ -38,7 +38,7 @@ pub(crate) struct TxCoordinator<'a> {
 
 impl<'a> TxCoordinator<'a> {
     pub fn new(
-        local_store: &'a Store,
+        local_store: &'a dyn StorageEngine,
         local_pending: &'a Arc<crate::ParticipantStaging>,
         routing: &'a Routing,
     ) -> Self {

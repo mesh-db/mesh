@@ -8,7 +8,7 @@ use crate::proto::{
 use crate::routing::Routing;
 use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use mesh_executor::{Error as ExecError, GraphReader, Result as ExecResult};
-use mesh_storage::Store;
+use mesh_storage::StorageEngine;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -28,13 +28,13 @@ use tokio::runtime::Handle;
 /// onto async gRPC via `Handle::block_on`, so callers MUST invoke the
 /// executor inside `tokio::task::spawn_blocking`.
 pub struct PartitionedGraphReader {
-    local: Arc<Store>,
+    local: Arc<dyn StorageEngine>,
     routing: Arc<Routing>,
     handle: Handle,
 }
 
 impl PartitionedGraphReader {
-    pub fn new(local: Arc<Store>, routing: Arc<Routing>) -> Self {
+    pub fn new(local: Arc<dyn StorageEngine>, routing: Arc<Routing>) -> Self {
         Self {
             local,
             routing,

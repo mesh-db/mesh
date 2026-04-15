@@ -21,8 +21,8 @@ use crate::routing::Routing;
 use crate::tx_coordinator::TxCoordinator;
 use mesh_cluster::raft::RaftCluster;
 use mesh_cluster::{Error as ClusterError, GraphCommand, PeerId};
-use mesh_executor::{execute_with_reader, GraphReader, GraphWriter};
-use mesh_storage::Store;
+use mesh_executor::{execute_with_reader, GraphReader, GraphWriter, StorageReaderAdapter};
+use mesh_storage::StorageEngine;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tonic::transport::{Channel, Endpoint};
@@ -30,7 +30,7 @@ use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
 pub struct MeshService {
-    store: Arc<Store>,
+    store: Arc<dyn StorageEngine>,
     routing: Option<Arc<Routing>>,
     raft: Option<Arc<RaftCluster>>,
     /// Per-service 2PC participant staging. Bounded-lifetime map of
@@ -46,7 +46,7 @@ pub struct MeshService {
 
 impl MeshService {
     /// Local-only service: every request is answered from the local store.
-    pub fn new(store: Arc<Store>) -> Self {
+    pub fn new(store: Arc<dyn StorageEngine>) -> Self {
         Self {
             store,
             routing: None,
@@ -58,7 +58,7 @@ impl MeshService {
 
     /// Routed service without a durable coordinator log. Equivalent
     /// to [`with_routing_and_log`] passing `None`.
-    pub fn with_routing(store: Arc<Store>, routing: Arc<Routing>) -> Self {
+    pub fn with_routing(store: Arc<dyn StorageEngine>, routing: Arc<Routing>) -> Self {
         Self::with_routing_and_log(store, routing, None)
     }
 
@@ -67,7 +67,7 @@ impl MeshService {
     /// and COMMIT can be recovered via
     /// [`Self::recover_pending_transactions`] at startup.
     pub fn with_routing_and_log(
-        store: Arc<Store>,
+        store: Arc<dyn StorageEngine>,
         routing: Arc<Routing>,
         coordinator_log: Option<Arc<crate::CoordinatorLog>>,
     ) -> Self {
@@ -84,7 +84,7 @@ impl MeshService {
     /// so every replica's local store ends up with the same data via the
     /// state machine's apply path. Reads go straight to the local store
     /// (every peer holds the full graph in this single-Raft-group model).
-    pub fn with_raft(store: Arc<Store>, raft: Arc<RaftCluster>) -> Self {
+    pub fn with_raft(store: Arc<dyn StorageEngine>, raft: Arc<RaftCluster>) -> Self {
         Self {
             store,
             routing: None,
@@ -276,7 +276,8 @@ impl MeshService {
                 (Vec<mesh_executor::Row>, Vec<GraphCommand>),
                 mesh_executor::Error,
             > {
-                let store_ref: &Store = &store;
+                let store_ref: &dyn StorageEngine = store.as_ref();
+                let storage_reader = StorageReaderAdapter(store_ref);
                 let writer = BufferingGraphWriter::new();
                 // Fold the previously-buffered tx writes into an
                 // overlay state. Empty for auto-commit RUNs; populated
@@ -298,7 +299,7 @@ impl MeshService {
                         &exec_params,
                     )?
                 } else {
-                    let base: &dyn GraphReader = store_ref as &dyn GraphReader;
+                    let base: &dyn GraphReader = &storage_reader;
                     let reader = crate::OverlayGraphReader::new(base, &overlay);
                     execute_with_reader(
                         &plan,
@@ -349,7 +350,8 @@ impl MeshService {
             if graph.is_empty() {
                 return Ok(());
             }
-            let mut coordinator = TxCoordinator::new(&self.store, &self.pending_batches, routing);
+            let mut coordinator =
+                TxCoordinator::new(self.store.as_ref(), &self.pending_batches, routing);
             if let Some(log) = self.coordinator_log.as_deref() {
                 coordinator = coordinator.with_log(log);
             }
@@ -402,7 +404,7 @@ impl MeshService {
         }
         // Single-node: apply the batch directly through the store's
         // atomic apply_batch helper (one rocksdb WriteBatch).
-        apply_prepared_batch(&self.store, &commands).map_err(internal)?;
+        apply_prepared_batch(self.store.as_ref(), &commands).map_err(internal)?;
         Ok(())
     }
 
@@ -428,7 +430,7 @@ impl MeshService {
         // Local apply first — if this fails we haven't touched any
         // peer, so the caller's error is clean.
         for cmd in ddl {
-            apply_ddl_to_store(cmd, &self.store).map_err(internal)?;
+            apply_ddl_to_store(cmd, self.store.as_ref()).map_err(internal)?;
         }
 
         let self_id = routing.cluster().self_id();
@@ -483,7 +485,7 @@ impl MeshService {
             // — the user already sees the original error.
             for cmd in ddl.iter().rev() {
                 let inverse = invert_ddl(cmd);
-                if let Err(e) = apply_ddl_to_store(&inverse, &self.store) {
+                if let Err(e) = apply_ddl_to_store(&inverse, self.store.as_ref()) {
                     tracing::error!(error = %e, "local DDL rollback failed");
                 }
             }
@@ -603,7 +605,7 @@ impl MeshService {
                 // to the crash, so just apply the commands directly.
                 // This bypasses the prepare-commit dance but reaches
                 // the same end state — an atomic apply_batch.
-                if let Err(e) = apply_prepared_batch(&self.store, cmds) {
+                if let Err(e) = apply_prepared_batch(self.store.as_ref(), cmds) {
                     tracing::warn!(
                         txid = %txid,
                         error = %e,
@@ -768,29 +770,28 @@ fn leader_redirect_address(status: &Status) -> Option<String> {
 }
 
 /// Flatten a tree of [`GraphCommand`] (which may nest `Batch` variants)
-/// into a flat `Vec<StoreMutation>` so `Store::apply_batch` can commit
-/// them as one rocksdb `WriteBatch`.
+/// into a flat `Vec<GraphMutation>` so `StorageEngine::apply_batch` can
+/// commit them atomically.
 ///
 /// DDL commands (`CreateIndex` / `DropIndex`) are intentionally not
-/// handled here — they can't be expressed as a `StoreMutation` because
+/// handled here — they can't be expressed as a `GraphMutation` because
 /// the backfill step needs to read the live graph, and an uncommitted
-/// `WriteBatch` isn't queryable. Callers going through
-/// [`apply_prepared_batch`] get correct split semantics for free;
-/// direct callers of `flatten_commands` must ensure the batch has
-/// already been stripped of DDL entries.
-pub(crate) fn flatten_commands(cmds: &[GraphCommand], out: &mut Vec<mesh_storage::StoreMutation>) {
-    use mesh_storage::StoreMutation;
+/// batch isn't queryable. Callers going through [`apply_prepared_batch`]
+/// get correct split semantics for free; direct callers of
+/// `flatten_commands` must ensure the batch has already been stripped
+/// of DDL entries.
+pub(crate) fn flatten_commands(cmds: &[GraphCommand], out: &mut Vec<mesh_storage::GraphMutation>) {
+    use mesh_storage::GraphMutation;
     for cmd in cmds {
         match cmd {
-            GraphCommand::PutNode(n) => out.push(StoreMutation::PutNode(n.clone())),
-            GraphCommand::PutEdge(e) => out.push(StoreMutation::PutEdge(e.clone())),
-            GraphCommand::DeleteEdge(id) => out.push(StoreMutation::DeleteEdge(*id)),
-            GraphCommand::DetachDeleteNode(id) => out.push(StoreMutation::DetachDeleteNode(*id)),
+            GraphCommand::PutNode(n) => out.push(GraphMutation::PutNode(n.clone())),
+            GraphCommand::PutEdge(e) => out.push(GraphMutation::PutEdge(e.clone())),
+            GraphCommand::DeleteEdge(id) => out.push(GraphMutation::DeleteEdge(*id)),
+            GraphCommand::DetachDeleteNode(id) => out.push(GraphMutation::DetachDeleteNode(*id)),
             GraphCommand::Batch(inner) => flatten_commands(inner, out),
             // Skip silently; the caller is responsible for applying
-            // DDL through `Store::create_property_index` /
-            // `Store::drop_property_index` before (or alongside)
-            // this batch.
+            // DDL through `StorageEngine::create_property_index` /
+            // `drop_property_index` before (or alongside) this batch.
             GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => {}
         }
     }
@@ -800,12 +801,13 @@ pub(crate) fn flatten_commands(cmds: &[GraphCommand], out: &mut Vec<mesh_storage
 /// `BatchWrite` commit phase and the in-process coordinator shortcut.
 ///
 /// Index DDL in the batch is applied up-front via
-/// `Store::create_property_index` / `drop_property_index` (each in
-/// its own rocksdb batch), then the remaining graph mutations commit
-/// as one atomic `apply_batch`. Cypher statements don't mix DDL and
-/// graph writes so this ordering doesn't affect typical workloads.
+/// `StorageEngine::create_property_index` / `drop_property_index`
+/// (each in its own small batch), then the remaining graph mutations
+/// commit as one atomic `apply_batch`. Cypher statements don't mix
+/// DDL and graph writes so this ordering doesn't affect typical
+/// workloads.
 pub(crate) fn apply_prepared_batch(
-    store: &Store,
+    store: &dyn StorageEngine,
     cmds: &[GraphCommand],
 ) -> std::result::Result<(), mesh_storage::Error> {
     apply_ddl_commands(cmds, store)?;
@@ -855,7 +857,7 @@ fn count_index_seeks(plan: &mesh_cypher::LogicalPlan) -> u64 {
 /// variants are a no-op — the caller filters them out beforehand.
 fn apply_ddl_to_store(
     cmd: &GraphCommand,
-    store: &Store,
+    store: &dyn StorageEngine,
 ) -> std::result::Result<(), mesh_storage::Error> {
     match cmd {
         GraphCommand::CreateIndex { label, property } => {
@@ -948,7 +950,7 @@ pub(crate) fn split_ddl(cmds: Vec<GraphCommand>) -> (Vec<GraphCommand>, Vec<Grap
 /// so index backfill reads see the pre-batch graph state.
 fn apply_ddl_commands(
     cmds: &[GraphCommand],
-    store: &Store,
+    store: &dyn StorageEngine,
 ) -> std::result::Result<(), mesh_storage::Error> {
     for cmd in cmds {
         match cmd {
@@ -1595,7 +1597,7 @@ impl MeshWrite for MeshService {
                 let cmds = self.pending_batches.take(&txid).ok_or_else(|| {
                     Status::failed_precondition(format!("txid {} not prepared on this peer", txid))
                 })?;
-                apply_prepared_batch(&self.store, &cmds).map_err(internal)?;
+                apply_prepared_batch(self.store.as_ref(), &cmds).map_err(internal)?;
                 Ok(Response::new(BatchWriteResponse {}))
             }
             BatchPhase::Abort => {

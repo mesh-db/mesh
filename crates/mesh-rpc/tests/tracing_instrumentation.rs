@@ -10,7 +10,7 @@ use mesh_rpc::proto::mesh_query_server::MeshQuery;
 use mesh_rpc::proto::mesh_write_server::MeshWrite;
 use mesh_rpc::proto::{GetNodeRequest, PutNodeRequest};
 use mesh_rpc::MeshService;
-use mesh_storage::Store;
+use mesh_storage::{RocksDbStorageEngine as Store, StorageEngine};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tonic::Request;
@@ -71,7 +71,7 @@ async fn put_node_handler_emits_instrumented_span() {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let dir = TempDir::new().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
     let svc = MeshService::new(store);
 
     let node = Node::new()

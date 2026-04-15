@@ -1,5 +1,5 @@
 //! [`GraphStateMachine`] implementation that applies graph mutations to a
-//! local [`mesh_storage::Store`].
+//! local [`mesh_storage::StorageEngine`].
 //!
 //! Plugged into [`mesh_cluster::raft::RaftCluster::new_with_applier`] so
 //! every Raft replica's local store ends up with the same graph data after
@@ -26,11 +26,11 @@
 //! bytes }` per file. No tar dep, no compression, just enough to round-trip
 //! the checkpoint directory structure that rocksdb needs to re-open it.
 //!
-//! [`Checkpoint`]: mesh_storage::Store::create_checkpoint
+//! [`Checkpoint`]: mesh_storage::StorageEngine::create_checkpoint
 
 use mesh_cluster::raft::GraphStateMachine;
 use mesh_cluster::GraphCommand;
-use mesh_storage::{Store, StoreMutation};
+use mesh_storage::{GraphMutation, RocksDbStorageEngine, StorageEngine};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ const ARCHIVE_MAGIC: &[u8; 4] = b"MSNP";
 const ARCHIVE_VERSION: u32 = 1;
 
 pub struct StoreGraphApplier {
-    store: Arc<Store>,
+    store: Arc<dyn StorageEngine>,
 }
 
 impl std::fmt::Debug for StoreGraphApplier {
@@ -53,7 +53,7 @@ impl std::fmt::Debug for StoreGraphApplier {
 }
 
 impl StoreGraphApplier {
-    pub fn new(store: Arc<Store>) -> Self {
+    pub fn new(store: Arc<dyn StorageEngine>) -> Self {
         Self { store }
     }
 }
@@ -82,14 +82,14 @@ impl GraphStateMachine for StoreGraphApplier {
                     .map_err(|e| e.to_string())
             }
             GraphCommand::Batch(cmds) => {
-                // Translate to StoreMutation and apply atomically through
+                // Translate to GraphMutation and apply atomically through
                 // a single rocksdb WriteBatch — either every mutation in
                 // the Cypher query lands or none does, even across a
                 // process crash. Nested Batch variants are flattened
                 // because `Store::apply_batch` only knows the leaf ops.
                 //
                 // DDL (CreateIndex / DropIndex) can't be expressed as a
-                // StoreMutation because the backfill step needs to read
+                // GraphMutation because the backfill step needs to read
                 // the live CF_NODES, which an uncommitted WriteBatch
                 // isn't queryable against. So we apply any DDL
                 // commands in the batch first (each in its own small
@@ -97,8 +97,8 @@ impl GraphStateMachine for StoreGraphApplier {
                 // WriteBatch. Cypher never mixes DDL with graph
                 // writes in a single query, so this ordering is only
                 // exercised on path that don't actually interleave.
-                let mut flat: Vec<StoreMutation> = Vec::with_capacity(cmds.len());
-                apply_ddl_and_collect(cmds, &self.store, &mut flat)?;
+                let mut flat: Vec<GraphMutation> = Vec::with_capacity(cmds.len());
+                apply_ddl_and_collect(cmds, self.store.as_ref(), &mut flat)?;
                 if !flat.is_empty() {
                     self.store.apply_batch(&flat).map_err(|e| e.to_string())?;
                 }
@@ -147,8 +147,13 @@ impl GraphStateMachine for StoreGraphApplier {
         std::fs::create_dir_all(&unpack_dir).map_err(|e| format!("creating unpack dir: {e}"))?;
         unpack_directory(snapshot, &unpack_dir).map_err(|e| format!("unpacking snapshot: {e}"))?;
 
-        let shipped =
-            Store::open(&unpack_dir).map_err(|e| format!("opening shipped store: {e}"))?;
+        // Backend-bound by choice: the shipped snapshot archive is a
+        // raw RocksDB checkpoint (SST files), so the unpacker opens it
+        // as a concrete RocksDB engine regardless of what the live
+        // engine is. When a second backend lands, the snapshot format
+        // becomes backend-specific and this site needs branching.
+        let shipped = RocksDbStorageEngine::open(&unpack_dir)
+            .map_err(|e| format!("opening shipped store: {e}"))?;
 
         self.store.clear_all().map_err(|e| e.to_string())?;
 
@@ -157,13 +162,13 @@ impl GraphStateMachine for StoreGraphApplier {
         // even when the shipped graph is large — we only hold
         // `CHUNK` items at a time rather than the whole dataset.
         const CHUNK: usize = 4096;
-        let mut buf: Vec<StoreMutation> = Vec::with_capacity(CHUNK);
+        let mut buf: Vec<GraphMutation> = Vec::with_capacity(CHUNK);
 
         for node in shipped
             .all_nodes()
             .map_err(|e| format!("reading shipped nodes: {e}"))?
         {
-            buf.push(StoreMutation::PutNode(node));
+            buf.push(GraphMutation::PutNode(node));
             if buf.len() >= CHUNK {
                 self.store
                     .apply_batch(&buf)
@@ -182,7 +187,7 @@ impl GraphStateMachine for StoreGraphApplier {
             .all_edges()
             .map_err(|e| format!("reading shipped edges: {e}"))?
         {
-            buf.push(StoreMutation::PutEdge(edge));
+            buf.push(GraphMutation::PutEdge(edge));
             if buf.len() >= CHUNK {
                 self.store
                     .apply_batch(&buf)
@@ -391,15 +396,15 @@ impl<'a> ArchiveReader<'a> {
 /// that misses the new nodes.
 fn apply_ddl_and_collect(
     cmds: &[GraphCommand],
-    store: &Store,
-    out: &mut Vec<StoreMutation>,
+    store: &dyn StorageEngine,
+    out: &mut Vec<GraphMutation>,
 ) -> Result<(), String> {
     for cmd in cmds {
         match cmd {
-            GraphCommand::PutNode(n) => out.push(StoreMutation::PutNode(n.clone())),
-            GraphCommand::PutEdge(e) => out.push(StoreMutation::PutEdge(e.clone())),
-            GraphCommand::DeleteEdge(id) => out.push(StoreMutation::DeleteEdge(*id)),
-            GraphCommand::DetachDeleteNode(id) => out.push(StoreMutation::DetachDeleteNode(*id)),
+            GraphCommand::PutNode(n) => out.push(GraphMutation::PutNode(n.clone())),
+            GraphCommand::PutEdge(e) => out.push(GraphMutation::PutEdge(e.clone())),
+            GraphCommand::DeleteEdge(id) => out.push(GraphMutation::DeleteEdge(*id)),
+            GraphCommand::DetachDeleteNode(id) => out.push(GraphMutation::DetachDeleteNode(*id)),
             GraphCommand::Batch(inner) => apply_ddl_and_collect(inner, store, out)?,
             GraphCommand::CreateIndex { label, property } => store
                 .create_property_index(label, property)
@@ -478,7 +483,8 @@ mod tests {
         // source store, snapshot it, restore into a fresh store,
         // assert every node and edge made it across.
         let src_dir = tempfile::tempdir().unwrap();
-        let src = Arc::new(Store::open(src_dir.path()).unwrap());
+        let src: Arc<dyn StorageEngine> =
+            Arc::new(RocksDbStorageEngine::open(src_dir.path()).unwrap());
 
         // Put ~500 nodes and a smattering of edges between them. Enough
         // to exercise the chunked apply_batch path (CHUNK = 4096) once
@@ -504,7 +510,8 @@ mod tests {
 
         // Restore into a brand-new store and verify contents.
         let dest_dir = tempfile::tempdir().unwrap();
-        let dest = Arc::new(Store::open(dest_dir.path()).unwrap());
+        let dest: Arc<dyn StorageEngine> =
+            Arc::new(RocksDbStorageEngine::open(dest_dir.path()).unwrap());
         let dest_applier = StoreGraphApplier::new(dest.clone());
         dest_applier
             .restore(&snapshot)
@@ -528,7 +535,8 @@ mod tests {
     #[test]
     fn empty_snapshot_restore_is_noop() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let store: Arc<dyn StorageEngine> =
+            Arc::new(RocksDbStorageEngine::open(dir.path()).unwrap());
         let applier = StoreGraphApplier::new(store.clone());
         // Empty blob should not error and must leave the store alone.
         applier.restore(&[]).unwrap();
@@ -538,7 +546,8 @@ mod tests {
     #[test]
     fn snapshot_of_empty_store_round_trips_to_empty_store() {
         let src_dir = tempfile::tempdir().unwrap();
-        let src = Arc::new(Store::open(src_dir.path()).unwrap());
+        let src: Arc<dyn StorageEngine> =
+            Arc::new(RocksDbStorageEngine::open(src_dir.path()).unwrap());
         let src_applier = StoreGraphApplier::new(src);
 
         let snapshot = src_applier.snapshot().unwrap();
@@ -548,7 +557,8 @@ mod tests {
         assert!(!snapshot.is_empty());
 
         let dest_dir = tempfile::tempdir().unwrap();
-        let dest = Arc::new(Store::open(dest_dir.path()).unwrap());
+        let dest: Arc<dyn StorageEngine> =
+            Arc::new(RocksDbStorageEngine::open(dest_dir.path()).unwrap());
         let dest_applier = StoreGraphApplier::new(dest.clone());
         dest_applier.restore(&snapshot).unwrap();
 
@@ -563,7 +573,8 @@ mod tests {
         // NOT survive, otherwise a follower catching up via snapshot
         // could end up with stale state from its previous term.
         let src_dir = tempfile::tempdir().unwrap();
-        let src = Arc::new(Store::open(src_dir.path()).unwrap());
+        let src: Arc<dyn StorageEngine> =
+            Arc::new(RocksDbStorageEngine::open(src_dir.path()).unwrap());
         let snapshot_node = Node::new().with_label("FromSnapshot");
         let snapshot_node_id = snapshot_node.id;
         src.put_node(&snapshot_node).unwrap();
@@ -571,7 +582,8 @@ mod tests {
         let snapshot = src_applier.snapshot().unwrap();
 
         let dest_dir = tempfile::tempdir().unwrap();
-        let dest = Arc::new(Store::open(dest_dir.path()).unwrap());
+        let dest: Arc<dyn StorageEngine> =
+            Arc::new(RocksDbStorageEngine::open(dest_dir.path()).unwrap());
         let stale = Node::new().with_label("Stale");
         let stale_id = stale.id;
         dest.put_node(&stale).unwrap();

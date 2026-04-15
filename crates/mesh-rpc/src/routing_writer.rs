@@ -3,7 +3,7 @@ use crate::proto::{DeleteEdgeRequest, DetachDeleteNodeRequest, PutEdgeRequest, P
 use crate::routing::Routing;
 use mesh_core::{Edge, EdgeId, Node, NodeId};
 use mesh_executor::{Error as ExecError, GraphWriter, Result as ExecResult};
-use mesh_storage::Store;
+use mesh_storage::StorageEngine;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -24,13 +24,13 @@ use tokio::runtime::Handle;
 /// `Handle::block_on`. Callers must run the executor inside
 /// `tokio::task::spawn_blocking`.
 pub struct RoutingGraphWriter {
-    local: Arc<Store>,
+    local: Arc<dyn StorageEngine>,
     routing: Arc<Routing>,
     handle: Handle,
 }
 
 impl RoutingGraphWriter {
-    pub fn new(local: Arc<Store>, routing: Arc<Routing>) -> Self {
+    pub fn new(local: Arc<dyn StorageEngine>, routing: Arc<Routing>) -> Self {
         Self {
             local,
             routing,

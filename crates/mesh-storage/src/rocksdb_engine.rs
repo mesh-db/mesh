@@ -1,4 +1,18 @@
+//! RocksDB-backed implementation of [`StorageEngine`].
+//!
+//! Holds the on-disk state for a single local peer: nodes, edges,
+//! adjacency lists, label/type/property indexes, and the index metadata
+//! needed to rehydrate at `open` time. Column families carve the backend
+//! into purpose-keyed namespaces so each access pattern walks a tight
+//! prefix.
+//!
+//! External callers should hold this as `Arc<dyn StorageEngine>` and
+//! route through the trait — the concrete type is only visible at the
+//! construction site (`RocksDbStorageEngine::open`) and at the Raft
+//! snapshot restore path, which is backend-bound by design.
+
 use crate::{
+    engine::{GraphMutation, PropertyIndexSpec, StorageEngine},
     error::{Error, Result},
     keys::{
         adj_key, edge_from_adj_key, encode_index_value, id_from_str_index_key, label_index_key,
@@ -35,78 +49,52 @@ const ALL_CFS: &[&str] = &[
     CF_INDEX_META,
 ];
 
-/// Declarative spec for a single-property equality index. An index is
-/// uniquely identified by its `(label, property)` pair — users don't
-/// name them, which keeps DROP/SHOW behavior simple and matches the
-/// way the planner looks them up when deciding whether to emit
-/// `IndexSeek`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PropertyIndexSpec {
-    pub label: String,
-    pub property: String,
+const EMPTY: &[u8] = &[];
+
+/// Encode a [`PropertyIndexSpec`] as a stable `CF_INDEX_META` key:
+/// `<label>\0<property>`. Neither label nor property key can contain a
+/// NUL byte (the grammar restricts them to identifier characters), so
+/// the NUL separator is unambiguous on decode.
+fn index_meta_key(spec: &PropertyIndexSpec) -> Vec<u8> {
+    let mut k = Vec::with_capacity(spec.label.len() + 1 + spec.property.len());
+    k.extend_from_slice(spec.label.as_bytes());
+    k.push(0);
+    k.extend_from_slice(spec.property.as_bytes());
+    k
 }
 
-impl PropertyIndexSpec {
-    /// Stable persistence key under [`CF_INDEX_META`]: `<label>\0<property>`.
-    /// Neither label nor property key can contain a NUL byte (the
-    /// grammar restricts them to identifier characters), so the NUL
-    /// separator is unambiguous on decode.
-    fn meta_key(&self) -> Vec<u8> {
-        let mut k = Vec::with_capacity(self.label.len() + 1 + self.property.len());
-        k.extend_from_slice(self.label.as_bytes());
-        k.push(0);
-        k.extend_from_slice(self.property.as_bytes());
-        k
-    }
-
-    fn from_meta_key(key: &[u8]) -> Result<Self> {
-        let sep = key
-            .iter()
-            .position(|b| *b == 0)
-            .ok_or(Error::CorruptBytes {
-                cf: CF_INDEX_META,
-                expected: 1,
-                actual: 0,
-            })?;
-        let label = std::str::from_utf8(&key[..sep])
-            .map_err(|_| Error::CorruptBytes {
-                cf: CF_INDEX_META,
-                expected: sep,
-                actual: sep,
-            })?
-            .to_string();
-        let property = std::str::from_utf8(&key[sep + 1..])
-            .map_err(|_| Error::CorruptBytes {
-                cf: CF_INDEX_META,
-                expected: key.len() - sep - 1,
-                actual: key.len() - sep - 1,
-            })?
-            .to_string();
-        Ok(Self { label, property })
-    }
+fn index_meta_key_decode(key: &[u8]) -> Result<PropertyIndexSpec> {
+    let sep = key
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or(Error::CorruptBytes {
+            cf: CF_INDEX_META,
+            expected: 1,
+            actual: 0,
+        })?;
+    let label = std::str::from_utf8(&key[..sep])
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_INDEX_META,
+            expected: sep,
+            actual: sep,
+        })?
+        .to_string();
+    let property = std::str::from_utf8(&key[sep + 1..])
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_INDEX_META,
+            expected: key.len() - sep - 1,
+            actual: key.len() - sep - 1,
+        })?
+        .to_string();
+    Ok(PropertyIndexSpec { label, property })
 }
 
-/// A single mutation that can be combined with others into an atomic
-/// [`Store::apply_batch`] call. Mirrors the shape of the per-op `Store`
-/// methods but lets the caller commit a sequence of mutations as one
-/// rocksdb [`WriteBatch`] — useful for giving multi-write Cypher queries
-/// crash-atomic local persistence.
-#[derive(Debug, Clone)]
-pub enum StoreMutation {
-    PutNode(Node),
-    PutEdge(Edge),
-    /// Idempotent within a batch: missing edges are skipped silently so a
-    /// log replay that re-applies a partially-committed batch is safe.
-    DeleteEdge(EdgeId),
-    /// Idempotent within a batch: missing nodes contribute no operations.
-    DetachDeleteNode(NodeId),
-}
-
-pub struct Store {
+pub struct RocksDbStorageEngine {
     db: DB,
     /// In-memory view of the registered property indexes, populated
     /// from [`CF_INDEX_META`] at open time and kept in sync by
-    /// [`Store::create_property_index`] and [`Store::drop_property_index`].
+    /// [`RocksDbStorageEngine::create_property_index`] and
+    /// [`RocksDbStorageEngine::drop_property_index`].
     ///
     /// The write-path consults this on every `append_put_node` /
     /// `append_detach_delete_node` call to decide which index entries
@@ -116,7 +104,7 @@ pub struct Store {
     indexes: RwLock<Vec<PropertyIndexSpec>>,
 }
 
-impl Store {
+impl RocksDbStorageEngine {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
@@ -354,18 +342,18 @@ impl Store {
     /// mutations in the same batch is *not* supported. The executor never
     /// generates such patterns: it produces fresh ids per row and
     /// dedupes mutated entities before flushing.
-    pub fn apply_batch(&self, mutations: &[StoreMutation]) -> Result<()> {
+    pub fn apply_batch(&self, mutations: &[GraphMutation]) -> Result<()> {
         let mut batch = WriteBatch::default();
         for m in mutations {
             match m {
-                StoreMutation::PutNode(n) => self.append_put_node(&mut batch, n)?,
-                StoreMutation::PutEdge(e) => self.append_put_edge(&mut batch, e)?,
-                StoreMutation::DeleteEdge(id) => {
+                GraphMutation::PutNode(n) => self.append_put_node(&mut batch, n)?,
+                GraphMutation::PutEdge(e) => self.append_put_edge(&mut batch, e)?,
+                GraphMutation::DeleteEdge(id) => {
                     if let Some(edge) = self.get_edge(*id)? {
                         self.append_delete_edge(&mut batch, *id, &edge)?;
                     }
                 }
-                StoreMutation::DetachDeleteNode(id) => {
+                GraphMutation::DetachDeleteNode(id) => {
                     self.append_detach_delete_node(&mut batch, *id)?;
                 }
             }
@@ -486,7 +474,7 @@ impl Store {
         let meta_cf = self.cf(CF_INDEX_META)?;
         let prop_cf = self.cf(CF_PROPERTY_INDEX)?;
         let mut batch = WriteBatch::default();
-        batch.put_cf(meta_cf, spec.meta_key(), EMPTY);
+        batch.put_cf(meta_cf, index_meta_key(&spec), EMPTY);
 
         // Backfill: walk the label index to find every current member
         // and probe its node record for the property. Nodes missing
@@ -529,7 +517,7 @@ impl Store {
         let meta_cf = self.cf(CF_INDEX_META)?;
         let prop_cf = self.cf(CF_PROPERTY_INDEX)?;
         let mut batch = WriteBatch::default();
-        batch.delete_cf(meta_cf, spec.meta_key());
+        batch.delete_cf(meta_cf, index_meta_key(&spec));
 
         let prefix = property_index_name_prefix(label, property);
         let iter = self
@@ -551,7 +539,8 @@ impl Store {
     /// Look up node ids for a `(label, property, value)` equality via
     /// the property index CF. The caller is responsible for checking
     /// that the index exists first (e.g. the planner only emits
-    /// `IndexSeek` when it has verified via [`Store::list_property_indexes`]).
+    /// `IndexSeek` when it has verified via
+    /// [`RocksDbStorageEngine::list_property_indexes`]).
     ///
     /// Unindexable value types (Float64, List, Map, Null) return
     /// [`Error::UnindexableValue`] — callers should surface this to
@@ -639,11 +628,9 @@ impl Store {
     }
 }
 
-const EMPTY: &[u8] = &[];
-
 /// Rehydrate the property-index registry from [`CF_INDEX_META`] at
-/// [`Store::open`] time. Runs once per process, so walking the CF
-/// sequentially is fine even for large index counts.
+/// [`RocksDbStorageEngine::open`] time. Runs once per process, so
+/// walking the CF sequentially is fine even for large index counts.
 fn load_index_meta(db: &DB) -> Result<Vec<PropertyIndexSpec>> {
     let cf = db
         .cf_handle(CF_INDEX_META)
@@ -651,7 +638,94 @@ fn load_index_meta(db: &DB) -> Result<Vec<PropertyIndexSpec>> {
     let mut specs = Vec::new();
     for item in db.iterator_cf(cf, IteratorMode::Start) {
         let (key, _) = item?;
-        specs.push(PropertyIndexSpec::from_meta_key(&key)?);
+        specs.push(index_meta_key_decode(&key)?);
     }
     Ok(specs)
+}
+
+impl StorageEngine for RocksDbStorageEngine {
+    fn put_node(&self, node: &Node) -> Result<()> {
+        RocksDbStorageEngine::put_node(self, node)
+    }
+
+    fn get_node(&self, id: NodeId) -> Result<Option<Node>> {
+        RocksDbStorageEngine::get_node(self, id)
+    }
+
+    fn detach_delete_node(&self, id: NodeId) -> Result<()> {
+        RocksDbStorageEngine::detach_delete_node(self, id)
+    }
+
+    fn put_edge(&self, edge: &Edge) -> Result<()> {
+        RocksDbStorageEngine::put_edge(self, edge)
+    }
+
+    fn get_edge(&self, id: EdgeId) -> Result<Option<Edge>> {
+        RocksDbStorageEngine::get_edge(self, id)
+    }
+
+    fn delete_edge(&self, id: EdgeId) -> Result<()> {
+        RocksDbStorageEngine::delete_edge(self, id)
+    }
+
+    fn apply_batch(&self, mutations: &[GraphMutation]) -> Result<()> {
+        RocksDbStorageEngine::apply_batch(self, mutations)
+    }
+
+    fn all_nodes(&self) -> Result<Vec<Node>> {
+        RocksDbStorageEngine::all_nodes(self)
+    }
+
+    fn all_edges(&self) -> Result<Vec<Edge>> {
+        RocksDbStorageEngine::all_edges(self)
+    }
+
+    fn all_node_ids(&self) -> Result<Vec<NodeId>> {
+        RocksDbStorageEngine::all_node_ids(self)
+    }
+
+    fn outgoing(&self, source: NodeId) -> Result<Vec<(EdgeId, NodeId)>> {
+        RocksDbStorageEngine::outgoing(self, source)
+    }
+
+    fn incoming(&self, target: NodeId) -> Result<Vec<(EdgeId, NodeId)>> {
+        RocksDbStorageEngine::incoming(self, target)
+    }
+
+    fn nodes_by_label(&self, label: &str) -> Result<Vec<NodeId>> {
+        RocksDbStorageEngine::nodes_by_label(self, label)
+    }
+
+    fn edges_by_type(&self, edge_type: &str) -> Result<Vec<EdgeId>> {
+        RocksDbStorageEngine::edges_by_type(self, edge_type)
+    }
+
+    fn nodes_by_property(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Property,
+    ) -> Result<Vec<NodeId>> {
+        RocksDbStorageEngine::nodes_by_property(self, label, property, value)
+    }
+
+    fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
+        RocksDbStorageEngine::create_property_index(self, label, property)
+    }
+
+    fn drop_property_index(&self, label: &str, property: &str) -> Result<()> {
+        RocksDbStorageEngine::drop_property_index(self, label, property)
+    }
+
+    fn list_property_indexes(&self) -> Vec<PropertyIndexSpec> {
+        RocksDbStorageEngine::list_property_indexes(self)
+    }
+
+    fn create_checkpoint(&self, path: &Path) -> Result<()> {
+        RocksDbStorageEngine::create_checkpoint(self, path)
+    }
+
+    fn clear_all(&self) -> Result<()> {
+        RocksDbStorageEngine::clear_all(self)
+    }
 }
