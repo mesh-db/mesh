@@ -253,15 +253,34 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
         LogicalPlan::Skip { input, count } => Box::new(SkipOp::new(build_op(input), *count)),
         LogicalPlan::Limit { input, count } => Box::new(LimitOp::new(build_op(input), *count)),
         LogicalPlan::MergeNode {
+            input,
             var,
             labels,
             properties,
             on_create,
             on_match,
         } => Box::new(MergeNodeOp::new(
+            input.as_ref().map(|p| build_op(p)),
             var.clone(),
             labels.clone(),
             properties.clone(),
+            on_create.clone(),
+            on_match.clone(),
+        )),
+        LogicalPlan::MergeEdge {
+            input,
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            on_create,
+            on_match,
+        } => Box::new(MergeEdgeOp::new(
+            build_op(input),
+            edge_var.clone(),
+            src_var.clone(),
+            dst_var.clone(),
+            edge_type.clone(),
             on_create.clone(),
             on_match.clone(),
         )),
@@ -889,16 +908,34 @@ struct MergeNodeOp {
     /// node when the merge took the match branch. Same row shape
     /// as `on_create`.
     on_match: Vec<SetAssignment>,
-    initialized: bool,
-    matched: Vec<Node>,
-    /// Resolved property values stashed by `scan()` so the create
-    /// branch in `next()` doesn't have to re-evaluate the expressions.
-    resolved_for_create: Option<Vec<(String, Property)>>,
+    /// Optional upstream operator. `None` means this is a
+    /// top-level producer (`MERGE (n) RETURN n`) and emits
+    /// rows with a fresh empty base. `Some` means this is a
+    /// mid-chain clause (`MATCH (a) MERGE (b) RETURN a, b`)
+    /// and each emitted row is a cross-join between an input
+    /// row and a merge-result node.
+    input: Option<Box<dyn Operator>>,
+    /// Cached merge result. Populated on the first `next()`
+    /// call by running the scan + maybe-create logic *once*,
+    /// then reused for every input row. Running the merge
+    /// exactly once sidesteps the read-after-write issue in
+    /// buffered-writer mode (a node created by the first input
+    /// row wouldn't be visible to a re-scan on the second).
+    merged_nodes: Vec<Node>,
+    /// Whether `merged_nodes` has been populated. The merge
+    /// logic runs lazily on the first `next()` so
+    /// `ExecCtx::params` is available.
+    merge_done: bool,
+    /// Current upstream row — held between calls while we drain
+    /// `merged_nodes` against it. `None` for the top-level
+    /// case (no input).
+    current_input_row: Option<Row>,
     cursor: usize,
 }
 
 impl MergeNodeOp {
     fn new(
+        input: Option<Box<dyn Operator>>,
         var: String,
         labels: Vec<String>,
         properties: Vec<(String, Expr)>,
@@ -911,20 +948,28 @@ impl MergeNodeOp {
             properties,
             on_create,
             on_match,
-            initialized: false,
-            matched: Vec::new(),
-            resolved_for_create: None,
+            input,
+            merged_nodes: Vec::new(),
+            merge_done: false,
+            current_input_row: None,
             cursor: 0,
         }
     }
 
-    fn scan(&mut self, ctx: &ExecCtx) -> Result<()> {
+    /// Run the MERGE logic exactly once: scan the store for
+    /// existing matches, apply ON MATCH SET to each; or create
+    /// a fresh node and apply ON CREATE SET; persist everything
+    /// via `ctx.writer`; stash the resulting nodes in
+    /// `self.merged_nodes`. Idempotent — subsequent calls are
+    /// no-ops once `self.merge_done` is set.
+    fn run_merge_once(&mut self, ctx: &ExecCtx) -> Result<()> {
+        if self.merge_done {
+            return Ok(());
+        }
         // Evaluate the pattern property expressions (literals or
         // parameters) once against an empty row + the per-query param
         // map. The grammar guarantees no row references in pattern
-        // values, so an empty row is sufficient. `value_to_property`
-        // surfaces InvalidSetValue for Node/Edge values — a clear error
-        // when a caller tries to MERGE on a graph-typed parameter.
+        // values, so an empty row is sufficient.
         let empty = Row::new();
         let resolved_props: Vec<(String, Property)> = self
             .properties
@@ -935,9 +980,9 @@ impl MergeNodeOp {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Pick a candidate set: by-label index when one is given, else
-        // a full node scan. Any extra labels beyond the first get filtered
-        // per-node, mirroring NodeScanByLabelsOp.
+        // Scan for existing matches: by-label index when one is
+        // given, else a full node scan. Any extra labels beyond
+        // the first get filtered per-node.
         let candidate_ids: Vec<NodeId> = if let Some(primary) = self.labels.first() {
             ctx.store.nodes_by_label(primary)?
         } else {
@@ -948,71 +993,283 @@ impl MergeNodeOp {
                 if has_all_labels(&node, &self.labels)
                     && matches_pattern_props(&node, &resolved_props)
                 {
-                    self.matched.push(node);
+                    self.merged_nodes.push(node);
                 }
             }
         }
 
-        // Stash the resolved properties so the create branch in `next`
-        // doesn't have to re-evaluate them.
-        self.resolved_for_create = Some(resolved_props);
+        if self.merged_nodes.is_empty() {
+            // Create path — no match, synthesize one node,
+            // apply ON CREATE SET, persist.
+            let mut node = Node::new();
+            for label in &self.labels {
+                node.labels.push(label.clone());
+            }
+            for (k, prop) in resolved_props {
+                node.properties.insert(k, prop);
+            }
+            apply_merge_actions(&mut node, &self.on_create, &self.var, ctx.params)?;
+            ctx.writer.put_node(&node)?;
+            self.merged_nodes.push(node);
+        } else if !self.on_match.is_empty() {
+            // Match path with ON MATCH SET — apply to every
+            // matched node and persist each. The outer `if !is_empty`
+            // skips the loop in the common no-ON-MATCH case.
+            for node in self.merged_nodes.iter_mut() {
+                apply_merge_actions(node, &self.on_match, &self.var, ctx.params)?;
+                ctx.writer.put_node(node)?;
+            }
+        }
+        self.merge_done = true;
         Ok(())
     }
 }
 
 impl Operator for MergeNodeOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        if !self.initialized {
-            self.scan(ctx)?;
-            if self.matched.is_empty() {
-                // No match — create exactly one node carrying the pattern's
-                // labels and properties, then fall through to emit it. The
-                // write goes through `ctx.writer`, so in cluster mode this
-                // becomes part of the BufferingGraphWriter's batch and
-                // commits atomically with any sibling mutations.
-                let mut node = Node::new();
-                for label in &self.labels {
-                    node.labels.push(label.clone());
-                }
-                let resolved = self
-                    .resolved_for_create
-                    .take()
-                    .expect("scan() populates resolved_for_create");
-                for (k, prop) in resolved {
-                    node.properties.insert(k, prop);
-                }
-                // Apply ON CREATE SET *before* the first put_node
-                // so the persisted node already has the SET-derived
-                // values — avoids an extra write.
-                apply_merge_actions(&mut node, &self.on_create, &self.var, ctx.params)?;
-                ctx.writer.put_node(&node)?;
-                self.matched.push(node);
-            } else if !self.on_match.is_empty() {
-                // Match path with ON MATCH SET — apply to every
-                // matched node and persist each one through the
-                // writer. The unconditional `if` skips this loop
-                // entirely when there's no on_match clause, so
-                // existing MERGE workloads pay no overhead.
-                for node in self.matched.iter_mut() {
-                    apply_merge_actions(node, &self.on_match, &self.var, ctx.params)?;
-                    ctx.writer.put_node(node)?;
+        self.run_merge_once(ctx)?;
+
+        // Top-level case (no upstream): drain merged_nodes once.
+        // The output row starts empty and gets the merged node
+        // bound into `var`.
+        if self.input.is_none() {
+            if self.cursor < self.merged_nodes.len() {
+                let node = self.merged_nodes[self.cursor].clone();
+                self.cursor += 1;
+                let mut row = Row::new();
+                row.insert(self.var.clone(), Value::Node(node));
+                return Ok(Some(row));
+            }
+            return Ok(None);
+        }
+
+        // Input-driven case: each merged node cross-joins with
+        // every upstream row. The loop alternates between
+        // "drain merged_nodes against the current upstream row"
+        // and "pull the next upstream row". Because merged_nodes
+        // is computed once (by run_merge_once), the node set is
+        // the same for every input row — the only thing that
+        // changes row-to-row is `current_input_row`.
+        loop {
+            if let Some(base) = self.current_input_row.as_ref() {
+                if self.cursor < self.merged_nodes.len() {
+                    let node = self.merged_nodes[self.cursor].clone();
+                    self.cursor += 1;
+                    let mut row = base.clone();
+                    row.insert(self.var.clone(), Value::Node(node));
+                    return Ok(Some(row));
                 }
             }
-            self.initialized = true;
-        }
-        if self.cursor < self.matched.len() {
-            let node = self.matched[self.cursor].clone();
-            self.cursor += 1;
-            let mut row = Row::new();
-            row.insert(self.var.clone(), Value::Node(node));
-            Ok(Some(row))
-        } else {
-            Ok(None)
+            // Pull a fresh upstream row and restart the drain.
+            match self.input.as_mut().unwrap().next(ctx)? {
+                None => return Ok(None),
+                Some(row) => {
+                    self.current_input_row = Some(row);
+                    self.cursor = 0;
+                }
+            }
         }
     }
 }
 
 /// Apply MERGE-conditional SET assignments (`ON CREATE` or
+/// Find-or-create executor for edge MERGE
+/// (`MERGE (a)-[r:KNOWS]->(b)`).
+///
+/// For every row pulled from `input`, looks up the `src_var`
+/// and `dst_var` bindings (which must be `Value::Node` — the
+/// planner enforces that they came from a prior MATCH or
+/// MERGE), scans `src`'s outgoing edges, and either:
+///
+/// - Picks the first edge of type `edge_type` whose target is
+///   `dst` and applies `on_match` to it, or
+/// - Creates a fresh `Edge::new(edge_type, src, dst)`, applies
+///   `on_create`, and persists it via `ctx.writer.put_edge`.
+///
+/// Either way, the resulting edge is bound into `edge_var` in
+/// the output row and the row is emitted. v1 restrictions:
+/// single directed hop, both endpoints already bound,
+/// explicit relationship type.
+struct MergeEdgeOp {
+    input: Box<dyn Operator>,
+    edge_var: String,
+    src_var: String,
+    dst_var: String,
+    edge_type: String,
+    on_create: Vec<SetAssignment>,
+    on_match: Vec<SetAssignment>,
+}
+
+impl MergeEdgeOp {
+    fn new(
+        input: Box<dyn Operator>,
+        edge_var: String,
+        src_var: String,
+        dst_var: String,
+        edge_type: String,
+        on_create: Vec<SetAssignment>,
+        on_match: Vec<SetAssignment>,
+    ) -> Self {
+        Self {
+            input,
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            on_create,
+            on_match,
+        }
+    }
+}
+
+impl Operator for MergeEdgeOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            let Some(mut row) = self.input.next(ctx)? else {
+                return Ok(None);
+            };
+            // Resolve src/dst. Both must be Value::Node — the
+            // planner enforces that the variables came from an
+            // earlier producer, so anything else is a bug or a
+            // later-added feature that didn't update the check.
+            let src_node = match row.get(&self.src_var) {
+                Some(Value::Node(n)) => n.clone(),
+                _ => return Err(Error::UnboundVariable(self.src_var.clone())),
+            };
+            let dst_node = match row.get(&self.dst_var) {
+                Some(Value::Node(n)) => n.clone(),
+                _ => return Err(Error::UnboundVariable(self.dst_var.clone())),
+            };
+
+            // Scan outgoing edges from src, looking for one
+            // that targets dst with the matching type.
+            let mut matched_edge: Option<Edge> = None;
+            for (edge_id, neighbor_id) in ctx.store.outgoing(src_node.id)? {
+                if neighbor_id != dst_node.id {
+                    continue;
+                }
+                if let Some(edge) = ctx.store.get_edge(edge_id)? {
+                    if edge.edge_type == self.edge_type {
+                        matched_edge = Some(edge);
+                        break;
+                    }
+                }
+            }
+
+            let edge = if let Some(mut existing) = matched_edge {
+                // Match branch: apply ON MATCH SET (if any)
+                // and persist if we touched anything.
+                if !self.on_match.is_empty() {
+                    apply_merge_edge_actions(
+                        &mut existing,
+                        &self.on_match,
+                        &self.edge_var,
+                        ctx.params,
+                    )?;
+                    ctx.writer.put_edge(&existing)?;
+                }
+                existing
+            } else {
+                // Create branch: synthesize a new edge, apply
+                // ON CREATE SET, persist.
+                let mut new_edge = Edge::new(&self.edge_type, src_node.id, dst_node.id);
+                apply_merge_edge_actions(
+                    &mut new_edge,
+                    &self.on_create,
+                    &self.edge_var,
+                    ctx.params,
+                )?;
+                ctx.writer.put_edge(&new_edge)?;
+                new_edge
+            };
+
+            row.insert(self.edge_var.clone(), Value::Edge(edge));
+            return Ok(Some(row));
+        }
+    }
+}
+
+/// Edge-side counterpart of [`apply_merge_actions`]. Evaluates
+/// each `SetAssignment` against a temporary row carrying the
+/// current edge, mutates the edge in place, and returns. Only
+/// property assignments are meaningful on edges (edges have no
+/// labels in Mesh's model); a Labels assignment against an
+/// edge-bound variable surfaces as `Error::UnboundVariable`
+/// via the mismatched-var check below.
+fn apply_merge_edge_actions(
+    edge: &mut Edge,
+    actions: &[SetAssignment],
+    var: &str,
+    params: &ParamMap,
+) -> Result<()> {
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let mut row = Row::new();
+    row.insert(var.to_string(), Value::Edge(edge.clone()));
+    for action in actions {
+        match action {
+            SetAssignment::Property {
+                var: target,
+                key,
+                value,
+            } => {
+                if target != var {
+                    return Err(Error::UnboundVariable(target.clone()));
+                }
+                let evaluated = eval_expr(value, &row, params)?;
+                let prop = value_to_property(evaluated)?;
+                edge.properties.insert(key.clone(), prop);
+                row.insert(var.to_string(), Value::Edge(edge.clone()));
+            }
+            SetAssignment::Merge {
+                var: target,
+                properties,
+            } => {
+                if target != var {
+                    return Err(Error::UnboundVariable(target.clone()));
+                }
+                let resolved: Vec<(String, Property)> = properties
+                    .iter()
+                    .map(|(k, expr)| {
+                        let v = eval_expr(expr, &row, params)?;
+                        Ok((k.clone(), value_to_property(v)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for (k, p) in resolved {
+                    edge.properties.insert(k, p);
+                }
+                row.insert(var.to_string(), Value::Edge(edge.clone()));
+            }
+            SetAssignment::Replace {
+                var: target,
+                properties,
+            } => {
+                if target != var {
+                    return Err(Error::UnboundVariable(target.clone()));
+                }
+                let resolved: Vec<(String, Property)> = properties
+                    .iter()
+                    .map(|(k, expr)| {
+                        let v = eval_expr(expr, &row, params)?;
+                        Ok((k.clone(), value_to_property(v)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                edge.properties.clear();
+                for (k, p) in resolved {
+                    edge.properties.insert(k, p);
+                }
+                row.insert(var.to_string(), Value::Edge(edge.clone()));
+            }
+            // Labels on edges don't exist — reject explicitly.
+            SetAssignment::Labels { var: target, .. } => {
+                return Err(Error::UnboundVariable(target.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `ON MATCH`) to `node` in place. Mirrors the `SetPropertyOp`
 /// dispatch but specialized to a single bound variable so we
 /// don't have to materialize a full row dispatcher.

@@ -208,7 +208,16 @@ fn scalar_call_labels_parses() {
 
 #[test]
 fn match_requires_tail() {
-    assert!(parse("MATCH (n)").is_err());
+    // The grammar is permissive — MATCH without a terminal
+    // parses fine (it's the same shape a bare MERGE needs),
+    // but the planner rejects it because a read-only query
+    // without a RETURN has nothing to return.
+    let stmt = parse("MATCH (n)").unwrap();
+    let err = plan(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("must be followed by RETURN"),
+        "expected missing-terminal planner error, got: {err}"
+    );
 }
 
 #[test]
@@ -1203,6 +1212,7 @@ fn three_match_stages_parse() {
             ReadingClause::Match(_) => "M",
             ReadingClause::With(_) => "W",
             ReadingClause::OptionalMatch(_) => "O",
+            ReadingClause::Merge(_) => "G",
         })
         .collect();
     assert_eq!(kinds, vec!["M", "W", "M", "W", "M"]);
@@ -1216,6 +1226,31 @@ fn match_without_with_still_parses_as_single_clause() {
     assert_eq!(m.clauses.len(), 1);
     assert!(matches!(m.clauses[0], ReadingClause::Match(_)));
     assert_eq!(m.terminal.return_items.len(), 1);
+}
+
+#[test]
+fn match_followed_by_merge_parses_as_chained_clauses() {
+    // MATCH → MERGE → RETURN — the user's original query
+    // shape that triggered this whole feature. Produces two
+    // reading clauses (Match then Merge) plus a terminal with
+    // one return item.
+    let m = unwrap_match(
+        parse(
+            "MATCH (a:Person {id: '1'}) \
+             MERGE (b:Person {id: '2'}) \
+             ON CREATE SET b.name = 'Bob' \
+             RETURN a, b",
+        )
+        .unwrap(),
+    );
+    assert_eq!(m.clauses.len(), 2);
+    assert!(matches!(m.clauses[0], ReadingClause::Match(_)));
+    let ReadingClause::Merge(mc) = &m.clauses[1] else {
+        panic!("expected second clause to be Merge, got {:?}", m.clauses[1]);
+    };
+    assert_eq!(mc.pattern.start.var.as_deref(), Some("b"));
+    assert_eq!(mc.on_create.len(), 1);
+    assert_eq!(m.terminal.return_items.len(), 2);
 }
 
 #[test]
@@ -1327,43 +1362,114 @@ fn optional_match_unbound_start_rejected_at_plan_time() {
     );
 }
 
+/// Extract the first MERGE clause out of a MatchStmt. Used by
+/// the migrated MERGE tests below that predate the unified
+/// reading-clause model and were written against the old
+/// Statement::Merge variant.
+fn first_merge(m: &MatchStmt) -> &MergeClause {
+    m.clauses
+        .iter()
+        .find_map(|c| match c {
+            ReadingClause::Merge(mc) => Some(mc),
+            _ => None,
+        })
+        .expect("expected a MERGE clause in the query")
+}
+
 #[test]
 fn merge_on_create_set_parses() {
-    let stmt =
-        parse("MERGE (p:Person {email: 'a@b'}) ON CREATE SET p.name = 'Ada' RETURN p").unwrap();
-    let m = match stmt {
-        Statement::Merge(m) => m,
-        other => panic!("expected Merge, got {other:?}"),
-    };
-    assert_eq!(m.on_create.len(), 1);
-    assert!(m.on_match.is_empty());
+    let m = unwrap_match(
+        parse("MERGE (p:Person {email: 'a@b'}) ON CREATE SET p.name = 'Ada' RETURN p").unwrap(),
+    );
+    let mc = first_merge(&m);
+    assert_eq!(mc.on_create.len(), 1);
+    assert!(mc.on_match.is_empty());
 }
 
 #[test]
 fn merge_on_match_set_parses() {
-    let stmt = parse("MERGE (p:Person {email: 'a@b'}) ON MATCH SET p.seen = true").unwrap();
-    let m = match stmt {
-        Statement::Merge(m) => m,
-        other => panic!("expected Merge, got {other:?}"),
+    let m = unwrap_match(
+        parse("MERGE (p:Person {email: 'a@b'}) ON MATCH SET p.seen = true RETURN p").unwrap(),
+    );
+    let mc = first_merge(&m);
+    assert!(mc.on_create.is_empty());
+    assert_eq!(mc.on_match.len(), 1);
+}
+
+#[test]
+fn multi_top_level_merge_parses_as_chained_clauses() {
+    // The user's canonical upsert-and-link shape. Starts
+    // with MERGE (no MATCH first), chains additional MERGEs,
+    // and ends in a RETURN. Parses as a MatchStmt with a
+    // Merge as its first reading clause.
+    let m = unwrap_match(
+        parse(
+            "MERGE (a:Person {id: '1'}) ON CREATE SET a.name = 'Alice' \
+             MERGE (b:Person {id: '2'}) ON CREATE SET b.name = 'Bob' \
+             MERGE (a)-[r:KNOWS]->(b) \
+             RETURN a, r, b",
+        )
+        .unwrap(),
+    );
+    assert_eq!(m.clauses.len(), 3);
+    for (i, c) in m.clauses.iter().enumerate() {
+        assert!(
+            matches!(c, ReadingClause::Merge(_)),
+            "clause {i} should be Merge, got {c:?}"
+        );
+    }
+    // The third clause is the edge merge.
+    let ReadingClause::Merge(edge_merge) = &m.clauses[2] else {
+        unreachable!()
     };
-    assert!(m.on_create.is_empty());
-    assert_eq!(m.on_match.len(), 1);
+    assert_eq!(edge_merge.pattern.hops.len(), 1);
+    assert_eq!(
+        edge_merge.pattern.hops[0].rel.edge_type.as_deref(),
+        Some("KNOWS")
+    );
+    assert_eq!(m.terminal.return_items.len(), 3);
+}
+
+#[test]
+fn bare_top_level_merge_parses_without_return() {
+    // `MERGE (n) ON CREATE SET n.name = 'x'` with no RETURN
+    // is effectful and should parse / plan cleanly.
+    let m = unwrap_match(parse("MERGE (n:Thing {id: '1'}) ON CREATE SET n.name = 'x'").unwrap());
+    assert_eq!(m.clauses.len(), 1);
+    assert!(matches!(m.clauses[0], ReadingClause::Merge(_)));
+    assert!(m.terminal.return_items.is_empty());
+    // Planner should accept it — MERGE is its own mutation
+    // so no RETURN is required.
+    plan(&parse("MERGE (n:Thing {id: '1'}) ON CREATE SET n.name = 'x'").unwrap()).unwrap();
+}
+
+#[test]
+fn edge_merge_unbound_endpoints_rejected_at_plan_time() {
+    // `MERGE (a)-[:KNOWS]->(b)` without a preceding MATCH or
+    // MERGE that binds `a` and `b` should error cleanly —
+    // v1 requires both endpoints to be already in scope.
+    let stmt = parse("MERGE (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
+    let err = plan(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("must be bound"),
+        "expected unbound-endpoint error, got: {err}"
+    );
 }
 
 #[test]
 fn merge_on_create_and_on_match_both_parse() {
-    let stmt = parse(
-        "MERGE (p:Person {email: 'a@b'}) \
-         ON CREATE SET p.name = 'Ada', p.created = true \
-         ON MATCH SET p.seen = true",
-    )
-    .unwrap();
-    let m = match stmt {
-        Statement::Merge(m) => m,
-        other => panic!("expected Merge, got {other:?}"),
-    };
-    assert_eq!(m.on_create.len(), 2);
-    assert_eq!(m.on_match.len(), 1);
+    let m = unwrap_match(
+        parse(
+            "MERGE (p:Person {email: 'a@b'}) \
+             ON CREATE SET p.name = 'Ada', p.created = true \
+             ON MATCH SET p.seen = true \
+             RETURN p",
+        )
+        .unwrap(),
+    );
+    let mc = first_merge(&m);
+    assert_eq!(mc.on_create.len(), 2);
+    assert_eq!(mc.on_match.len(), 1);
 }
 
 #[test]

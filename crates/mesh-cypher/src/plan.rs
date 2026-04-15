@@ -1,6 +1,6 @@
 use crate::ast::{
-    CallArgs, CreateStmt, Direction, Expr, IndexDdl, Literal, MatchStmt, MergeStmt, NodePattern,
-    Pattern, ReturnItem, ReturnStmt, SortItem, Statement, UnwindStmt,
+    CallArgs, CreateStmt, Direction, Expr, IndexDdl, Literal, MatchStmt, NodePattern, Pattern,
+    ReturnItem, ReturnStmt, SortItem, Statement, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -124,7 +124,22 @@ pub enum LogicalPlan {
     /// node with the given labels + properties and returns one row.
     /// Property values are `Expr` so they can carry parameters; the
     /// executor evaluates them once at the start of execution.
+    ///
+    /// When `input` is `None`, `MergeNode` is a top-level producer —
+    /// the merge logic runs once and emits its rows directly.
+    ///
+    /// When `input` is `Some`, `MergeNode` is a mid-chain clause —
+    /// the merge logic still runs *once* (scan + maybe-create), and
+    /// then every input row from the inner operator cross-joins
+    /// with the merged node(s). This matches openCypher semantics
+    /// for `MATCH ... MERGE ... RETURN` where the MERGE side has
+    /// no references to input variables: the node is created on
+    /// the first iteration and reused for every subsequent input
+    /// row. Running the merge exactly once also sidesteps the
+    /// "newly-created node invisible to a re-scan in the same
+    /// query" issue caused by the buffered writer pattern.
     MergeNode {
+        input: Option<Box<LogicalPlan>>,
         var: String,
         labels: Vec<String>,
         properties: Vec<(String, Expr)>,
@@ -135,6 +150,25 @@ pub enum LogicalPlan {
         /// `ON MATCH SET ...` assignments — applied to every
         /// matched node when MERGE took the match path. Empty
         /// when the user wrote no `ON MATCH` clause.
+        on_match: Vec<SetAssignment>,
+    },
+    /// Match-or-create a relationship between two bound
+    /// endpoints. For each row from `input`, reads the
+    /// `src_var` and `dst_var` node bindings, scans outgoing
+    /// edges from src, and either binds an existing edge that
+    /// targets dst with the matching type or creates a fresh
+    /// one. `ON CREATE SET` applies only on creation, `ON
+    /// MATCH SET` applies only when an existing edge was
+    /// found. v1 requires both endpoints to be already in
+    /// scope and the relationship to be a single directed
+    /// hop with an explicit type.
+    MergeEdge {
+        input: Box<LogicalPlan>,
+        edge_var: String,
+        src_var: String,
+        dst_var: String,
+        edge_type: String,
+        on_create: Vec<SetAssignment>,
         on_match: Vec<SetAssignment>,
     },
     /// Evaluate `expr` once, cast it to a list, and emit one row per element
@@ -272,7 +306,6 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
     match statement {
         Statement::Create(c) => plan_create(c),
         Statement::Match(m) => plan_match(m, ctx),
-        Statement::Merge(m) => plan_merge(m),
         Statement::Unwind(u) => plan_unwind(u),
         Statement::Return(r) => plan_return_only(r),
         Statement::CreateIndex(IndexDdl { label, property }) => {
@@ -338,41 +371,10 @@ fn plan_unwind(stmt: &UnwindStmt) -> Result<LogicalPlan> {
     )
 }
 
-fn plan_merge(stmt: &MergeStmt) -> Result<LogicalPlan> {
-    // Auto-name the binding when the user wrote `MERGE (:Label {...})` — we
-    // still need *some* var so RETURN can refer to it via the auto-name.
-    let var = stmt
-        .pattern
-        .var
-        .clone()
-        .unwrap_or_else(|| "__merge0".to_string());
-    let on_create: Vec<SetAssignment> = stmt.on_create.iter().map(set_item_to_assignment).collect();
-    let on_match: Vec<SetAssignment> = stmt.on_match.iter().map(set_item_to_assignment).collect();
-    let plan = LogicalPlan::MergeNode {
-        var,
-        labels: stmt.pattern.labels.clone(),
-        properties: stmt.pattern.properties.clone(),
-        on_create,
-        on_match,
-    };
-
-    if stmt.return_items.is_empty() {
-        Ok(plan)
-    } else {
-        apply_return_pipeline(
-            plan,
-            &stmt.return_items,
-            stmt.distinct,
-            &stmt.order_by,
-            stmt.skip,
-            stmt.limit,
-        )
-    }
-}
-
 /// Lower an AST `SetItem` to an executor-side `SetAssignment`.
-/// Pulled out of `plan_match` so `plan_merge` can reuse the same
-/// mapping for `ON CREATE SET` / `ON MATCH SET` actions.
+/// Shared by every site that converts SET items into plan
+/// assignments — both top-level `MATCH ... SET` and the
+/// MERGE-conditional `ON CREATE SET` / `ON MATCH SET` forms.
 fn set_item_to_assignment(item: &crate::ast::SetItem) -> SetAssignment {
     match item {
         crate::ast::SetItem::Property { var, key, value } => SetAssignment::Property {
@@ -1003,6 +1005,147 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // references a projected name still passes its
                 // "already bound" check on the old name.
             }
+            ReadingClause::Merge(mc) => {
+                // Lower a MERGE clause. Dispatch on whether
+                // the pattern has hops: zero-hop is a node
+                // merge (the existing `MergeNode` variant);
+                // non-zero is an edge merge (`MergeEdge`,
+                // v1-restricted to a single directed hop with
+                // both endpoints already bound).
+                //
+                // When `plan` is already populated, the
+                // resulting plan chains via `input`. When it's
+                // None (MERGE is the first clause of the
+                // query), the merge runs top-level as a
+                // producer with `input = None`.
+                let on_create = mc
+                    .on_create
+                    .iter()
+                    .map(set_item_to_assignment)
+                    .collect::<Vec<_>>();
+                let on_match = mc
+                    .on_match
+                    .iter()
+                    .map(set_item_to_assignment)
+                    .collect::<Vec<_>>();
+
+                if mc.pattern.hops.is_empty() {
+                    // --- node merge ---
+                    let var = mc
+                        .pattern
+                        .start
+                        .var
+                        .clone()
+                        .unwrap_or_else(|| format!("__merge_stage{}", stage_pattern_offset));
+                    if bound_vars.contains(&var) {
+                        return Err(Error::Plan(format!(
+                            "variable '{}' is already bound; MERGE cannot rebind \
+                             an existing variable in a chained clause",
+                            var
+                        )));
+                    }
+                    plan = Some(LogicalPlan::MergeNode {
+                        input: plan.take().map(Box::new),
+                        var: var.clone(),
+                        labels: mc.pattern.start.labels.clone(),
+                        properties: mc.pattern.start.properties.clone(),
+                        on_create,
+                        on_match,
+                    });
+                    bound_vars.insert(var);
+                } else {
+                    // --- edge merge ---
+                    if mc.pattern.hops.len() != 1 {
+                        return Err(Error::Plan(
+                            "MERGE with multi-hop paths is not yet supported; split \
+                             into multiple single-hop MERGE clauses"
+                                .into(),
+                        ));
+                    }
+                    let hop = &mc.pattern.hops[0];
+                    if hop.rel.var_length.is_some() {
+                        return Err(Error::Plan(
+                            "MERGE does not support variable-length relationships".into(),
+                        ));
+                    }
+                    let edge_type = hop.rel.edge_type.clone().ok_or_else(|| {
+                        Error::Plan(
+                            "MERGE edge pattern requires an explicit relationship type, \
+                             e.g. `MERGE (a)-[:KNOWS]->(b)`"
+                                .into(),
+                        )
+                    })?;
+                    if !matches!(hop.rel.direction, Direction::Outgoing) {
+                        return Err(Error::Plan(
+                            "MERGE currently supports only directed outgoing edges \
+                             (`(a)-[:T]->(b)`)"
+                                .into(),
+                        ));
+                    }
+                    if !mc.pattern.start.labels.is_empty()
+                        || !mc.pattern.start.properties.is_empty()
+                        || !hop.target.labels.is_empty()
+                        || !hop.target.properties.is_empty()
+                    {
+                        return Err(Error::Plan(
+                            "MERGE edge endpoints must be pure references to \
+                             already-bound variables; move any label or property \
+                             assertions into a WHERE clause on the previous MATCH"
+                                .into(),
+                        ));
+                    }
+                    let src_var = mc.pattern.start.var.clone().ok_or_else(|| {
+                        Error::Plan("MERGE edge source must be a named bound variable".into())
+                    })?;
+                    let dst_var = hop.target.var.clone().ok_or_else(|| {
+                        Error::Plan("MERGE edge target must be a named bound variable".into())
+                    })?;
+                    if !bound_vars.contains(&src_var) {
+                        return Err(Error::Plan(format!(
+                            "MERGE edge source variable '{}' must be bound by an \
+                             earlier clause",
+                            src_var
+                        )));
+                    }
+                    if !bound_vars.contains(&dst_var) {
+                        return Err(Error::Plan(format!(
+                            "MERGE edge target variable '{}' must be bound by an \
+                             earlier clause",
+                            dst_var
+                        )));
+                    }
+                    let edge_var = hop
+                        .rel
+                        .var
+                        .clone()
+                        .unwrap_or_else(|| format!("__merge_edge{}", stage_pattern_offset));
+                    if bound_vars.contains(&edge_var) {
+                        return Err(Error::Plan(format!(
+                            "variable '{}' is already bound; MERGE cannot rebind \
+                             an existing edge variable",
+                            edge_var
+                        )));
+                    }
+                    let current = plan.take().ok_or_else(|| {
+                        Error::Plan(
+                            "MERGE on an edge pattern requires a preceding producer \
+                             clause that binds the endpoints"
+                                .into(),
+                        )
+                    })?;
+                    plan = Some(LogicalPlan::MergeEdge {
+                        input: Box::new(current),
+                        edge_var: edge_var.clone(),
+                        src_var,
+                        dst_var,
+                        edge_type,
+                        on_create,
+                        on_match,
+                    });
+                    bound_vars.insert(edge_var);
+                }
+                stage_pattern_offset += 1;
+            }
         }
     }
 
@@ -1047,6 +1190,15 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         || !terminal.set_items.is_empty()
         || !terminal.create_patterns.is_empty();
 
+    // MERGE clauses count as side-effectful even without a
+    // trailing RETURN, so `MERGE (x)` is a valid complete
+    // query. MATCH-only (with no terminal and no writing
+    // clause) is still an error.
+    let has_merge_clause = stmt
+        .clauses
+        .iter()
+        .any(|c| matches!(c, crate::ast::ReadingClause::Merge(_)));
+
     if !terminal.return_items.is_empty() {
         plan = apply_return_pipeline(
             plan,
@@ -1056,9 +1208,9 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
             terminal.skip,
             terminal.limit,
         )?;
-    } else if !has_mutation {
+    } else if !has_mutation && !has_merge_clause {
         return Err(Error::Plan(
-            "MATCH must be followed by RETURN, SET, DELETE, or CREATE".into(),
+            "query must be followed by RETURN, SET, DELETE, CREATE, or end with a MERGE".into(),
         ));
     }
 

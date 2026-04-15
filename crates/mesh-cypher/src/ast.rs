@@ -1,8 +1,13 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Create(CreateStmt),
+    /// A reading-clause-initiated query. Includes both
+    /// `MATCH`- and `MERGE`-initiated statements — MERGE-only
+    /// queries (like `MERGE (n) RETURN n` or the idempotent
+    /// upsert-and-link pattern from real driver code) are
+    /// modelled as `MatchStmt::clauses` starting with a
+    /// `ReadingClause::Merge`, with an optional terminal.
     Match(MatchStmt),
-    Merge(MergeStmt),
     Unwind(UnwindStmt),
     /// Bare `RETURN <items>` with no producer clause. Behaves like
     /// `UNWIND [0] AS _ RETURN <items>` — produces exactly one row,
@@ -48,24 +53,6 @@ pub struct UnwindStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct MergeStmt {
-    pub pattern: NodePattern,
-    /// `ON CREATE SET ...` items — applied only when the MERGE
-    /// took the create branch (no existing node matched the
-    /// pattern). May be empty.
-    pub on_create: Vec<SetItem>,
-    /// `ON MATCH SET ...` items — applied to every row when the
-    /// MERGE took the match branch (one or more existing nodes
-    /// matched). May be empty.
-    pub on_match: Vec<SetItem>,
-    pub return_items: Vec<ReturnItem>,
-    pub distinct: bool,
-    pub order_by: Vec<SortItem>,
-    pub skip: Option<i64>,
-    pub limit: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct CreateStmt {
     pub patterns: Vec<Pattern>,
     pub return_items: Vec<ReturnItem>,
@@ -91,15 +78,40 @@ pub struct MatchStmt {
 
 /// One element of a `MatchStmt`'s reading-clause list. Mirrors
 /// the openCypher clause taxonomy for reading clauses —
-/// producers (`MATCH`), left-joins (`OPTIONAL MATCH`), and
-/// re-projection stages (`WITH`). Mutating clauses (`SET`,
-/// `DELETE`, `CREATE`) live in [`TerminalTail`] because
-/// grammatically they only appear at the end.
+/// producers (`MATCH`), left-joins (`OPTIONAL MATCH`),
+/// re-projection stages (`WITH`), and mid-query upserts
+/// (`MERGE`, which reads like a clause even though it also
+/// writes). Pure-mutation clauses (`SET`, `DELETE`, `CREATE`)
+/// live in [`TerminalTail`] because grammatically they only
+/// appear at the end.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadingClause {
     Match(MatchClause),
     OptionalMatch(OptionalMatchClause),
     With(WithClause),
+    Merge(MergeClause),
+}
+
+/// A single `MERGE (pattern) [ON CREATE SET ...] [ON MATCH SET
+/// ...]` clause. `pattern` can describe either a lone node
+/// (`MERGE (n:Label {k: v})`) or an edge between two nodes
+/// (`MERGE (a)-[:REL]->(b)`). The planner dispatches on
+/// whether `pattern.hops` is empty:
+///
+/// * Empty hops → node merge, lowered as `LogicalPlan::MergeNode`.
+/// * Non-empty hops → edge merge, lowered as
+///   `LogicalPlan::MergeEdge`. v1 restricts edge merges to
+///   single-hop, directed, with *both* endpoints already
+///   bound by an earlier reading clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeClause {
+    pub pattern: Pattern,
+    /// `ON CREATE SET ...` items — applied only when the MERGE
+    /// created the node or edge.
+    pub on_create: Vec<SetItem>,
+    /// `ON MATCH SET ...` items — applied when the MERGE
+    /// found an existing match.
+    pub on_match: Vec<SetItem>,
 }
 
 /// A single `MATCH pattern_list [WHERE expr]` clause. This is

@@ -4,7 +4,7 @@ query = { SOI ~ statement ~ EOI }
 
 statement = {
     create_index_stmt | drop_index_stmt | show_indexes_stmt |
-    unwind_stmt | merge_stmt | create_stmt | match_stmt | return_only_stmt
+    unwind_stmt | create_stmt | match_stmt | return_only_stmt
 }
 
 // Bare `RETURN <expr> AS alias` with no producer clause — Neo4j's
@@ -16,7 +16,15 @@ statement = {
 return_only_stmt = { return_tail }
 
 create_stmt = { kw_create ~ pattern_list ~ return_tail? }
-merge_stmt  = { kw_merge ~ node_pattern ~ merge_action* ~ return_tail? }
+
+// A single `MERGE (pattern) [ON CREATE SET ...] [ON MATCH SET
+// ...]` clause. `pattern` covers both node-only
+// (`MERGE (n:Label {k: v})`) and edge merges
+// (`MERGE (a)-[:REL]->(b)`) — the planner dispatches on
+// whether `hops` is empty. MERGE-initiated queries flow through
+// `match_stmt`'s reading_clause chain like any other reading
+// clause, so multiple MERGEs compose naturally.
+merge_clause = { kw_merge ~ pattern ~ merge_action* }
 
 // `ON CREATE SET ...` / `ON MATCH SET ...` clauses on a MERGE.
 // Both are optional and may appear in any order; the action is
@@ -50,15 +58,15 @@ unwind_stmt = {
     return_tail
 }
 
-// A MATCH-initiated query is a sequence of reading clauses
-// (at least one MATCH, plus any mix of OPTIONAL MATCH / WITH
-// in any order) ending in a terminal tail. Every prior shape
-// (`MATCH RETURN`, `MATCH WHERE RETURN`, `MATCH WITH RETURN`,
-// `MATCH SET RETURN?`, etc.) still parses because it's a
-// proper subset: one match_clause followed by the
-// terminal_tail is a valid reading_clause+ sequence.
+// A reading-clause-initiated query. Despite the name, this
+// rule handles both MATCH- and MERGE-initiated statements —
+// MERGE-initiated queries flow through here because
+// `merge_clause` is a valid `reading_clause`, and there's no
+// separate `merge_stmt` at the top level anymore. The
+// terminal tail is optional: a bare `MERGE (n)` has no
+// RETURN but is still valid (it's effectful).
 match_stmt = {
-    reading_clause+ ~ terminal_tail
+    reading_clause+ ~ terminal_tail?
 }
 
 // One reading stage. The parser enforces that the first
@@ -66,7 +74,7 @@ match_stmt = {
 // query can't start with OPTIONAL MATCH or WITH without
 // something to pull rows from first.
 reading_clause = {
-    match_clause | optional_match_clause | with_tail
+    match_clause | optional_match_clause | with_tail | merge_clause
 }
 
 // A single `MATCH pattern_list [WHERE expr]` — the producer

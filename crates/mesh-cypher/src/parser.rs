@@ -31,7 +31,6 @@ fn build_statement(pair: Pair<Rule>) -> Result<Statement> {
     match inner.as_rule() {
         Rule::create_stmt => Ok(Statement::Create(build_create(inner)?)),
         Rule::match_stmt => Ok(Statement::Match(build_match(inner)?)),
-        Rule::merge_stmt => Ok(Statement::Merge(build_merge(inner)?)),
         Rule::unwind_stmt => Ok(Statement::Unwind(build_unwind(inner)?)),
         Rule::return_only_stmt => Ok(Statement::Return(build_return_only(inner)?)),
         Rule::create_index_stmt => Ok(Statement::CreateIndex(build_index_ddl(inner)?)),
@@ -171,19 +170,20 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
     })
 }
 
-fn build_merge(pair: Pair<Rule>) -> Result<MergeStmt> {
-    let mut pattern: Option<NodePattern> = None;
+/// Parse a `merge_clause` pair — the `MERGE` keyword, the
+/// pattern (a node or a single-hop edge path), and any
+/// `ON CREATE SET` / `ON MATCH SET` actions — into a
+/// [`MergeClause`]. Used by `build_match` for every
+/// `reading_clause` whose inner is a `merge_clause`; there is
+/// no separate top-level MERGE statement anymore.
+fn build_merge_clause(pair: Pair<Rule>) -> Result<crate::ast::MergeClause> {
+    debug_assert_eq!(pair.as_rule(), Rule::merge_clause);
+    let mut pattern: Option<Pattern> = None;
     let mut on_create: Vec<crate::ast::SetItem> = Vec::new();
     let mut on_match: Vec<crate::ast::SetItem> = Vec::new();
-    let mut return_items = Vec::new();
-    let mut distinct = false;
-    let mut order_by: Vec<SortItem> = Vec::new();
-    let mut skip = None;
-    let mut limit = None;
-
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::node_pattern => pattern = Some(build_node_pattern(p)?),
+            Rule::pattern => pattern = Some(build_pattern(p)?),
             Rule::merge_action => {
                 let (which, items) = build_merge_action(p)?;
                 match which {
@@ -191,30 +191,19 @@ fn build_merge(pair: Pair<Rule>) -> Result<MergeStmt> {
                     MergeActionKind::OnMatch => on_match.extend(items),
                 }
             }
-            Rule::return_tail => {
-                parse_return_tail(
-                    p,
-                    &mut return_items,
-                    &mut distinct,
-                    &mut order_by,
-                    &mut skip,
-                    &mut limit,
-                )?;
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in merge_clause: {:?}",
+                    r
+                )))
             }
-            r => return Err(Error::Parse(format!("unexpected rule in merge: {:?}", r))),
         }
     }
-
-    let pattern = pattern.ok_or_else(|| Error::Parse("MERGE requires a node pattern".into()))?;
-    Ok(MergeStmt {
+    let pattern = pattern.ok_or_else(|| Error::Parse("MERGE requires a pattern".into()))?;
+    Ok(crate::ast::MergeClause {
         pattern,
         on_create,
         on_match,
-        return_items,
-        distinct,
-        order_by,
-        skip,
-        limit,
     })
 }
 
@@ -367,6 +356,9 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                     Rule::with_tail => {
                         clauses.push(ReadingClause::With(build_with_tail(inner)?));
                     }
+                    Rule::merge_clause => {
+                        clauses.push(ReadingClause::Merge(build_merge_clause(inner)?));
+                    }
                     r => {
                         return Err(Error::Parse(format!(
                             "unexpected rule inside reading_clause: {:?}",
@@ -392,12 +384,17 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
             "match_stmt requires at least one reading clause".into(),
         ));
     }
-    if !matches!(clauses[0], ReadingClause::Match(_)) {
-        return Err(Error::Parse(
-            "MATCH must be the first clause of a query — OPTIONAL MATCH and WITH \
-             can only appear after an initial MATCH"
-                .into(),
-        ));
+    // A query must start with a producer — MATCH pulls rows
+    // from the store, MERGE either matches or creates them.
+    // OPTIONAL MATCH and WITH both depend on an existing row
+    // stream, so they can't be the first clause.
+    match &clauses[0] {
+        ReadingClause::Match(_) | ReadingClause::Merge(_) => {}
+        ReadingClause::OptionalMatch(_) | ReadingClause::With(_) => {
+            return Err(Error::Parse(
+                "OPTIONAL MATCH and WITH can only appear after an initial MATCH or MERGE".into(),
+            ));
+        }
     }
 
     Ok(MatchStmt { clauses, terminal })

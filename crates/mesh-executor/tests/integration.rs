@@ -2748,6 +2748,216 @@ fn chained_with_progressive_filters() {
 }
 
 // ---------------------------------------------------------------
+// MERGE as a mid-query reading clause (MATCH → MERGE → RETURN)
+// ---------------------------------------------------------------
+
+#[test]
+fn match_then_merge_creates_node_on_first_run() {
+    // Seed one Person, then run a chained MATCH → MERGE. The
+    // MERGE should create the target node on the first
+    // iteration and bind it into every output row (one per
+    // existing Person that the MATCH finds).
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {id: '1', name: 'Alice'})");
+    let rows = run(
+        &store,
+        "MATCH (a:Person {id: '1'}) \
+         MERGE (b:Person {id: '2'}) \
+         ON CREATE SET b.name = 'Bob' \
+         RETURN a.name AS a_name, b.name AS b_name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a_name"), "Alice");
+    assert_eq!(str_prop(&rows[0], "b_name"), "Bob");
+
+    // Verify the new node actually persisted.
+    let verify = run(&store, "MATCH (n:Person {id: '2'}) RETURN n.name AS n");
+    assert_eq!(verify.len(), 1);
+    assert_eq!(str_prop(&verify[0], "n"), "Bob");
+}
+
+#[test]
+fn match_then_merge_binds_existing_node_on_subsequent_run() {
+    // First query creates Bob via MERGE. Second query runs
+    // the same MERGE — should find the existing Bob and apply
+    // ON MATCH SET instead of ON CREATE SET.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {id: '1', name: 'Alice'})");
+    run(
+        &store,
+        "MATCH (a:Person {id: '1'}) \
+         MERGE (b:Person {id: '2'}) \
+         ON CREATE SET b.name = 'Bob', b.visits = 1 \
+         RETURN a, b",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {id: '1'}) \
+         MERGE (b:Person {id: '2'}) \
+         ON CREATE SET b.visits = 0 \
+         ON MATCH SET b.visits = 2 \
+         RETURN b.name AS name, b.visits AS visits",
+    );
+    assert_eq!(rows.len(), 1);
+    // Name was set by ON CREATE on the first invocation and
+    // carried forward — ON MATCH on the second didn't touch it.
+    assert_eq!(str_prop(&rows[0], "name"), "Bob");
+    // Visits reflects the ON MATCH SET (2), not the
+    // first-run ON CREATE SET (1) or the second-run ON
+    // CREATE SET (0).
+    assert_eq!(int_prop(&rows[0], "visits"), 2);
+}
+
+#[test]
+fn match_then_merge_cross_joins_with_multiple_match_rows() {
+    // Two Persons from the MATCH × one merged Company →
+    // two output rows, each carrying a different person
+    // combined with the same merged company.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         MERGE (c:Company {name: 'Acme'}) \
+         RETURN p.name AS person, c.name AS company",
+    );
+    assert_eq!(rows.len(), 2);
+    let mut pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "person"), str_prop(r, "company")))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Alice".to_string(), "Acme".to_string()),
+            ("Bob".to_string(), "Acme".to_string()),
+        ]
+    );
+    // Verify Acme was created exactly once, not twice.
+    let count = run(
+        &store,
+        "MATCH (c:Company {name: 'Acme'}) RETURN c.name AS n",
+    );
+    assert_eq!(count.len(), 1);
+}
+
+#[test]
+fn top_level_merge_still_works_after_mid_chain_refactor() {
+    // Regression: standalone `MERGE (n) RETURN n` must still
+    // behave as a producer that creates + yields.
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "MERGE (p:Person {id: '1'}) ON CREATE SET p.name = 'Ada' RETURN p.name AS n",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Ada");
+
+    // Second invocation: should match and not create again.
+    let rows2 = run(&store, "MERGE (p:Person {id: '1'}) RETURN p.name AS n");
+    assert_eq!(rows2.len(), 1);
+    assert_eq!(str_prop(&rows2[0], "n"), "Ada");
+
+    let count = run(&store, "MATCH (p:Person) RETURN p.name AS n");
+    assert_eq!(count.len(), 1, "merge should be idempotent");
+}
+
+#[test]
+fn canonical_upsert_two_nodes_and_edge_works() {
+    // The user's actual query shape — multi-top-level MERGE
+    // that idempotently creates two nodes and the KNOWS edge
+    // between them. First run creates everything; second run
+    // finds everything and doesn't duplicate.
+    let (store, _d) = open_store();
+
+    let query = "MERGE (a:Person {id: '1'}) ON CREATE SET a.name = 'Alice' \
+                 MERGE (b:Person {id: '2'}) ON CREATE SET b.name = 'Bob' \
+                 MERGE (a)-[r:KNOWS]->(b) \
+                 RETURN a.name AS a_name, b.name AS b_name";
+
+    let rows = run(&store, query);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a_name"), "Alice");
+    assert_eq!(str_prop(&rows[0], "b_name"), "Bob");
+
+    // Second run: idempotent. Same answer, no duplicates.
+    let rows2 = run(&store, query);
+    assert_eq!(rows2.len(), 1);
+    assert_eq!(str_prop(&rows2[0], "a_name"), "Alice");
+    assert_eq!(str_prop(&rows2[0], "b_name"), "Bob");
+
+    // Verify only 2 Persons and 1 KNOWS edge exist.
+    let persons = run(&store, "MATCH (p:Person) RETURN p.name AS n");
+    assert_eq!(persons.len(), 2);
+    let edges = run(
+        &store,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS a, b.name AS b",
+    );
+    assert_eq!(edges.len(), 1);
+    assert_eq!(str_prop(&edges[0], "a"), "Alice");
+    assert_eq!(str_prop(&edges[0], "b"), "Bob");
+}
+
+#[test]
+fn edge_merge_on_match_fires_on_subsequent_runs() {
+    // ON MATCH SET on an edge merge updates properties when
+    // the edge already exists. Counter pattern.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "MERGE (a:Person {id: '1'}) ON CREATE SET a.name = 'Alice' \
+         MERGE (b:Person {id: '2'}) ON CREATE SET b.name = 'Bob' \
+         MERGE (a)-[r:KNOWS]->(b) ON CREATE SET r.visits = 1",
+    );
+    run(
+        &store,
+        "MERGE (a:Person {id: '1'}) \
+         MERGE (b:Person {id: '2'}) \
+         MERGE (a)-[r:KNOWS]->(b) ON MATCH SET r.visits = 2",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person)-[r:KNOWS]->(b) RETURN r.visits AS v",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "v"), 2);
+}
+
+#[test]
+fn top_level_merge_without_return_is_effectful() {
+    // `MERGE (n) ON CREATE SET ...` with no RETURN is a
+    // valid effectful statement — the planner now accepts
+    // it (MERGE counts as mutation for the
+    // missing-terminal check). Verify the side effect
+    // persisted regardless of whether the executor emits
+    // rows for the merge itself.
+    let (store, _d) = open_store();
+    let _ = run(
+        &store,
+        "MERGE (n:Thing {id: '1'}) ON CREATE SET n.name = 'widget'",
+    );
+    let verify = run(&store, "MATCH (n:Thing) RETURN n.name AS n");
+    assert_eq!(verify.len(), 1);
+    assert_eq!(str_prop(&verify[0], "n"), "widget");
+}
+
+#[test]
+fn chained_merge_var_collision_rejected() {
+    // `MATCH (a) MERGE (a {id: '2'})` tries to rebind `a`
+    // through MERGE. MERGE is a producer, not a rebind
+    // operator, so the planner rejects.
+    let stmt = mesh_cypher::parse("MATCH (a:Person) MERGE (a:Person {id: '2'}) RETURN a").unwrap();
+    let err = mesh_cypher::plan(&stmt).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already bound"),
+        "expected var-collision error, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------
 // Cross-stage variable re-reference: MATCH (a) WITH a MATCH (a)-[...]->(b)
 // ---------------------------------------------------------------
 
