@@ -367,6 +367,9 @@ fn validate_pattern_predicates(plan: &LogicalPlan) -> Result<()> {
             if let Expr::PatternExists(pattern) = e {
                 validate_pattern_predicate(pattern)?;
             }
+            if let Expr::ExistsSubquery { pattern, .. } = e {
+                validate_pattern_predicate(pattern)?;
+            }
             Ok(())
         })
     })
@@ -589,6 +592,18 @@ where
         // (pattern-property values are restricted to literals
         // and parameters, which the walker doesn't care about).
         Expr::PatternExists(_) => Ok(()),
+        // `Expr::ExistsSubquery` has an inner WHERE expression
+        // that can itself contain pattern predicates, nested
+        // existence checks, etc. — recurse into it so those
+        // inner expressions get validated too. The pattern's
+        // shape is checked separately by the subquery
+        // validation pass.
+        Expr::ExistsSubquery { where_clause, .. } => {
+            if let Some(w) = where_clause {
+                walk_expr(w, visit)?;
+            }
+            Ok(())
+        }
     }
 }
 

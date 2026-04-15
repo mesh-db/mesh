@@ -4335,3 +4335,228 @@ fn datetime_parsed_string_roundtrips_comparison() {
         other => panic!("expected Bool, got {other:?}"),
     }
 }
+
+// ---- EXISTS { subquery } ----
+
+#[test]
+fn exists_subquery_filters_nodes_with_matching_pattern() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         WHERE EXISTS { MATCH (p)-[:KNOWS]->(f:Person) } \
+         RETURN p.name AS name",
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Ada".to_string()]);
+}
+
+#[test]
+fn exists_subquery_with_inner_where_filters_further() {
+    // Ada knows two people — a young Bob and an older Cara.
+    // EXISTS with an inner WHERE filters Ada in only if the
+    // matched friend passes the age check.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), \
+                 (:Person {name: 'Bob', age: 17}), \
+                 (:Person {name: 'Cara', age: 42}), \
+                 (:Person {name: 'Dex', age: 25})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    );
+    // Dex knows only Bob (age 17), so Dex fails the inner WHERE.
+    run(
+        &store,
+        "MATCH (d:Person {name: 'Dex'}), (b:Person {name: 'Bob'}) \
+         CREATE (d)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         WHERE EXISTS { MATCH (p)-[:KNOWS]->(f:Person) WHERE f.age >= 30 } \
+         RETURN p.name AS name",
+    );
+    // Only Ada has a KNOWS-edge to a friend aged >= 30.
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Ada".to_string()]);
+}
+
+#[test]
+fn not_exists_subquery_excludes_matching_nodes() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:BLOCKED]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         WHERE NOT EXISTS { MATCH (p)-[:BLOCKED]->(x) } \
+         RETURN p.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Bob".to_string(), "Cara".to_string()]);
+}
+
+#[test]
+fn exists_subquery_inner_where_references_outer_and_inner() {
+    // The inner WHERE should see both the outer variable (`p`)
+    // and the inner binding (`f`). This distinguishes EXISTS
+    // from plain pattern predicates.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada', age: 30}), \
+                 (:Person {name: 'Bob', age: 40}), \
+                 (:Person {name: 'Cara', age: 20})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    );
+    // Find people who know someone older than themselves.
+    // Only Ada (30) knows Bob (40), so only Ada qualifies.
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         WHERE EXISTS { MATCH (p)-[:KNOWS]->(f:Person) WHERE f.age > p.age } \
+         RETURN p.name AS name",
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Ada".to_string()]);
+}
+
+#[test]
+fn exists_subquery_multi_hop_pattern() {
+    // Two-hop EXISTS: filter people who know someone who knows someone else.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), \
+                 (:Person {name: 'Cara'}), (:Person {name: 'Dex'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Cara'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         WHERE EXISTS { MATCH (p)-[:KNOWS]->(:Person)-[:KNOWS]->(:Person) } \
+         RETURN p.name AS name",
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Ada".to_string()]);
+}
+
+#[test]
+fn exists_subquery_with_no_match_returns_empty() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'})",
+    );
+    // Nobody has KNOWS edges; EXISTS is always false.
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         WHERE EXISTS { MATCH (p)-[:KNOWS]->(f) } \
+         RETURN p.name AS name",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn exists_subquery_combined_with_scalar_predicate() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada', age: 36}), \
+                 (:Person {name: 'Bob', age: 17}), \
+                 (:Person {name: 'Cara', age: 42})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    );
+    // age >= 18 AND has a KNOWS edge — Ada qualifies, Cara is
+    // over 18 but has no outgoing KNOWS, Bob is too young.
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         WHERE p.age >= 18 AND EXISTS { MATCH (p)-[:KNOWS]->(f) } \
+         RETURN p.name AS name",
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Ada".to_string()]);
+}
+
+#[test]
+fn exists_subquery_binds_edge_variable_in_where() {
+    // The inner WHERE can reference the edge variable — that's
+    // the real power over a pattern predicate, which only
+    // supports filtering on pattern-shape constraints. Ada has
+    // a KNOWS edge and a BLOCKED edge; the subquery uses `type(r)`
+    // on the bound edge var to filter down.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'}), (:Person {name: 'Cara'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) \
+         CREATE (a)-[:BLOCKED]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) \
+         WHERE EXISTS { MATCH (p)-[r]->(f) WHERE type(r) = 'KNOWS' } \
+         RETURN p.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}

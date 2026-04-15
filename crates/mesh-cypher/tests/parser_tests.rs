@@ -1937,3 +1937,90 @@ fn parenthesized_arithmetic_still_parses_as_expression() {
         }
     ));
 }
+
+#[test]
+fn exists_subquery_simple_match_parses() {
+    let s = parse(
+        "MATCH (a:Person) \
+         WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) } \
+         RETURN a",
+    )
+    .unwrap();
+    let m = unwrap_match(s);
+    let Expr::ExistsSubquery {
+        pattern,
+        where_clause,
+    } = first_match(&m).where_clause.clone().unwrap()
+    else {
+        panic!("expected Expr::ExistsSubquery");
+    };
+    assert_eq!(pattern.start.var.as_deref(), Some("a"));
+    assert_eq!(pattern.hops.len(), 1);
+    assert!(where_clause.is_none());
+}
+
+#[test]
+fn exists_subquery_with_inner_where_parses() {
+    let s = parse(
+        "MATCH (a:Person) \
+         WHERE EXISTS { MATCH (a)-[:KNOWS]->(f:Person) WHERE f.age > 30 } \
+         RETURN a",
+    )
+    .unwrap();
+    let m = unwrap_match(s);
+    let Expr::ExistsSubquery {
+        pattern,
+        where_clause,
+    } = first_match(&m).where_clause.clone().unwrap()
+    else {
+        panic!("expected Expr::ExistsSubquery");
+    };
+    assert_eq!(pattern.hops.len(), 1);
+    let w = where_clause.expect("inner WHERE");
+    assert!(matches!(w.as_ref(), Expr::Compare { .. }));
+}
+
+#[test]
+fn not_exists_subquery_parses() {
+    let s = parse(
+        "MATCH (a:Person) \
+         WHERE NOT EXISTS { MATCH (a)-[:BLOCKED]->(b) } \
+         RETURN a",
+    )
+    .unwrap();
+    let m = unwrap_match(s);
+    let Expr::Not(inner) = first_match(&m).where_clause.clone().unwrap() else {
+        panic!("expected Not");
+    };
+    assert!(matches!(inner.as_ref(), Expr::ExistsSubquery { .. }));
+}
+
+#[test]
+fn exists_subquery_rejects_path_variable() {
+    let err = parse(
+        "MATCH (a:Person) \
+         WHERE EXISTS { MATCH p = (a)-[:KNOWS]->(b) } \
+         RETURN a",
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("path variable"),
+        "expected path-var rejection, got: {err}"
+    );
+}
+
+#[test]
+fn exists_subquery_var_length_rejected_at_plan_time() {
+    let s = parse(
+        "MATCH (a:Person) \
+         WHERE EXISTS { MATCH (a)-[:KNOWS*1..3]->(b) } \
+         RETURN a",
+    )
+    .unwrap();
+    let err = plan(&s).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("variable-length"),
+        "expected var-length rejection, got: {msg}"
+    );
+}

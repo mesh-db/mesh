@@ -267,6 +267,7 @@ op_contains    = @{ ^"contains" ~ !id_cont }
 primary = {
     case_expr |
     reduce_expr |
+    exists_subquery |
     list_comp |
     list_literal |
     map_literal |
@@ -277,6 +278,18 @@ primary = {
     property_access |
     identifier |
     ("(" ~ expression ~ ")")
+}
+
+// `EXISTS { MATCH pattern [WHERE expr] }` — Cypher 5 subquery
+// existence form. A strict superset of `pattern_predicate` that
+// adds a WHERE clause evaluated against the matched row's
+// (outer + inner) bindings. v1 restricts the body to a single
+// `MATCH` + optional `WHERE`; full sub-pipelines (WITH, nested
+// MATCH, aggregation) are deferred. Multi-pattern comma lists
+// inside the MATCH are also deferred — v1 takes exactly one
+// pattern.
+exists_subquery = {
+    kw_exists ~ "{" ~ kw_match ~ pattern ~ where_clause? ~ "}"
 }
 
 // A `pattern` used as a boolean expression — `(a)-[:KNOWS]->(b)`
@@ -406,3 +419,4 @@ kw_optional = @{ ^"optional" ~ !id_cont }
 kw_union = @{ ^"union" ~ !id_cont }
 kw_all = @{ ^"all" ~ !id_cont }
 kw_reduce = @{ ^"reduce" ~ !id_cont }
+kw_exists = @{ ^"exists" ~ !id_cont }

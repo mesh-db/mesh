@@ -362,6 +362,25 @@ pub enum Expr {
     /// variable-length hops, no path variables, and the pattern
     /// must carry at least one hop.
     PatternExists(Pattern),
+    /// `EXISTS { MATCH pattern [WHERE expr] }` — Cypher 5
+    /// subquery existence form. A strict superset of
+    /// [`Expr::PatternExists`]: the WHERE clause can reference
+    /// any variable bound along the walked pattern (not just
+    /// the pattern shape), and the outer row's bindings are
+    /// visible throughout the subquery.
+    ///
+    /// Evaluates to `true` iff **some** combination of
+    /// intermediate bindings satisfies both the pattern and
+    /// (if present) the WHERE expression. Inner bindings are
+    /// ephemeral — they don't leak out into the outer row.
+    ///
+    /// v1 restrictions: single pattern (no comma lists), same
+    /// pattern-shape rules as [`Expr::PatternExists`] (bound
+    /// start, no var-length, no path var, at least one hop).
+    ExistsSubquery {
+        pattern: Pattern,
+        where_clause: Option<Box<Expr>>,
+    },
     /// Binary arithmetic — `+`, `-`, `*`, `/`, `%`. Evaluated
     /// with numeric coercion (Int + Int = Int; any Float operand
     /// widens to Float) and null propagation. `+` additionally

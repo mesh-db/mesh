@@ -289,6 +289,13 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let b = pattern_exists(pattern, ctx)?;
             Ok(Value::Property(Property::Bool(b)))
         }
+        Expr::ExistsSubquery {
+            pattern,
+            where_clause,
+        } => {
+            let b = exists_subquery_matches(pattern, where_clause.as_deref(), ctx)?;
+            Ok(Value::Property(Property::Bool(b)))
+        }
     }
 }
 
@@ -388,6 +395,174 @@ fn pattern_exists(pattern: &Pattern, ctx: &EvalCtx) -> Result<bool> {
         frontier = next;
     }
     Ok(!frontier.is_empty())
+}
+
+/// Check whether `EXISTS { MATCH pattern [WHERE expr] }` has
+/// any satisfying assignment given the outer row's bindings.
+///
+/// Structurally a correlated subquery: walk the pattern
+/// collecting candidate `(edge, target)` pairs at each hop,
+/// materialize each complete binding as a scratch row (outer
+/// row plus the inner pattern bindings), and evaluate the
+/// optional `where_clause` against it. Returns `true` on the
+/// first assignment where the pattern matches and the WHERE
+/// evaluates truthy.
+///
+/// Compared to [`pattern_exists`], this version can't early-
+/// stop on the first complete walk — it needs to hold each
+/// candidate's full binding state long enough to evaluate
+/// WHERE. The frontier therefore carries `(node, scratch_row)`
+/// pairs instead of just node ids.
+fn exists_subquery_matches(
+    pattern: &Pattern,
+    where_clause: Option<&Expr>,
+    ctx: &EvalCtx,
+) -> Result<bool> {
+    let start_var = pattern
+        .start
+        .var
+        .as_ref()
+        .expect("planner guarantees bound start var for exists subqueries");
+    let start_node = match ctx.row.get(start_var) {
+        Some(Value::Node(n)) => n.clone(),
+        _ => return Ok(false),
+    };
+    if !start_node_matches(&start_node, &pattern.start, ctx)? {
+        return Ok(false);
+    }
+
+    // Zero-hop patterns: no frontier to walk; run the WHERE
+    // (if any) against the outer row alone.
+    if pattern.hops.is_empty() {
+        return match where_clause {
+            None => Ok(true),
+            Some(w) => {
+                let v = eval_expr(w, ctx)?;
+                Ok(to_bool(&v).unwrap_or(false))
+            }
+        };
+    }
+
+    // Seed frontier: one entry carrying the start node and a
+    // scratch row cloned from the outer row. Each hop extends
+    // both the frontier nodes and the bindings visible to the
+    // WHERE clause.
+    let mut frontier: Vec<(mesh_core::Node, Row)> = Vec::new();
+    {
+        let mut seed = ctx.row.clone();
+        seed.insert(start_var.clone(), Value::Node(start_node.clone()));
+        frontier.push((start_node, seed));
+    }
+
+    for hop in &pattern.hops {
+        let mut next: Vec<(mesh_core::Node, Row)> = Vec::new();
+        for (node, row) in &frontier {
+            let neighbors = match hop.rel.direction {
+                Direction::Outgoing => ctx.reader.outgoing(node.id)?,
+                Direction::Incoming => ctx.reader.incoming(node.id)?,
+                Direction::Both => {
+                    let mut out = ctx.reader.outgoing(node.id)?;
+                    out.extend(ctx.reader.incoming(node.id)?);
+                    out
+                }
+            };
+            for (edge_id, neighbor_id) in neighbors {
+                // Fetch the edge when we need its type or when
+                // the WHERE clause will bind it by variable.
+                let edge_record = if hop.rel.edge_type.is_some() || hop.rel.var.is_some() {
+                    match ctx.reader.get_edge(edge_id)? {
+                        Some(e) => Some(e),
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
+                if let Some(t) = &hop.rel.edge_type {
+                    if let Some(e) = &edge_record {
+                        if &e.edge_type != t {
+                            continue;
+                        }
+                    }
+                }
+                // Fetch the target node when we need its
+                // labels/properties or the WHERE binds it.
+                let need_target = !hop.target.labels.is_empty()
+                    || !hop.target.properties.is_empty()
+                    || hop.target.var.is_some();
+                let target_node = if need_target {
+                    match ctx.reader.get_node(neighbor_id)? {
+                        Some(n) => Some(n),
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
+                if let Some(n) = &target_node {
+                    if (!hop.target.labels.is_empty() || !hop.target.properties.is_empty())
+                        && !node_pattern_matches(n, &hop.target, ctx)?
+                    {
+                        continue;
+                    }
+                }
+                // Correlated constraint: if the target var is
+                // already bound in the scratch row (from an
+                // outer row OR an earlier hop), require the
+                // walked neighbor to match it.
+                if let Some(target_var) = &hop.target.var {
+                    if let Some(Value::Node(bound)) = row.get(target_var) {
+                        if bound.id != neighbor_id {
+                            continue;
+                        }
+                    }
+                }
+                // Extend the scratch row. Bind the edge var
+                // (if named) and the target var (if named) so
+                // the WHERE clause can touch them.
+                let mut next_row = row.clone();
+                if let Some(edge_var) = &hop.rel.var {
+                    if let Some(e) = &edge_record {
+                        next_row.insert(edge_var.clone(), Value::Edge(e.clone()));
+                    }
+                }
+                // We need a concrete target node for the next
+                // hop's frontier regardless of whether we
+                // fetched it above.
+                let concrete = match target_node {
+                    Some(n) => n,
+                    None => match ctx.reader.get_node(neighbor_id)? {
+                        Some(n) => n,
+                        None => continue,
+                    },
+                };
+                if let Some(target_var) = &hop.target.var {
+                    next_row.insert(target_var.clone(), Value::Node(concrete.clone()));
+                }
+                next.push((concrete, next_row));
+            }
+        }
+        if next.is_empty() {
+            return Ok(false);
+        }
+        frontier = next;
+    }
+
+    // Every frontier entry now represents a complete walk
+    // matching the pattern shape. With no WHERE we return true
+    // on the first one; with a WHERE we evaluate it against
+    // each candidate's scratch row until one passes.
+    match where_clause {
+        None => Ok(true),
+        Some(w) => {
+            for (_, row) in &frontier {
+                let sub_ctx = ctx.with_row(row);
+                let v = eval_expr(w, &sub_ctx)?;
+                if to_bool(&v).unwrap_or(false) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
 }
 
 /// Check whether the bound start node satisfies its pattern's

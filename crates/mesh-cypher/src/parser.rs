@@ -1293,6 +1293,44 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
         }
         Rule::list_comp => build_list_comp(pair),
         Rule::reduce_expr => build_reduce_expr(pair),
+        Rule::exists_subquery => {
+            // Children (silent `kw_exists` / `kw_match` filtered
+            // out): a single `pattern`, then an optional
+            // `where_clause`. v1 enforces no path var on the
+            // pattern — the `p =` prefix is a pattern-binding
+            // form, not a predicate form.
+            let mut pat: Option<Pattern> = None;
+            let mut where_expr: Option<Box<Expr>> = None;
+            for p in pair.into_inner() {
+                match p.as_rule() {
+                    Rule::kw_exists | Rule::kw_match => {}
+                    Rule::pattern => pat = Some(build_pattern(p)?),
+                    Rule::where_clause => {
+                        let ep = p
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| Error::Parse("empty exists where".into()))?;
+                        where_expr = Some(Box::new(build_expression(ep)?));
+                    }
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rule in exists_subquery: {r:?}"
+                        )))
+                    }
+                }
+            }
+            let pattern =
+                pat.ok_or_else(|| Error::Parse("exists_subquery missing pattern".into()))?;
+            if pattern.path_var.is_some() {
+                return Err(Error::Parse(
+                    "path variable binding is not allowed inside EXISTS { ... }".into(),
+                ));
+            }
+            Ok(Expr::ExistsSubquery {
+                pattern,
+                where_clause: where_expr,
+            })
+        }
         Rule::pattern_predicate => {
             // `pattern_predicate` has the same inner structure as
             // `pattern` (minus the optional `path_var_binding`
