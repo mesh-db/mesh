@@ -95,13 +95,24 @@ enum Phase {
 /// Accept Bolt connections on `listener` forever, spawning a new tokio
 /// task per connection that runs [`serve_connection`]. The function
 /// itself returns only if the listener errors.
-pub async fn run_listener(listener: TcpListener, service: Arc<MeshService>) -> anyhow::Result<()> {
+///
+/// `auth` is the optional user table loaded from
+/// [`crate::config::ServerConfig::bolt_auth`]. When `None`, the
+/// HELLO handler accepts any incoming credentials (pre-auth
+/// behavior). When `Some`, every HELLO is validated and rejected
+/// with `Neo.ClientError.Security.Unauthorized` on mismatch.
+pub async fn run_listener(
+    listener: TcpListener,
+    service: Arc<MeshService>,
+    auth: Option<Arc<crate::config::BoltAuthConfig>>,
+) -> anyhow::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         tracing::debug!(%peer, "bolt connection accepted");
         let service = service.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(socket, service).await {
+            if let Err(e) = serve_connection(socket, service, auth).await {
                 tracing::warn!(%peer, error = %e, "bolt connection terminated");
             } else {
                 tracing::debug!(%peer, "bolt connection closed cleanly");
@@ -112,7 +123,11 @@ pub async fn run_listener(listener: TcpListener, service: Arc<MeshService>) -> a
 
 /// Run the full Bolt lifecycle on a single socket: handshake, HELLO,
 /// then a request/response loop until GOODBYE or a socket error.
-pub async fn serve_connection<S>(socket: S, service: Arc<MeshService>) -> anyhow::Result<()>
+pub async fn serve_connection<S>(
+    socket: S,
+    service: Arc<MeshService>,
+    auth: Option<Arc<crate::config::BoltAuthConfig>>,
+) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -147,12 +162,27 @@ where
     }
     tracing::debug!("bolt handshake complete, speaking 4.4");
 
-    // Phase 2: HELLO → SUCCESS. Accept any metadata; return a fixed
-    // server identification string so drivers log it cleanly.
+    // Phase 2: HELLO → SUCCESS (or FAILURE + close when auth is
+    // configured and the credentials don't match). On success the
+    // response carries a fixed server identification string so
+    // drivers log it cleanly.
     let hello = read_message(&mut reader).await?;
     let hello_msg = BoltMessage::decode(&hello)?;
     match hello_msg {
-        BoltMessage::Hello { .. } => {
+        BoltMessage::Hello { extra } => {
+            if let Err(msg) = check_bolt_auth(auth.as_deref(), &extra) {
+                tracing::info!(error = %msg, "bolt auth rejected");
+                send(
+                    &mut writer,
+                    &failure("Neo.ClientError.Security.Unauthorized", &msg),
+                )
+                .await?;
+                writer.flush().await.ok();
+                // Bolt convention: close the connection after a
+                // HELLO failure. The driver sees the FAILURE
+                // first and translates it into an AuthError.
+                return Ok(());
+            }
             let metadata = BoltValue::map([
                 ("server", BoltValue::String("Mesh/0.1.0".into())),
                 ("connection_id", BoltValue::String("mesh-bolt-1".into())),
@@ -504,6 +534,58 @@ fn failure_from_status(status: &tonic::Status) -> BoltMessage {
         _ => "Mesh.ServerError.Unknown",
     };
     failure(code, status.message())
+}
+
+/// Validate a Bolt HELLO's auth fields against the configured
+/// user table. Returns `Ok(())` when the HELLO is accepted and
+/// `Err(reason)` otherwise — the caller turns the reason into a
+/// `Neo.ClientError.Security.Unauthorized` failure and closes
+/// the connection.
+///
+/// Accept paths:
+///   * `auth = None` → accept any HELLO (pre-auth behavior).
+///   * `auth = Some(cfg)` with `cfg.users.is_empty()` → also
+///     accept any HELLO; an empty users list is a config error
+///     the operator can surface via startup validation later,
+///     but at runtime we don't want to lock everyone out.
+///   * `auth = Some(cfg)` with `scheme = "basic"` and a matching
+///     `principal` / `credentials` pair.
+///
+/// Reject paths (all map to Unauthorized):
+///   * Missing `scheme` field or `scheme != "basic"` (explicitly
+///     including `scheme = "none"`).
+///   * `principal` / `credentials` missing or non-string.
+///   * Credentials present but the user table doesn't contain
+///     the pair.
+fn check_bolt_auth(
+    auth: Option<&crate::config::BoltAuthConfig>,
+    extra: &BoltValue,
+) -> std::result::Result<(), String> {
+    let Some(cfg) = auth else {
+        return Ok(());
+    };
+    if cfg.users.is_empty() {
+        return Ok(());
+    }
+    let scheme = extra.get("scheme").and_then(|v| v.as_str()).unwrap_or("");
+    if scheme != "basic" {
+        return Err(format!(
+            "authentication required; scheme `{}` not supported",
+            scheme
+        ));
+    }
+    let principal = extra
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing principal in HELLO".to_string())?;
+    let credentials = extra
+        .get("credentials")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing credentials in HELLO".to_string())?;
+    if !cfg.verify(principal, credentials) {
+        return Err("invalid username or password".into());
+    }
+    Ok(())
 }
 
 fn failure(code: &str, message: &str) -> BoltMessage {

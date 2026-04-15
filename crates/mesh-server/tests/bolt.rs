@@ -28,7 +28,7 @@ async fn spawn_bolt_server() -> (String, TempDir) {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let _ = run_listener(listener, service).await;
+        let _ = run_listener(listener, service, None).await;
     });
 
     // Give the listener a moment to enter its accept loop.
@@ -850,4 +850,121 @@ async fn bolt_tx_delete_edge_hides_edge_from_traversal() {
     assert_eq!(records.len(), 1, "rollback should restore the edge");
 
     goodbye(sock).await;
+}
+
+// ---------------------------------------------------------------
+// Bolt auth validation
+// ---------------------------------------------------------------
+
+/// Spawn a Bolt listener with an auth table containing a single
+/// user. Returns the bound address plus a guard.
+async fn spawn_bolt_server_with_auth(username: &str, password: &str) -> (String, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let service = Arc::new(MeshService::new(store));
+    let auth = Arc::new(mesh_server::config::BoltAuthConfig {
+        users: vec![mesh_server::config::BoltUser {
+            username: username.to_string(),
+            password: password.to_string(),
+        }],
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = run_listener(listener, service, Some(auth)).await;
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    (addr.to_string(), dir)
+}
+
+/// Send a HELLO with the given scheme / principal / credentials
+/// and return the server's reply. Handshake is performed first.
+/// Caller handles the returned BoltMessage for assertions.
+async fn connect_and_hello_with(
+    addr: &str,
+    scheme: &str,
+    principal: Option<&str>,
+    credentials: Option<&str>,
+) -> BoltMessage {
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    let preferences = [BOLT_4_4, [0; 4], [0; 4], [0; 4]];
+    let agreed = perform_client_handshake(&mut sock, &preferences)
+        .await
+        .unwrap();
+    assert_eq!(agreed, BOLT_4_4);
+
+    let mut entries: Vec<(String, BoltValue)> = vec![
+        (
+            "user_agent".into(),
+            BoltValue::String("mesh-test/0.1".into()),
+        ),
+        ("scheme".into(), BoltValue::String(scheme.into())),
+    ];
+    if let Some(p) = principal {
+        entries.push(("principal".into(), BoltValue::String(p.into())));
+    }
+    if let Some(c) = credentials {
+        entries.push(("credentials".into(), BoltValue::String(c.into())));
+    }
+    let hello = BoltMessage::Hello {
+        extra: BoltValue::Map(entries),
+    };
+    write_message(&mut sock, &hello.encode()).await.unwrap();
+    let reply_bytes = read_message(&mut sock).await.unwrap();
+    BoltMessage::decode(&reply_bytes).unwrap()
+}
+
+#[tokio::test]
+async fn bolt_auth_accepts_matching_basic_credentials() {
+    let (addr, _dir) = spawn_bolt_server_with_auth("neo4j", "secret").await;
+    let reply = connect_and_hello_with(&addr, "basic", Some("neo4j"), Some("secret")).await;
+    assert!(
+        matches!(reply, BoltMessage::Success { .. }),
+        "expected SUCCESS, got {:?}",
+        reply
+    );
+}
+
+#[tokio::test]
+async fn bolt_auth_rejects_wrong_password() {
+    let (addr, _dir) = spawn_bolt_server_with_auth("neo4j", "secret").await;
+    let reply = connect_and_hello_with(&addr, "basic", Some("neo4j"), Some("wrong")).await;
+    match reply {
+        BoltMessage::Failure { metadata } => {
+            let code = metadata
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            assert_eq!(code, "Neo.ClientError.Security.Unauthorized");
+        }
+        other => panic!("expected FAILURE, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn bolt_auth_rejects_scheme_none() {
+    let (addr, _dir) = spawn_bolt_server_with_auth("neo4j", "secret").await;
+    let reply = connect_and_hello_with(&addr, "none", None, None).await;
+    assert!(
+        matches!(reply, BoltMessage::Failure { .. }),
+        "expected FAILURE for scheme=none when auth required, got {:?}",
+        reply
+    );
+}
+
+#[tokio::test]
+async fn bolt_auth_rejects_missing_principal() {
+    let (addr, _dir) = spawn_bolt_server_with_auth("neo4j", "secret").await;
+    let reply = connect_and_hello_with(&addr, "basic", None, Some("secret")).await;
+    assert!(matches!(reply, BoltMessage::Failure { .. }));
+}
+
+#[tokio::test]
+async fn bolt_no_auth_accepts_any_hello() {
+    // Baseline regression check: the unauthenticated path (the
+    // default for existing configs) still accepts any HELLO.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let reply = connect_and_hello_with(&addr, "basic", Some("anyone"), Some("anything")).await;
+    assert!(matches!(reply, BoltMessage::Success { .. }));
 }

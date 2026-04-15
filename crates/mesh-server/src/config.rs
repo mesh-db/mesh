@@ -74,6 +74,17 @@ pub struct ServerConfig {
     #[serde(default)]
     pub metrics_address: Option<String>,
 
+    /// Optional Bolt protocol authentication. When set, every
+    /// incoming Bolt `HELLO` is validated against the configured
+    /// user table: `scheme = "basic"` with a matching username +
+    /// password succeeds, anything else responds with a
+    /// `Neo.ClientError.Security.Unauthorized` failure and the
+    /// connection is closed. Omitted → accept-any, which is the
+    /// pre-auth default behaviour and what the existing configs
+    /// in the repo rely on.
+    #[serde(default)]
+    pub bolt_auth: Option<BoltAuthConfig>,
+
     /// Cluster operating mode. Omitted → inferred from `peers` (empty
     /// → Single, non-empty → Raft) for backward compatibility with
     /// configs from before this field existed. Set explicitly to
@@ -92,6 +103,40 @@ fn default_num_partitions() -> u32 {
 pub struct PeerConfig {
     pub id: u64,
     pub address: String,
+}
+
+/// Authentication table for the Bolt listener. Enabled by adding a
+/// `[bolt_auth]` section to the TOML config with one or more
+/// `[[bolt_auth.users]]` entries. Absent → unauthenticated
+/// (accept-any), which matches the pre-auth behavior.
+///
+/// Passwords are stored in plain text on disk for v1 — callers
+/// should protect the config file with filesystem permissions and
+/// treat it like any other secrets file. Bcrypt / scrypt hashing
+/// is a follow-up.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoltAuthConfig {
+    #[serde(default)]
+    pub users: Vec<BoltUser>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoltUser {
+    pub username: String,
+    pub password: String,
+}
+
+impl BoltAuthConfig {
+    /// Returns `true` when `username` / `password` matches any
+    /// configured user exactly. Plain-text comparison — if/when
+    /// we move to hashing, this grows a constant-time compare.
+    pub fn verify(&self, username: &str, password: &str) -> bool {
+        self.users
+            .iter()
+            .any(|u| u.username == username && u.password == password)
+    }
 }
 
 impl ServerConfig {

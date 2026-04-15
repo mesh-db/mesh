@@ -241,15 +241,22 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // that a port-in-use error at startup is immediately fatal rather
     // than surfacing only on the first Bolt client connection.
     let service_arc = Arc::new(service.clone());
+    let bolt_auth = config.bolt_auth.clone().map(Arc::new);
     let bolt_task = if let Some(bolt_addr) = config.bolt_address.as_ref() {
         let bolt_listener = TcpListener::bind(bolt_addr)
             .await
             .with_context(|| format!("binding bolt {}", bolt_addr))?;
         let bolt_local = bolt_listener.local_addr()?;
-        tracing::info!(addr = %bolt_local, "mesh-server bolt listening");
+        let auth_state = if bolt_auth.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        tracing::info!(addr = %bolt_local, auth = auth_state, "mesh-server bolt listening");
         let bolt_service = service_arc.clone();
+        let bolt_auth_clone = bolt_auth.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = bolt::run_listener(bolt_listener, bolt_service).await {
+            if let Err(e) = bolt::run_listener(bolt_listener, bolt_service, bolt_auth_clone).await {
                 tracing::error!(error = %e, "bolt listener exited");
             }
         }))
