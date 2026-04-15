@@ -231,6 +231,14 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// Postfix null check: `IS NULL` when `negated = false`,
+    /// `IS NOT NULL` when `negated = true`. Always produces a
+    /// Bool; evaluates `inner` and returns whether the result
+    /// is `Value::Null` / `Property::Null`.
+    IsNull {
+        negated: bool,
+        inner: Box<Expr>,
+    },
     Call {
         name: String,
         args: CallArgs,
@@ -272,6 +280,13 @@ pub enum CompareOp {
     Le,
     Gt,
     Ge,
+    /// `left STARTS WITH right` — both sides must be strings,
+    /// returns Bool. Null-propagating (either side Null → Null).
+    StartsWith,
+    /// `left ENDS WITH right` — same semantics as StartsWith.
+    EndsWith,
+    /// `left CONTAINS right` — same semantics as StartsWith.
+    Contains,
 }
 
 #[derive(Debug, Clone, PartialEq)]

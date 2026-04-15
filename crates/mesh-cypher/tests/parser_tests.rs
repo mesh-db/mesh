@@ -1202,3 +1202,48 @@ fn pattern_prop_filter_plus_where_rewrites_through_chain() {
     };
     assert!(matches!(*seek, LogicalPlan::IndexSeek { .. }));
 }
+
+#[test]
+fn starts_with_operator_parses() {
+    let m = unwrap_match(parse("MATCH (n) WHERE n.name STARTS WITH 'A' RETURN n").unwrap());
+    let Expr::Compare { op, .. } = m.where_clause.unwrap() else {
+        panic!("expected Compare");
+    };
+    assert_eq!(op, CompareOp::StartsWith);
+}
+
+#[test]
+fn ends_with_operator_parses() {
+    let m = unwrap_match(parse("MATCH (n) WHERE n.name ENDS WITH 'z' RETURN n").unwrap());
+    let Expr::Compare { op, .. } = m.where_clause.unwrap() else {
+        panic!("expected Compare");
+    };
+    assert_eq!(op, CompareOp::EndsWith);
+}
+
+#[test]
+fn contains_operator_parses() {
+    let m = unwrap_match(parse("MATCH (n) WHERE n.name CONTAINS 'ad' RETURN n").unwrap());
+    let Expr::Compare { op, .. } = m.where_clause.unwrap() else {
+        panic!("expected Compare");
+    };
+    assert_eq!(op, CompareOp::Contains);
+}
+
+#[test]
+fn is_null_operator_parses() {
+    let m = unwrap_match(parse("MATCH (n) WHERE n.name IS NULL RETURN n").unwrap());
+    let Expr::IsNull { negated, .. } = m.where_clause.unwrap() else {
+        panic!("expected IsNull");
+    };
+    assert!(!negated);
+}
+
+#[test]
+fn is_not_null_operator_parses() {
+    let m = unwrap_match(parse("MATCH (n) WHERE n.name IS NOT NULL RETURN n").unwrap());
+    let Expr::IsNull { negated, .. } = m.where_clause.unwrap() else {
+        panic!("expected IsNull");
+    };
+    assert!(negated);
+}

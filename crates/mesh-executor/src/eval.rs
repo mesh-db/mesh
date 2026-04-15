@@ -68,6 +68,15 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             let vr = eval_expr(right, row, params)?;
             Ok(Value::Property(Property::Bool(compare(*op, &vl, &vr)?)))
         }
+        Expr::IsNull { negated, inner } => {
+            let v = eval_expr(inner, row, params)?;
+            let is_null = matches!(v, Value::Null | Value::Property(Property::Null));
+            Ok(Value::Property(Property::Bool(if *negated {
+                !is_null
+            } else {
+                is_null
+            })))
+        }
         Expr::Call { name, args } => call_scalar(name, args, row, params),
         Expr::List(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -282,6 +291,147 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
             }
             Ok(Value::Null)
         }
+        "substring" => {
+            // substring(str, start [, length]) — 0-indexed,
+            // clamp at string length, negative start → 0.
+            // Missing length → suffix from start.
+            if arg_exprs.len() != 2 && arg_exprs.len() != 3 {
+                return Err(Error::UnknownScalarFunction(
+                    "substring expects 2 or 3 arguments".into(),
+                ));
+            }
+            let sv = eval_expr(&arg_exprs[0], row, params)?;
+            let start_v = eval_expr(&arg_exprs[1], row, params)?;
+            if matches!(sv, Value::Null) || matches!(start_v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let s = match sv {
+                Value::Property(Property::String(s)) => s,
+                _ => return Err(Error::TypeMismatch),
+            };
+            let start = match start_v {
+                Value::Property(Property::Int64(i)) => i.max(0) as usize,
+                _ => return Err(Error::TypeMismatch),
+            };
+            // Work on Unicode chars, not bytes, so non-ASCII
+            // inputs don't produce split-byte garbage.
+            let chars: Vec<char> = s.chars().collect();
+            let start = start.min(chars.len());
+            let end = if arg_exprs.len() == 3 {
+                let len_v = eval_expr(&arg_exprs[2], row, params)?;
+                if matches!(len_v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let len = match len_v {
+                    Value::Property(Property::Int64(i)) => i.max(0) as usize,
+                    _ => return Err(Error::TypeMismatch),
+                };
+                (start + len).min(chars.len())
+            } else {
+                chars.len()
+            };
+            let result: String = chars[start..end].iter().collect();
+            Ok(Value::Property(Property::String(result)))
+        }
+        "trim" | "ltrim" | "rtrim" => {
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Property(Property::String(s)) => {
+                    let trimmed = match name.to_ascii_lowercase().as_str() {
+                        "trim" => s.trim().to_string(),
+                        "ltrim" => s.trim_start().to_string(),
+                        "rtrim" => s.trim_end().to_string(),
+                        _ => unreachable!(),
+                    };
+                    Ok(Value::Property(Property::String(trimmed)))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "replace" => {
+            if arg_exprs.len() != 3 {
+                return Err(Error::UnknownScalarFunction(
+                    "replace expects 3 arguments (str, search, replacement)".into(),
+                ));
+            }
+            let sv = eval_expr(&arg_exprs[0], row, params)?;
+            let fv = eval_expr(&arg_exprs[1], row, params)?;
+            let tv = eval_expr(&arg_exprs[2], row, params)?;
+            if matches!(sv, Value::Null) || matches!(fv, Value::Null) || matches!(tv, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let (s, f, t) = match (sv, fv, tv) {
+                (
+                    Value::Property(Property::String(s)),
+                    Value::Property(Property::String(f)),
+                    Value::Property(Property::String(t)),
+                ) => (s, f, t),
+                _ => return Err(Error::TypeMismatch),
+            };
+            Ok(Value::Property(Property::String(s.replace(&f, &t))))
+        }
+        "split" => {
+            // split(str, delim) → list of strings. Matches
+            // openCypher: empty delimiter returns individual
+            // characters.
+            if arg_exprs.len() != 2 {
+                return Err(Error::UnknownScalarFunction(
+                    "split expects 2 arguments (str, delimiter)".into(),
+                ));
+            }
+            let sv = eval_expr(&arg_exprs[0], row, params)?;
+            let dv = eval_expr(&arg_exprs[1], row, params)?;
+            if matches!(sv, Value::Null) || matches!(dv, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let (s, d) = match (sv, dv) {
+                (Value::Property(Property::String(s)), Value::Property(Property::String(d))) => {
+                    (s, d)
+                }
+                _ => return Err(Error::TypeMismatch),
+            };
+            let items: Vec<Value> = if d.is_empty() {
+                s.chars()
+                    .map(|c| Value::Property(Property::String(c.to_string())))
+                    .collect()
+            } else {
+                s.split(&d)
+                    .map(|p| Value::Property(Property::String(p.to_string())))
+                    .collect()
+            };
+            Ok(Value::List(items))
+        }
+        "tofloat" => {
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Property(Property::Float64(f)) => Ok(Value::Property(Property::Float64(f))),
+                Value::Property(Property::Int64(i)) => {
+                    Ok(Value::Property(Property::Float64(i as f64)))
+                }
+                Value::Property(Property::String(s)) => match s.trim().parse::<f64>() {
+                    Ok(f) => Ok(Value::Property(Property::Float64(f))),
+                    Err(_) => Ok(Value::Null),
+                },
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "toboolean" => {
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Property(Property::Bool(b)) => Ok(Value::Property(Property::Bool(b))),
+                Value::Property(Property::String(s)) => {
+                    match s.trim().to_ascii_lowercase().as_str() {
+                        "true" => Ok(Value::Property(Property::Bool(true))),
+                        "false" => Ok(Value::Property(Property::Bool(false))),
+                        _ => Ok(Value::Null),
+                    }
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
         _ => Err(Error::UnknownScalarFunction(name.to_string())),
     }
 }
@@ -418,6 +568,26 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(false);
     }
+    // String-predicate operators dispatch separately from
+    // ordering comparisons because they're only defined on
+    // strings and don't need a cross-type Ordering coercion.
+    match op {
+        CompareOp::StartsWith | CompareOp::EndsWith | CompareOp::Contains => {
+            let (ls, rs) = match (l, r) {
+                (Value::Property(Property::String(a)), Value::Property(Property::String(b))) => {
+                    (a.as_str(), b.as_str())
+                }
+                _ => return Err(Error::TypeMismatch),
+            };
+            return Ok(match op {
+                CompareOp::StartsWith => ls.starts_with(rs),
+                CompareOp::EndsWith => ls.ends_with(rs),
+                CompareOp::Contains => ls.contains(rs),
+                _ => unreachable!(),
+            });
+        }
+        _ => {}
+    }
     let (lp, rp) = match (l, r) {
         (Value::Property(lp), Value::Property(rp)) => (lp, rp),
         _ => return Err(Error::TypeMismatch),
@@ -450,5 +620,8 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
         CompareOp::Le => ord != Ordering::Greater,
         CompareOp::Gt => ord == Ordering::Greater,
         CompareOp::Ge => ord != Ordering::Less,
+        // String-predicate ops handled in the early-return
+        // branch above.
+        CompareOp::StartsWith | CompareOp::EndsWith | CompareOp::Contains => unreachable!(),
     })
 }

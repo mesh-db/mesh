@@ -2505,3 +2505,159 @@ fn bare_return_does_not_leak_placeholder_column() {
     assert_eq!(row.len(), 1, "row should contain only the projected column");
     assert!(row.contains_key("answer"));
 }
+
+#[test]
+fn starts_with_operator_filters_rows() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Adam'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE p.name STARTS WITH 'Ad' RETURN p.name AS n",
+    );
+    assert_eq!(rows.len(), 2);
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "n")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string(), "Adam".to_string()]);
+}
+
+#[test]
+fn ends_with_operator_filters_rows() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Linda'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE p.name ENDS WITH 'da' RETURN p.name AS n",
+    );
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn contains_operator_with_parameter_filters_rows() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Charlie'})");
+    let mut params = ParamMap::new();
+    params.insert("q".into(), Value::Property(Property::String("li".into())));
+    let rows = run_with_params(
+        &store,
+        "MATCH (p:Person) WHERE p.name CONTAINS $q RETURN p.name AS n",
+        &params,
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "n")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Alice".to_string(), "Charlie".to_string()]);
+}
+
+#[test]
+fn contains_with_tolower_composes() {
+    // The canonical driver pattern: case-insensitive search by
+    // lower-casing both sides of CONTAINS.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    run(&store, "CREATE (:Person {name: 'bob'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE toLower(p.name) CONTAINS 'ali' RETURN p.name AS n",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Alice");
+}
+
+#[test]
+fn is_null_filters_on_missing_property() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob', age: 30})");
+    // Ada has no age; n.age evaluates to Null and IS NULL
+    // passes.
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE p.age IS NULL RETURN p.name AS n",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Ada");
+}
+
+#[test]
+fn is_not_null_after_optional_match() {
+    // Canonical "find only the rows that actually matched"
+    // pattern using IS NOT NULL on an optional variable.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cid'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cid'}) CREATE (a)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f) \
+         WITH p, f WHERE f IS NOT NULL RETURN p.name AS n",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Ada");
+}
+
+#[test]
+fn substring_extracts_slice() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN substring('hello world', 6, 5) AS w");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "w"), "world");
+}
+
+#[test]
+fn substring_without_length_takes_suffix() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN substring('hello', 2) AS s");
+    assert_eq!(str_prop(&rows[0], "s"), "llo");
+}
+
+#[test]
+fn trim_removes_surrounding_whitespace() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN trim('  hi  ') AS t");
+    assert_eq!(str_prop(&rows[0], "t"), "hi");
+}
+
+#[test]
+fn replace_swaps_substring() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN replace('foo bar', 'bar', 'baz') AS r");
+    assert_eq!(str_prop(&rows[0], "r"), "foo baz");
+}
+
+#[test]
+fn split_produces_list_of_strings() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN split('a,b,c', ',') AS parts");
+    assert_eq!(rows.len(), 1);
+    let parts = match rows[0].get("parts") {
+        Some(Value::List(items)) => items,
+        other => panic!("expected list, got {other:?}"),
+    };
+    assert_eq!(parts.len(), 3);
+}
+
+#[test]
+fn tofloat_parses_numeric_string_or_returns_null() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN toFloat('3.14') AS pi, toFloat('nope') AS bad",
+    );
+    assert!(matches!(
+        rows[0].get("pi"),
+        Some(Value::Property(Property::Float64(_)))
+    ));
+    assert!(matches!(
+        rows[0].get("bad"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}

@@ -144,15 +144,32 @@ expression = { or_expr }
 or_expr = { and_expr ~ (kw_or ~ and_expr)* }
 and_expr = { not_expr ~ (kw_and ~ not_expr)* }
 not_expr = { (kw_not ~ not_expr) | comparison }
-comparison = { primary ~ (comparison_op ~ primary)? }
+comparison = { primary ~ (null_predicate | (comparison_op ~ primary))? }
 
-comparison_op = { op_neq | op_leq | op_geq | op_eq | op_lt | op_gt }
+// Postfix `IS NULL` / `IS NOT NULL`. Ordered so `IS NOT NULL`
+// is tried first — the `NOT` alternative is a proper prefix of
+// the plain form so the grammar would otherwise eagerly match
+// `IS NULL` and leave `NOT NULL` dangling.
+null_predicate = { is_not_null_op | is_null_op }
+is_not_null_op = @{ ^"is" ~ (" " | "\t" | "\r" | "\n")+ ~ ^"not" ~ (" " | "\t" | "\r" | "\n")+ ~ ^"null" ~ !id_cont }
+is_null_op     = @{ ^"is" ~ (" " | "\t" | "\r" | "\n")+ ~ ^"null" ~ !id_cont }
+
+comparison_op = {
+    op_starts_with | op_ends_with | op_contains |
+    op_neq | op_leq | op_geq | op_eq | op_lt | op_gt
+}
 op_eq = { "=" }
 op_neq = { "<>" }
 op_leq = { "<=" }
 op_geq = { ">=" }
 op_lt = { "<" }
 op_gt = { ">" }
+// Cypher's case-insensitive string operators. Multi-word, so
+// the grammar matches each keyword separately with `!id_cont`
+// to keep them from sticking to trailing identifier chars.
+op_starts_with = @{ ^"starts" ~ (" " | "\t")+ ~ ^"with" ~ !id_cont }
+op_ends_with   = @{ ^"ends" ~ (" " | "\t")+ ~ ^"with" ~ !id_cont }
+op_contains    = @{ ^"contains" ~ !id_cont }
 
 primary = {
     case_expr |
@@ -213,7 +230,7 @@ reserved = @{
      ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc" |
      ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind" |
      ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on" |
-     ^"with" | ^"optional")
+     ^"with" | ^"optional" | ^"contains")
     ~ !id_cont
 }
 

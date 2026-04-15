@@ -934,20 +934,46 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                     .next()
                     .ok_or_else(|| Error::Parse("empty comparison".into()))?,
             )?;
-            if let Some(op_pair) = inner.next() {
-                let op = build_compare_op(op_pair)?;
-                let right = build_expression(
-                    inner
+            // The comparison tail is either a `null_predicate`
+            // (postfix IS NULL / IS NOT NULL) or a binary
+            // `comparison_op primary` pair. The grammar tries
+            // `null_predicate` first so it doesn't conflict with
+            // the binary form.
+            match inner.next() {
+                None => Ok(left),
+                Some(tail) if tail.as_rule() == Rule::null_predicate => {
+                    let kind = tail
+                        .into_inner()
                         .next()
-                        .ok_or_else(|| Error::Parse("missing comparison rhs".into()))?,
-                )?;
-                Ok(Expr::Compare {
-                    op,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            } else {
-                Ok(left)
+                        .ok_or_else(|| Error::Parse("empty null predicate".into()))?;
+                    let negated = match kind.as_rule() {
+                        Rule::is_null_op => false,
+                        Rule::is_not_null_op => true,
+                        r => {
+                            return Err(Error::Parse(format!(
+                                "unexpected null predicate rule: {:?}",
+                                r
+                            )))
+                        }
+                    };
+                    Ok(Expr::IsNull {
+                        negated,
+                        inner: Box::new(left),
+                    })
+                }
+                Some(op_pair) => {
+                    let op = build_compare_op(op_pair)?;
+                    let right = build_expression(
+                        inner
+                            .next()
+                            .ok_or_else(|| Error::Parse("missing comparison rhs".into()))?,
+                    )?;
+                    Ok(Expr::Compare {
+                        op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    })
+                }
             }
         }
         Rule::primary => build_expression(
@@ -1182,6 +1208,9 @@ fn build_compare_op(pair: Pair<Rule>) -> Result<CompareOp> {
         Rule::op_leq => CompareOp::Le,
         Rule::op_gt => CompareOp::Gt,
         Rule::op_geq => CompareOp::Ge,
+        Rule::op_starts_with => CompareOp::StartsWith,
+        Rule::op_ends_with => CompareOp::EndsWith,
+        Rule::op_contains => CompareOp::Contains,
         r => return Err(Error::Parse(format!("unexpected op: {:?}", r))),
     })
 }
