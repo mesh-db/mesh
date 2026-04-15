@@ -336,6 +336,40 @@ pub enum Expr {
         predicate: Option<Box<Expr>>,
         projection: Option<Box<Expr>>,
     },
+    /// Binary arithmetic — `+`, `-`, `*`, `/`, `%`. Evaluated
+    /// with numeric coercion (Int + Int = Int; any Float operand
+    /// widens to Float) and null propagation. `+` additionally
+    /// handles string concatenation and list concatenation
+    /// when both operands are of the matching type.
+    BinaryOp {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// Unary negation — `-x`. Int and Float only; null
+    /// propagates. The grammar leaves negative numeric literals
+    /// as `Literal(Integer(-n))` via the `"-"?` prefix inside
+    /// `integer` / `float`, so this variant only fires for
+    /// negation applied to a non-literal expression (e.g.
+    /// `-a.age`, `-(x + y)`).
+    UnaryOp {
+        op: UnaryOp,
+        operand: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
 }
 
 #[derive(Debug, Clone, PartialEq)]

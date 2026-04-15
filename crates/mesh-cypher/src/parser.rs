@@ -1116,6 +1116,92 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 }
             }
         }
+        Rule::add_expr => {
+            // Left-associative fold over `mul_expr (op mul_expr)*`.
+            // Children alternate between operands and `op_add`/
+            // `op_sub` markers; drain them in pairs, building up
+            // a left-leaning `BinaryOp` tree.
+            let mut inner = pair.into_inner();
+            let mut left = build_expression(
+                inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty add_expr".into()))?,
+            )?;
+            while let Some(op_pair) = inner.next() {
+                let op = match op_pair.as_rule() {
+                    Rule::op_add => BinaryOp::Add,
+                    Rule::op_sub => BinaryOp::Sub,
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rule in add_expr: {:?}",
+                            r
+                        )))
+                    }
+                };
+                let right = build_expression(
+                    inner
+                        .next()
+                        .ok_or_else(|| Error::Parse("add_expr missing rhs".into()))?,
+                )?;
+                left = Expr::BinaryOp {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            }
+            Ok(left)
+        }
+        Rule::mul_expr => {
+            let mut inner = pair.into_inner();
+            let mut left = build_expression(
+                inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty mul_expr".into()))?,
+            )?;
+            while let Some(op_pair) = inner.next() {
+                let op = match op_pair.as_rule() {
+                    Rule::op_mul => BinaryOp::Mul,
+                    Rule::op_div => BinaryOp::Div,
+                    Rule::op_mod => BinaryOp::Mod,
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rule in mul_expr: {:?}",
+                            r
+                        )))
+                    }
+                };
+                let right = build_expression(
+                    inner
+                        .next()
+                        .ok_or_else(|| Error::Parse("mul_expr missing rhs".into()))?,
+                )?;
+                left = Expr::BinaryOp {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            }
+            Ok(left)
+        }
+        Rule::unary_expr => {
+            let mut inner = pair.into_inner();
+            let first = inner
+                .next()
+                .ok_or_else(|| Error::Parse("empty unary_expr".into()))?;
+            if first.as_rule() == Rule::op_neg {
+                let operand = build_expression(
+                    inner
+                        .next()
+                        .ok_or_else(|| Error::Parse("unary - missing operand".into()))?,
+                )?;
+                Ok(Expr::UnaryOp {
+                    op: UnaryOp::Neg,
+                    operand: Box::new(operand),
+                })
+            } else {
+                build_expression(first)
+            }
+        }
         Rule::primary => build_expression(
             pair.into_inner()
                 .next()

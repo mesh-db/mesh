@@ -216,7 +216,28 @@ expression = { or_expr }
 or_expr = { and_expr ~ (kw_or ~ and_expr)* }
 and_expr = { not_expr ~ (kw_and ~ not_expr)* }
 not_expr = { (kw_not ~ not_expr) | comparison }
-comparison = { primary ~ (null_predicate | (comparison_op ~ primary))? }
+comparison = { add_expr ~ (null_predicate | (comparison_op ~ add_expr))? }
+
+// Arithmetic precedence levels. `add_expr` has `+` / `-`,
+// below it `mul_expr` has `*` / `/` / `%`, and the lowest
+// binding `unary_expr` lets a leading `-` negate a primary.
+// Left-associative via pest's repetition: `a - b - c` parses
+// as `((a - b) - c)` which matches standard arithmetic.
+//
+// Both arithmetic levels sit between `comparison` and
+// `primary`, so a mixed expression like `a.age + 1 > 18`
+// parses as `(a.age + 1) > 18` instead of trying to treat the
+// comparison as a primary.
+add_expr = { mul_expr ~ ((op_add | op_sub) ~ mul_expr)* }
+mul_expr = { unary_expr ~ ((op_mul | op_div | op_mod) ~ unary_expr)* }
+unary_expr = { (op_neg ~ unary_expr) | primary }
+
+op_add = { "+" }
+op_sub = { "-" }
+op_mul = { "*" }
+op_div = { "/" }
+op_mod = { "%" }
+op_neg = { "-" }
 
 // Postfix `IS NULL` / `IS NOT NULL`. Ordered so `IS NOT NULL`
 // is tried first — the `NOT` alternative is a proper prefix of

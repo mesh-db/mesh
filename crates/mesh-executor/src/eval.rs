@@ -3,7 +3,7 @@ use crate::{
     value::{ParamMap, Row, Value},
 };
 use mesh_core::Property;
-use mesh_cypher::{CallArgs, CompareOp, Expr, Literal};
+use mesh_cypher::{BinaryOp, CallArgs, CompareOp, Expr, Literal, UnaryOp};
 use std::cmp::Ordering;
 
 pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Value> {
@@ -186,6 +186,151 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             }
             Ok(Value::List(out))
         }
+        Expr::BinaryOp { op, left, right } => {
+            let l = eval_expr(left, row, params)?;
+            let r = eval_expr(right, row, params)?;
+            eval_binary_op(*op, l, r)
+        }
+        Expr::UnaryOp { op, operand } => {
+            let v = eval_expr(operand, row, params)?;
+            eval_unary_op(*op, v)
+        }
+    }
+}
+
+/// Apply a binary arithmetic operator to two already-evaluated
+/// operands. Null on either side short-circuits to Null
+/// (three-valued logic). Numeric operands coerce via the
+/// widening rule: `Int op Int → Int`, anything with a `Float`
+/// widens the result to `Float`. For `+`, String operands
+/// concatenate and List operands concatenate; for the other
+/// operators those shapes are a type error. Division and
+/// modulo with a zero RHS return [`Error::DivideByZero`] on
+/// integer operands and produce `±inf` / `NaN` on float
+/// operands, matching the behavior of the underlying `f64`
+/// arithmetic.
+pub(crate) fn eval_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<Value> {
+    // Null propagation: any Null operand collapses the whole
+    // expression to Null, regardless of the operator.
+    if matches!(left, Value::Null) || matches!(right, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if matches!(left, Value::Property(Property::Null))
+        || matches!(right, Value::Property(Property::Null))
+    {
+        return Ok(Value::Null);
+    }
+
+    // String and list concatenation only live on `+`.
+    if op == BinaryOp::Add {
+        match (&left, &right) {
+            (Value::Property(Property::String(a)), Value::Property(Property::String(b))) => {
+                let mut out = String::with_capacity(a.len() + b.len());
+                out.push_str(a);
+                out.push_str(b);
+                return Ok(Value::Property(Property::String(out)));
+            }
+            (Value::List(a), Value::List(b)) => {
+                let mut out = Vec::with_capacity(a.len() + b.len());
+                out.extend(a.iter().cloned());
+                out.extend(b.iter().cloned());
+                return Ok(Value::List(out));
+            }
+            _ => {}
+        }
+    }
+
+    // Fall through to numeric arithmetic. Extract i64 / f64
+    // from either `Value::Property(Int64/Float64)` directly,
+    // erroring on anything else (Node, Edge, List, Map, etc.).
+    let ln = to_number(&left)?;
+    let rn = to_number(&right)?;
+    let result = match (ln, rn) {
+        (Num::Int(a), Num::Int(b)) => match op {
+            BinaryOp::Add => Num::Int(a.wrapping_add(b)),
+            BinaryOp::Sub => Num::Int(a.wrapping_sub(b)),
+            BinaryOp::Mul => Num::Int(a.wrapping_mul(b)),
+            BinaryOp::Div => {
+                if b == 0 {
+                    return Err(Error::DivideByZero);
+                }
+                // Cypher and Neo4j use truncated integer
+                // division for int/int; `/` on f64 is floating
+                // and diverges. `wrapping_div` guards against
+                // `i64::MIN / -1` panicking.
+                Num::Int(a.wrapping_div(b))
+            }
+            BinaryOp::Mod => {
+                if b == 0 {
+                    return Err(Error::DivideByZero);
+                }
+                Num::Int(a.wrapping_rem(b))
+            }
+        },
+        (a, b) => {
+            let af = a.to_f64();
+            let bf = b.to_f64();
+            let r = match op {
+                BinaryOp::Add => af + bf,
+                BinaryOp::Sub => af - bf,
+                BinaryOp::Mul => af * bf,
+                BinaryOp::Div => af / bf,
+                BinaryOp::Mod => af % bf,
+            };
+            Num::Float(r)
+        }
+    };
+    Ok(result.into_value())
+}
+
+/// Unary negation. Nulls propagate; non-numeric values are a
+/// type error.
+pub(crate) fn eval_unary_op(op: UnaryOp, v: Value) -> Result<Value> {
+    match op {
+        UnaryOp::Neg => match v {
+            Value::Null => Ok(Value::Null),
+            Value::Property(Property::Null) => Ok(Value::Null),
+            Value::Property(Property::Int64(i)) => {
+                // `i64::MIN.wrapping_neg() == i64::MIN`, which
+                // preserves the type shape without panicking.
+                Ok(Value::Property(Property::Int64(i.wrapping_neg())))
+            }
+            Value::Property(Property::Float64(f)) => Ok(Value::Property(Property::Float64(-f))),
+            _ => Err(Error::TypeMismatch),
+        },
+    }
+}
+
+/// Internal tagged-number type used by `eval_binary_op` to
+/// carry the numeric value through the coercion branches
+/// without allocating an `Value` on every step.
+#[derive(Debug, Clone, Copy)]
+enum Num {
+    Int(i64),
+    Float(f64),
+}
+
+impl Num {
+    fn to_f64(self) -> f64 {
+        match self {
+            Num::Int(i) => i as f64,
+            Num::Float(f) => f,
+        }
+    }
+
+    fn into_value(self) -> Value {
+        match self {
+            Num::Int(i) => Value::Property(Property::Int64(i)),
+            Num::Float(f) => Value::Property(Property::Float64(f)),
+        }
+    }
+}
+
+fn to_number(v: &Value) -> Result<Num> {
+    match v {
+        Value::Property(Property::Int64(i)) => Ok(Num::Int(*i)),
+        Value::Property(Property::Float64(f)) => Ok(Num::Float(*f)),
+        _ => Err(Error::TypeMismatch),
     }
 }
 

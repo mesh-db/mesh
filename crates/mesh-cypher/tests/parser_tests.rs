@@ -1739,3 +1739,82 @@ fn pattern_without_path_variable_has_none() {
     let m = unwrap_match(parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap());
     assert_eq!(first_pattern(&m).path_var, None);
 }
+
+#[test]
+fn addition_parses_as_binary_op() {
+    let s = parse("RETURN 1 + 2 AS total").unwrap();
+    let Statement::Return(r) = s else {
+        panic!("expected Return");
+    };
+    let Expr::BinaryOp { op, .. } = &r.return_items[0].expr else {
+        panic!("expected BinaryOp, got {:?}", r.return_items[0].expr);
+    };
+    assert_eq!(*op, BinaryOp::Add);
+}
+
+#[test]
+fn mul_binds_tighter_than_add() {
+    // `1 + 2 * 3` should parse as `1 + (2 * 3)`, not `(1 + 2) * 3`.
+    let s = parse("RETURN 1 + 2 * 3 AS r").unwrap();
+    let Statement::Return(r) = s else {
+        panic!("expected Return");
+    };
+    let Expr::BinaryOp { op, left: _, right } = &r.return_items[0].expr else {
+        panic!("expected BinaryOp at root");
+    };
+    assert_eq!(*op, BinaryOp::Add);
+    let Expr::BinaryOp { op: inner_op, .. } = right.as_ref() else {
+        panic!("expected BinaryOp on RHS, got {:?}", right);
+    };
+    assert_eq!(*inner_op, BinaryOp::Mul);
+}
+
+#[test]
+fn subtraction_is_left_associative() {
+    // `10 - 3 - 2` should parse as `(10 - 3) - 2 = 5`, not
+    // `10 - (3 - 2) = 9`. Verify by shape: the root is a Sub
+    // whose left child is itself a Sub.
+    let s = parse("RETURN 10 - 3 - 2 AS r").unwrap();
+    let Statement::Return(r) = s else {
+        panic!("expected Return");
+    };
+    let Expr::BinaryOp { op, left, .. } = &r.return_items[0].expr else {
+        panic!("expected BinaryOp");
+    };
+    assert_eq!(*op, BinaryOp::Sub);
+    assert!(matches!(
+        left.as_ref(),
+        Expr::BinaryOp {
+            op: BinaryOp::Sub,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn arithmetic_binds_tighter_than_comparison() {
+    // `a + 1 > 5` should parse as `(a + 1) > 5`, meaning the
+    // comparison's left side is a BinaryOp::Add.
+    let s = parse("MATCH (n) WHERE n.age + 1 > 18 RETURN n").unwrap();
+    let m = unwrap_match(s);
+    let Expr::Compare { left, .. } = first_match(&m).where_clause.clone().unwrap() else {
+        panic!("expected Compare");
+    };
+    assert!(matches!(
+        left.as_ref(),
+        Expr::BinaryOp {
+            op: BinaryOp::Add,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unary_negation_parses() {
+    let s = parse("MATCH (n) RETURN -n.age AS neg").unwrap();
+    let m = unwrap_match(s);
+    let Expr::UnaryOp { op, .. } = &m.terminal.return_items[0].expr else {
+        panic!("expected UnaryOp");
+    };
+    assert_eq!(*op, UnaryOp::Neg);
+}

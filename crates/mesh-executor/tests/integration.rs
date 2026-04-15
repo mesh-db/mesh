@@ -3600,3 +3600,117 @@ fn path_variable_with_unnamed_edge_still_binds() {
     assert_eq!(rows.len(), 1);
     assert_eq!(int_prop(&rows[0], "len"), 1);
 }
+
+#[test]
+fn arithmetic_integer_add_sub_mul_div_mod() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN 1 + 2 AS s, 10 - 3 AS d, 4 * 5 AS m, 20 / 6 AS q, 20 % 6 AS r",
+    );
+    assert_eq!(int_prop(&rows[0], "s"), 3);
+    assert_eq!(int_prop(&rows[0], "d"), 7);
+    assert_eq!(int_prop(&rows[0], "m"), 20);
+    assert_eq!(int_prop(&rows[0], "q"), 3); // truncated int division
+    assert_eq!(int_prop(&rows[0], "r"), 2);
+}
+
+#[test]
+fn arithmetic_precedence_matches_math() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN 1 + 2 * 3 AS r, (1 + 2) * 3 AS p");
+    assert_eq!(int_prop(&rows[0], "r"), 7);
+    assert_eq!(int_prop(&rows[0], "p"), 9);
+}
+
+#[test]
+fn arithmetic_int_float_coercion_widens_to_float() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN 1 + 2.5 AS r");
+    assert!((float_prop(&rows[0], "r") - 3.5).abs() < 1e-12);
+}
+
+#[test]
+fn arithmetic_unary_negation_on_expression() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {age: 36})");
+    let rows = run(&store, "MATCH (p:Person) RETURN -p.age AS neg");
+    assert_eq!(int_prop(&rows[0], "neg"), -36);
+}
+
+#[test]
+fn arithmetic_null_propagates() {
+    let (store, _d) = open_store();
+    // `null + 1` should produce null, not a type error.
+    let rows = run(&store, "RETURN coalesce(null) + 1 AS r");
+    assert!(matches!(
+        rows[0].get("r"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
+
+#[test]
+fn arithmetic_string_concat_with_plus() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN 'foo' + 'bar' AS r");
+    assert_eq!(str_prop(&rows[0], "r"), "foobar");
+}
+
+#[test]
+fn arithmetic_list_concat_with_plus() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [1, 2] + [3, 4] AS r");
+    match rows[0].get("r") {
+        Some(Value::List(items)) => {
+            assert_eq!(items.len(), 4);
+        }
+        other => panic!("expected list, got {other:?}"),
+    }
+}
+
+#[test]
+fn arithmetic_integer_divide_by_zero_errors() {
+    let (store, _d) = open_store();
+    let plan = mesh_cypher::plan(&mesh_cypher::parse("RETURN 1 / 0 AS r").unwrap()).unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    assert!(
+        matches!(err, mesh_executor::Error::DivideByZero),
+        "expected DivideByZero, got {err:?}"
+    );
+}
+
+#[test]
+fn arithmetic_mod_by_zero_errors() {
+    let (store, _d) = open_store();
+    let plan = mesh_cypher::plan(&mesh_cypher::parse("RETURN 5 % 0 AS r").unwrap()).unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    assert!(matches!(err, mesh_executor::Error::DivideByZero));
+}
+
+#[test]
+fn arithmetic_in_where_clause_filters_rows() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada', age: 30}), (:Person {name: 'Bob', age: 17})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE p.age + 1 > 18 RETURN p.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string()]);
+}
+
+#[test]
+fn arithmetic_with_parameters() {
+    let (store, _d) = open_store();
+    let mut params = ParamMap::new();
+    params.insert(
+        "multiplier".to_string(),
+        Value::Property(Property::Int64(10)),
+    );
+    let rows = run_with_params(&store, "RETURN 5 * $multiplier AS r", &params);
+    assert_eq!(int_prop(&rows[0], "r"), 50);
+}

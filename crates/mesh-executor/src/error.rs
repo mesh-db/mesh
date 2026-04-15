@@ -43,6 +43,9 @@ pub enum Error {
 
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    #[error("integer division or modulo by zero")]
+    DivideByZero,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
