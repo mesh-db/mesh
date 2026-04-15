@@ -336,6 +336,20 @@ pub enum Expr {
         predicate: Option<Box<Expr>>,
         projection: Option<Box<Expr>>,
     },
+    /// `reduce(acc = init, elem IN source | body)` — a left
+    /// fold over a list. `acc_init` is evaluated once against
+    /// the outer row; then for each element the evaluator binds
+    /// both `acc_var` (carrying the running accumulator) and
+    /// `elem_var` (the current element) into a scratch row and
+    /// evaluates `body` to produce the next accumulator. The
+    /// final accumulator is the expression's value.
+    Reduce {
+        acc_var: String,
+        acc_init: Box<Expr>,
+        elem_var: String,
+        source: Box<Expr>,
+        body: Box<Expr>,
+    },
     /// Binary arithmetic — `+`, `-`, `*`, `/`, `%`. Evaluated
     /// with numeric coercion (Int + Int = Int; any Float operand
     /// widens to Float) and null propagation. `+` additionally

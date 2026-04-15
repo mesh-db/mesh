@@ -266,6 +266,7 @@ op_contains    = @{ ^"contains" ~ !id_cont }
 
 primary = {
     case_expr |
+    reduce_expr |
     list_comp |
     list_literal |
     map_literal |
@@ -275,6 +276,21 @@ primary = {
     property_access |
     identifier |
     ("(" ~ expression ~ ")")
+}
+
+// `reduce(acc = init, x IN source | body)`. A left fold with its
+// own binding scope — `acc` holds the running accumulator, `x`
+// binds to each element in turn, and `body` computes the next
+// accumulator value. Parsed as a dedicated primary (not a plain
+// function_call) because the argument list uses `=` and `|`
+// which aren't legal inside a normal `fn_arg_list`. Slotted
+// above `function_call` in the `primary` alternation so the
+// `reduce` keyword is consumed as the special form.
+reduce_expr = {
+    kw_reduce ~ "(" ~
+    identifier ~ "=" ~ expression ~ "," ~
+    identifier ~ kw_in ~ expression ~ "|" ~ expression ~
+    ")"
 }
 
 // Map literal: `{k1: e1, k2: e2, ...}`. Distinct from pattern
@@ -374,3 +390,4 @@ kw_with = @{ ^"with" ~ !id_cont }
 kw_optional = @{ ^"optional" ~ !id_cont }
 kw_union = @{ ^"union" ~ !id_cont }
 kw_all = @{ ^"all" ~ !id_cont }
+kw_reduce = @{ ^"reduce" ~ !id_cont }

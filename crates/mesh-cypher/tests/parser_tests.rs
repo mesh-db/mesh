@@ -1818,3 +1818,53 @@ fn unary_negation_parses() {
     };
     assert_eq!(*op, UnaryOp::Neg);
 }
+
+#[test]
+fn reduce_expression_parses() {
+    let s = parse("RETURN reduce(acc = 0, x IN [1, 2, 3] | acc + x) AS total").unwrap();
+    let Statement::Return(r) = s else {
+        panic!("expected Return");
+    };
+    let Expr::Reduce {
+        acc_var,
+        elem_var,
+        acc_init,
+        source,
+        body,
+    } = &r.return_items[0].expr
+    else {
+        panic!("expected Expr::Reduce, got {:?}", r.return_items[0].expr);
+    };
+    assert_eq!(acc_var, "acc");
+    assert_eq!(elem_var, "x");
+    assert!(matches!(
+        acc_init.as_ref(),
+        Expr::Literal(Literal::Integer(0))
+    ));
+    assert!(matches!(source.as_ref(), Expr::List(items) if items.len() == 3));
+    assert!(matches!(
+        body.as_ref(),
+        Expr::BinaryOp {
+            op: BinaryOp::Add,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn reduce_with_property_source_parses() {
+    // The source side is a full expression, so row-variable
+    // property accesses like `a.friends` should be accepted.
+    let s = parse(
+        "MATCH (a:Person) \
+         RETURN reduce(total = 0, f IN a.friends | total + 1) AS count",
+    )
+    .unwrap();
+    let Statement::Match(m) = s else {
+        panic!("expected Match");
+    };
+    assert!(matches!(
+        m.terminal.return_items[0].expr,
+        Expr::Reduce { .. }
+    ));
+}

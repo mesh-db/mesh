@@ -1292,6 +1292,7 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             Ok(Expr::Map(entries))
         }
         Rule::list_comp => build_list_comp(pair),
+        Rule::reduce_expr => build_reduce_expr(pair),
         r => Err(Error::Parse(format!(
             "unexpected rule in expression: {:?}",
             r
@@ -1354,6 +1355,56 @@ fn build_case_expr(pair: Pair<Rule>) -> Result<Expr> {
         scrutinee,
         branches,
         else_expr,
+    })
+}
+
+fn build_reduce_expr(pair: Pair<Rule>) -> Result<Expr> {
+    // Grammar children after filtering out the silent `kw_reduce`
+    // and `kw_in` atoms are (in order):
+    //   identifier  acc_var
+    //   expression  acc_init
+    //   identifier  elem_var
+    //   expression  source
+    //   expression  body
+    // Keep the 5 positional slots rather than name-matching so a
+    // future grammar tweak that adds WHERE-style guards doesn't
+    // silently break the builder.
+    let mut ids: Vec<String> = Vec::with_capacity(2);
+    let mut exprs: Vec<Expr> = Vec::with_capacity(3);
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::kw_reduce | Rule::kw_in => {}
+            Rule::identifier => ids.push(p.as_str().to_string()),
+            Rule::expression => exprs.push(build_expression(p)?),
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in reduce_expr: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+    if ids.len() != 2 || exprs.len() != 3 {
+        return Err(Error::Parse(format!(
+            "reduce requires acc/elem identifiers and init/source/body exprs; \
+             got {} identifiers and {} expressions",
+            ids.len(),
+            exprs.len()
+        )));
+    }
+    let mut exprs_iter = exprs.into_iter();
+    let acc_init = exprs_iter.next().unwrap();
+    let source = exprs_iter.next().unwrap();
+    let body = exprs_iter.next().unwrap();
+    let mut ids_iter = ids.into_iter();
+    let acc_var = ids_iter.next().unwrap();
+    let elem_var = ids_iter.next().unwrap();
+    Ok(Expr::Reduce {
+        acc_var,
+        acc_init: Box::new(acc_init),
+        elem_var,
+        source: Box::new(source),
+        body: Box::new(body),
     })
 }
 

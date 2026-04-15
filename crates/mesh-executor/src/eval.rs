@@ -186,6 +186,59 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
             }
             Ok(Value::List(out))
         }
+        Expr::Reduce {
+            acc_var,
+            acc_init,
+            elem_var,
+            source,
+            body,
+        } => {
+            // Left fold: evaluate acc_init once, then for each
+            // element bind acc + elem into a scratch row and
+            // evaluate body to get the next acc. Empty source
+            // returns the init value unchanged. Null source
+            // propagates as in every other collection primitive.
+            let source_val = eval_expr(source, row, params)?;
+            let items = match source_val {
+                Value::List(items) => items,
+                Value::Property(Property::List(props)) => {
+                    props.into_iter().map(Value::Property).collect()
+                }
+                Value::Null => return Ok(Value::Null),
+                Value::Property(Property::Null) => return Ok(Value::Null),
+                _ => return Err(Error::TypeMismatch),
+            };
+            let mut acc = eval_expr(acc_init, row, params)?;
+            let mut scratch = row.clone();
+            // Save any prior bindings under the two iteration
+            // variables so reduce's scope doesn't leak into
+            // sibling expressions in the same row — Cypher's
+            // scoping rules make the fold's acc/elem ephemeral.
+            let prev_acc = scratch.get(acc_var).cloned();
+            let prev_elem = scratch.get(elem_var).cloned();
+            for item in items {
+                scratch.insert(acc_var.clone(), acc);
+                scratch.insert(elem_var.clone(), item);
+                acc = eval_expr(body, &scratch, params)?;
+            }
+            match prev_acc {
+                Some(v) => {
+                    scratch.insert(acc_var.clone(), v);
+                }
+                None => {
+                    scratch.remove(acc_var);
+                }
+            }
+            match prev_elem {
+                Some(v) => {
+                    scratch.insert(elem_var.clone(), v);
+                }
+                None => {
+                    scratch.remove(elem_var);
+                }
+            }
+            Ok(acc)
+        }
         Expr::BinaryOp { op, left, right } => {
             let l = eval_expr(left, row, params)?;
             let r = eval_expr(right, row, params)?;

@@ -3714,3 +3714,95 @@ fn arithmetic_with_parameters() {
     let rows = run_with_params(&store, "RETURN 5 * $multiplier AS r", &params);
     assert_eq!(int_prop(&rows[0], "r"), 50);
 }
+
+#[test]
+fn reduce_sums_integer_list() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN reduce(acc = 0, x IN [1, 2, 3, 4] | acc + x) AS total",
+    );
+    assert_eq!(int_prop(&rows[0], "total"), 10);
+}
+
+#[test]
+fn reduce_with_non_zero_initial_value() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN reduce(acc = 100, x IN [1, 2, 3] | acc + x) AS total",
+    );
+    assert_eq!(int_prop(&rows[0], "total"), 106);
+}
+
+#[test]
+fn reduce_computes_product_with_mul() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN reduce(p = 1, x IN [2, 3, 4] | p * x) AS product",
+    );
+    assert_eq!(int_prop(&rows[0], "product"), 24);
+}
+
+#[test]
+fn reduce_over_empty_list_returns_init() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN reduce(acc = 42, x IN [] | acc + x) AS total",
+    );
+    assert_eq!(int_prop(&rows[0], "total"), 42);
+}
+
+#[test]
+fn reduce_over_null_source_propagates_null() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN reduce(acc = 0, x IN coalesce(null) | acc + x) AS total",
+    );
+    assert!(matches!(
+        rows[0].get("total"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
+
+#[test]
+fn reduce_with_row_variable_in_body() {
+    // The body can reference outer bindings alongside acc + x.
+    // Using UNWIND to get a single row with a bound outer var,
+    // since bare `WITH` isn't valid without a prior reading clause.
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "UNWIND [10] AS multiplier \
+         RETURN reduce(acc = 0, x IN [1, 2, 3] | acc + x * multiplier) AS total",
+    );
+    // 0 + 1*10 + 2*10 + 3*10 = 60
+    assert_eq!(int_prop(&rows[0], "total"), 60);
+}
+
+#[test]
+fn reduce_scope_does_not_leak_iteration_vars() {
+    // After reduce finishes, the outer `x = 5` binding must
+    // survive — reduce's `x` shadow is scoped to the fold only.
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "UNWIND [5] AS x \
+         RETURN reduce(acc = 0, x IN [1, 2, 3] | acc + x) AS total, x AS outer_x",
+    );
+    assert_eq!(int_prop(&rows[0], "total"), 6);
+    assert_eq!(int_prop(&rows[0], "outer_x"), 5);
+}
+
+#[test]
+fn reduce_concatenates_strings() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN reduce(s = '', w IN ['foo', 'bar', 'baz'] | s + w) AS joined",
+    );
+    assert_eq!(str_prop(&rows[0], "joined"), "foobarbaz");
+}
