@@ -831,6 +831,16 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     // `(n:L {nonindexed: ...}) WHERE n.indexed = ...`.
     plan = optimize_filter_chain_to_index_seek(plan, ctx);
 
+    // Optional `WITH` stage between the MATCH pattern and the
+    // final RETURN: projects the row stream, applies an optional
+    // post-projection WHERE, then order / skip / limit. Pattern
+    // variables not carried through the WITH items go out of
+    // scope downstream — that's enforced implicitly by the Project
+    // operator, which only emits the named aliases.
+    if let Some(w) = &stmt.with_clause {
+        plan = apply_with_clause(plan, w)?;
+    }
+
     // Apply at most one mutation to the pipeline (they are grammatically exclusive).
     if let Some(delete_clause) = &stmt.delete {
         plan = LogicalPlan::Delete {
@@ -923,6 +933,64 @@ fn apply_return_pipeline(
     }
 
     if let Some(n) = limit {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            count: n,
+        };
+    }
+
+    Ok(plan)
+}
+
+/// Lower an intermediate `WITH` clause onto `plan`. The order of
+/// operations matches openCypher: projection/aggregation runs
+/// first, then DISTINCT, then the post-projection WHERE (which
+/// references the newly-bound aliases), then ORDER BY, SKIP, and
+/// LIMIT. Downstream clauses (RETURN, another MATCH) then see
+/// only the names introduced by this WITH's items.
+fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Result<LogicalPlan> {
+    let (group_keys, aggregates) = classify_return_items(&w.items)?;
+    plan = if !aggregates.is_empty() {
+        LogicalPlan::Aggregate {
+            input: Box::new(plan),
+            group_keys,
+            aggregates,
+        }
+    } else {
+        LogicalPlan::Project {
+            input: Box::new(plan),
+            items: w.items.clone(),
+        }
+    };
+
+    if w.distinct {
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+    }
+
+    // Post-projection WHERE — references the WITH's aliases,
+    // not the pattern's bindings.
+    if let Some(predicate) = &w.where_clause {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: predicate.clone(),
+        };
+    }
+
+    if !w.order_by.is_empty() {
+        plan = LogicalPlan::OrderBy {
+            input: Box::new(plan),
+            sort_items: w.order_by.clone(),
+        };
+    }
+    if let Some(n) = w.skip {
+        plan = LogicalPlan::Skip {
+            input: Box::new(plan),
+            count: n,
+        };
+    }
+    if let Some(n) = w.limit {
         plan = LogicalPlan::Limit {
             input: Box::new(plan),
             count: n,

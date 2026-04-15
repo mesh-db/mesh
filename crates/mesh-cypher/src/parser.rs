@@ -347,6 +347,7 @@ fn build_pattern_list(pair: Pair<Rule>) -> Result<Vec<Pattern>> {
 fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     let mut patterns: Vec<Pattern> = Vec::new();
     let mut where_clause = None;
+    let mut with_clause: Option<crate::ast::WithClause> = None;
     let mut return_items = Vec::new();
     let mut distinct = false;
     let mut order_by: Vec<SortItem> = Vec::new();
@@ -372,6 +373,9 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                     .next()
                     .ok_or_else(|| Error::Parse("empty where".into()))?;
                 where_clause = Some(build_expression(expr_pair)?);
+            }
+            Rule::with_tail => {
+                with_clause = Some(build_with_tail(p)?);
             }
             Rule::return_tail => {
                 parse_return_tail(
@@ -429,6 +433,7 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     Ok(MatchStmt {
         patterns,
         where_clause,
+        with_clause,
         return_items,
         distinct,
         order_by,
@@ -437,6 +442,63 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         set_items,
         delete,
         create_patterns,
+    })
+}
+
+/// Parse a `with_tail` pair (`WITH <items> [WHERE] [ORDER BY]
+/// [SKIP] [LIMIT]`) into a [`WithClause`]. Walks the inner rules
+/// in grammar order and fills each optional slot as it goes.
+fn build_with_tail(pair: Pair<Rule>) -> Result<crate::ast::WithClause> {
+    let mut items = Vec::new();
+    let mut distinct = false;
+    let mut where_clause: Option<Expr> = None;
+    let mut order_by: Vec<SortItem> = Vec::new();
+    let mut skip: Option<i64> = None;
+    let mut limit: Option<i64> = None;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            // `kw_with` is atomic so it shows up as a visible
+            // pair; other atomic keywords do the same. Just skip.
+            Rule::kw_with => {}
+            Rule::kw_distinct => distinct = true,
+            Rule::return_items => items = build_return_items(inner)?,
+            Rule::where_clause => {
+                let expr_pair = inner
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty where in WITH".into()))?;
+                where_clause = Some(build_expression(expr_pair)?);
+            }
+            Rule::order_by_clause => order_by = build_order_by(inner)?,
+            Rule::skip_clause => {
+                let int_pair = inner
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty skip in WITH".into()))?;
+                skip = Some(parse_integer(int_pair.as_str())?);
+            }
+            Rule::limit_clause => {
+                let int_pair = inner
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty limit in WITH".into()))?;
+                limit = Some(parse_integer(int_pair.as_str())?);
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in WITH tail: {:?}",
+                    r
+                )));
+            }
+        }
+    }
+    Ok(crate::ast::WithClause {
+        items,
+        distinct,
+        where_clause,
+        order_by,
+        skip,
+        limit,
     })
 }
 

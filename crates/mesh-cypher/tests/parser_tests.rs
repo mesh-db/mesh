@@ -1034,6 +1034,48 @@ fn bare_return_supports_multiple_items() {
 }
 
 #[test]
+fn with_clause_parses_with_projection() {
+    let m = unwrap_match(parse("MATCH (n) WITH n.name AS name RETURN name").unwrap());
+    let w = m.with_clause.expect("should have with_clause");
+    assert_eq!(w.items.len(), 1);
+    assert_eq!(w.items[0].alias.as_deref(), Some("name"));
+    assert!(w.where_clause.is_none());
+    assert!(!w.distinct);
+}
+
+#[test]
+fn with_clause_parses_with_where_filter() {
+    let m = unwrap_match(parse("MATCH (n) WITH n.age AS age WHERE age > 20 RETURN age").unwrap());
+    let w = m.with_clause.expect("should have with_clause");
+    assert!(w.where_clause.is_some());
+}
+
+#[test]
+fn with_clause_parses_distinct() {
+    let m = unwrap_match(parse("MATCH (n) WITH DISTINCT n.name AS name RETURN name").unwrap());
+    let w = m.with_clause.expect("should have with_clause");
+    assert!(w.distinct);
+}
+
+#[test]
+fn with_clause_parses_order_skip_limit() {
+    let m = unwrap_match(
+        parse("MATCH (n) WITH n.age AS age ORDER BY age DESC SKIP 1 LIMIT 5 RETURN age").unwrap(),
+    );
+    let w = m.with_clause.expect("should have with_clause");
+    assert_eq!(w.skip, Some(1));
+    assert_eq!(w.limit, Some(5));
+    assert_eq!(w.order_by.len(), 1);
+}
+
+#[test]
+fn match_without_with_still_parses() {
+    // Regression: existing MATCH RETURN shape stays intact.
+    let m = unwrap_match(parse("MATCH (n) RETURN n").unwrap());
+    assert!(m.with_clause.is_none());
+}
+
+#[test]
 fn merge_on_create_set_parses() {
     let stmt =
         parse("MERGE (p:Person {email: 'a@b'}) ON CREATE SET p.name = 'Ada' RETURN p").unwrap();

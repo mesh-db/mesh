@@ -53,7 +53,23 @@ unwind_stmt = {
 match_stmt = {
     kw_match ~ pattern_list ~
     where_clause? ~
-    (return_tail | ((set_tail | delete_tail | create_tail) ~ return_tail?))
+    (with_tail ~ return_tail | return_tail | ((set_tail | delete_tail | create_tail) ~ return_tail?))
+}
+
+// Intermediate projection / filter stage. Behaves like a
+// `return_tail` with a WHERE slot, and is lowered to the same
+// Project (or Aggregate) operator followed by the same
+// Distinct / OrderBy / Skip / Limit chain, plus a Filter for
+// the optional WHERE. Chained WITHs (`WITH ... WITH ... RETURN`)
+// are intentionally not supported yet — the surrounding
+// `match_stmt` only allows one `with_tail` before the final
+// `return_tail`.
+with_tail = {
+    kw_with ~ kw_distinct? ~ return_items ~
+    where_clause? ~
+    order_by_clause? ~
+    skip_clause? ~
+    limit_clause?
 }
 
 pattern_list = { pattern ~ ("," ~ pattern)* }
@@ -188,7 +204,8 @@ reserved = @{
      ^"set" | ^"delete" | ^"detach" |
      ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc" |
      ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind" |
-     ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on")
+     ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on" |
+     ^"with")
     ~ !id_cont
 }
 
@@ -224,3 +241,4 @@ kw_drop = @{ ^"drop" ~ !id_cont }
 kw_show = @{ ^"show" ~ !id_cont }
 kw_for = @{ ^"for" ~ !id_cont }
 kw_on = @{ ^"on" ~ !id_cont }
+kw_with = @{ ^"with" ~ !id_cont }

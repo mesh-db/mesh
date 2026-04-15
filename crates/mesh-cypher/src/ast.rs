@@ -79,6 +79,14 @@ pub struct CreateStmt {
 pub struct MatchStmt {
     pub patterns: Vec<Pattern>,
     pub where_clause: Option<Expr>,
+    /// Optional intermediate `WITH` projection between the MATCH
+    /// pattern and the final `RETURN`. When present, the plan
+    /// tree is `MATCH → [pre-WHERE] → WITH(items, WHERE, ORDER,
+    /// SKIP, LIMIT) → RETURN`, and the bindings downstream of
+    /// `with_clause` are *only* the names introduced by the WITH
+    /// items — pattern variables that aren't re-projected go out
+    /// of scope.
+    pub with_clause: Option<WithClause>,
     pub return_items: Vec<ReturnItem>,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,
@@ -87,6 +95,19 @@ pub struct MatchStmt {
     pub set_items: Vec<SetItem>,
     pub delete: Option<DeleteClause>,
     pub create_patterns: Vec<Pattern>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub items: Vec<ReturnItem>,
+    pub distinct: bool,
+    /// Post-projection filter. Applies to the row stream *after*
+    /// the WITH projection and before its ORDER BY / SKIP / LIMIT,
+    /// so predicates can reference the newly-introduced aliases.
+    pub where_clause: Option<Expr>,
+    pub order_by: Vec<SortItem>,
+    pub skip: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

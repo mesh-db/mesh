@@ -2209,6 +2209,78 @@ fn bare_return_with_parameter() {
 }
 
 #[test]
+fn with_clause_rebinds_variables_for_return() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada', age: 37})");
+    run(&store, "CREATE (:Person {name: 'Bob', age: 28})");
+    let rows = run(&store, "MATCH (p:Person) WITH p.name AS name RETURN name");
+    assert_eq!(rows.len(), 2);
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string(), "Bob".to_string()]);
+}
+
+#[test]
+fn with_clause_where_filters_on_projected_alias() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada', age: 37})");
+    run(&store, "CREATE (:Person {name: 'Bob', age: 28})");
+    run(&store, "CREATE (:Person {name: 'Cid', age: 19})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WITH p.name AS name, p.age AS age WHERE age >= 25 RETURN name",
+    );
+    assert_eq!(rows.len(), 2);
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["Ada".to_string(), "Bob".to_string()]);
+}
+
+#[test]
+fn with_clause_aggregates_then_filters() {
+    // The canonical `WITH n, count(...)` pipeline: count per
+    // group, then WHERE on the aggregated value.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {team: 'red'})");
+    run(&store, "CREATE (:Person {team: 'red'})");
+    run(&store, "CREATE (:Person {team: 'blue'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WITH p.team AS team, count(*) AS n WHERE n > 1 RETURN team",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "team"), "red");
+}
+
+#[test]
+fn with_clause_limit_applies_before_return() {
+    let (store, _d) = open_store();
+    for i in 0..5 {
+        run(&store, &format!("CREATE (:Item {{idx: {}}})", i));
+    }
+    let rows = run(
+        &store,
+        "MATCH (i:Item) WITH i.idx AS idx ORDER BY idx LIMIT 2 RETURN idx",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(int_prop(&rows[0], "idx"), 0);
+    assert_eq!(int_prop(&rows[1], "idx"), 1);
+}
+
+#[test]
+fn with_clause_distinct_drops_duplicates() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {team: 'red'})");
+    run(&store, "CREATE (:Person {team: 'red'})");
+    run(&store, "CREATE (:Person {team: 'blue'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WITH DISTINCT p.team AS team RETURN team",
+    );
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
 fn merge_on_create_sets_properties_on_first_run() {
     let (store, _d) = open_store();
     run(
