@@ -305,6 +305,17 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             let branch_ops: Vec<Box<dyn Operator>> = branches.iter().map(build_op).collect();
             Box::new(UnionOp::new(branch_ops, *all))
         }
+        LogicalPlan::BindPath {
+            input,
+            path_var,
+            node_vars,
+            edge_vars,
+        } => Box::new(BindPathOp::new(
+            build_op(input),
+            path_var.clone(),
+            node_vars.clone(),
+            edge_vars.clone(),
+        )),
         LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
         | LogicalPlan::ShowPropertyIndexes => {
@@ -737,7 +748,9 @@ fn value_to_property(v: Value) -> Result<Property> {
     match v {
         Value::Property(p) => Ok(p),
         Value::Null => Ok(Property::Null),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) => Err(Error::InvalidSetValue),
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path { .. } => {
+            Err(Error::InvalidSetValue)
+        }
     }
 }
 
@@ -865,7 +878,7 @@ impl Operator for IndexSeekOp {
             let property = match value {
                 Value::Property(p) => p,
                 Value::Null => Property::Null,
-                Value::Node(_) | Value::Edge(_) | Value::List(_) => {
+                Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path { .. } => {
                     return Err(Error::InvalidSetValue);
                 }
             };
@@ -1866,6 +1879,84 @@ impl Operator for DistinctOp {
             }
         }
         Ok(None)
+    }
+}
+
+/// Assemble a `Value::Path` from a row's already-bound node and
+/// edge variables. Emitted by `plan_pattern` when the source
+/// pattern carries `path_var`. The operator pulls `node_vars[i]`
+/// and `edge_vars[i]` out of every row, walks them in order, and
+/// inserts the result into the row under `path_var` before
+/// forwarding downstream.
+///
+/// Rows where any referenced variable is missing or not the
+/// expected Node/Edge shape get a `Value::Null` at `path_var` —
+/// matching how `OPTIONAL MATCH` flows null bindings through the
+/// downstream projection without hard-erroring. Missing bindings
+/// shouldn't normally happen (the planner fills in synthetic
+/// names via `ensure_path_bindings`), but the null fallback
+/// means an unexpected upstream shape degrades gracefully
+/// instead of crashing the whole query.
+struct BindPathOp {
+    input: Box<dyn Operator>,
+    path_var: String,
+    node_vars: Vec<String>,
+    edge_vars: Vec<String>,
+}
+
+impl BindPathOp {
+    fn new(
+        input: Box<dyn Operator>,
+        path_var: String,
+        node_vars: Vec<String>,
+        edge_vars: Vec<String>,
+    ) -> Self {
+        Self {
+            input,
+            path_var,
+            node_vars,
+            edge_vars,
+        }
+    }
+}
+
+impl Operator for BindPathOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        let Some(mut row) = self.input.next(ctx)? else {
+            return Ok(None);
+        };
+        // Extract the ordered node + edge sequence from the row.
+        // Any missing or wrong-shaped entry collapses the whole
+        // path binding to null and falls through.
+        let mut nodes: Vec<mesh_core::Node> = Vec::with_capacity(self.node_vars.len());
+        let mut edges: Vec<mesh_core::Edge> = Vec::with_capacity(self.edge_vars.len());
+        let mut abort = false;
+        for name in &self.node_vars {
+            match row.get(name) {
+                Some(Value::Node(n)) => nodes.push(n.clone()),
+                _ => {
+                    abort = true;
+                    break;
+                }
+            }
+        }
+        if !abort {
+            for name in &self.edge_vars {
+                match row.get(name) {
+                    Some(Value::Edge(e)) => edges.push(e.clone()),
+                    _ => {
+                        abort = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if abort {
+            row.insert(self.path_var.clone(), Value::Null);
+        } else {
+            row.insert(self.path_var.clone(), Value::Path { nodes, edges });
+        }
+        Ok(Some(row))
     }
 }
 

@@ -689,16 +689,38 @@ fn build_order_by(pair: Pair<Rule>) -> Result<Vec<SortItem>> {
 
 fn build_pattern(pair: Pair<Rule>) -> Result<Pattern> {
     let mut inner = pair.into_inner();
-    let start_pair = inner
+    let first = inner
         .next()
         .ok_or_else(|| Error::Parse("empty pattern".into()))?;
+
+    // Optional `identifier =` prefix that binds the whole
+    // traversal as a Path. When present, the next pair in the
+    // iterator is the real start `node_pattern`.
+    let (path_var, start_pair) = if first.as_rule() == Rule::path_var_binding {
+        let name = first
+            .into_inner()
+            .next()
+            .ok_or_else(|| Error::Parse("empty path_var_binding".into()))?
+            .as_str()
+            .to_string();
+        let node = inner
+            .next()
+            .ok_or_else(|| Error::Parse("path_var_binding not followed by node_pattern".into()))?;
+        (Some(name), node)
+    } else {
+        (None, first)
+    };
     let start = build_node_pattern(start_pair)?;
     let mut hops = Vec::new();
     for hop_pair in inner {
         debug_assert_eq!(hop_pair.as_rule(), Rule::hop);
         hops.push(build_hop(hop_pair)?);
     }
-    Ok(Pattern { start, hops })
+    Ok(Pattern {
+        start,
+        hops,
+        path_var,
+    })
 }
 
 fn build_hop(pair: Pair<Rule>) -> Result<Hop> {

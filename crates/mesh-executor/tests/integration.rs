@@ -3490,3 +3490,113 @@ fn map_literal_rejects_node_values() {
         "expected TypeMismatch, got {err:?}"
     );
 }
+
+#[test]
+fn path_variable_single_hop_binds_path() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}), (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH p = (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person) RETURN p",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("p") {
+        Some(Value::Path { nodes, edges }) => {
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(edges.len(), 1);
+            assert_eq!(
+                nodes[0].properties.get("name"),
+                Some(&Property::String("Ada".into()))
+            );
+            assert_eq!(
+                nodes[1].properties.get("name"),
+                Some(&Property::String("Bob".into()))
+            );
+            assert_eq!(edges[0].edge_type, "KNOWS");
+        }
+        other => panic!("expected Value::Path, got {other:?}"),
+    }
+}
+
+#[test]
+fn path_variable_length_returns_hop_count() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}), \
+                 (c:Person {name: 'Cara'}), (a)-[:KNOWS]->(b), (b)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH p = (a:Person {name: 'Ada'})-[:KNOWS]->(b)-[:KNOWS]->(c) \
+                 RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 2);
+}
+
+#[test]
+fn path_variable_nodes_and_relationships_unpack_sequence() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}), \
+                 (c:Person {name: 'Cara'}), (a)-[:KNOWS]->(b), (b)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH p = (a:Person {name: 'Ada'})-[:KNOWS]->(b)-[:KNOWS]->(c) \
+                 RETURN nodes(p) AS ns, relationships(p) AS rs",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("ns") {
+        Some(Value::List(items)) => {
+            assert_eq!(items.len(), 3);
+            assert!(items.iter().all(|v| matches!(v, Value::Node(_))));
+        }
+        other => panic!("expected Value::List of Node, got {other:?}"),
+    }
+    match rows[0].get("rs") {
+        Some(Value::List(items)) => {
+            assert_eq!(items.len(), 2);
+            assert!(items.iter().all(|v| matches!(v, Value::Edge(_))));
+        }
+        other => panic!("expected Value::List of Edge, got {other:?}"),
+    }
+}
+
+#[test]
+fn path_variable_zero_hop_pattern_is_single_node_path() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(&store, "MATCH p = (n:Person) RETURN length(p) AS len, p");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 0);
+    match rows[0].get("p") {
+        Some(Value::Path { nodes, edges }) => {
+            assert_eq!(nodes.len(), 1);
+            assert!(edges.is_empty());
+        }
+        other => panic!("expected Value::Path, got {other:?}"),
+    }
+}
+
+#[test]
+fn path_variable_with_unnamed_edge_still_binds() {
+    // The edge has no user-given variable; the planner should
+    // synthesize one so BindPath has an edge to pull out of the row.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}), (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH p = (a:Person)-[:KNOWS]->(b:Person) RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 1);
+}

@@ -8,6 +8,17 @@ pub enum Value {
     Edge(Edge),
     Property(Property),
     List(Vec<Value>),
+    /// A Cypher path — a materialized traversal produced by
+    /// `MATCH p = (...)-[...]->(...)`. The invariant is
+    /// `nodes.len() == edges.len() + 1`; a zero-hop path
+    /// (`MATCH p = (n)`) has one node and zero edges. Stored
+    /// alongside the other Value variants (rather than inside
+    /// `Property`) because paths carry full Node/Edge values
+    /// which the backend-neutral `Property` type can't hold.
+    Path {
+        nodes: Vec<Node>,
+        edges: Vec<Edge>,
+    },
     Null,
 }
 

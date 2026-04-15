@@ -219,6 +219,20 @@ pub enum LogicalPlan {
         branches: Vec<LogicalPlan>,
         all: bool,
     },
+    /// Assemble a `Value::Path` into the row stream from the
+    /// sequence of node / edge variables a pattern binds. Emitted
+    /// once per row by `plan_pattern` when the source `Pattern`
+    /// carries a `path_var`. `node_vars` holds the ordered list
+    /// of per-hop node bindings (start + one per hop, so
+    /// `node_vars.len() == edge_vars.len() + 1`). `edge_vars` has
+    /// one entry per hop, referencing the edge variable the
+    /// corresponding `EdgeExpand` binds into the row.
+    BindPath {
+        input: Box<LogicalPlan>,
+        path_var: String,
+        node_vars: Vec<String>,
+        edge_vars: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -616,7 +630,17 @@ fn plan_pattern(
     pattern_idx: usize,
     ctx: &PlannerContext,
 ) -> Result<LogicalPlan> {
-    let start_var = pattern
+    // Clone + pre-fill synthetic names for unnamed edges/targets
+    // when the pattern has a path variable, so every hop binds a
+    // named node and edge that `BindPath` can pull out of the row.
+    // For path-less patterns the clone is untouched and behaves
+    // identically to the original.
+    let mut working = pattern.clone();
+    if working.path_var.is_some() {
+        ensure_path_bindings(&mut working, pattern_idx)?;
+    }
+
+    let start_var = working
         .start
         .var
         .clone()
@@ -624,15 +648,16 @@ fn plan_pattern(
 
     let (mut plan, remaining_props) = plan_start_node(
         &start_var,
-        &pattern.start.labels,
-        &pattern.start.properties,
+        &working.start.labels,
+        &working.start.properties,
         ctx,
     );
     // Any pattern properties not consumed by an IndexSeek still need a
     // filter so the executor actually enforces them.
     plan = wrap_with_pattern_prop_filter(plan, &start_var, &remaining_props);
 
-    chain_hops(plan, pattern, &start_var, pattern_idx)
+    let plan = chain_hops(plan, &working, &start_var, pattern_idx)?;
+    Ok(wrap_with_bind_path(plan, &working, &start_var))
 }
 
 /// Lower a pattern that starts from an already-bound row-stream
@@ -663,7 +688,77 @@ fn plan_pattern_from_bound(
         .var
         .clone()
         .expect("plan_pattern_from_bound requires a named start variable");
-    chain_hops(input, pattern, &start_var, pattern_idx)
+    let mut working = pattern.clone();
+    if working.path_var.is_some() {
+        ensure_path_bindings(&mut working, pattern_idx)?;
+    }
+    let plan = chain_hops(input, &working, &start_var, pattern_idx)?;
+    Ok(wrap_with_bind_path(plan, &working, &start_var))
+}
+
+/// Pre-fill synthetic names for unnamed edges and target nodes
+/// in a path-bound pattern so every hop binds something the
+/// `BindPath` operator can reference. Synthetic names match the
+/// `__p{idx}_{e,a}{i}` scheme `chain_hops` uses for auto-named
+/// targets, so the two halves stay consistent even if someone
+/// mixes named and unnamed hops in the same pattern.
+///
+/// Rejects variable-length hops: `VarLengthExpand` doesn't track
+/// intermediate nodes along the walk, so a `Value::Path` built
+/// from its output would be missing data. Drivers that need
+/// variable-length path binding should use a concrete depth
+/// (`[*2..2]` → unrolled as two fixed hops) or wait for a
+/// follow-up that extends `VarLengthExpand` to retain the walk.
+fn ensure_path_bindings(pattern: &mut Pattern, pattern_idx: usize) -> Result<()> {
+    for (i, hop) in pattern.hops.iter_mut().enumerate() {
+        if hop.rel.var_length.is_some() {
+            return Err(Error::Plan(
+                "variable-length patterns (`*`) cannot be bound to a path variable yet; \
+                 use concrete hop counts or drop the path binding"
+                    .into(),
+            ));
+        }
+        if hop.rel.var.is_none() {
+            hop.rel.var = Some(format!("__p{}_e{}", pattern_idx, i + 1));
+        }
+        if hop.target.var.is_none() {
+            hop.target.var = Some(format!("__p{}_a{}", pattern_idx, i + 1));
+        }
+    }
+    Ok(())
+}
+
+/// Wrap `plan` in a `BindPath` operator when the pattern carries
+/// a path variable. The collected `node_vars` / `edge_vars`
+/// reference the per-hop bindings `ensure_path_bindings` filled
+/// in, plus the pattern's start variable as the first node.
+fn wrap_with_bind_path(plan: LogicalPlan, pattern: &Pattern, start_var: &str) -> LogicalPlan {
+    let Some(path_var) = pattern.path_var.clone() else {
+        return plan;
+    };
+    let mut node_vars = Vec::with_capacity(pattern.hops.len() + 1);
+    let mut edge_vars = Vec::with_capacity(pattern.hops.len());
+    node_vars.push(start_var.to_string());
+    for hop in &pattern.hops {
+        edge_vars.push(
+            hop.rel
+                .var
+                .clone()
+                .expect("ensure_path_bindings must have filled edge var"),
+        );
+        node_vars.push(
+            hop.target
+                .var
+                .clone()
+                .expect("ensure_path_bindings must have filled target var"),
+        );
+    }
+    LogicalPlan::BindPath {
+        input: Box::new(plan),
+        path_var,
+        node_vars,
+        edge_vars,
+    }
 }
 
 /// Chain `EdgeExpand` / `VarLengthExpand` operators for every

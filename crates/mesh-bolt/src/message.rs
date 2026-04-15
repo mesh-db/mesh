@@ -42,6 +42,13 @@ pub const TAG_FAILURE: u8 = 0x7F;
 pub const TAG_NODE: u8 = 0x4E;
 pub const TAG_RELATIONSHIP: u8 = 0x52;
 pub const TAG_UNBOUND_RELATIONSHIP: u8 = 0x72;
+/// Bolt 4.4 Path struct. Fields are `{nodes: List<Node>,
+/// rels: List<UnboundRelationship>, sequence: List<Int>}` — the
+/// sequence alternates `(rel_index, node_index)` pairs so the
+/// client can reconstruct the traversal with deduplicated nodes
+/// and rels. `value_conv::path_to_bolt` in mesh-server packs our
+/// `Value::Path` into this shape.
+pub const TAG_PATH: u8 = 0x50;
 
 /// One logical Bolt message. The coarse-grained variants are carried as
 /// `BoltValue::Map`s rather than typed structs so the library stays

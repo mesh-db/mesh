@@ -227,6 +227,11 @@ pub struct DeleteClause {
 pub struct Pattern {
     pub start: NodePattern,
     pub hops: Vec<Hop>,
+    /// `Some(p)` when the pattern was written as `p = (...)-[...]->(...)`.
+    /// Plans with a path variable wrap the expand chain in a
+    /// `BindPath` operator that assembles the traversed
+    /// node/edge sequence into a `Value::Path` bound to `p`.
+    pub path_var: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

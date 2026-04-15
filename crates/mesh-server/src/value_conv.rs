@@ -13,7 +13,7 @@
 //! long-term stability (Bolt 5+) should use `element_id`, which we
 //! set to the full UUID string.
 
-use mesh_bolt::{BoltValue, TAG_NODE, TAG_RELATIONSHIP};
+use mesh_bolt::{BoltValue, TAG_NODE, TAG_PATH, TAG_RELATIONSHIP, TAG_UNBOUND_RELATIONSHIP};
 use mesh_core::{Edge, Node, NodeId, Property};
 use mesh_executor::{ParamMap, Row, Value};
 use std::collections::HashMap;
@@ -56,6 +56,91 @@ fn value_to_bolt(value: &Value) -> BoltValue {
         Value::List(items) => BoltValue::List(items.iter().map(value_to_bolt).collect()),
         Value::Node(n) => node_to_bolt(n),
         Value::Edge(e) => edge_to_bolt(e),
+        Value::Path { nodes, edges } => path_to_bolt(nodes, edges),
+    }
+}
+
+/// Convert a `Value::Path` into a Bolt 4.4 Path struct (tag
+/// `TAG_PATH`). The wire format uses three parallel lists:
+/// `nodes` and `rels` are deduplicated, and `sequence`
+/// alternates `(rel_index_1based_signed, node_index)` pairs so
+/// the client can walk the traversal in order. Sign of the
+/// rel index encodes direction: positive means source→target,
+/// negative means target→source — for the v1 path binding we
+/// always emit positive indices because `BindPath` assembles
+/// the sequence in forward traversal order regardless of the
+/// query's arrow direction.
+///
+/// Rel deduplication is keyed off the RocksDB `EdgeId`, which
+/// is unique within a path even when the same edge type is
+/// traversed twice. Node deduplication uses the `NodeId`
+/// similarly — a cyclic path that returns to its start still
+/// produces a single entry in `nodes` and a sequence that
+/// references it twice, matching Neo4j's shape.
+fn path_to_bolt(nodes: &[Node], edges: &[Edge]) -> BoltValue {
+    use std::collections::HashMap as StdHashMap;
+
+    let mut unique_nodes: Vec<BoltValue> = Vec::new();
+    let mut node_index: StdHashMap<NodeId, i64> = StdHashMap::new();
+    for n in nodes {
+        if !node_index.contains_key(&n.id) {
+            node_index.insert(n.id, unique_nodes.len() as i64);
+            unique_nodes.push(node_to_bolt(n));
+        }
+    }
+
+    let mut unique_rels: Vec<BoltValue> = Vec::new();
+    let mut rel_index: StdHashMap<mesh_core::EdgeId, i64> = StdHashMap::new();
+    for e in edges {
+        if !rel_index.contains_key(&e.id) {
+            // Bolt's path rel indices are 1-based (0 would be
+            // ambiguous with the sign bit), so we stage the
+            // 1-based slot here and push the unbound rel into
+            // the deduped list.
+            rel_index.insert(e.id, (unique_rels.len() as i64) + 1);
+            unique_rels.push(unbound_relationship_to_bolt(e));
+        }
+    }
+
+    // Sequence alternates rel_index, node_index for each hop.
+    // Path with N nodes has N-1 hops; sequence length = 2*(N-1).
+    let mut sequence: Vec<BoltValue> = Vec::with_capacity(2 * edges.len());
+    for (i, e) in edges.iter().enumerate() {
+        sequence.push(BoltValue::Int(rel_index[&e.id]));
+        // Target node for this hop = nodes[i + 1].
+        sequence.push(BoltValue::Int(node_index[&nodes[i + 1].id]));
+    }
+
+    BoltValue::Struct {
+        tag: TAG_PATH,
+        fields: vec![
+            BoltValue::List(unique_nodes),
+            BoltValue::List(unique_rels),
+            BoltValue::List(sequence),
+        ],
+    }
+}
+
+/// Bolt 4.4 UnboundRelationship — a relationship without its
+/// source/target node ids, used inside Path structs where the
+/// endpoints are reconstructed from the `sequence` indices into
+/// the accompanying `nodes` list. Fields:
+/// `{id, type, properties, element_id}`.
+fn unbound_relationship_to_bolt(edge: &Edge) -> BoltValue {
+    let mut props: Vec<(String, BoltValue)> = edge
+        .properties
+        .iter()
+        .map(|(k, v)| (k.clone(), property_to_bolt(v)))
+        .collect();
+    props.sort_by(|a, b| a.0.cmp(&b.0));
+    BoltValue::Struct {
+        tag: TAG_UNBOUND_RELATIONSHIP,
+        fields: vec![
+            BoltValue::Int(edge_uuid_to_bolt_id(edge.id)),
+            BoltValue::String(edge.edge_type.clone()),
+            BoltValue::Map(props),
+            BoltValue::String(edge.id.as_uuid().to_string()),
+        ],
     }
 }
 

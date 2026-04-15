@@ -110,11 +110,13 @@ pub(crate) fn eval_expr(expr: &Expr, row: &Row, params: &ParamMap) -> Result<Val
                         }
                         Property::List(props)
                     }
-                    // Nodes and Edges can't nest inside a Property::Map
-                    // in the current type model. Cypher's real
-                    // semantics allow this; revisit if driver code
-                    // actually needs it.
-                    Value::Node(_) | Value::Edge(_) => return Err(Error::TypeMismatch),
+                    // Nodes / Edges / Paths can't nest inside a
+                    // Property::Map in the current type model.
+                    // Cypher's real semantics allow this; revisit
+                    // if driver code actually needs it.
+                    Value::Node(_) | Value::Edge(_) | Value::Path { .. } => {
+                        return Err(Error::TypeMismatch)
+                    }
                 };
                 out.insert(key.clone(), prop);
             }
@@ -219,6 +221,37 @@ fn call_scalar(name: &str, args: &CallArgs, row: &Row, params: &ParamMap) -> Res
                 }
                 Value::Property(Property::String(s)) => {
                     Ok(Value::Property(Property::Int64(s.chars().count() as i64)))
+                }
+                // `length(p)` on a Path returns the number of
+                // relationships traversed, matching Cypher's
+                // definition. Lists and paths converge on `size`
+                // here too so `size(p)` is a synonym.
+                Value::Path { edges, .. } => {
+                    Ok(Value::Property(Property::Int64(edges.len() as i64)))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "nodes" => {
+            // `nodes(p)` returns the ordered list of nodes in a
+            // path. Null-propagating: `nodes(null)` → null.
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Path { nodes, .. } => {
+                    Ok(Value::List(nodes.into_iter().map(Value::Node).collect()))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "relationships" => {
+            // `relationships(p)` returns the ordered list of edges
+            // in a path. Null-propagating.
+            let v = single_arg(name, arg_exprs, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Path { edges, .. } => {
+                    Ok(Value::List(edges.into_iter().map(Value::Edge).collect()))
                 }
                 _ => Err(Error::TypeMismatch),
             }
@@ -759,6 +792,25 @@ pub(crate) fn value_key(v: &Value) -> String {
         }
         Value::Node(n) => format!("N:{}", n.id),
         Value::Edge(e) => format!("E:{}", e.id),
+        Value::Path { nodes, edges } => {
+            // Stable key: "P:<start>;<e0>,<n1>;<e1>,<n2>;...". Enough
+            // to distinguish paths for DISTINCT/UNION dedup even
+            // when two paths visit the same set of nodes in
+            // different orders.
+            let mut out = String::from("P:");
+            if let Some(first) = nodes.first() {
+                out.push_str(&first.id.to_string());
+            }
+            for (i, e) in edges.iter().enumerate() {
+                out.push(';');
+                out.push_str(&e.id.to_string());
+                out.push(',');
+                if let Some(n) = nodes.get(i + 1) {
+                    out.push_str(&n.id.to_string());
+                }
+            }
+            out
+        }
         Value::List(items) => {
             let mut out = String::from("L:[");
             for it in items {

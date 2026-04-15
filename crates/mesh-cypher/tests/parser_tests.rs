@@ -1695,3 +1695,47 @@ fn map_literal_with_property_reference_parses() {
         Expr::Property { ref var, ref key } if var == "a" && key == "name"
     ));
 }
+
+fn first_pattern(m: &MatchStmt) -> &Pattern {
+    match &m.clauses[0] {
+        ReadingClause::Match(c) => &c.patterns[0],
+        _ => panic!("expected first clause to be MATCH"),
+    }
+}
+
+#[test]
+fn path_variable_on_single_hop_pattern_parses() {
+    let m = unwrap_match(parse("MATCH p = (a)-[:KNOWS]->(b) RETURN p").unwrap());
+    let pat = first_pattern(&m);
+    assert_eq!(pat.path_var.as_deref(), Some("p"));
+    assert_eq!(pat.hops.len(), 1);
+}
+
+#[test]
+fn path_variable_on_zero_hop_pattern_parses() {
+    // `MATCH p = (n)` — a trivial path containing just one node.
+    let m = unwrap_match(parse("MATCH p = (n:Person) RETURN p").unwrap());
+    let pat = first_pattern(&m);
+    assert_eq!(pat.path_var.as_deref(), Some("p"));
+    assert!(pat.hops.is_empty());
+}
+
+#[test]
+fn path_variable_with_variable_length_rejected_at_plan_time() {
+    // Parser accepts the shape; the planner rejects var-length
+    // patterns under a path variable because `VarLengthExpand`
+    // doesn't retain intermediate nodes.
+    let s = parse("MATCH p = (a)-[:KNOWS*1..3]->(b) RETURN p").unwrap();
+    let err = plan(&s).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("variable-length") && msg.contains("path variable"),
+        "expected var-length rejection message, got: {msg}"
+    );
+}
+
+#[test]
+fn pattern_without_path_variable_has_none() {
+    let m = unwrap_match(parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap());
+    assert_eq!(first_pattern(&m).path_var, None);
+}

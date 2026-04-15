@@ -174,7 +174,15 @@ set_replace_item = { identifier ~ "=" ~ properties }
 delete_tail = { kw_detach? ~ kw_delete ~ delete_items }
 delete_items = { identifier ~ ("," ~ identifier)* }
 
-pattern = { node_pattern ~ hop* }
+// A pattern is a start node plus zero or more relationship+node
+// hops, optionally prefixed with `<var> =` to bind the full
+// traversal as a Path value. The named form is only valid in
+// read contexts (MATCH / OPTIONAL MATCH) and is rejected by the
+// planner for variable-length patterns — `VarLengthExpand`
+// doesn't currently track intermediate nodes along the expanded
+// walk, and a Path requires them.
+pattern = { path_var_binding? ~ node_pattern ~ hop* }
+path_var_binding = { identifier ~ "=" }
 hop = { rel_pattern ~ node_pattern }
 
 rel_pattern = { rel_right | rel_left | rel_both }
