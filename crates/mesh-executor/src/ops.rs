@@ -129,6 +129,7 @@ pub fn execute_with_reader(
     if let Some(rows) = try_execute_ddl(plan, reader, writer)? {
         return Ok(rows);
     }
+    let suppress_output = is_write_only_plan(plan);
     let mut op = build_op(plan);
     let ctx = ExecCtx {
         store: reader,
@@ -139,7 +140,33 @@ pub fn execute_with_reader(
     while let Some(row) = op.next(&ctx)? {
         rows.push(row);
     }
-    Ok(rows)
+    if suppress_output {
+        Ok(Vec::new())
+    } else {
+        Ok(rows)
+    }
+}
+
+fn is_write_only_plan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::CreatePath { input: None, .. } => true,
+        LogicalPlan::Delete { .. }
+        | LogicalPlan::SetProperty { .. }
+        | LogicalPlan::Remove { .. }
+        | LogicalPlan::Foreach { .. } => !has_projection_above(plan),
+        _ => false,
+    }
+}
+
+fn has_projection_above(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Project { .. } | LogicalPlan::Identity { .. } => true,
+        LogicalPlan::Distinct { input }
+        | LogicalPlan::OrderBy { input, .. }
+        | LogicalPlan::Skip { input, .. }
+        | LogicalPlan::Limit { input, .. } => has_projection_above(input),
+        _ => false,
+    }
 }
 
 /// DDL dispatch. Returns `Ok(Some(rows))` when `plan` is a schema
