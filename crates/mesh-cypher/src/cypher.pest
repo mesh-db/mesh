@@ -128,7 +128,7 @@ match_clause = {
 // `match_stmt`.
 terminal_tail = {
     return_tail
-    | ((set_tail | delete_tail | create_tail) ~ return_tail?)
+    | ((set_tail | delete_tail | create_tail | remove_tail) ~ return_tail?)
 }
 
 // `OPTIONAL MATCH <pattern> [WHERE ...]` — left-join semantics.
@@ -180,6 +180,12 @@ set_label_item = { identifier ~ label_spec+ }
 set_prop_item = { property_access ~ "=" ~ expression }
 set_merge_item = { identifier ~ "+=" ~ properties }
 set_replace_item = { identifier ~ "=" ~ properties }
+
+remove_tail = { kw_remove ~ remove_items }
+remove_items = { remove_item ~ ("," ~ remove_item)* }
+remove_item = { remove_label_item | remove_prop_item }
+remove_label_item = { identifier ~ label_spec+ }
+remove_prop_item = { property_access }
 
 delete_tail = { kw_detach? ~ kw_delete ~ delete_items }
 delete_items = { identifier ~ ("," ~ identifier)* }
@@ -416,7 +422,7 @@ reserved = @{
      ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc" |
      ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind" |
      ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on" |
-     ^"with" | ^"optional" | ^"contains" | ^"explain")
+     ^"with" | ^"optional" | ^"contains" | ^"explain" | ^"remove")
     ~ !id_cont
 }
 
@@ -459,5 +465,6 @@ kw_all = @{ ^"all" ~ !id_cont }
 kw_reduce = @{ ^"reduce" ~ !id_cont }
 kw_exists = @{ ^"exists" ~ !id_cont }
 kw_explain = @{ ^"explain" ~ !id_cont }
+kw_remove = _{ ^"remove" }
 kw_shortest_path = @{ ^"shortestPath" ~ !id_cont }
 kw_all_shortest_paths = @{ ^"allShortestPaths" ~ !id_cont }

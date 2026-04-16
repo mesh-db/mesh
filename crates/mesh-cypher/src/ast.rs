@@ -181,6 +181,7 @@ pub struct TerminalTail {
     pub set_items: Vec<SetItem>,
     pub delete: Option<DeleteClause>,
     pub create_patterns: Vec<Pattern>,
+    pub remove_items: Vec<RemoveItem>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,6 +235,12 @@ pub enum SetItem {
         var: String,
         properties: Vec<(String, Expr)>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoveItem {
+    Property { var: String, key: String },
+    Labels { var: String, labels: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -119,6 +119,10 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         assignments: Vec<SetAssignment>,
     },
+    Remove {
+        input: Box<LogicalPlan>,
+        items: Vec<RemoveSpec>,
+    },
     /// Match-or-create a single node. If at least one node matches the
     /// `(labels, properties)` pattern, returns one row per match (binding
     /// the existing node to `var`). If none match, creates exactly one
@@ -313,6 +317,12 @@ pub enum SetAssignment {
         var: String,
         properties: Vec<(String, Expr)>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoveSpec {
+    Property { var: String, key: String },
+    Labels { var: String, labels: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -517,6 +527,10 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         }
         LogicalPlan::SetProperty { input, .. } => {
             buf.push_str(&format!("{indent}SetProperty\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::Remove { input, .. } => {
+            buf.push_str(&format!("{indent}Remove\n"));
             format_plan_inner(input, buf, depth + 1);
         }
         LogicalPlan::IndexSeek {
@@ -764,6 +778,7 @@ where
         | LogicalPlan::Skip { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Delete { input, .. }
+        | LogicalPlan::Remove { input, .. }
         | LogicalPlan::MergeEdge { input, .. }
         | LogicalPlan::BindPath { input, .. }
         | LogicalPlan::ShortestPath { input, .. } => walk_plan_exprs(input, visit),
@@ -2138,6 +2153,25 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
             input: Box::new(plan),
             assignments,
         };
+    } else if !terminal.remove_items.is_empty() {
+        let items = terminal
+            .remove_items
+            .iter()
+            .map(|ri| match ri {
+                crate::ast::RemoveItem::Property { var, key } => RemoveSpec::Property {
+                    var: var.clone(),
+                    key: key.clone(),
+                },
+                crate::ast::RemoveItem::Labels { var, labels } => RemoveSpec::Labels {
+                    var: var.clone(),
+                    labels: labels.clone(),
+                },
+            })
+            .collect();
+        plan = LogicalPlan::Remove {
+            input: Box::new(plan),
+            items,
+        };
     } else if !terminal.create_patterns.is_empty() {
         let mut nodes: Vec<CreateNodeSpec> = Vec::new();
         let mut edges: Vec<CreateEdgeSpec> = Vec::new();
@@ -2154,7 +2188,8 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
 
     let has_mutation = terminal.delete.is_some()
         || !terminal.set_items.is_empty()
-        || !terminal.create_patterns.is_empty();
+        || !terminal.create_patterns.is_empty()
+        || !terminal.remove_items.is_empty();
 
     // MERGE clauses count as side-effectful even without a
     // trailing RETURN, so `MERGE (x)` is a valid complete

@@ -2674,6 +2674,96 @@ fn create_with_return_edge() {
     assert_eq!(str_prop(&rows[0], "b"), "Bob");
 }
 
+// --- REMOVE clause -----------------------------------------------------
+
+#[test]
+fn remove_property_deletes_from_node() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada', age: 37})");
+    run(&store, "MATCH (p:Person {name: 'Ada'}) REMOVE p.age");
+    let rows = run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) RETURN exists(p.age) AS has_age",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("has_age") {
+        Some(Value::Property(Property::Bool(b))) => assert!(!b),
+        other => panic!("expected false, got: {other:?}"),
+    }
+}
+
+#[test]
+fn remove_label_strips_label_from_node() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person:Employee {name: 'Ada'})");
+    run(&store, "MATCH (p:Person {name: 'Ada'}) REMOVE p:Employee");
+    let rows = run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) RETURN labels(p) AS labs",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("labs") {
+        Some(Value::List(labs)) => {
+            let names: Vec<&str> = labs
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::String(s)) => s.as_str(),
+                    _ => panic!("expected string"),
+                })
+                .collect();
+            assert!(names.contains(&"Person"));
+            assert!(!names.contains(&"Employee"));
+        }
+        other => panic!("expected list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn remove_multiple_items() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person:Admin {name: 'Ada', age: 37, email: 'ada@x.com'})",
+    );
+    run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) REMOVE p.age, p.email, p:Admin",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) \
+         RETURN exists(p.age) AS a, exists(p.email) AS e, labels(p) AS labs",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("a") {
+        Some(Value::Property(Property::Bool(b))) => assert!(!b),
+        other => panic!("expected false, got: {other:?}"),
+    }
+    match rows[0].get("e") {
+        Some(Value::Property(Property::Bool(b))) => assert!(!b),
+        other => panic!("expected false, got: {other:?}"),
+    }
+    match rows[0].get("labs") {
+        Some(Value::List(labs)) => {
+            assert_eq!(labs.len(), 1);
+        }
+        other => panic!("expected list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn remove_nonexistent_property_is_noop() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "MATCH (p:Person {name: 'Ada'}) REMOVE p.missing");
+    let rows = run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) RETURN p.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
 // --- Parameter execution -----------------------------------------------
 
 #[test]

@@ -600,6 +600,55 @@ fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail
                 }
                 terminal.delete = Some(DeleteClause { detach, vars });
             }
+            Rule::remove_tail => {
+                let items_pair = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty remove".into()))?;
+                for item_pair in items_pair.into_inner() {
+                    debug_assert_eq!(item_pair.as_rule(), Rule::remove_item);
+                    let inner = item_pair
+                        .into_inner()
+                        .next()
+                        .ok_or_else(|| Error::Parse("empty remove item".into()))?;
+                    match inner.as_rule() {
+                        Rule::remove_prop_item => {
+                            let mut parts = inner.into_inner();
+                            let pa = parts.next().unwrap();
+                            let mut pa_inner = pa.into_inner();
+                            let var = pa_inner.next().unwrap().as_str().to_string();
+                            let key = pa_inner.next().unwrap().as_str().to_string();
+                            terminal
+                                .remove_items
+                                .push(crate::ast::RemoveItem::Property { var, key });
+                        }
+                        Rule::remove_label_item => {
+                            let mut var = String::new();
+                            let mut labels = Vec::new();
+                            for child in inner.into_inner() {
+                                match child.as_rule() {
+                                    Rule::identifier => var = child.as_str().to_string(),
+                                    Rule::label_spec => {
+                                        let label =
+                                            child.into_inner().next().unwrap().as_str().to_string();
+                                        labels.push(label);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            terminal
+                                .remove_items
+                                .push(crate::ast::RemoveItem::Labels { var, labels });
+                        }
+                        r => {
+                            return Err(Error::Parse(format!(
+                                "unexpected rule in remove item: {:?}",
+                                r
+                            )));
+                        }
+                    }
+                }
+            }
             r => {
                 return Err(Error::Parse(format!(
                     "unexpected rule in terminal tail: {:?}",

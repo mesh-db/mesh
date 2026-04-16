@@ -8,7 +8,7 @@ use crate::{
 use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use mesh_cypher::{
     AggregateArg, AggregateFn, AggregateSpec, CreateEdgeSpec, CreateNodeSpec, Direction, Expr,
-    LogicalPlan, ReturnItem, SetAssignment, SortItem,
+    LogicalPlan, RemoveSpec, ReturnItem, SetAssignment, SortItem,
 };
 use mesh_storage::RocksDbStorageEngine;
 use std::cmp::Ordering;
@@ -197,6 +197,9 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
         } => Box::new(DeleteOp::new(build_op(input), *detach, vars.clone())),
         LogicalPlan::SetProperty { input, assignments } => {
             Box::new(SetPropertyOp::new(build_op(input), assignments.clone()))
+        }
+        LogicalPlan::Remove { input, items } => {
+            Box::new(RemoveOp::new(build_op(input), items.clone()))
         }
         LogicalPlan::NodeScanAll { var } => Box::new(NodeScanAllOp::new(var.clone())),
         LogicalPlan::NodeScanByLabels { var, labels } => {
@@ -859,6 +862,62 @@ impl Operator for SetPropertyOp {
                     }
                 }
 
+                Ok(Some(row))
+            }
+        }
+    }
+}
+
+struct RemoveOp {
+    input: Box<dyn Operator>,
+    items: Vec<RemoveSpec>,
+}
+
+impl RemoveOp {
+    fn new(input: Box<dyn Operator>, items: Vec<RemoveSpec>) -> Self {
+        Self { input, items }
+    }
+}
+
+impl Operator for RemoveOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        match self.input.next(ctx)? {
+            None => Ok(None),
+            Some(mut row) => {
+                let mut updated_nodes: HashSet<String> = HashSet::new();
+                let mut updated_edges: HashSet<String> = HashSet::new();
+                for item in &self.items {
+                    match item {
+                        RemoveSpec::Property { var, key } => match row.get_mut(var) {
+                            Some(Value::Node(n)) => {
+                                n.properties.remove(key);
+                                updated_nodes.insert(var.clone());
+                            }
+                            Some(Value::Edge(e)) => {
+                                e.properties.remove(key);
+                                updated_edges.insert(var.clone());
+                            }
+                            _ => return Err(Error::UnboundVariable(var.clone())),
+                        },
+                        RemoveSpec::Labels { var, labels } => match row.get_mut(var) {
+                            Some(Value::Node(n)) => {
+                                n.labels.retain(|l| !labels.contains(l));
+                                updated_nodes.insert(var.clone());
+                            }
+                            _ => return Err(Error::UnboundVariable(var.clone())),
+                        },
+                    }
+                }
+                for var in &updated_nodes {
+                    if let Some(Value::Node(n)) = row.get(var) {
+                        ctx.writer.put_node(n)?;
+                    }
+                }
+                for var in &updated_edges {
+                    if let Some(Value::Edge(e)) = row.get(var) {
+                        ctx.writer.put_edge(e)?;
+                    }
+                }
                 Ok(Some(row))
             }
         }

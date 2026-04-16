@@ -841,7 +841,8 @@ fn count_index_seeks(plan: &mesh_cypher::LogicalPlan) -> u64 {
         | P::OptionalEdgeExpand { input, .. }
         | P::VarLengthExpand { input, .. }
         | P::MergeEdge { input, .. }
-        | P::UnwindChain { input, .. } => count_index_seeks(input),
+        | P::UnwindChain { input, .. }
+        | P::Remove { input, .. } => count_index_seeks(input),
         P::CartesianProduct { left, right } => count_index_seeks(left) + count_index_seeks(right),
         P::Union { branches, .. } => branches.iter().map(count_index_seeks).sum(),
         P::BindPath { input, .. } | P::ShortestPath { input, .. } => count_index_seeks(input),
