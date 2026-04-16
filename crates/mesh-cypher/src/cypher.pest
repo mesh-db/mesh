@@ -426,12 +426,14 @@ literal = { float | integer | string | boolean_lit | null_lit }
 float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 integer = @{ "-"? ~ ASCII_DIGIT+ }
 string = ${ "\"" ~ string_dq ~ "\"" | "'" ~ string_sq ~ "'" }
-string_dq = @{ (!"\"" ~ ANY)* }
-string_sq = @{ (!"'" ~ ANY)* }
+string_dq = @{ ("\\" ~ ANY | (!"\"" ~ !"\\" ~ ANY))* }
+string_sq = @{ ("\\" ~ ANY | (!"'" ~ !"\\" ~ ANY))* }
 boolean_lit = @{ (^"true" | ^"false") ~ !id_cont }
 null_lit = @{ ^"null" ~ !id_cont }
 
-identifier = @{ !reserved ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+identifier = @{ backtick_id | plain_id }
+plain_id = @{ !reserved ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+backtick_id = @{ "`" ~ (!"`" ~ ANY)+ ~ "`" }
 id_cont = _{ ASCII_ALPHANUMERIC | "_" }
 
 reserved = @{

@@ -170,7 +170,7 @@ fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
                 let lab = inner
                     .next()
                     .ok_or_else(|| Error::Parse("index target missing label".into()))?;
-                label = Some(lab.as_str().to_string());
+                label = Some(parse_ident(lab.as_str()));
             }
             Rule::index_property => {
                 let mut inner = p.into_inner();
@@ -180,7 +180,7 @@ fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
                 let key = inner
                     .next()
                     .ok_or_else(|| Error::Parse("index property missing key".into()))?;
-                property = Some(key.as_str().to_string());
+                property = Some(parse_ident(key.as_str()));
             }
             _ => {}
         }
@@ -208,7 +208,7 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
                 expr = Some(build_expression(p)?);
             }
             Rule::identifier if alias.is_none() => {
-                alias = Some(p.as_str().to_string());
+                alias = Some(parse_ident(p.as_str()));
             }
             Rule::where_clause => {
                 let ep = p
@@ -261,7 +261,7 @@ fn build_unwind_clause(pair: Pair<Rule>) -> Result<crate::ast::UnwindClause> {
                 expr = Some(build_expression(p)?);
             }
             Rule::identifier if alias.is_none() => {
-                alias = Some(p.as_str().to_string());
+                alias = Some(parse_ident(p.as_str()));
             }
             Rule::kw_unwind | Rule::kw_as => {}
             r => {
@@ -490,7 +490,7 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                                     path_expr = Some(build_expression(child)?);
                                 }
                                 Rule::identifier if alias.is_empty() => {
-                                    alias = child.as_str().to_string();
+                                    alias = parse_ident(child.as_str());
                                 }
                                 _ => {}
                             }
@@ -647,7 +647,7 @@ fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail
                         Rule::kw_detach => detach = true,
                         Rule::delete_items => {
                             for id in inner.into_inner() {
-                                vars.push(id.as_str().to_string());
+                                vars.push(parse_ident(id.as_str()));
                             }
                         }
                         r => {
@@ -687,7 +687,7 @@ fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail
                             let mut labels = Vec::new();
                             for child in inner.into_inner() {
                                 match child.as_rule() {
-                                    Rule::identifier => var = child.as_str().to_string(),
+                                    Rule::identifier => var = parse_ident(child.as_str()),
                                     Rule::label_spec => {
                                         let label =
                                             child.into_inner().next().unwrap().as_str().to_string();
@@ -717,7 +717,7 @@ fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail
                 for inner in p.into_inner() {
                     match inner.as_rule() {
                         Rule::identifier if var.is_empty() => {
-                            var = inner.as_str().to_string();
+                            var = parse_ident(inner.as_str());
                         }
                         Rule::expression if list_expr.is_none() => {
                             list_expr = Some(build_expression(inner)?);
@@ -773,7 +773,7 @@ fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail
                                                 for child in inner2.into_inner() {
                                                     match child.as_rule() {
                                                         Rule::identifier => {
-                                                            v = child.as_str().to_string()
+                                                            v = parse_ident(child.as_str())
                                                         }
                                                         Rule::label_spec => {
                                                             labels.push(
@@ -1067,11 +1067,11 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
         if p.as_rule() == Rule::rel_detail {
             for d in p.into_inner() {
                 match d.as_rule() {
-                    Rule::identifier => var = Some(d.as_str().to_string()),
+                    Rule::identifier => var = Some(parse_ident(d.as_str())),
                     Rule::rel_type_spec => {
                         for id in d.into_inner() {
                             if id.as_rule() == Rule::identifier {
-                                edge_types.push(id.as_str().to_string());
+                                edge_types.push(parse_ident(id.as_str()));
                             }
                         }
                     }
@@ -1175,7 +1175,7 @@ fn build_set_item(pair: Pair<Rule>) -> Result<SetItem> {
                     .into_inner()
                     .next()
                     .ok_or_else(|| Error::Parse("empty label".into()))?;
-                labels.push(id.as_str().to_string());
+                labels.push(parse_ident(id.as_str()));
             }
             Ok(SetItem::Labels { var, labels })
         }
@@ -1238,13 +1238,13 @@ fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {
 
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::identifier => var = Some(p.as_str().to_string()),
+            Rule::identifier => var = Some(parse_ident(p.as_str())),
             Rule::label_spec => {
                 let label_id = p
                     .into_inner()
                     .next()
                     .ok_or_else(|| Error::Parse("empty label".into()))?;
-                labels.push(label_id.as_str().to_string());
+                labels.push(parse_ident(label_id.as_str()));
             }
             Rule::properties => properties = build_properties(p)?,
             r => {
@@ -1329,7 +1329,7 @@ fn build_return_items(pair: Pair<Rule>) -> Result<(Vec<ReturnItem>, bool)> {
                 .next()
                 .ok_or_else(|| Error::Parse("return expr".into()))?,
         )?;
-        let alias = inner.next().map(|p| p.as_str().to_string());
+        let alias = inner.next().map(|p| parse_ident(p.as_str()));
         items.push(ReturnItem { expr, alias });
     }
     Ok((items, false))
@@ -1686,7 +1686,7 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 .to_string();
             Ok(Expr::Property { var, key })
         }
-        Rule::identifier => Ok(Expr::Identifier(pair.as_str().to_string())),
+        Rule::identifier => Ok(Expr::Identifier(parse_ident(pair.as_str()))),
         Rule::parameter => Ok(Expr::Parameter(parameter_name(pair))),
         Rule::case_expr => build_case_expr(pair),
         Rule::list_literal => {
@@ -1709,7 +1709,7 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 let value_pair = inner
                     .next()
                     .ok_or_else(|| Error::Parse("map entry missing value".into()))?;
-                let key = key_pair.as_str().to_string();
+                let key = parse_ident(key_pair.as_str());
                 let value = build_expression(value_pair)?;
                 entries.push((key, value));
             }
@@ -1888,7 +1888,7 @@ fn build_reduce_expr(pair: Pair<Rule>) -> Result<Expr> {
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::kw_reduce | Rule::kw_in => {}
-            Rule::identifier => ids.push(p.as_str().to_string()),
+            Rule::identifier => ids.push(parse_ident(p.as_str())),
             Rule::expression => exprs.push(build_expression(p)?),
             r => {
                 return Err(Error::Parse(format!(
@@ -1932,7 +1932,7 @@ fn build_list_comp(pair: Pair<Rule>) -> Result<Expr> {
         match p.as_rule() {
             Rule::kw_in => {}
             Rule::identifier if var.is_none() => {
-                var = Some(p.as_str().to_string());
+                var = Some(parse_ident(p.as_str()));
             }
             Rule::expression if source.is_none() => {
                 source = Some(build_expression(p)?);
@@ -1991,7 +1991,7 @@ fn build_literal(pair: Pair<Rule>) -> Result<Literal> {
                 .into_inner()
                 .next()
                 .ok_or_else(|| Error::Parse("empty string literal".into()))?;
-            Ok(Literal::String(inner.as_str().to_string()))
+            Ok(Literal::String(unescape_string(inner.as_str())))
         }
         Rule::boolean_lit => Ok(Literal::Boolean(
             lit_pair.as_str().eq_ignore_ascii_case("true"),
@@ -1999,6 +1999,41 @@ fn build_literal(pair: Pair<Rule>) -> Result<Literal> {
         Rule::null_lit => Ok(Literal::Null),
         r => Err(Error::Parse(format!("unexpected literal rule: {:?}", r))),
     }
+}
+
+fn parse_ident(s: &str) -> String {
+    if s.starts_with('`') && s.ends_with('`') && s.len() >= 2 {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn unescape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('\'') => out.push('\''),
+                Some('"') => out.push('"'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('b') => out.push('\u{0008}'),
+                Some('f') => out.push('\u{000C}'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_integer(s: &str) -> Result<i64> {
