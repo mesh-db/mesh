@@ -7112,6 +7112,8 @@ fn stdev_and_stdevp_aggregates() {
         (sd - expected_sd).abs() < 1e-6,
         "stDev should be ~{expected_sd}, got {sd}"
     );
+}
+
 // ── RETURN * / WITH * ─────────────────────────────────────────────
 
 #[test]
