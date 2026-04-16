@@ -293,8 +293,10 @@ op_regex_match = { "=~" }
 // `.identifier` suffixes chain property lookups. `x.name` resolves
 // via `property_access` inside `base_primary` (backward compat);
 // `startNode(r).name` and `(a).prop.sub` use the postfix chain.
-primary = { base_primary ~ property_chain* }
+primary = { base_primary ~ postfix_chain* }
+postfix_chain = { property_chain | index_access }
 property_chain = { "." ~ identifier }
+index_access = { "[" ~ expression ~ "]" }
 
 base_primary = {
     case_expr |

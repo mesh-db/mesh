@@ -580,6 +580,10 @@ where
             Ok(())
         }
         Expr::PropertyAccess { base, .. } => walk_expr(base, visit),
+        Expr::IndexAccess { base, index } => {
+            walk_expr(base, visit)?;
+            walk_expr(index, visit)
+        }
         Expr::Not(e) => walk_expr(e, visit),
         Expr::And(a, b) | Expr::Or(a, b) => {
             walk_expr(a, visit)?;

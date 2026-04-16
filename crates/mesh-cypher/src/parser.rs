@@ -1302,17 +1302,45 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 .ok_or_else(|| Error::Parse("empty primary".into()))?;
             let mut expr = build_expression(base_pair)?;
             for chain in inner {
-                if chain.as_rule() == Rule::property_chain {
-                    let key = chain
-                        .into_inner()
-                        .find(|p| p.as_rule() == Rule::identifier)
-                        .ok_or_else(|| Error::Parse("property_chain missing key".into()))?
-                        .as_str()
-                        .to_string();
-                    expr = Expr::PropertyAccess {
-                        base: Box::new(expr),
-                        key,
-                    };
+                if chain.as_rule() != Rule::postfix_chain {
+                    continue;
+                }
+                let inner_rule = chain
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty postfix_chain".into()))?;
+                match inner_rule.as_rule() {
+                    Rule::property_chain => {
+                        let key = inner_rule
+                            .into_inner()
+                            .find(|p| p.as_rule() == Rule::identifier)
+                            .ok_or_else(|| Error::Parse("property_chain missing key".into()))?
+                            .as_str()
+                            .to_string();
+                        expr = Expr::PropertyAccess {
+                            base: Box::new(expr),
+                            key,
+                        };
+                    }
+                    Rule::index_access => {
+                        let idx_expr = inner_rule
+                            .into_inner()
+                            .find(|p| p.as_rule() == Rule::expression)
+                            .ok_or_else(|| {
+                                Error::Parse("index_access missing expression".into())
+                            })?;
+                        let index = build_expression(idx_expr)?;
+                        expr = Expr::IndexAccess {
+                            base: Box::new(expr),
+                            index: Box::new(index),
+                        };
+                    }
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected postfix_chain child: {:?}",
+                            r
+                        )));
+                    }
                 }
             }
             Ok(expr)

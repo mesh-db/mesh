@@ -102,6 +102,38 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 _ => Err(Error::NotNodeOrEdge),
             }
         }
+        Expr::IndexAccess { base, index } => {
+            let base_val = eval_expr(base, ctx)?;
+            let idx_val = eval_expr(index, ctx)?;
+            if matches!(base_val, Value::Null | Value::Property(Property::Null))
+                || matches!(idx_val, Value::Null | Value::Property(Property::Null))
+            {
+                return Ok(Value::Null);
+            }
+            let items = match base_val {
+                Value::List(items) => items,
+                Value::Property(Property::List(props)) => {
+                    props.into_iter().map(Value::Property).collect()
+                }
+                _ => return Err(Error::TypeMismatch),
+            };
+            let i = match idx_val {
+                Value::Property(Property::Int64(i)) => i,
+                _ => return Err(Error::TypeMismatch),
+            };
+            let resolved = if i >= 0 {
+                items.into_iter().nth(i as usize)
+            } else {
+                let len = items.len() as i64;
+                let pos = len + i;
+                if pos < 0 {
+                    None
+                } else {
+                    items.into_iter().nth(pos as usize)
+                }
+            };
+            Ok(resolved.unwrap_or(Value::Null))
+        }
         Expr::Not(inner) => {
             let v = eval_expr(inner, ctx)?;
             Ok(Value::Property(Property::Bool(!to_bool(&v)?)))

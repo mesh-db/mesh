@@ -2138,6 +2138,75 @@ fn chained_property_null_propagates() {
 }
 
 #[test]
+fn index_access_on_list_literal() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20, 30][1] AS v");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "v"), 20);
+}
+
+#[test]
+fn index_access_negative_index() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20, 30][-1] AS v");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "v"), 30);
+}
+
+#[test]
+fn index_access_out_of_bounds_returns_null() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20][5] AS v");
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(
+        rows[0].get("v"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
+
+#[test]
+fn index_access_on_property_list() {
+    let (store, _d) = open_store();
+    let mut ps = ParamMap::new();
+    ps.insert(
+        "tags".into(),
+        Value::Property(Property::List(vec![
+            Property::String("a".into()),
+            Property::String("b".into()),
+            Property::String("c".into()),
+        ])),
+    );
+    run_with_params(&store, "CREATE (:N {tags: $tags})", &ps);
+    let rows = run(&store, "MATCH (n:N) RETURN (n.tags)[0] AS first");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "first"), "a");
+}
+
+#[test]
+fn index_access_chained_with_property() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [{name: 'Ada'}, {name: 'Bob'}][1].name AS v");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "v"), "Bob");
+}
+
+#[test]
+fn index_access_null_base_returns_null() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'a'})");
+    run(&store, "CREATE (:N)");
+    let rows = run(
+        &store,
+        "MATCH (n:N) WHERE n.name = 'a' RETURN (n.missing)[0] AS v",
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(
+        rows[0].get("v"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
+
+#[test]
 fn properties_returns_map() {
     let (store, _d) = open_store();
     run(&store, "CREATE (:Person {name: 'Ada', age: 37})");

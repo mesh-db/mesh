@@ -349,6 +349,14 @@ pub enum Expr {
         base: Box<Expr>,
         key: String,
     },
+    /// `expr[index]` — list index access. Evaluates `base` to a
+    /// list and `index` to an integer, returns the element at that
+    /// position. Zero-based; negative indices count from the end.
+    /// Out-of-bounds returns Null. Null base or null index → Null.
+    IndexAccess {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// `element IN list` — list membership test. Evaluates
     /// `element` and `list`, then checks whether `element` is
     /// equal to any item in `list`. Null-propagating: null
