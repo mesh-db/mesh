@@ -151,7 +151,7 @@ fn split_statements(text: &str) -> Vec<String> {
 #[given("parameters are:")]
 fn given_parameters(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
     if let Some(table) = &step.table {
-        for row in &table.rows[1..] {
+        for row in &table.rows {
             if row.len() >= 2 {
                 let name = row[0].trim().to_string();
                 let val = parse_tck_value(&row[1]);

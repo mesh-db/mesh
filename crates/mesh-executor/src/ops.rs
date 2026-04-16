@@ -657,7 +657,12 @@ impl CreatePathOp {
         for spec in &self.edges {
             let src = node_ids[spec.src_idx];
             let dst = node_ids[spec.dst_idx];
-            let edge = Edge::new(spec.edge_type.clone(), src, dst);
+            let mut edge = Edge::new(spec.edge_type.clone(), src, dst);
+            for (k, expr) in &spec.properties {
+                let value = eval_expr(expr, &ctx.eval_ctx(row))?;
+                let prop = value_to_property(value)?;
+                edge.properties.insert(k.clone(), prop);
+            }
             ctx.writer.put_edge(&edge)?;
             if let Some(v) = &spec.var {
                 out.insert(v.clone(), Value::Edge(edge));

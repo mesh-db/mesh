@@ -332,6 +332,7 @@ pub struct CreateEdgeSpec {
     pub edge_type: String,
     pub src_idx: usize,
     pub dst_idx: usize,
+    pub properties: Vec<(String, Expr)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1273,6 +1274,7 @@ fn build_create_pattern(
             edge_type,
             src_idx,
             dst_idx,
+            properties: hop.rel.properties.clone(),
         });
         prev_idx = target_idx;
     }
