@@ -268,6 +268,17 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 is_null
             })))
         }
+        Expr::HasLabels { expr, labels } => {
+            let v = eval_expr(expr, ctx)?;
+            match v {
+                Value::Node(n) => {
+                    let has_all = labels.iter().all(|l| n.labels.contains(l));
+                    Ok(Value::Property(Property::Bool(has_all)))
+                }
+                Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                _ => Ok(Value::Property(Property::Bool(false))),
+            }
+        }
         Expr::InList { element, list } => {
             let elem = eval_expr(element, ctx)?;
             if matches!(elem, Value::Null | Value::Property(Property::Null)) {

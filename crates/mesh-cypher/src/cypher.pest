@@ -259,8 +259,9 @@ or_expr = { xor_expr ~ (kw_or ~ xor_expr)* }
 xor_expr = { and_expr ~ (kw_xor ~ and_expr)* }
 and_expr = { not_expr ~ (kw_and ~ not_expr)* }
 not_expr = { (kw_not ~ not_expr) | comparison }
-comparison = { add_expr ~ (null_predicate | in_predicate | (comparison_op ~ add_expr))? }
+comparison = { add_expr ~ (null_predicate | in_predicate | label_predicate | (comparison_op ~ add_expr))? }
 in_predicate = { kw_in ~ add_expr }
+label_predicate = { label_spec+ }
 
 // Arithmetic precedence levels. `add_expr` has `+` / `-`,
 // below it `mul_expr` has `*` / `/` / `%`, and the lowest

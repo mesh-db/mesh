@@ -1403,6 +1403,20 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             // the binary form.
             match inner.next() {
                 None => Ok(left),
+                Some(tail) if tail.as_rule() == Rule::label_predicate => {
+                    let mut labels = Vec::new();
+                    for child in tail.into_inner() {
+                        if child.as_rule() == Rule::label_spec {
+                            if let Some(id) = child.into_inner().next() {
+                                labels.push(parse_ident(id.as_str()));
+                            }
+                        }
+                    }
+                    Ok(Expr::HasLabels {
+                        expr: Box::new(left),
+                        labels,
+                    })
+                }
                 Some(tail) if tail.as_rule() == Rule::in_predicate => {
                     let rhs_pair = tail
                         .into_inner()

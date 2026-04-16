@@ -412,6 +412,11 @@ pub enum Expr {
         start: Option<Box<Expr>>,
         end: Option<Box<Expr>>,
     },
+    /// `n:Label` — label test. True if the node has the given labels.
+    HasLabels {
+        expr: Box<Expr>,
+        labels: Vec<String>,
+    },
     /// `element IN list` — list membership test. Evaluates
     /// `element` and `list`, then checks whether `element` is
     /// equal to any item in `list`. Null-propagating: null

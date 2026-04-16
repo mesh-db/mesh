@@ -893,6 +893,7 @@ where
             Ok(())
         }
         Expr::PropertyAccess { base, .. } => walk_expr(base, visit),
+        Expr::HasLabels { expr, .. } => walk_expr(expr, visit),
         Expr::IndexAccess { base, index } => {
             walk_expr(base, visit)?;
             walk_expr(index, visit)
