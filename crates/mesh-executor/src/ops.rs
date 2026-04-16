@@ -1299,9 +1299,14 @@ fn value_to_property(v: Value) -> Result<Property> {
     match v {
         Value::Property(p) => Ok(p),
         Value::Null => Ok(Property::Null),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path { .. } => {
-            Err(Error::InvalidSetValue)
+        Value::List(items) => {
+            let props: Vec<Property> = items
+                .into_iter()
+                .map(|item| value_to_property(item))
+                .collect::<Result<_>>()?;
+            Ok(Property::List(props))
         }
+        Value::Node(_) | Value::Edge(_) | Value::Path { .. } => Err(Error::InvalidSetValue),
     }
 }
 
