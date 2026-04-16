@@ -353,7 +353,25 @@ fn format_property(p: &Property) -> String {
                 .collect();
             format!("{{{}}}", entries.join(", "))
         }
-        Property::DateTime(_) | Property::Date(_) | Property::Duration(_) => {
+        Property::DateTime(millis) => {
+            let secs = millis / 1000;
+            let nanos = ((millis % 1000) * 1_000_000) as u32;
+            if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
+                format!("'{}'", dt.format("%Y-%m-%dT%H:%M:%S"))
+            } else {
+                format!("{millis}")
+            }
+        }
+        Property::Date(days) => {
+            if let Some(d) = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .and_then(|epoch| epoch.checked_add_signed(chrono::Duration::days(*days as i64)))
+            {
+                format!("'{}'", d.format("%Y-%m-%d"))
+            } else {
+                format!("{days}")
+            }
+        }
+        Property::Duration(_) => {
             format!("{p:?}")
         }
     }

@@ -14,6 +14,7 @@ tempfile = "3"
 cucumber = "0.21"
 futures = "0.3"
 regex = "1"
+chrono = { workspace = true }
 
 [[test]]
 name = "tck"
