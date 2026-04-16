@@ -3105,6 +3105,16 @@ enum AggState {
     Min(Option<Property>),
     Max(Option<Property>),
     Collect(Vec<Value>),
+    StDev {
+        sum: f64,
+        sum_sq: f64,
+        count: i64,
+    },
+    StDevP {
+        sum: f64,
+        sum_sq: f64,
+        count: i64,
+    },
 }
 
 impl AggState {
@@ -3123,6 +3133,16 @@ impl AggState {
             AggregateFn::Min => AggState::Min(None),
             AggregateFn::Max => AggState::Max(None),
             AggregateFn::Collect => AggState::Collect(Vec::new()),
+            AggregateFn::StDev => AggState::StDev {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+            },
+            AggregateFn::StDevP => AggState::StDevP {
+                sum: 0.0,
+                sum_sq: 0.0,
+                count: 0,
+            },
         }
     }
 
@@ -3207,6 +3227,24 @@ impl AggState {
                     items.push(v);
                 }
             }
+            AggState::StDev { sum, sum_sq, count } | AggState::StDevP { sum, sum_sq, count } => {
+                let v = expr_arg_value(arg, ctx)?;
+                match v {
+                    Value::Null => {}
+                    Value::Property(Property::Int64(i)) => {
+                        let f = i as f64;
+                        *sum += f;
+                        *sum_sq += f * f;
+                        *count += 1;
+                    }
+                    Value::Property(Property::Float64(f)) => {
+                        *sum += f;
+                        *sum_sq += f * f;
+                        *count += 1;
+                    }
+                    _ => return Err(Error::AggregateTypeError),
+                }
+            }
         }
         Ok(())
     }
@@ -3237,6 +3275,24 @@ impl AggState {
                 None => Value::Null,
             },
             AggState::Collect(items) => Value::List(items.clone()),
+            AggState::StDevP { sum, sum_sq, count } => {
+                if *count == 0 {
+                    Value::Property(Property::Float64(0.0))
+                } else {
+                    let n = *count as f64;
+                    let variance = *sum_sq / n - (*sum / n).powi(2);
+                    Value::Property(Property::Float64(variance.max(0.0).sqrt()))
+                }
+            }
+            AggState::StDev { sum, sum_sq, count } => {
+                if *count < 2 {
+                    Value::Property(Property::Float64(0.0))
+                } else {
+                    let n = *count as f64;
+                    let variance = (*sum_sq - *sum * *sum / n) / (n - 1.0);
+                    Value::Property(Property::Float64(variance.max(0.0).sqrt()))
+                }
+            }
         }
     }
 }

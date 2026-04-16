@@ -2172,6 +2172,47 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         "exp" => math_unary(name, arg_exprs, ctx, |f| f.exp()),
         "log" | "ln" => math_unary(name, arg_exprs, ctx, |f| f.ln()),
         "log10" => math_unary(name, arg_exprs, ctx, |f| f.log10()),
+
+        // --- Trigonometric functions ---
+        "sin" => math_unary(name, arg_exprs, ctx, |f| f.sin()),
+        "cos" => math_unary(name, arg_exprs, ctx, |f| f.cos()),
+        "tan" => math_unary(name, arg_exprs, ctx, |f| f.tan()),
+        "cot" => math_unary(name, arg_exprs, ctx, |f| 1.0 / f.tan()),
+        "asin" => math_unary(name, arg_exprs, ctx, |f| f.asin()),
+        "acos" => math_unary(name, arg_exprs, ctx, |f| f.acos()),
+        "atan" => math_unary(name, arg_exprs, ctx, |f| f.atan()),
+        "atan2" => {
+            if arg_exprs.len() != 2 {
+                return Err(Error::UnknownScalarFunction(
+                    "atan2() expects 2 arguments".into(),
+                ));
+            }
+            let y = eval_expr(&arg_exprs[0], ctx)?;
+            let x = eval_expr(&arg_exprs[1], ctx)?;
+            match (y, x) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Property(Property::Null), _) | (_, Value::Property(Property::Null)) => {
+                    Ok(Value::Null)
+                }
+                (Value::Property(py), Value::Property(px)) => {
+                    let yf = match py {
+                        Property::Int64(i) => i as f64,
+                        Property::Float64(f) => f,
+                        _ => return Err(Error::TypeMismatch),
+                    };
+                    let xf = match px {
+                        Property::Int64(i) => i as f64,
+                        Property::Float64(f) => f,
+                        _ => return Err(Error::TypeMismatch),
+                    };
+                    Ok(Value::Property(Property::Float64(yf.atan2(xf))))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "degrees" => math_unary(name, arg_exprs, ctx, |f| f.to_degrees()),
+        "radians" => math_unary(name, arg_exprs, ctx, |f| f.to_radians()),
+
         "rand" => {
             if !arg_exprs.is_empty() {
                 return Err(Error::UnknownScalarFunction(

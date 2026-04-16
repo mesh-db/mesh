@@ -363,6 +363,8 @@ pub enum AggregateFn {
     Min,
     Max,
     Collect,
+    StDev,
+    StDevP,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -380,6 +382,8 @@ fn aggregate_fn_from_name(name: &str) -> Option<AggregateFn> {
         "min" => Some(AggregateFn::Min),
         "max" => Some(AggregateFn::Max),
         "collect" => Some(AggregateFn::Collect),
+        "stdev" => Some(AggregateFn::StDev),
+        "stdevp" => Some(AggregateFn::StDevP),
         _ => None,
     }
 }

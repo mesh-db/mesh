@@ -6924,3 +6924,91 @@ fn shortest_path_without_path_variable_rejected() {
     let err = mesh_cypher::plan(&parsed).unwrap_err();
     assert!(format!("{err}").contains("path variable"));
 }
+
+// ---------------------------------------------------------------
+// Trigonometric and conversion scalar functions
+// ---------------------------------------------------------------
+
+#[test]
+fn trig_sin_cos_degrees() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN sin(0) AS s, cos(0) AS c, degrees(pi()) AS d",
+    );
+    assert_eq!(rows.len(), 1);
+    let s = float_prop(&rows[0], "s");
+    let c = float_prop(&rows[0], "c");
+    let d = float_prop(&rows[0], "d");
+    assert!((s - 0.0).abs() < 1e-10, "sin(0) should be 0, got {s}");
+    assert!((c - 1.0).abs() < 1e-10, "cos(0) should be 1, got {c}");
+    assert!(
+        (d - 180.0).abs() < 1e-10,
+        "degrees(pi()) should be 180, got {d}"
+    );
+}
+
+#[test]
+fn trig_atan2() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN atan2(1, 1) AS a");
+    assert_eq!(rows.len(), 1);
+    let a = float_prop(&rows[0], "a");
+    let expected = std::f64::consts::FRAC_PI_4;
+    assert!(
+        (a - expected).abs() < 1e-10,
+        "atan2(1,1) should be pi/4 ({expected}), got {a}"
+    );
+}
+
+#[test]
+fn trig_tan_cot_asin_acos_atan_radians() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN tan(0) AS t, asin(0) AS as2, acos(1) AS ac, atan(0) AS at, radians(180) AS r",
+    );
+    assert_eq!(rows.len(), 1);
+    assert!((float_prop(&rows[0], "t")).abs() < 1e-10);
+    assert!((float_prop(&rows[0], "as2")).abs() < 1e-10);
+    assert!((float_prop(&rows[0], "ac")).abs() < 1e-10);
+    assert!((float_prop(&rows[0], "at")).abs() < 1e-10);
+    let r = float_prop(&rows[0], "r");
+    assert!(
+        (r - std::f64::consts::PI).abs() < 1e-10,
+        "radians(180) should be pi, got {r}"
+    );
+}
+
+#[test]
+fn trig_cot_value() {
+    let (store, _d) = open_store();
+    // cot(pi/4) = 1/tan(pi/4) = 1.0
+    let rows = run(&store, "RETURN cot(pi() / 4) AS c");
+    assert_eq!(rows.len(), 1);
+    let c = float_prop(&rows[0], "c");
+    assert!((c - 1.0).abs() < 1e-10, "cot(pi/4) should be 1.0, got {c}");
+}
+
+// ---------------------------------------------------------------
+// stDev / stDevP aggregate functions
+// ---------------------------------------------------------------
+
+#[test]
+fn stdev_and_stdevp_aggregates() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "UNWIND [2, 4, 4, 4, 5, 5, 7, 9] AS x RETURN stDev(x) AS sd, stDevP(x) AS sdp",
+    );
+    assert_eq!(rows.len(), 1);
+    let sd = float_prop(&rows[0], "sd");
+    let sdp = float_prop(&rows[0], "sdp");
+    // Expected: population stdev = 2.0, sample stdev = 2.13809...
+    assert!((sdp - 2.0).abs() < 1e-10, "stDevP should be 2.0, got {sdp}");
+    let expected_sd = (32.0_f64 / 7.0).sqrt(); // ~2.1380899...
+    assert!(
+        (sd - expected_sd).abs() < 1e-6,
+        "stDev should be ~{expected_sd}, got {sd}"
+    );
+}
