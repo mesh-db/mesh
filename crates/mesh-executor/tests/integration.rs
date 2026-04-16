@@ -1766,10 +1766,8 @@ fn unwind_aggregate_counts_elements() {
 #[test]
 fn chained_unwind_after_match_expands_per_row_list() {
     // Per-row UNWIND where the list comes from a property on the
-    // matched node. Parens around `p.tags` work around a pre-existing
-    // parser limitation that rejects bare property-access expressions
-    // in UNWIND position. Lists are seeded via parameters because
-    // list literals aren't accepted in pattern-property position.
+    // matched node. Lists are seeded via parameters because list
+    // literals aren't accepted in pattern-property position.
     let (store, _d) = open_store();
     let mut ps = ParamMap::new();
     ps.insert(
@@ -1788,7 +1786,7 @@ fn chained_unwind_after_match_expands_per_row_list() {
     run_with_params(&store, "CREATE (:Post {title: 'B', tags: $b})", &ps);
     let rows = run(
         &store,
-        "MATCH (p:Post) UNWIND (p.tags) AS tag \
+        "MATCH (p:Post) UNWIND p.tags AS tag \
          RETURN p.title AS title, tag ORDER BY title, tag",
     );
     let got: Vec<(String, String)> = rows
@@ -1873,7 +1871,7 @@ fn chained_unwind_empty_list_drops_input_row() {
     run_with_params(&store, "CREATE (:Post {title: 'C', tags: $c})", &ps);
     let rows = run(
         &store,
-        "MATCH (p:Post) UNWIND (p.tags) AS tag \
+        "MATCH (p:Post) UNWIND p.tags AS tag \
          RETURN p.title AS title, tag ORDER BY title, tag",
     );
     let got: Vec<(String, String)> = rows

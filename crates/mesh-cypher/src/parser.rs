@@ -211,7 +211,7 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
                     &mut limit,
                 )?;
             }
-            Rule::kw_as => {}
+            Rule::kw_as | Rule::kw_unwind => {}
             r => return Err(Error::Parse(format!("unexpected rule in unwind: {:?}", r))),
         }
     }

@@ -811,6 +811,35 @@ fn unwind_with_where_and_order() {
 }
 
 #[test]
+fn unwind_bare_identifier_expression_parses() {
+    let u = unwrap_unwind(parse("UNWIND x AS y RETURN y").unwrap());
+    assert_eq!(u.alias, "y");
+    assert!(matches!(u.expr, Expr::Identifier(ref v) if v == "x"));
+}
+
+#[test]
+fn unwind_property_access_expression_parses() {
+    let u = unwrap_unwind(parse("UNWIND p.tags AS tag RETURN tag").unwrap());
+    assert_eq!(u.alias, "tag");
+    assert!(matches!(u.expr, Expr::Property { .. }));
+}
+
+#[test]
+fn unwind_function_call_expression_parses() {
+    let u = unwrap_unwind(parse("UNWIND keys(n) AS k RETURN k").unwrap());
+    assert_eq!(u.alias, "k");
+    assert!(matches!(u.expr, Expr::Call { .. }));
+}
+
+#[test]
+fn unwind_clause_in_match_chain_parses() {
+    let m = unwrap_match(parse("MATCH (n) UNWIND n.tags AS t RETURN t").unwrap());
+    assert_eq!(m.clauses.len(), 2);
+    assert!(matches!(m.clauses[0], ReadingClause::Match(_)));
+    assert!(matches!(m.clauses[1], ReadingClause::Unwind(_)));
+}
+
+#[test]
 fn parenthesized_expression() {
     let m =
         unwrap_match(parse("MATCH (n) WHERE (n.a = 1 OR n.b = 2) AND n.c = 3 RETURN n").unwrap());
