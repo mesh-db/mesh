@@ -25,10 +25,11 @@ pub enum Statement {
     /// `UNION ALL` in the same chain is rejected at parse time.
     Union(UnionStmt),
     /// `EXPLAIN <query>` — return the logical plan as text instead
-    /// of executing the query. The inner statement is planned
-    /// normally; the executor formats the plan tree as a
-    /// single-column result.
+    /// of executing the query.
     Explain(Box<Statement>),
+    /// `PROFILE <query>` — execute the query and return the plan
+    /// annotated with row counts per operator.
+    Profile(Box<Statement>),
 }
 
 /// `query1 UNION [ALL] query2 [UNION [ALL] query3 ...]`. Each

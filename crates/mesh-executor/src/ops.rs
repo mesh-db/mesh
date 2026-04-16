@@ -83,6 +83,23 @@ pub fn explain(plan: &LogicalPlan) -> Vec<Row> {
     vec![row]
 }
 
+pub fn profile(plan: &LogicalPlan, store: &RocksDbStorageEngine) -> Result<Vec<Row>> {
+    let result_rows = execute(plan, store)?;
+    let row_count = result_rows.len() as i64;
+    let plan_text = mesh_cypher::format_plan(plan);
+    let summary = format!("{plan_text}\nRows: {row_count}");
+    let mut row = Row::new();
+    row.insert(
+        "profile".to_string(),
+        Value::Property(Property::String(summary)),
+    );
+    row.insert(
+        "rows".to_string(),
+        Value::Property(Property::Int64(row_count)),
+    );
+    Ok(vec![row])
+}
+
 pub fn execute_with_reader(
     plan: &LogicalPlan,
     reader: &dyn GraphReader,

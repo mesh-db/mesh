@@ -1,6 +1,6 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
-query = { SOI ~ kw_explain? ~ query_body ~ EOI }
+query = { SOI ~ (kw_explain | kw_profile)? ~ query_body ~ EOI }
 
 // Top-level query: either a standalone non-read statement (DDL,
 // CREATE), or a read query optionally stitched with UNION / UNION
@@ -429,7 +429,7 @@ reserved = @{
      ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc" |
      ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind" |
      ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on" |
-     ^"with" | ^"optional" | ^"contains" | ^"explain" | ^"remove")
+     ^"with" | ^"optional" | ^"contains" | ^"remove")
     ~ !id_cont
 }
 
@@ -472,6 +472,7 @@ kw_all = @{ ^"all" ~ !id_cont }
 kw_reduce = @{ ^"reduce" ~ !id_cont }
 kw_exists = @{ ^"exists" ~ !id_cont }
 kw_explain = @{ ^"explain" ~ !id_cont }
+kw_profile = @{ ^"profile" ~ !id_cont }
 kw_remove = _{ ^"remove" }
 kw_count = @{ ^"count" ~ !id_cont }
 kw_call = _{ ^"call" }

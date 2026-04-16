@@ -398,7 +398,9 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
         },
         Statement::ShowIndexes => LogicalPlan::ShowPropertyIndexes,
         Statement::Union(u) => plan_union(u, ctx)?,
-        Statement::Explain(inner) => return plan_with_context(inner, ctx),
+        Statement::Explain(inner) | Statement::Profile(inner) => {
+            return plan_with_context(inner, ctx)
+        }
     };
     validate_pattern_predicates(&plan)?;
     Ok(plan)
@@ -1027,7 +1029,7 @@ fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
                 .map(union_branch_columns)
                 .unwrap_or_else(|| Err(Error::Plan("empty nested UNION".into())))
         }
-        Statement::Explain(inner) => union_branch_columns(inner),
+        Statement::Explain(inner) | Statement::Profile(inner) => union_branch_columns(inner),
         Statement::Create(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)

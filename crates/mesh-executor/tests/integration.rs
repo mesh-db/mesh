@@ -1,7 +1,7 @@
 use mesh_core::{Edge, Node, NodeId, Property};
 use mesh_cypher::{parse, plan, plan_with_context, PlannerContext};
 use mesh_executor::{
-    execute, execute_with_reader, explain, GraphReader, GraphWriter, ParamMap, Row, Value,
+    execute, execute_with_reader, explain, profile, GraphReader, GraphWriter, ParamMap, Row, Value,
 };
 use mesh_storage::RocksDbStorageEngine as Store;
 use tempfile::TempDir;
@@ -17,6 +17,10 @@ fn run(store: &Store, q: &str) -> Vec<Row> {
     if let mesh_cypher::Statement::Explain(inner) = &stmt {
         let p = plan(inner).unwrap_or_else(|e| panic!("plan {q}: {e}"));
         return explain(&p);
+    }
+    if let mesh_cypher::Statement::Profile(inner) = &stmt {
+        let p = plan(inner).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+        return profile(&p, store).unwrap_or_else(|e| panic!("profile {q}: {e}"));
     }
     let p = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
     execute(&p, store).unwrap_or_else(|e| panic!("exec {q}: {e}"))
@@ -2628,6 +2632,30 @@ fn explain_multi_hop_shows_expand_chain() {
         expand_count >= 2,
         "expected 2+ EdgeExpand, got: {plan_text}"
     );
+}
+
+// --- PROFILE -----------------------------------------------------------
+
+#[test]
+fn profile_returns_plan_and_row_count() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    let rows = run(&store, "PROFILE MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(rows.len(), 1);
+    let prof = str_prop(&rows[0], "profile");
+    assert!(prof.contains("NodeScanByLabels"), "got: {prof}");
+    assert!(prof.contains("Rows: 2"), "got: {prof}");
+    assert_eq!(int_prop(&rows[0], "rows"), 2);
+}
+
+#[test]
+fn profile_actually_executes_mutations() {
+    let (store, _d) = open_store();
+    run(&store, "PROFILE CREATE (:Ghost {name: 'Casper'})");
+    let rows = run(&store, "MATCH (n:Ghost) RETURN n.name AS name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Casper");
 }
 
 // --- CREATE with RETURN ------------------------------------------------
