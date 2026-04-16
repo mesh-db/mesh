@@ -2658,6 +2658,70 @@ fn profile_actually_executes_mutations() {
     assert_eq!(str_prop(&rows[0], "name"), "Casper");
 }
 
+// --- FOREACH -----------------------------------------------------------
+
+#[test]
+fn foreach_sets_property_on_each_element() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(
+        &store,
+        "MATCH (p:Person) \
+         FOREACH (p IN [p] | SET p.marked = true)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE p.marked = true RETURN p.name AS name ORDER BY name",
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Ada", "Bob"]);
+}
+
+#[test]
+fn foreach_removes_property() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A', temp: 1})");
+    run(&store, "CREATE (:N {name: 'B', temp: 2})");
+    run(
+        &store,
+        "MATCH (n:N) \
+         FOREACH (n IN [n] | REMOVE n.temp)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (n:N) RETURN n.name AS name, exists(n.temp) AS has ORDER BY name",
+    );
+    assert_eq!(rows.len(), 2);
+    match rows[0].get("has") {
+        Some(Value::Property(Property::Bool(b))) => assert!(!b),
+        other => panic!("expected false, got: {other:?}"),
+    }
+}
+
+#[test]
+fn foreach_does_not_expand_row_stream() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A'})");
+    let mut params = ParamMap::new();
+    params.insert(
+        "tags".into(),
+        Value::Property(Property::List(vec![
+            Property::String("x".into()),
+            Property::String("y".into()),
+        ])),
+    );
+    let rows = run_with_params(
+        &store,
+        "MATCH (n:N) \
+         FOREACH (t IN $tags | SET n.last_tag = t) \
+         RETURN n.name AS name",
+        &params,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "A");
+}
+
 // --- CREATE with RETURN ------------------------------------------------
 
 #[test]

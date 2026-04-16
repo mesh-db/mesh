@@ -130,8 +130,13 @@ match_clause = {
 // `match_stmt`.
 terminal_tail = {
     return_tail
-    | ((set_tail | delete_tail | create_tail | remove_tail) ~ return_tail?)
+    | ((set_tail | delete_tail | create_tail | remove_tail | foreach_tail) ~ return_tail?)
 }
+
+foreach_tail = {
+    kw_foreach ~ "(" ~ identifier ~ kw_in ~ expression ~ "|" ~ foreach_body+ ~ ")"
+}
+foreach_body = { set_tail | remove_tail }
 
 // `OPTIONAL MATCH <pattern> [WHERE ...]` — left-join semantics.
 // A reading clause that extends the row stream with Null
@@ -476,5 +481,6 @@ kw_profile = @{ ^"profile" ~ !id_cont }
 kw_remove = _{ ^"remove" }
 kw_count = @{ ^"count" ~ !id_cont }
 kw_call = _{ ^"call" }
+kw_foreach = _{ ^"foreach" }
 kw_shortest_path = @{ ^"shortestPath" ~ !id_cont }
 kw_all_shortest_paths = @{ ^"allShortestPaths" ~ !id_cont }

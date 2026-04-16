@@ -660,6 +660,108 @@ fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail
                     }
                 }
             }
+            Rule::foreach_tail => {
+                let mut var = String::new();
+                let mut list_expr = None;
+                let mut set_items = Vec::new();
+                let mut remove_items = Vec::new();
+                for inner in p.into_inner() {
+                    match inner.as_rule() {
+                        Rule::identifier if var.is_empty() => {
+                            var = inner.as_str().to_string();
+                        }
+                        Rule::expression if list_expr.is_none() => {
+                            list_expr = Some(build_expression(inner)?);
+                        }
+                        Rule::kw_in | Rule::kw_foreach => {}
+                        Rule::foreach_body => {
+                            let body_inner = inner
+                                .into_inner()
+                                .next()
+                                .ok_or_else(|| Error::Parse("empty foreach body".into()))?;
+                            match body_inner.as_rule() {
+                                Rule::set_tail => {
+                                    let items_pair = body_inner
+                                        .into_inner()
+                                        .next()
+                                        .ok_or_else(|| Error::Parse("empty set".into()))?;
+                                    for si in items_pair.into_inner() {
+                                        let inner2 = si
+                                            .into_inner()
+                                            .next()
+                                            .ok_or_else(|| Error::Parse("empty set item".into()))?;
+                                        set_items.push(build_set_item(inner2)?);
+                                    }
+                                }
+                                Rule::remove_tail => {
+                                    let items_pair = body_inner
+                                        .into_inner()
+                                        .next()
+                                        .ok_or_else(|| Error::Parse("empty remove".into()))?;
+                                    for ri in items_pair.into_inner() {
+                                        let inner2 = ri.into_inner().next().ok_or_else(|| {
+                                            Error::Parse("empty remove item".into())
+                                        })?;
+                                        match inner2.as_rule() {
+                                            Rule::remove_prop_item => {
+                                                let mut parts = inner2.into_inner();
+                                                let pa = parts.next().unwrap();
+                                                let mut pa_inner = pa.into_inner();
+                                                let v =
+                                                    pa_inner.next().unwrap().as_str().to_string();
+                                                let k =
+                                                    pa_inner.next().unwrap().as_str().to_string();
+                                                remove_items.push(
+                                                    crate::ast::RemoveItem::Property {
+                                                        var: v,
+                                                        key: k,
+                                                    },
+                                                );
+                                            }
+                                            Rule::remove_label_item => {
+                                                let mut v = String::new();
+                                                let mut labels = Vec::new();
+                                                for child in inner2.into_inner() {
+                                                    match child.as_rule() {
+                                                        Rule::identifier => {
+                                                            v = child.as_str().to_string()
+                                                        }
+                                                        Rule::label_spec => {
+                                                            labels.push(
+                                                                child
+                                                                    .into_inner()
+                                                                    .next()
+                                                                    .unwrap()
+                                                                    .as_str()
+                                                                    .to_string(),
+                                                            );
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                                remove_items.push(crate::ast::RemoveItem::Labels {
+                                                    var: v,
+                                                    labels,
+                                                });
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                terminal.foreach = Some(crate::ast::ForeachClause {
+                    var,
+                    list_expr: list_expr
+                        .ok_or_else(|| Error::Parse("FOREACH missing list expression".into()))?,
+                    set_items,
+                    remove_items,
+                });
+            }
             r => {
                 return Err(Error::Parse(format!(
                     "unexpected rule in terminal tail: {:?}",

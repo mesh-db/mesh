@@ -227,6 +227,19 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
         LogicalPlan::Remove { input, items } => {
             Box::new(RemoveOp::new(child!(input), items.clone()))
         }
+        LogicalPlan::Foreach {
+            input,
+            var,
+            list_expr,
+            set_assignments,
+            remove_items,
+        } => Box::new(ForeachOp::new(
+            child!(input),
+            var.clone(),
+            list_expr.clone(),
+            set_assignments.clone(),
+            remove_items.clone(),
+        )),
         LogicalPlan::CallSubquery { input, body } => {
             Box::new(CallSubqueryOp::new(child!(input), (**body).clone()))
         }
@@ -954,6 +967,106 @@ impl Operator for RemoveOp {
                 Ok(Some(row))
             }
         }
+    }
+}
+
+struct ForeachOp {
+    input: Box<dyn Operator>,
+    var: String,
+    list_expr: Expr,
+    set_assignments: Vec<SetAssignment>,
+    remove_items: Vec<RemoveSpec>,
+}
+
+impl ForeachOp {
+    fn new(
+        input: Box<dyn Operator>,
+        var: String,
+        list_expr: Expr,
+        set_assignments: Vec<SetAssignment>,
+        remove_items: Vec<RemoveSpec>,
+    ) -> Self {
+        Self {
+            input,
+            var,
+            list_expr,
+            set_assignments,
+            remove_items,
+        }
+    }
+}
+
+impl Operator for ForeachOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        let Some(row) = self.input.next(ctx)? else {
+            return Ok(None);
+        };
+        let ectx = ctx.eval_ctx(&row);
+        let list_val = eval_expr(&self.list_expr, &ectx)?;
+        let items = match list_val {
+            Value::List(items) => items,
+            Value::Property(Property::List(props)) => {
+                props.into_iter().map(Value::Property).collect()
+            }
+            Value::Null | Value::Property(Property::Null) => Vec::new(),
+            _ => return Err(Error::TypeMismatch),
+        };
+        for item in items {
+            let mut scratch = row.clone();
+            scratch.insert(self.var.clone(), item);
+            for a in &self.set_assignments {
+                match a {
+                    SetAssignment::Property { var, key, value } => {
+                        let evaluated = eval_expr(value, &ctx.eval_ctx(&scratch))?;
+                        let prop = value_to_property(evaluated)?;
+                        match scratch.get_mut(var) {
+                            Some(Value::Node(n)) => {
+                                n.properties.insert(key.clone(), prop);
+                            }
+                            Some(Value::Edge(e)) => {
+                                e.properties.insert(key.clone(), prop);
+                            }
+                            _ => return Err(Error::UnboundVariable(var.clone())),
+                        }
+                    }
+                    SetAssignment::Labels { var, labels } => {
+                        if let Some(Value::Node(n)) = scratch.get_mut(var) {
+                            for l in labels {
+                                if !n.labels.contains(l) {
+                                    n.labels.push(l.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for ri in &self.remove_items {
+                match ri {
+                    RemoveSpec::Property { var, key } => {
+                        if let Some(Value::Node(n)) = scratch.get_mut(var) {
+                            n.properties.remove(key);
+                        } else if let Some(Value::Edge(e)) = scratch.get_mut(var) {
+                            e.properties.remove(key);
+                        }
+                    }
+                    RemoveSpec::Labels { var, labels } => {
+                        if let Some(Value::Node(n)) = scratch.get_mut(var) {
+                            n.labels.retain(|l| !labels.contains(l));
+                        }
+                    }
+                }
+            }
+            // Flush mutated entities for each iteration
+            for (_, val) in scratch.iter() {
+                match val {
+                    Value::Node(n) => ctx.writer.put_node(n)?,
+                    Value::Edge(e) => ctx.writer.put_edge(e)?,
+                    _ => {}
+                }
+            }
+        }
+        Ok(Some(row))
     }
 }
 

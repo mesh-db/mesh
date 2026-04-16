@@ -187,6 +187,15 @@ pub struct TerminalTail {
     pub delete: Option<DeleteClause>,
     pub create_patterns: Vec<Pattern>,
     pub remove_items: Vec<RemoveItem>,
+    pub foreach: Option<ForeachClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeachClause {
+    pub var: String,
+    pub list_expr: Expr,
+    pub set_items: Vec<SetItem>,
+    pub remove_items: Vec<RemoveItem>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

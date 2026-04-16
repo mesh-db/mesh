@@ -127,6 +127,13 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         body: Box<LogicalPlan>,
     },
+    Foreach {
+        input: Box<LogicalPlan>,
+        var: String,
+        list_expr: Expr,
+        set_assignments: Vec<SetAssignment>,
+        remove_items: Vec<RemoveSpec>,
+    },
     /// Placeholder leaf used as the seed producer inside CALL { }
     /// bodies when the first clause is WITH (importing outer
     /// bindings). At execution time, the `CallSubqueryOp` replaces
@@ -544,6 +551,10 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             buf.push_str(&format!("{indent}Remove\n"));
             format_plan_inner(input, buf, depth + 1);
         }
+        LogicalPlan::Foreach { input, var, .. } => {
+            buf.push_str(&format!("{indent}Foreach({var})\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
         LogicalPlan::CallSubquery { input, body } => {
             buf.push_str(&format!("{indent}CallSubquery\n"));
             buf.push_str(&format!("{indent}  body:\n"));
@@ -801,6 +812,7 @@ where
         | LogicalPlan::Delete { input, .. }
         | LogicalPlan::Remove { input, .. }
         | LogicalPlan::MergeEdge { input, .. }
+        | LogicalPlan::Foreach { input, .. }
         | LogicalPlan::CallSubquery { input, .. }
         | LogicalPlan::BindPath { input, .. }
         | LogicalPlan::ShortestPath { input, .. } => walk_plan_exprs(input, visit),
@@ -2224,10 +2236,36 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         };
     }
 
+    if let Some(fe) = &terminal.foreach {
+        let set_assignments = fe.set_items.iter().map(set_item_to_assignment).collect();
+        let remove_specs = fe
+            .remove_items
+            .iter()
+            .map(|ri| match ri {
+                crate::ast::RemoveItem::Property { var, key } => RemoveSpec::Property {
+                    var: var.clone(),
+                    key: key.clone(),
+                },
+                crate::ast::RemoveItem::Labels { var, labels } => RemoveSpec::Labels {
+                    var: var.clone(),
+                    labels: labels.clone(),
+                },
+            })
+            .collect();
+        plan = LogicalPlan::Foreach {
+            input: Box::new(plan),
+            var: fe.var.clone(),
+            list_expr: fe.list_expr.clone(),
+            set_assignments,
+            remove_items: remove_specs,
+        };
+    }
+
     let has_mutation = terminal.delete.is_some()
         || !terminal.set_items.is_empty()
         || !terminal.create_patterns.is_empty()
-        || !terminal.remove_items.is_empty();
+        || !terminal.remove_items.is_empty()
+        || terminal.foreach.is_some();
 
     // MERGE clauses count as side-effectful even without a
     // trailing RETURN, so `MERGE (x)` is a valid complete
