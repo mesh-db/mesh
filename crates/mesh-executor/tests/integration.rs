@@ -2238,6 +2238,47 @@ fn id_on_null_returns_null() {
 }
 
 #[test]
+fn exists_filters_on_property_presence() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada', email: 'ada@x.com'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE exists(p.email) RETURN p.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn exists_returns_false_for_missing_property() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN exists(p.email) AS has_email",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("has_email") {
+        Some(Value::Property(Property::Bool(b))) => assert!(!b),
+        other => panic!("expected false, got: {other:?}"),
+    }
+}
+
+#[test]
+fn not_exists_excludes_present_property() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada', email: 'ada@x.com'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) WHERE NOT exists(p.email) RETURN p.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Bob");
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");

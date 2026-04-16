@@ -1404,6 +1404,11 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 _ => Err(Error::TypeMismatch),
             }
         }
+        "exists" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            let is_present = !matches!(v, Value::Null | Value::Property(Property::Null));
+            Ok(Value::Property(Property::Bool(is_present)))
+        }
         "tolower" => {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
