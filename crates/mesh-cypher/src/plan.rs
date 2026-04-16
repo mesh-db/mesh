@@ -2297,6 +2297,23 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     // Multiple mutation clauses can appear in sequence:
     // CREATE (n) SET n.name = 'Ada' REMOVE n:Temp RETURN n
     if !terminal.create_patterns.is_empty() {
+        for pattern in &terminal.create_patterns {
+            // Reject CREATE on already-bound nodes that try to
+            // CREATE new labels/properties (VariableAlreadyBound).
+            // Pure references (no labels, no properties) are fine.
+            if let Some(var) = &pattern.start.var {
+                if bound_vars.contains_key(var)
+                    && (!pattern.start.labels.is_empty()
+                        || !pattern.start.properties.is_empty()
+                        || pattern.hops.is_empty())
+                {
+                    return Err(Error::Plan(format!(
+                        "variable '{}' already defined with a different type",
+                        var
+                    )));
+                }
+            }
+        }
         let mut nodes: Vec<CreateNodeSpec> = Vec::new();
         let mut edges: Vec<CreateEdgeSpec> = Vec::new();
         let mut var_idx: HashMap<String, usize> = HashMap::new();

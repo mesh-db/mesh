@@ -148,23 +148,17 @@ pub fn execute_with_reader(
 }
 
 fn is_write_only_plan(plan: &LogicalPlan) -> bool {
+    // A plan is write-only when its top-level operator is a mutation
+    // with no projection (Project/Identity) wrapping it. Mutations
+    // with RETURN have a Project on top.
     match plan {
-        LogicalPlan::CreatePath { input: None, .. } => true,
-        LogicalPlan::Delete { .. }
+        LogicalPlan::CreatePath { .. }
+        | LogicalPlan::Delete { .. }
         | LogicalPlan::SetProperty { .. }
         | LogicalPlan::Remove { .. }
-        | LogicalPlan::Foreach { .. } => !has_projection_above(plan),
-        _ => false,
-    }
-}
-
-fn has_projection_above(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Project { .. } | LogicalPlan::Identity { .. } => true,
-        LogicalPlan::Distinct { input }
-        | LogicalPlan::OrderBy { input, .. }
-        | LogicalPlan::Skip { input, .. }
-        | LogicalPlan::Limit { input, .. } => has_projection_above(input),
+        | LogicalPlan::Foreach { .. }
+        | LogicalPlan::MergeNode { .. }
+        | LogicalPlan::MergeEdge { .. } => true,
         _ => false,
     }
 }
