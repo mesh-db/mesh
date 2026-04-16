@@ -1,0 +1,616 @@
+:numbered:
+:toc:
+:toc-placement: macro
+:source-highlighter: pygments
+
+= The Cypher Style Guide
+
+toc::[]
+
+This is the style guide for the Cypher language, in the context of its standardization through the openCypher project.
+This document consists of two main sections: <<Rules>> and <<Recommendations>>.
+
+In <<Rules>>, we list syntax guidelines for composing Cypher queries in a conventional, readability-oriented way.
+The examples provided always transform _valid_, but poorly formatted, queries into a different query in the recommended format, whilst retaining the same semantics.
+
+In <<Recommendations>>, we list guidelines that may have an effect on the semantics of queries, such as the way a graph schema is composed through label and relationship types.
+Bear in mind that these recommendations will not work after-the-fact: if the graph has been constructed with one set of label and relationship types, queries in the associated workload cannot be re-formatted according to these recommendations without also refactoring the data graph.
+
+== Why is style important?
+
+Consider this dadaist work of art from Nigel Small and Nicole White:
+
+.Insane query
+[source, cypher]
+----
+MATCH (null)-[:merge]->(true)
+with null.delete as foreach, `true`.false as null
+return 2 + foreach, coalesce(null, 3.1415)
+limit 10;
+----
+
+Then compare it to this classical piece by Mark Needham:
+
+.Sane query
+[source, cypher]
+----
+MATCH (member:Member {name: 'Mark Needham'})
+      -[:HAS_MEMBERSHIP]->()-[:OF_GROUP]->(:Group)-[:HAS_TOPIC]->(topic)
+WITH member, topic, count(*) AS score
+MATCH (topic)<-[:HAS_TOPIC]-(otherGroup:Group)
+WHERE NOT (member)-[:HAS_MEMBERSHIP]->(:Membership)-[:OF_GROUP]->(otherGroup)
+RETURN otherGroup.name, collect(topic.name), sum(score) AS score
+ORDER BY score DESC
+----
+
+---
+
+The purpose of this document is to help users of the language to share queries with each other with minimal friction, and to construct a consistent and portable usage of the language across many use cases and implementations.
+
+== Rules
+
+In case two rules are in conflict, and there is no explicit mention of which rule trumps, the rule mentioned last applies.
+
+// Template:
+//. rule
+//+
+//.Bad
+//[source, cypher]
+//----
+//RETURN 1
+//----
+//+
+//.Good
+//[source, cypher]
+//----
+//RETURN 1
+//----
+
+=== Indentation and line breaks
+
+. Start a new clause on a new line.
++
+.Bad
+[source, cypher]
+----
+MATCH (n) WHERE n.name CONTAINS 's' RETURN n.name
+----
++
+.Good
+[source, cypher]
+----
+MATCH (n)
+WHERE n.name CONTAINS 's'
+RETURN n.name
+----
+
+.. Indent `ON MATCH` and `ON CREATE` with two spaces.
++
+.Bad
+[source, cypher]
+----
+MERGE (n) ON CREATE SET n.prop = 0
+MERGE (a:A)-[:T]-(b:B)
+ON CREATE SET a.name = 'me'
+ON MATCH SET b.name = 'you'
+RETURN a.prop
+----
++
+.Good
+[source, cypher]
+----
+MERGE (n)
+  ON CREATE SET n.prop = 0
+MERGE (a:A)-[:T]-(b:B)
+  ON CREATE SET a.name = 'me'
+  ON MATCH SET b.name = 'you'
+RETURN a.prop
+----
+
+.. Put `ON CREATE` before `ON MATCH` if both are present.
+// no example necessary
+
+. Start a subquery on a new line after the opening brace, indented with two (additional) spaces.
+Leave the closing brace on its own line.
++
+.Bad
+[source, cypher]
+----
+MATCH (a:A)
+WHERE
+  EXISTS { MATCH (a)-->(b:B) WHERE b.prop = $param }
+RETURN a.foo
+----
++
+.Also bad
+[source, cypher]
+----
+MATCH (a:A)
+WHERE EXISTS
+{MATCH (a)-->(b:B)
+WHERE b.prop = $param}
+RETURN a.foo
+----
++
+.Good
+[source, cypher]
+----
+MATCH (a:A)
+WHERE EXISTS {
+  MATCH (a)-->(b:B)
+  WHERE b.prop = $param
+}
+RETURN a.foo
+----
+
+.. Do not break the line if the simplified subquery form is used.
++
+.Bad
+[source, cypher]
+----
+MATCH (a:A)
+WHERE EXISTS {
+  (a)-->(b:B)
+}
+RETURN a.prop
+----
++
+.Good
+[source, cypher]
+----
+MATCH (a:A)
+WHERE EXISTS { (a)-->(b:B) }
+RETURN a.prop
+----
+
+=== Meta-characters
+
+. Use single quotes (Unicode character U+0027: ') for literal string values.
++
+.Bad
+[source, cypher]
+----
+RETURN "Cypher"
+----
++
+.Good
+[source, cypher]
+----
+RETURN 'Cypher'
+----
+
+.. Disregard this rule for literal strings that contain a single quote character. If the string has both, use the form that creates the fewest escapes. In the case of a tie, prefer single quotes.
++
+.Bad
+[source, cypher]
+----
+RETURN 'Cypher\'s a nice language', "Mats' quote: \"statement\""
+----
++
+.Good
+[source, cypher]
+----
+RETURN "Cypher's a nice language", 'Mats\' quote: "statement"'
+----
+
+. Avoid having to use back-ticks to escape characters and keywords.
++
+.Bad
+[source, cypher]
+----
+MATCH (`odd-ch@racter$`:`Spaced Label` {`&property`: 42})
+RETURN labels(`odd-ch@racter$`)
+----
++
+.Good
+[source, cypher]
+----
+MATCH (node:NonSpacedLabel {property: 42})
+RETURN labels(node)
+----
+
+. Do not use a semicolon at the end of the statement.
++
+.Bad
+[source, cypher]
+----
+RETURN 1;
+----
++
+.Good
+[source, cypher]
+----
+RETURN 1
+----
+
+=== Casing
+
+. Write keywords in upper case.
++
+.Bad
+[source, cypher]
+----
+match (p:Person)
+where p.name starts with 'Ma'
+return p.name
+----
++
+.Good
+[source, cypher]
+----
+MATCH (p:Person)
+WHERE p.name STARTS WITH 'Ma'
+RETURN p.name
+----
+
+. Write the value `null` in lower case.
++
+.Bad
+[source, cypher]
+----
+WITH NULL AS n1, Null AS n2
+RETURN n1 IS NULL AND n2 IS NOT NULL
+----
++
+.Good
+[source, cypher]
+----
+WITH null AS n1, null as n2
+RETURN n1 IS NULL AND n2 IS NOT NULL
+----
+
+. Write boolean literals in lower case.
++
+.Bad
+[source, cypher]
+----
+WITH TRUE AS b1, False AS b2
+RETURN b1 AND b2
+----
++
+.Good
+[source, cypher]
+----
+WITH true AS b1, false AS b2
+RETURN b1 AND b2
+----
+
+. Use camel case, starting with a lower case character, for:
+.. functions
+.. properties
+.. variables
+.. parameters
++
+.Bad
+[source, cypher]
+----
+CREATE (N {Prop: 0})
+WITH RAND() AS Rand, $pArAm AS MAP
+RETURN Rand, MAP.property_key, Count(N)
+----
++
+.Good
+[source, cypher]
+----
+CREATE (n {prop: 0})
+WITH rand() AS rand, $param AS map
+RETURN rand, map.propertyKey, count(n)
+----
+
+=== Patterns
+
+. When patterns wrap lines, break after arrows, not before.
++
+.Bad
+[source, cypher]
+----
+MATCH (:Person)-->(vehicle:Car)-->(:Company)
+      <--(:Country)
+RETURN count(vehicle)
+----
++
+.Good
+[source, cypher]
+----
+MATCH (:Person)-->(vehicle:Car)-->(:Company)<--
+      (:Country)
+RETURN count(vehicle)
+----
+
+. Use anonymous nodes and relationships when the variable would not be used.
++
+.Bad
+[source, cypher]
+----
+MATCH (a:End {prop: 42}),
+      (b:End {prop: 3}),
+      (c:Begin {prop: id(a)})
+----
++
+.Good
+[source, cypher]
+----
+MATCH (a:End {prop: 42}),
+      (:End {prop: 3}),
+      (:Begin {prop: id(a)})
+----
+
+. Chain patterns together to avoid repeating variables.
++
+.Bad
+[source, cypher]
+----
+MATCH (:Person)-->(vehicle:Car), (vehicle:Car)-->(:Company)
+RETURN count(vehicle)
+----
++
+.Good
+[source, cypher]
+----
+MATCH (:Person)-->(vehicle:Car)-->(:Company)
+RETURN count(vehicle)
+----
+
+. Put named nodes before anonymous nodes.
++
+.Bad
+[source, cypher]
+----
+MATCH ()-->(vehicle:Car)-->(manufacturer:Company)
+WHERE manufacturer.foundedYear < 2000
+RETURN vehicle.mileage
+----
++
+.Good
+[source, cypher]
+----
+MATCH (manufacturer:Company)<--(vehicle:Car)<--()
+WHERE manufacturer.foundedYear < 2000
+RETURN vehicle.mileage
+----
+
+. Keep anchor nodes at the beginning of the `MATCH` clause.
++
+.Bad
+[source, cypher]
+----
+MATCH (:Person)-->(vehicle:Car)-->(manufacturer:Company)
+WHERE manufacturer.foundedYear < 2000
+RETURN vehicle.mileage
+----
++
+.Good
+[source, cypher]
+----
+MATCH (manufacturer:Company)<--(vehicle:Car)<--(:Person)
+WHERE manufacturer.foundedYear < 2000
+RETURN vehicle.mileage
+----
+
+. Prefer outgoing (left to right) pattern relationships to incoming pattern relationships.
++
+.Bad
+[source, cypher]
+----
+MATCH (:Country)-->(:Company)<--(vehicle:Car)<--(:Person)
+RETURN vehicle.mileage
+----
++
+.Good
+[source, cypher]
+----
+MATCH (:Person)-->(vehicle:Car)-->(:Company)<--(:Country)
+RETURN vehicle.mileage
+----
+
+=== Spacing
+
+. For literal maps:
+.. No space between the opening brace and the first key
+.. No space between key and colon
+.. One space between colon and value
+.. No space between value and comma
+.. One space between comma and next key
+.. No space between the last value and the closing brace
++
+.Bad
+[source, cypher]
+----
+WITH { key1 :'value' ,key2  :  42 } AS map
+RETURN map
+----
++
+.Good
+[source, cypher]
+----
+WITH {key1: 'value', key2: 42} AS map
+RETURN map
+----
+
+. No padding space for parameters.
+.. This rule mentions deprecated syntax. See link:https://github.com/opencypher/openCypher/blob/master/cip/2.testable/CIP2016-07-07-Parameter-syntax.adoc#interaction-with-existing-features[Parameter Syntax].
++
+.Bad
+[source, cypher]
+----
+RETURN { param }
+----
++
+.Good
+[source, cypher]
+----
+RETURN {param}
+----
+
+. One space between label/type predicates and property predicates in patterns.
++
+.Bad
+[source, cypher]
+----
+MATCH (p:Person{property: -1})-[:KNOWS   {since: 2016}]->()
+RETURN p.name
+----
++
+.Good
+[source, cypher]
+----
+MATCH (p:Person {property: -1})-[:KNOWS {since: 2016}]->()
+RETURN p.name
+----
+
+. No space in patterns.
++
+.Bad
+[source, cypher]
+----
+MATCH (:Person) --> (:Vehicle)
+RETURN count(*)
+----
++
+.Good
+[source, cypher]
+----
+MATCH (:Person)-->(:Vehicle)
+RETURN count(*)
+----
+
+. Use a wrapping space around operators.
++
+.Bad
+[source, cypher]
+----
+MATCH p=(s)-->(e)
+WHERE s.name<>e.name
+RETURN length(p)
+----
++
+.Good
+[source, cypher]
+----
+MATCH p = (s)-->(e)
+WHERE s.name <> e.name
+RETURN length(p)
+----
+
+. No space in label predicates.
++
+.Bad
+[source, cypher]
+----
+MATCH (person    : Person  :  Owner  )
+RETURN person.name
+----
++
+.Good
+[source, cypher]
+----
+MATCH (person:Person:Owner)
+RETURN person.name
+----
+
+. Use a space after each comma in lists and enumerations.
++
+.Bad
+[source, cypher]
+----
+MATCH (),()
+WITH ['a','b',3.14] AS list
+RETURN list,2,3,4
+----
++
+.Good
+[source, cypher]
+----
+MATCH (), ()
+WITH ['a', 'b', 3.14] AS list
+RETURN list, 2, 3, 4
+----
+
+. No padding space within function call parentheses.
++
+.Bad
+[source, cypher]
+----
+RETURN split( 'original', 'i' )
+----
++
+.Good
+[source, cypher]
+----
+RETURN split('original', 'i')
+----
+
+. Use padding space within simple subquery expressions.
++
+.Bad
+[source, cypher]
+----
+MATCH (a:A)
+WHERE EXISTS {(a)-->(b:B)}
+RETURN a.prop
+----
++
+.Good
+[source, cypher]
+----
+MATCH (a:A)
+WHERE EXISTS { (a)-->(b:B) }
+RETURN a.prop
+----
+
+== Recommendations
+
+* When using Cypher language constructs in prose, use a monospaced font and follow the styling rules.
+** When referring to labels and relationship types, the colon should be included as follows: `:Label`, `:REL_TYPE`.
+** When referring to functions, use lower camel case and parentheses should be used as follows: `shortestPath()`. Arguments should normally not be included.
+* If you are storing Cypher statements in a separate file, use the file extension `.cypher`.
+
+=== Graph modelling
+
+. Prefer single nouns for labels.
++
+.Bad
+[source, cypher]
+----
+MATCH (e:IsEmployed)
+RETURN e.name
+----
++
+.Good
+[source, cypher]
+----
+MATCH (e:Employee)
+RETURN e.name
+----
+
+. Write labels in camel case, starting with an upper case character.
++
+.Bad
+[source, cypher]
+----
+MATCH (e:editor_in_chief)-->(:EMPLOYEE)
+RETURN e.name
+----
++
+.Good
+[source, cypher]
+----
+MATCH (e:EditorInChief)-->(:Employee)
+RETURN e.name
+----
+
+. Write relationship types in upper case, using an underscore (`_`) to separate words.
++
+.Bad
+[source, cypher]
+----
+MATCH (:Person)-[own:ownsVehicle]->(:Car)
+RETURN own.since
+----
++
+.Good
+[source, cypher]
+----
+MATCH (:Person)-[own:OWNS_VEHICLE]->(:Car)
+RETURN own.since
+----
