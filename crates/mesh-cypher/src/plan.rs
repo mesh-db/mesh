@@ -930,7 +930,7 @@ where
         // inner expressions get validated too. The pattern's
         // shape is checked separately by the subquery
         // validation pass.
-        Expr::ExistsSubquery { where_clause, .. } => {
+        Expr::ExistsSubquery { where_clause, .. } | Expr::CountSubquery { where_clause, .. } => {
             if let Some(w) = where_clause {
                 walk_expr(w, visit)?;
             }

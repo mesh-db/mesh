@@ -461,6 +461,13 @@ pub enum Expr {
         pattern: Pattern,
         where_clause: Option<Box<Expr>>,
     },
+    /// `count { MATCH pattern [WHERE expr] }` — returns the number
+    /// of matches as an Int64. Same semantics as ExistsSubquery but
+    /// counts all matches instead of short-circuiting on the first.
+    CountSubquery {
+        pattern: Pattern,
+        where_clause: Option<Box<Expr>>,
+    },
     /// Binary arithmetic — `+`, `-`, `*`, `/`, `%`. Evaluated
     /// with numeric coercion (Int + Int = Int; any Float operand
     /// widens to Float) and null propagation. `+` additionally

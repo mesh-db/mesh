@@ -419,6 +419,13 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let b = exists_subquery_matches(pattern, where_clause.as_deref(), ctx)?;
             Ok(Value::Property(Property::Bool(b)))
         }
+        Expr::CountSubquery {
+            pattern,
+            where_clause,
+        } => {
+            let n = count_subquery_matches(pattern, where_clause.as_deref(), ctx)?;
+            Ok(Value::Property(Property::Int64(n)))
+        }
     }
 }
 
@@ -592,6 +599,139 @@ fn exists_subquery_matches(
         }
     }
     Ok(false)
+}
+
+fn count_subquery_matches(
+    pattern: &Pattern,
+    where_clause: Option<&Expr>,
+    ctx: &EvalCtx,
+) -> Result<i64> {
+    let mut total: i64 = 0;
+    let start_candidates = resolve_exists_start_candidates(&pattern.start, ctx)?;
+    for start_node in start_candidates {
+        if !start_node_matches(&start_node, &pattern.start, ctx)? {
+            continue;
+        }
+        let mut seed = ctx.row.clone();
+        if let Some(start_var) = &pattern.start.var {
+            seed.insert(start_var.clone(), Value::Node(start_node.clone()));
+        }
+        if pattern.hops.is_empty() {
+            match where_clause {
+                None => total += 1,
+                Some(w) => {
+                    let sub_ctx = ctx.with_row(&seed);
+                    let v = eval_expr(w, &sub_ctx)?;
+                    if to_bool(&v).unwrap_or(false) {
+                        total += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        let mut frontier: Vec<(mesh_core::Node, Row)> = vec![(start_node.clone(), seed)];
+        total += count_walk_hops(pattern, where_clause, &mut frontier, ctx)?;
+    }
+    Ok(total)
+}
+
+fn count_walk_hops(
+    pattern: &Pattern,
+    where_clause: Option<&Expr>,
+    frontier: &mut Vec<(mesh_core::Node, Row)>,
+    ctx: &EvalCtx,
+) -> Result<i64> {
+    for hop in &pattern.hops {
+        let mut next: Vec<(mesh_core::Node, Row)> = Vec::new();
+        for (node, row) in frontier.iter() {
+            let neighbors = match hop.rel.direction {
+                Direction::Outgoing => ctx.reader.outgoing(node.id)?,
+                Direction::Incoming => ctx.reader.incoming(node.id)?,
+                Direction::Both => {
+                    let mut out = ctx.reader.outgoing(node.id)?;
+                    out.extend(ctx.reader.incoming(node.id)?);
+                    out
+                }
+            };
+            for (edge_id, neighbor_id) in neighbors {
+                let edge_record = if hop.rel.edge_type.is_some() || hop.rel.var.is_some() {
+                    match ctx.reader.get_edge(edge_id)? {
+                        Some(e) => Some(e),
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
+                if let Some(t) = &hop.rel.edge_type {
+                    if let Some(e) = &edge_record {
+                        if &e.edge_type != t {
+                            continue;
+                        }
+                    }
+                }
+                let need_target = !hop.target.labels.is_empty()
+                    || !hop.target.properties.is_empty()
+                    || hop.target.var.is_some();
+                let target_node = if need_target {
+                    match ctx.reader.get_node(neighbor_id)? {
+                        Some(n) => Some(n),
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
+                if let Some(n) = &target_node {
+                    if (!hop.target.labels.is_empty() || !hop.target.properties.is_empty())
+                        && !node_pattern_matches(n, &hop.target, ctx)?
+                    {
+                        continue;
+                    }
+                }
+                if let Some(target_var) = &hop.target.var {
+                    if let Some(Value::Node(bound)) = row.get(target_var) {
+                        if bound.id != neighbor_id {
+                            continue;
+                        }
+                    }
+                }
+                let mut next_row = row.clone();
+                if let Some(edge_var) = &hop.rel.var {
+                    if let Some(e) = &edge_record {
+                        next_row.insert(edge_var.clone(), Value::Edge(e.clone()));
+                    }
+                }
+                let concrete = match target_node {
+                    Some(n) => n,
+                    None => match ctx.reader.get_node(neighbor_id)? {
+                        Some(n) => n,
+                        None => continue,
+                    },
+                };
+                if let Some(target_var) = &hop.target.var {
+                    next_row.insert(target_var.clone(), Value::Node(concrete.clone()));
+                }
+                next.push((concrete, next_row));
+            }
+        }
+        if next.is_empty() {
+            return Ok(0);
+        }
+        *frontier = next;
+    }
+    match where_clause {
+        None => Ok(frontier.len() as i64),
+        Some(w) => {
+            let mut count = 0i64;
+            for (_, row) in frontier.iter() {
+                let sub_ctx = ctx.with_row(row);
+                let v = eval_expr(w, &sub_ctx)?;
+                if to_bool(&v).unwrap_or(false) {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        }
+    }
 }
 
 /// Compute the list of candidate start nodes for an

@@ -2764,6 +2764,108 @@ fn remove_nonexistent_property_is_noop() {
     assert_eq!(str_prop(&rows[0], "name"), "Ada");
 }
 
+// --- count { } subquery ------------------------------------------------
+
+#[test]
+fn count_subquery_returns_match_count() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cara'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) CREATE (a)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         RETURN p.name AS name, count { MATCH (p)-[:KNOWS]->() } AS friends \
+         ORDER BY name",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+    assert_eq!(int_prop(&rows[0], "friends"), 2);
+    assert_eq!(str_prop(&rows[1], "name"), "Bob");
+    assert_eq!(int_prop(&rows[1], "friends"), 0);
+    assert_eq!(str_prop(&rows[2], "name"), "Cara");
+    assert_eq!(int_prop(&rows[2], "friends"), 0);
+}
+
+#[test]
+fn count_subquery_in_where_filters_by_threshold() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cara'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) CREATE (a)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         WHERE count { MATCH (p)-[:KNOWS]->() } > 1 \
+         RETURN p.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn count_subquery_with_where_clause() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob', active: true})");
+    run(&store, "CREATE (:Person {name: 'Cara', active: false})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) CREATE (a)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) \
+         RETURN count { MATCH (p)-[:KNOWS]->(f) WHERE f.active = true } AS active_friends",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "active_friends"), 1);
+}
+
+#[test]
+fn count_subquery_zero_for_no_matches() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         RETURN count { MATCH (p)-[:NOPE]->() } AS n",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "n"), 0);
+}
+
+#[test]
+fn count_function_still_works_as_aggregate() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N {v: 2})");
+    run(&store, "CREATE (:N {v: 3})");
+    let rows = run(&store, "MATCH (n:N) RETURN count(*) AS c");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "c"), 3);
+}
+
 // --- Parameter execution -----------------------------------------------
 
 #[test]

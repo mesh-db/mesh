@@ -1531,6 +1531,39 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
         }
         Rule::list_comp => build_list_comp(pair),
         Rule::reduce_expr => build_reduce_expr(pair),
+        Rule::count_subquery => {
+            let mut pat: Option<Pattern> = None;
+            let mut where_expr: Option<Box<Expr>> = None;
+            for p in pair.into_inner() {
+                match p.as_rule() {
+                    Rule::kw_count | Rule::kw_match => {}
+                    Rule::pattern => pat = Some(build_pattern(p)?),
+                    Rule::where_clause => {
+                        let ep = p
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| Error::Parse("empty count where".into()))?;
+                        where_expr = Some(Box::new(build_expression(ep)?));
+                    }
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rule in count_subquery: {r:?}"
+                        )))
+                    }
+                }
+            }
+            let pattern =
+                pat.ok_or_else(|| Error::Parse("count_subquery missing pattern".into()))?;
+            if pattern.path_var.is_some() {
+                return Err(Error::Parse(
+                    "path variable binding is not allowed inside count { ... }".into(),
+                ));
+            }
+            Ok(Expr::CountSubquery {
+                pattern,
+                where_clause: where_expr,
+            })
+        }
         Rule::exists_subquery => {
             // Children (silent `kw_exists` / `kw_match` filtered
             // out): a single `pattern`, then an optional

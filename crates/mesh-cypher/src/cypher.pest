@@ -311,6 +311,7 @@ slice_all  = { ".." }
 base_primary = {
     case_expr |
     reduce_expr |
+    count_subquery |
     exists_subquery |
     list_comp |
     list_literal |
@@ -332,6 +333,10 @@ base_primary = {
 // MATCH, aggregation) are deferred. Multi-pattern comma lists
 // inside the MATCH are also deferred — v1 takes exactly one
 // pattern.
+count_subquery = {
+    kw_count ~ "{" ~ kw_match ~ pattern ~ where_clause? ~ "}"
+}
+
 exists_subquery = {
     kw_exists ~ "{" ~ kw_match ~ pattern ~ where_clause? ~ "}"
 }
@@ -466,5 +471,6 @@ kw_reduce = @{ ^"reduce" ~ !id_cont }
 kw_exists = @{ ^"exists" ~ !id_cont }
 kw_explain = @{ ^"explain" ~ !id_cont }
 kw_remove = _{ ^"remove" }
+kw_count = @{ ^"count" ~ !id_cont }
 kw_shortest_path = @{ ^"shortestPath" ~ !id_cont }
 kw_all_shortest_paths = @{ ^"allShortestPaths" ~ !id_cont }
