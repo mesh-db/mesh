@@ -327,6 +327,7 @@ pub struct RelPattern {
     pub edge_types: Vec<String>,
     pub direction: Direction,
     pub var_length: Option<VarLength>,
+    pub properties: Vec<(String, Expr)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

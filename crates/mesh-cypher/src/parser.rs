@@ -1059,6 +1059,7 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
     let mut var = None;
     let mut edge_types = Vec::new();
     let mut var_length = None;
+    let mut properties = Vec::new();
     for p in inner.into_inner() {
         if p.as_rule() == Rule::rel_detail {
             for d in p.into_inner() {
@@ -1074,6 +1075,9 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
                     Rule::var_length => {
                         var_length = Some(build_var_length(d)?);
                     }
+                    Rule::properties => {
+                        properties = build_properties(d)?;
+                    }
                     r => return Err(Error::Parse(format!("unexpected rel detail rule: {:?}", r))),
                 }
             }
@@ -1083,6 +1087,7 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
     Ok(RelPattern {
         var,
         edge_types,
+        properties,
         direction,
         var_length,
     })
