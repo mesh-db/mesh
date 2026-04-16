@@ -134,8 +134,9 @@ match_clause = {
 // `match_stmt`.
 terminal_tail = {
     return_tail
-    | ((set_tail | delete_tail | create_tail | remove_tail | foreach_tail) ~ return_tail?)
+    | (mutation_clause+ ~ return_tail?)
 }
+mutation_clause = { set_tail | delete_tail | create_tail | remove_tail | foreach_tail }
 
 foreach_tail = {
     kw_foreach ~ "(" ~ identifier ~ kw_in ~ expression ~ "|" ~ foreach_body+ ~ ")"

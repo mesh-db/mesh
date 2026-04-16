@@ -2216,15 +2216,29 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
 
     let terminal = &stmt.terminal;
 
-    // At most one mutation is grammatically allowed at the
-    // terminal — pick whichever the parser populated.
+    // Multiple mutation clauses can appear in sequence:
+    // CREATE (n) SET n.name = 'Ada' REMOVE n:Temp RETURN n
+    if !terminal.create_patterns.is_empty() {
+        let mut nodes: Vec<CreateNodeSpec> = Vec::new();
+        let mut edges: Vec<CreateEdgeSpec> = Vec::new();
+        let mut var_idx: HashMap<String, usize> = HashMap::new();
+        for pattern in &terminal.create_patterns {
+            build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &bound_vars)?;
+        }
+        plan = LogicalPlan::CreatePath {
+            input: Some(Box::new(plan)),
+            nodes,
+            edges,
+        };
+    }
     if let Some(delete_clause) = &terminal.delete {
         plan = LogicalPlan::Delete {
             input: Box::new(plan),
             detach: delete_clause.detach,
             vars: delete_clause.vars.clone(),
         };
-    } else if !terminal.set_items.is_empty() {
+    }
+    if !terminal.set_items.is_empty() {
         let assignments = terminal
             .set_items
             .iter()
@@ -2234,7 +2248,8 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
             input: Box::new(plan),
             assignments,
         };
-    } else if !terminal.remove_items.is_empty() {
+    }
+    if !terminal.remove_items.is_empty() {
         let items = terminal
             .remove_items
             .iter()
@@ -2252,18 +2267,6 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         plan = LogicalPlan::Remove {
             input: Box::new(plan),
             items,
-        };
-    } else if !terminal.create_patterns.is_empty() {
-        let mut nodes: Vec<CreateNodeSpec> = Vec::new();
-        let mut edges: Vec<CreateEdgeSpec> = Vec::new();
-        let mut var_idx: HashMap<String, usize> = HashMap::new();
-        for pattern in &terminal.create_patterns {
-            build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &bound_vars)?;
-        }
-        plan = LogicalPlan::CreatePath {
-            input: Some(Box::new(plan)),
-            nodes,
-            edges,
         };
     }
 

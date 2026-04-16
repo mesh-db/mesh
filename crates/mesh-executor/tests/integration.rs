@@ -2785,6 +2785,69 @@ fn load_csv_with_headers_field_access() {
     assert_eq!(str_prop(&rows[1], "name"), "Bob");
 }
 
+// --- Combined mutation clauses ------------------------------------------
+
+#[test]
+fn match_create_then_set_in_same_terminal() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Seed {v: 1})");
+    let rows = run(
+        &store,
+        "MATCH (s:Seed) \
+         CREATE (n:Person {name: 'placeholder'}) SET n.name = 'Ada' \
+         RETURN n.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn match_create_then_remove_in_same_terminal() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Seed {v: 1})");
+    let rows = run(
+        &store,
+        "MATCH (s:Seed) \
+         CREATE (n:Person:Temp {name: 'Bob'}) REMOVE n:Temp \
+         RETURN labels(n) AS labs",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("labs") {
+        Some(Value::List(labs)) => {
+            let names: Vec<&str> = labs
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::String(s)) => s.as_str(),
+                    _ => panic!("expected string"),
+                })
+                .collect();
+            assert!(names.contains(&"Person"));
+            assert!(!names.contains(&"Temp"));
+        }
+        other => panic!("expected list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn set_then_remove_in_same_query() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A', old: 1})");
+    run(&store, "MATCH (n:N) SET n.new_prop = 'hello' REMOVE n.old");
+    let rows = run(
+        &store,
+        "MATCH (n:N) RETURN exists(n.new_prop) AS has_new, exists(n.old) AS has_old",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("has_new") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
+    match rows[0].get("has_old") {
+        Some(Value::Property(Property::Bool(b))) => assert!(!b),
+        other => panic!("expected false, got: {other:?}"),
+    }
+}
+
 // --- CREATE with RETURN ------------------------------------------------
 
 #[test]

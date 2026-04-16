@@ -585,6 +585,13 @@ fn build_match_clause(pair: Pair<Rule>) -> Result<crate::ast::MatchClause> {
 fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail) -> Result<()> {
     debug_assert_eq!(pair.as_rule(), Rule::terminal_tail);
     for p in pair.into_inner() {
+        let p = if p.as_rule() == Rule::mutation_clause {
+            p.into_inner()
+                .next()
+                .ok_or_else(|| Error::Parse("empty mutation_clause".into()))?
+        } else {
+            p
+        };
         match p.as_rule() {
             Rule::return_tail => {
                 parse_return_tail(
