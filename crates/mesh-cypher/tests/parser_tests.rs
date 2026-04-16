@@ -1751,16 +1751,19 @@ fn path_variable_on_zero_hop_pattern_parses() {
 }
 
 #[test]
-fn path_variable_with_variable_length_rejected_at_plan_time() {
-    // Parser accepts the shape; the planner rejects var-length
-    // patterns under a path variable because `VarLengthExpand`
-    // doesn't retain intermediate nodes.
+fn path_variable_with_variable_length_plans_successfully() {
     let s = parse("MATCH p = (a)-[:KNOWS*1..3]->(b) RETURN p").unwrap();
+    plan(&s).expect("single var-length hop with path variable should plan");
+}
+
+#[test]
+fn path_variable_with_multi_hop_var_length_rejected() {
+    let s = parse("MATCH p = (a)-[:KNOWS]->(b)-[:LIKES*1..3]->(c) RETURN p").unwrap();
     let err = plan(&s).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("variable-length") && msg.contains("path variable"),
-        "expected var-length rejection message, got: {msg}"
+        msg.contains("variable-length") && msg.contains("multi-hop"),
+        "expected multi-hop var-length rejection, got: {msg}"
     );
 }
 

@@ -2279,6 +2279,103 @@ fn not_exists_excludes_present_property() {
 }
 
 #[test]
+fn var_length_path_binding_returns_path() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'A'})");
+    run(&store, "CREATE (:Person {name: 'B'})");
+    run(&store, "CREATE (:Person {name: 'C'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}), (c:Person {name: 'C'}) CREATE (b)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH p = (a:Person {name: 'A'})-[:KNOWS*1..3]->(c:Person {name: 'C'}) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 2);
+}
+
+#[test]
+fn var_length_path_binding_nodes_and_relationships() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A'})");
+    run(&store, "CREATE (:N {name: 'B'})");
+    run(
+        &store,
+        "MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:R]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH p = (a:N {name: 'A'})-[:R*1..1]->(b:N) \
+         RETURN length(p) AS len, nodes(p) AS ns, relationships(p) AS rs",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 1);
+    match rows[0].get("ns") {
+        Some(Value::List(ns)) => assert_eq!(ns.len(), 2),
+        other => panic!("expected 2 nodes, got: {other:?}"),
+    }
+    match rows[0].get("rs") {
+        Some(Value::List(rs)) => assert_eq!(rs.len(), 1),
+        other => panic!("expected 1 edge, got: {other:?}"),
+    }
+}
+
+#[test]
+fn var_length_path_binding_multiple_results() {
+    // Diamond: A->B, A->C, B->D, C->D — two 2-hop paths from A to D.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A'})");
+    run(&store, "CREATE (:N {name: 'B'})");
+    run(&store, "CREATE (:N {name: 'C'})");
+    run(&store, "CREATE (:N {name: 'D'})");
+    run(
+        &store,
+        "MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:R]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:N {name: 'A'}), (c:N {name: 'C'}) CREATE (a)-[:R]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (b:N {name: 'B'}), (d:N {name: 'D'}) CREATE (b)-[:R]->(d)",
+    );
+    run(
+        &store,
+        "MATCH (c:N {name: 'C'}), (d:N {name: 'D'}) CREATE (c)-[:R]->(d)",
+    );
+    let rows = run(
+        &store,
+        "MATCH p = (a:N {name: 'A'})-[:R*1..3]->(d:N {name: 'D'}) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        assert_eq!(int_prop(r, "len"), 2);
+    }
+}
+
+#[test]
+fn var_length_path_no_match_produces_no_rows() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A'})");
+    run(&store, "CREATE (:N {name: 'Z'})");
+    let rows = run(
+        &store,
+        "MATCH p = (a:N {name: 'A'})-[:R*1..5]->(z:N {name: 'Z'}) \
+         RETURN length(p) AS len",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");

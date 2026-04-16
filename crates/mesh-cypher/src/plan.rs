@@ -71,6 +71,7 @@ pub enum LogicalPlan {
         direction: Direction,
         min_hops: u64,
         max_hops: u64,
+        path_var: Option<String>,
     },
     Filter {
         input: Box<LogicalPlan>,
@@ -1151,14 +1152,25 @@ fn plan_shortest_path(
 /// (`[*2..2]` → unrolled as two fixed hops) or wait for a
 /// follow-up that extends `VarLengthExpand` to retain the walk.
 fn ensure_path_bindings(pattern: &mut Pattern, pattern_idx: usize) -> Result<()> {
-    for (i, hop) in pattern.hops.iter_mut().enumerate() {
-        if hop.rel.var_length.is_some() {
+    // Single var-length hop with a path variable is handled
+    // directly by the VarLengthExpand operator — it builds the
+    // Value::Path from the DFS walk. Multi-hop patterns where
+    // any hop is var-length are still rejected because the
+    // BindPath operator can't interleave fixed and var-length
+    // node/edge sequences.
+    let has_var_length = pattern.hops.iter().any(|h| h.rel.var_length.is_some());
+    if has_var_length {
+        if pattern.hops.len() != 1 {
             return Err(Error::Plan(
-                "variable-length patterns (`*`) cannot be bound to a path variable yet; \
-                 use concrete hop counts or drop the path binding"
+                "variable-length patterns (`*`) in multi-hop path bindings \
+                 are not yet supported; use a single-hop variable-length \
+                 pattern or drop the path binding"
                     .into(),
             ));
         }
+        return Ok(());
+    }
+    for (i, hop) in pattern.hops.iter_mut().enumerate() {
         if hop.rel.var.is_none() {
             hop.rel.var = Some(format!("__p{}_e{}", pattern_idx, i + 1));
         }
@@ -1177,6 +1189,11 @@ fn wrap_with_bind_path(plan: LogicalPlan, pattern: &Pattern, start_var: &str) ->
     let Some(path_var) = pattern.path_var.clone() else {
         return plan;
     };
+    // Single var-length hop patterns have their path_var handled
+    // directly by VarLengthExpand — no BindPath wrapper needed.
+    if pattern.hops.len() == 1 && pattern.hops[0].rel.var_length.is_some() {
+        return plan;
+    }
     let mut node_vars = Vec::with_capacity(pattern.hops.len() + 1);
     let mut edge_vars = Vec::with_capacity(pattern.hops.len());
     node_vars.push(start_var.to_string());
@@ -1221,6 +1238,19 @@ fn chain_hops(
     start_var: &str,
     pattern_idx: usize,
 ) -> Result<LogicalPlan> {
+    // When the pattern is a single var-length hop with a path_var,
+    // pass the path_var into VarLengthExpand so it builds the
+    // Value::Path directly. Multi-hop patterns use BindPath instead
+    // (with var-length rejected at ensure_path_bindings time).
+    let vl_path_var = if pattern.hops.len() == 1
+        && pattern.hops[0].rel.var_length.is_some()
+        && pattern.path_var.is_some()
+    {
+        pattern.path_var.clone()
+    } else {
+        None
+    };
+
     let mut current_var = start_var.to_string();
     for (i, hop) in pattern.hops.iter().enumerate() {
         let dst_var = hop
@@ -1245,6 +1275,7 @@ fn chain_hops(
                 direction: hop.rel.direction,
                 min_hops: vl.min,
                 max_hops: vl.max,
+                path_var: vl_path_var.clone(),
             }
         } else {
             LogicalPlan::EdgeExpand {

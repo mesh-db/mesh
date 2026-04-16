@@ -239,6 +239,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             direction,
             min_hops,
             max_hops,
+            path_var,
         } => Box::new(VarLengthExpandOp::new(
             build_op(input),
             src_var.clone(),
@@ -249,6 +250,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             *direction,
             *min_hops,
             *max_hops,
+            path_var.clone(),
         )),
         LogicalPlan::Filter { input, predicate } => {
             Box::new(FilterOp::new(build_op(input), predicate.clone()))
@@ -1738,8 +1740,10 @@ struct VarLengthExpandOp {
     direction: Direction,
     min_hops: u64,
     max_hops: u64,
+    path_var: Option<String>,
     current_row: Option<Row>,
     pending_paths: Vec<Vec<Edge>>,
+    pending_node_paths: Vec<Vec<NodeId>>,
     pending_targets: Vec<NodeId>,
     pending_idx: usize,
 }
@@ -1756,6 +1760,7 @@ impl VarLengthExpandOp {
         direction: Direction,
         min_hops: u64,
         max_hops: u64,
+        path_var: Option<String>,
     ) -> Self {
         Self {
             input,
@@ -1767,39 +1772,52 @@ impl VarLengthExpandOp {
             direction,
             min_hops,
             max_hops,
+            path_var,
             current_row: None,
             pending_paths: Vec::new(),
+            pending_node_paths: Vec::new(),
             pending_targets: Vec::new(),
             pending_idx: 0,
         }
     }
 
-    fn enumerate(&self, ctx: &ExecCtx, start: NodeId) -> Result<(Vec<Vec<Edge>>, Vec<NodeId>)> {
+    fn enumerate(
+        &self,
+        ctx: &ExecCtx,
+        start: NodeId,
+    ) -> Result<(Vec<Vec<Edge>>, Vec<Vec<NodeId>>, Vec<NodeId>)> {
         let mut paths: Vec<Vec<Edge>> = Vec::new();
+        let mut node_paths: Vec<Vec<NodeId>> = Vec::new();
         let mut targets: Vec<NodeId> = Vec::new();
-        let mut current: Vec<Edge> = Vec::new();
+        let mut edge_buf: Vec<Edge> = Vec::new();
+        let mut node_buf: Vec<NodeId> = vec![start];
         let mut used: HashSet<EdgeId> = HashSet::new();
         self.dfs(
             ctx,
             start,
-            &mut current,
+            &mut edge_buf,
+            &mut node_buf,
             &mut used,
             &mut paths,
+            &mut node_paths,
             &mut targets,
         )?;
-        Ok((paths, targets))
+        Ok((paths, node_paths, targets))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dfs(
         &self,
         ctx: &ExecCtx,
         current_node: NodeId,
-        path: &mut Vec<Edge>,
+        edge_buf: &mut Vec<Edge>,
+        node_buf: &mut Vec<NodeId>,
         used: &mut HashSet<EdgeId>,
         out_paths: &mut Vec<Vec<Edge>>,
+        out_node_paths: &mut Vec<Vec<NodeId>>,
         out_targets: &mut Vec<NodeId>,
     ) -> Result<()> {
-        let depth = path.len() as u64;
+        let depth = edge_buf.len() as u64;
 
         if depth >= self.min_hops && depth <= self.max_hops {
             let terminal_ok = match ctx.store.get_node(current_node)? {
@@ -1807,7 +1825,8 @@ impl VarLengthExpandOp {
                 None => false,
             };
             if terminal_ok {
-                out_paths.push(path.clone());
+                out_paths.push(edge_buf.clone());
+                out_node_paths.push(node_buf.clone());
                 out_targets.push(current_node);
             }
         }
@@ -1840,9 +1859,20 @@ impl VarLengthExpandOp {
                 }
             }
             used.insert(eid);
-            path.push(edge);
-            self.dfs(ctx, neighbor_id, path, used, out_paths, out_targets)?;
-            path.pop();
+            edge_buf.push(edge);
+            node_buf.push(neighbor_id);
+            self.dfs(
+                ctx,
+                neighbor_id,
+                edge_buf,
+                node_buf,
+                used,
+                out_paths,
+                out_node_paths,
+                out_targets,
+            )?;
+            edge_buf.pop();
+            node_buf.pop();
             used.remove(&eid);
         }
 
@@ -1868,7 +1898,7 @@ impl Operator for VarLengthExpandOp {
                     .as_ref()
                     .expect("pending without source row");
                 let mut out = base.clone();
-                out.insert(self.dst_var.clone(), Value::Node(target));
+                out.insert(self.dst_var.clone(), Value::Node(target.clone()));
                 if let Some(ev) = &self.edge_var {
                     let edges: Vec<Value> = self.pending_paths[i]
                         .iter()
@@ -1876,6 +1906,17 @@ impl Operator for VarLengthExpandOp {
                         .map(Value::Edge)
                         .collect();
                     out.insert(ev.clone(), Value::List(edges));
+                }
+                if let Some(pv) = &self.path_var {
+                    let mut nodes = Vec::with_capacity(self.pending_node_paths[i].len());
+                    for nid in &self.pending_node_paths[i] {
+                        match ctx.store.get_node(*nid)? {
+                            Some(n) => nodes.push(n),
+                            None => continue,
+                        }
+                    }
+                    let edges = self.pending_paths[i].clone();
+                    out.insert(pv.clone(), Value::Path { nodes, edges });
                 }
                 return Ok(Some(out));
             }
@@ -1887,8 +1928,9 @@ impl Operator for VarLengthExpandOp {
                         Some(Value::Node(n)) => n.id,
                         _ => return Err(Error::UnboundVariable(self.src_var.clone())),
                     };
-                    let (paths, targets) = self.enumerate(ctx, src_id)?;
+                    let (paths, node_paths, targets) = self.enumerate(ctx, src_id)?;
                     self.pending_paths = paths;
+                    self.pending_node_paths = node_paths;
                     self.pending_targets = targets;
                     self.pending_idx = 0;
                     self.current_row = Some(row);
