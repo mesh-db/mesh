@@ -920,6 +920,12 @@ where
             walk_expr(element, visit)?;
             walk_expr(list, visit)
         }
+        Expr::ListPredicate {
+            list, predicate, ..
+        } => {
+            walk_expr(list, visit)?;
+            walk_expr(predicate, visit)
+        }
         Expr::Call { args, .. } => match args {
             CallArgs::Star => Ok(()),
             CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) => {

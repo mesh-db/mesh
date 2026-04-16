@@ -325,6 +325,7 @@ slice_all  = { ".." }
 base_primary = {
     case_expr |
     reduce_expr |
+    list_predicate |
     count_subquery |
     exists_subquery |
     list_comp |
@@ -383,6 +384,11 @@ reduce_expr = {
     identifier ~ kw_in ~ expression ~ "|" ~ expression ~
     ")"
 }
+
+list_predicate = {
+    list_pred_name ~ "(" ~ identifier ~ kw_in ~ expression ~ kw_where ~ expression ~ ")"
+}
+list_pred_name = @{ (^"any" | ^"all" | ^"none" | ^"single") ~ !id_cont }
 
 // Map literal: `{k1: e1, k2: e2, ...}`. Distinct from pattern
 // property maps (`node_pattern`'s `properties` rule) which only

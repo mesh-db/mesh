@@ -502,6 +502,13 @@ pub enum Expr {
         pattern: Pattern,
         where_clause: Option<Box<Expr>>,
     },
+    /// `any(x IN list WHERE pred)`, `all(...)`, `none(...)`, `single(...)`
+    ListPredicate {
+        kind: ListPredicateKind,
+        var: String,
+        list: Box<Expr>,
+        predicate: Box<Expr>,
+    },
     /// Binary arithmetic — `+`, `-`, `*`, `/`, `%`. Evaluated
     /// with numeric coercion (Int + Int = Int; any Float operand
     /// widens to Float) and null propagation. `+` additionally
@@ -543,6 +550,14 @@ pub enum CallArgs {
     Star,
     Exprs(Vec<Expr>),
     DistinctExprs(Vec<Expr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPredicateKind {
+    Any,
+    All,
+    None,
+    Single,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

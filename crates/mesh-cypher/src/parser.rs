@@ -1717,6 +1717,42 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
         }
         Rule::list_comp => build_list_comp(pair),
         Rule::reduce_expr => build_reduce_expr(pair),
+        Rule::list_predicate => {
+            let mut inner = pair.into_inner();
+            let name_pair = inner
+                .next()
+                .ok_or_else(|| Error::Parse("list_predicate missing name".into()))?;
+            let kind = match name_pair.as_str().to_ascii_lowercase().as_str() {
+                "any" => crate::ast::ListPredicateKind::Any,
+                "all" => crate::ast::ListPredicateKind::All,
+                "none" => crate::ast::ListPredicateKind::None,
+                "single" => crate::ast::ListPredicateKind::Single,
+                other => return Err(Error::Parse(format!("unknown list predicate: {other}"))),
+            };
+            let mut var = String::new();
+            let mut list = None;
+            let mut predicate = None;
+            for p in inner {
+                match p.as_rule() {
+                    Rule::identifier if var.is_empty() => var = parse_ident(p.as_str()),
+                    Rule::expression if list.is_none() => list = Some(build_expression(p)?),
+                    Rule::expression => predicate = Some(build_expression(p)?),
+                    Rule::kw_in | Rule::kw_where => {}
+                    _ => {}
+                }
+            }
+            Ok(Expr::ListPredicate {
+                kind,
+                var,
+                list: Box::new(
+                    list.ok_or_else(|| Error::Parse("list_predicate missing list".into()))?,
+                ),
+                predicate: Box::new(
+                    predicate
+                        .ok_or_else(|| Error::Parse("list_predicate missing predicate".into()))?,
+                ),
+            })
+        }
         Rule::count_subquery => {
             let mut pat: Option<Pattern> = None;
             let mut where_expr: Option<Box<Expr>> = None;

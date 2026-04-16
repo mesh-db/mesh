@@ -212,6 +212,44 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let vb = to_bool(&eval_expr(b, ctx)?)?;
             Ok(Value::Property(Property::Bool(va ^ vb)))
         }
+        Expr::ListPredicate {
+            kind,
+            var,
+            list,
+            predicate,
+        } => {
+            let list_val = eval_expr(list, ctx)?;
+            let items = match list_val {
+                Value::List(items) => items,
+                Value::Property(Property::List(props)) => {
+                    props.into_iter().map(Value::Property).collect()
+                }
+                Value::Null | Value::Property(Property::Null) => {
+                    return Ok(Value::Property(Property::Bool(false)));
+                }
+                _ => return Err(Error::TypeMismatch),
+            };
+            let mut count = 0usize;
+            for item in &items {
+                let mut scratch = ctx.row.clone();
+                scratch.insert(var.clone(), item.clone());
+                let sub_ctx = ctx.with_row(&scratch);
+                let v = eval_expr(predicate, &sub_ctx)?;
+                if to_bool(&v).unwrap_or(false) {
+                    count += 1;
+                    if *kind == mesh_cypher::ListPredicateKind::Any {
+                        return Ok(Value::Property(Property::Bool(true)));
+                    }
+                }
+            }
+            let result = match kind {
+                mesh_cypher::ListPredicateKind::Any => count > 0,
+                mesh_cypher::ListPredicateKind::All => count == items.len(),
+                mesh_cypher::ListPredicateKind::None => count == 0,
+                mesh_cypher::ListPredicateKind::Single => count == 1,
+            };
+            Ok(Value::Property(Property::Bool(result)))
+        }
         Expr::Compare { op, left, right } => {
             let vl = eval_expr(left, ctx)?;
             let vr = eval_expr(right, ctx)?;
