@@ -629,15 +629,15 @@ fn where_all_comparison_ops() {
 #[test]
 fn skip_and_limit() {
     let m = unwrap_match(parse("MATCH (n) RETURN n SKIP 5 LIMIT 10").unwrap());
-    assert_eq!(m.terminal.skip, Some(5));
-    assert_eq!(m.terminal.limit, Some(10));
+    assert_eq!(m.terminal.skip, Some(Expr::Literal(Literal::Integer(5))));
+    assert_eq!(m.terminal.limit, Some(Expr::Literal(Literal::Integer(10))));
 }
 
 #[test]
 fn limit_only() {
     let m = unwrap_match(parse("MATCH (n) RETURN n LIMIT 3").unwrap());
     assert_eq!(m.terminal.skip, None);
-    assert_eq!(m.terminal.limit, Some(3));
+    assert_eq!(m.terminal.limit, Some(Expr::Literal(Literal::Integer(3))));
 }
 
 #[test]
@@ -1181,8 +1181,8 @@ fn with_clause_parses_order_skip_limit() {
         parse("MATCH (n) WITH n.age AS age ORDER BY age DESC SKIP 1 LIMIT 5 RETURN age").unwrap(),
     );
     let w = first_with(&m).expect("should have with_clause");
-    assert_eq!(w.skip, Some(1));
-    assert_eq!(w.limit, Some(5));
+    assert_eq!(w.skip, Some(Expr::Literal(Literal::Integer(1))));
+    assert_eq!(w.limit, Some(Expr::Literal(Literal::Integer(5))));
     assert_eq!(w.order_by.len(), 1);
 }
 
@@ -1511,8 +1511,8 @@ fn merge_on_create_and_on_match_both_parse() {
 fn bare_return_supports_skip_and_limit() {
     match parse("RETURN 1 AS x SKIP 0 LIMIT 1").unwrap() {
         Statement::Return(r) => {
-            assert_eq!(r.skip, Some(0));
-            assert_eq!(r.limit, Some(1));
+            assert_eq!(r.skip, Some(Expr::Literal(Literal::Integer(0))));
+            assert_eq!(r.limit, Some(Expr::Literal(Literal::Integer(1))));
         }
         other => panic!("expected Statement::Return, got {other:?}"),
     }

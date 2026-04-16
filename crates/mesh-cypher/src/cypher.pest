@@ -170,8 +170,8 @@ pattern_list = { pattern ~ ("," ~ pattern)* }
 create_tail = { kw_create ~ pattern_list }
 
 where_clause = { kw_where ~ expression }
-skip_clause = { kw_skip ~ integer }
-limit_clause = { kw_limit ~ integer }
+skip_clause = { kw_skip ~ expression }
+limit_clause = { kw_limit ~ expression }
 
 return_tail = {
     kw_return ~ kw_distinct? ~ return_items ~

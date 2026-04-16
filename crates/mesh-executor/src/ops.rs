@@ -343,8 +343,8 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
         LogicalPlan::OrderBy { input, sort_items } => {
             Box::new(OrderByOp::new(child!(input), sort_items.clone()))
         }
-        LogicalPlan::Skip { input, count } => Box::new(SkipOp::new(child!(input), *count)),
-        LogicalPlan::Limit { input, count } => Box::new(LimitOp::new(child!(input), *count)),
+        LogicalPlan::Skip { input, count } => Box::new(SkipOp::new(child!(input), count.clone())),
+        LogicalPlan::Limit { input, count } => Box::new(LimitOp::new(child!(input), count.clone())),
         LogicalPlan::MergeNode {
             input,
             var,
@@ -3324,25 +3324,34 @@ fn expr_arg_value(arg: &AggregateArg, ctx: &EvalCtx) -> Result<Value> {
 
 struct SkipOp {
     input: Box<dyn Operator>,
-    remaining: i64,
+    count_expr: Expr,
+    remaining: Option<i64>,
 }
 
 impl SkipOp {
-    fn new(input: Box<dyn Operator>, count: i64) -> Self {
+    fn new(input: Box<dyn Operator>, count_expr: Expr) -> Self {
         Self {
             input,
-            remaining: count,
+            count_expr,
+            remaining: None,
         }
     }
 }
 
 impl Operator for SkipOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        while self.remaining > 0 {
+        if self.remaining.is_none() {
+            let empty = Row::new();
+            let ectx = ctx.eval_ctx(&empty);
+            let val = eval_expr(&self.count_expr, &ectx)?;
+            self.remaining = Some(expr_to_count(val)?);
+        }
+        let rem = self.remaining.as_mut().unwrap();
+        while *rem > 0 {
             if self.input.next(ctx)?.is_none() {
                 return Ok(None);
             }
-            self.remaining -= 1;
+            *rem -= 1;
         }
         self.input.next(ctx)
     }
@@ -3350,29 +3359,47 @@ impl Operator for SkipOp {
 
 struct LimitOp {
     input: Box<dyn Operator>,
-    remaining: i64,
+    count_expr: Expr,
+    remaining: Option<i64>,
 }
 
 impl LimitOp {
-    fn new(input: Box<dyn Operator>, count: i64) -> Self {
+    fn new(input: Box<dyn Operator>, count_expr: Expr) -> Self {
         Self {
             input,
-            remaining: count,
+            count_expr,
+            remaining: None,
         }
     }
 }
 
 impl Operator for LimitOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        if self.remaining <= 0 {
+        if self.remaining.is_none() {
+            let empty = Row::new();
+            let ectx = ctx.eval_ctx(&empty);
+            let val = eval_expr(&self.count_expr, &ectx)?;
+            self.remaining = Some(expr_to_count(val)?);
+        }
+        let rem = self.remaining.as_mut().unwrap();
+        if *rem <= 0 {
             return Ok(None);
         }
         match self.input.next(ctx)? {
             Some(row) => {
-                self.remaining -= 1;
+                *rem -= 1;
                 Ok(Some(row))
             }
             None => Ok(None),
         }
+    }
+}
+
+fn expr_to_count(val: Value) -> Result<i64> {
+    match val {
+        Value::Null | Value::Property(Property::Null) => Ok(0),
+        Value::Property(Property::Int64(n)) if n >= 0 => Ok(n),
+        Value::Property(Property::Float64(f)) if f >= 0.0 => Ok(f as i64),
+        _ => Err(Error::TypeMismatch),
     }
 }

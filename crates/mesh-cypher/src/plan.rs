@@ -96,11 +96,11 @@ pub enum LogicalPlan {
     },
     Skip {
         input: Box<LogicalPlan>,
-        count: i64,
+        count: Expr,
     },
     Limit {
         input: Box<LogicalPlan>,
-        count: i64,
+        count: Expr,
     },
     CreatePath {
         input: Option<Box<LogicalPlan>>,
@@ -540,11 +540,11 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             format_plan_inner(input, buf, depth + 1);
         }
         LogicalPlan::Skip { input, count } => {
-            buf.push_str(&format!("{indent}Skip({count})\n"));
+            buf.push_str(&format!("{indent}Skip({})\n", render_expr_key(count)));
             format_plan_inner(input, buf, depth + 1);
         }
         LogicalPlan::Limit { input, count } => {
-            buf.push_str(&format!("{indent}Limit({count})\n"));
+            buf.push_str(&format!("{indent}Limit({})\n", render_expr_key(count)));
             format_plan_inner(input, buf, depth + 1);
         }
         LogicalPlan::Distinct { input } => {
@@ -837,8 +837,6 @@ where
         | LogicalPlan::OptionalEdgeExpand { input, .. }
         | LogicalPlan::VarLengthExpand { input, .. }
         | LogicalPlan::Distinct { input }
-        | LogicalPlan::Skip { input, .. }
-        | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Delete { input, .. }
         | LogicalPlan::Remove { input, .. }
         | LogicalPlan::MergeEdge { input, .. }
@@ -850,6 +848,10 @@ where
         | LogicalPlan::BindPath { input, .. }
         | LogicalPlan::ShortestPath { input, .. }
         | LogicalPlan::Identity { input } => walk_plan_exprs(input, visit),
+        LogicalPlan::Skip { input, count } | LogicalPlan::Limit { input, count } => {
+            visit(count)?;
+            walk_plan_exprs(input, visit)
+        }
         LogicalPlan::CartesianProduct { left, right } => {
             walk_plan_exprs(left, visit)?;
             walk_plan_exprs(right, visit)
@@ -1154,8 +1156,8 @@ fn plan_return_only(stmt: &ReturnStmt) -> Result<LogicalPlan> {
         stmt.star,
         stmt.distinct,
         &stmt.order_by,
-        stmt.skip,
-        stmt.limit,
+        stmt.skip.clone(),
+        stmt.limit.clone(),
     )
 }
 
@@ -1178,8 +1180,8 @@ fn plan_unwind(stmt: &UnwindStmt) -> Result<LogicalPlan> {
         stmt.star,
         stmt.distinct,
         &stmt.order_by,
-        stmt.skip,
-        stmt.limit,
+        stmt.skip.clone(),
+        stmt.limit.clone(),
     )
 }
 
@@ -1234,8 +1236,8 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
             stmt.star,
             stmt.distinct,
             &stmt.order_by,
-            stmt.skip,
-            stmt.limit,
+            stmt.skip.clone(),
+            stmt.limit.clone(),
         )
     }
 }
@@ -2334,8 +2336,8 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
             terminal.star,
             terminal.distinct,
             &terminal.order_by,
-            terminal.skip,
-            terminal.limit,
+            terminal.skip.clone(),
+            terminal.limit.clone(),
         )?;
     } else if !has_mutation && !has_merge_clause {
         return Err(Error::Plan(
@@ -2352,8 +2354,8 @@ fn apply_return_pipeline(
     star: bool,
     distinct: bool,
     order_by: &[SortItem],
-    skip: Option<i64>,
-    limit: Option<i64>,
+    skip: Option<Expr>,
+    limit: Option<Expr>,
 ) -> Result<LogicalPlan> {
     if star {
         plan = LogicalPlan::Identity {
@@ -2568,16 +2570,16 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
             sort_items: w.order_by.clone(),
         };
     }
-    if let Some(n) = w.skip {
+    if let Some(n) = &w.skip {
         plan = LogicalPlan::Skip {
             input: Box::new(plan),
-            count: n,
+            count: n.clone(),
         };
     }
-    if let Some(n) = w.limit {
+    if let Some(n) = &w.limit {
         plan = LogicalPlan::Limit {
             input: Box::new(plan),
-            count: n,
+            count: n.clone(),
         };
     }
 

@@ -56,8 +56,8 @@ pub struct ReturnStmt {
     pub star: bool,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,
-    pub skip: Option<i64>,
-    pub limit: Option<i64>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
 }
 
 /// Declarative description of a property index for DDL statements.
@@ -79,8 +79,8 @@ pub struct UnwindStmt {
     pub star: bool,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,
-    pub skip: Option<i64>,
-    pub limit: Option<i64>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,8 +90,8 @@ pub struct CreateStmt {
     pub star: bool,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,
-    pub skip: Option<i64>,
-    pub limit: Option<i64>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
 }
 
 /// A `MATCH`-initiated query: an ordered list of reading clauses
@@ -191,8 +191,8 @@ pub struct TerminalTail {
     pub star: bool,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,
-    pub skip: Option<i64>,
-    pub limit: Option<i64>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
     pub set_items: Vec<SetItem>,
     pub delete: Option<DeleteClause>,
     pub create_patterns: Vec<Pattern>,
@@ -239,8 +239,8 @@ pub struct WithClause {
     /// so predicates can reference the newly-introduced aliases.
     pub where_clause: Option<Expr>,
     pub order_by: Vec<SortItem>,
-    pub skip: Option<i64>,
-    pub limit: Option<i64>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

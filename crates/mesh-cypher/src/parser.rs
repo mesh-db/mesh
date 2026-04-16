@@ -401,8 +401,8 @@ fn parse_return_tail(
     star: &mut bool,
     distinct: &mut bool,
     order_by: &mut Vec<SortItem>,
-    skip: &mut Option<i64>,
-    limit: &mut Option<i64>,
+    skip: &mut Option<Expr>,
+    limit: &mut Option<Expr>,
 ) -> Result<()> {
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -414,18 +414,18 @@ fn parse_return_tail(
             }
             Rule::order_by_clause => *order_by = build_order_by(inner)?,
             Rule::skip_clause => {
-                let int_pair = inner
+                let expr_pair = inner
                     .into_inner()
                     .next()
                     .ok_or_else(|| Error::Parse("empty skip".into()))?;
-                *skip = Some(parse_integer(int_pair.as_str())?);
+                *skip = Some(build_expression(expr_pair)?);
             }
             Rule::limit_clause => {
-                let int_pair = inner
+                let expr_pair = inner
                     .into_inner()
                     .next()
                     .ok_or_else(|| Error::Parse("empty limit".into()))?;
-                *limit = Some(parse_integer(int_pair.as_str())?);
+                *limit = Some(build_expression(expr_pair)?);
             }
             r => {
                 return Err(Error::Parse(format!(
@@ -864,8 +864,8 @@ fn build_with_tail(pair: Pair<Rule>) -> Result<crate::ast::WithClause> {
     let mut distinct = false;
     let mut where_clause: Option<Expr> = None;
     let mut order_by: Vec<SortItem> = Vec::new();
-    let mut skip: Option<i64> = None;
-    let mut limit: Option<i64> = None;
+    let mut skip: Option<Expr> = None;
+    let mut limit: Option<Expr> = None;
     for inner in pair.into_inner() {
         match inner.as_rule() {
             // `kw_with` is atomic so it shows up as a visible
@@ -886,18 +886,18 @@ fn build_with_tail(pair: Pair<Rule>) -> Result<crate::ast::WithClause> {
             }
             Rule::order_by_clause => order_by = build_order_by(inner)?,
             Rule::skip_clause => {
-                let int_pair = inner
+                let expr_pair = inner
                     .into_inner()
                     .next()
                     .ok_or_else(|| Error::Parse("empty skip in WITH".into()))?;
-                skip = Some(parse_integer(int_pair.as_str())?);
+                skip = Some(build_expression(expr_pair)?);
             }
             Rule::limit_clause => {
-                let int_pair = inner
+                let expr_pair = inner
                     .into_inner()
                     .next()
                     .ok_or_else(|| Error::Parse("empty limit in WITH".into()))?;
-                limit = Some(parse_integer(int_pair.as_str())?);
+                limit = Some(build_expression(expr_pair)?);
             }
             r => {
                 return Err(Error::Parse(format!(

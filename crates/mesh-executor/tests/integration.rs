@@ -7230,3 +7230,73 @@ fn string_escape_sequences() {
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "s"), "hello\nworld");
 }
+
+#[test]
+fn skip_with_parameter() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N {v: 2})");
+    run(&store, "CREATE (:N {v: 3})");
+    run(&store, "CREATE (:N {v: 4})");
+    let mut params = ParamMap::new();
+    params.insert("s".into(), Value::Property(Property::Int64(2)));
+    let rows = run_with_params(
+        &store,
+        "MATCH (n:N) RETURN n.v AS v ORDER BY v SKIP $s",
+        &params,
+    );
+    let vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "v")).collect();
+    assert_eq!(vals, vec![3, 4]);
+}
+
+#[test]
+fn limit_with_parameter() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N {v: 2})");
+    run(&store, "CREATE (:N {v: 3})");
+    let mut params = ParamMap::new();
+    params.insert("l".into(), Value::Property(Property::Int64(2)));
+    let rows = run_with_params(
+        &store,
+        "MATCH (n:N) RETURN n.v AS v ORDER BY v LIMIT $l",
+        &params,
+    );
+    let vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "v")).collect();
+    assert_eq!(vals, vec![1, 2]);
+}
+
+#[test]
+fn skip_and_limit_with_parameters() {
+    let (store, _d) = open_store();
+    for i in 1..=5 {
+        run(&store, &format!("CREATE (:N {{v: {i}}})"));
+    }
+    let mut params = ParamMap::new();
+    params.insert("s".into(), Value::Property(Property::Int64(1)));
+    params.insert("l".into(), Value::Property(Property::Int64(2)));
+    let rows = run_with_params(
+        &store,
+        "MATCH (n:N) RETURN n.v AS v ORDER BY v SKIP $s LIMIT $l",
+        &params,
+    );
+    let vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "v")).collect();
+    assert_eq!(vals, vec![2, 3]);
+}
+
+#[test]
+fn limit_with_expression() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N {v: 2})");
+    run(&store, "CREATE (:N {v: 3})");
+    let mut params = ParamMap::new();
+    params.insert("x".into(), Value::Property(Property::Int64(1)));
+    let rows = run_with_params(
+        &store,
+        "MATCH (n:N) RETURN n.v AS v ORDER BY v LIMIT $x + 1",
+        &params,
+    );
+    let vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "v")).collect();
+    assert_eq!(vals, vec![1, 2]);
+}
