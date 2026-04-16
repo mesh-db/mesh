@@ -1292,21 +1292,7 @@ fn build_property_value(pair: Pair<Rule>) -> Result<Expr> {
         .into_inner()
         .next()
         .ok_or_else(|| Error::Parse("empty property value".into()))?;
-    match inner.as_rule() {
-        Rule::literal => Ok(Expr::Literal(build_literal(inner)?)),
-        Rule::parameter => Ok(Expr::Parameter(parameter_name(inner))),
-        Rule::list_literal => {
-            let items: Vec<Expr> = inner
-                .into_inner()
-                .map(build_expression)
-                .collect::<Result<_>>()?;
-            Ok(Expr::List(items))
-        }
-        r => Err(Error::Parse(format!(
-            "unexpected rule in property value: {:?}",
-            r
-        ))),
-    }
+    build_expression(inner)
 }
 
 /// Strip the leading `$` from a `parameter` parse pair and return the
