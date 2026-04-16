@@ -1295,10 +1295,32 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 build_expression(first)
             }
         }
-        Rule::primary => build_expression(
+        Rule::primary => {
+            let mut inner = pair.into_inner();
+            let base_pair = inner
+                .next()
+                .ok_or_else(|| Error::Parse("empty primary".into()))?;
+            let mut expr = build_expression(base_pair)?;
+            for chain in inner {
+                if chain.as_rule() == Rule::property_chain {
+                    let key = chain
+                        .into_inner()
+                        .find(|p| p.as_rule() == Rule::identifier)
+                        .ok_or_else(|| Error::Parse("property_chain missing key".into()))?
+                        .as_str()
+                        .to_string();
+                    expr = Expr::PropertyAccess {
+                        base: Box::new(expr),
+                        key,
+                    };
+                }
+            }
+            Ok(expr)
+        }
+        Rule::base_primary => build_expression(
             pair.into_inner()
                 .next()
-                .ok_or_else(|| Error::Parse("empty primary".into()))?,
+                .ok_or_else(|| Error::Parse("empty base_primary".into()))?,
         ),
         Rule::literal => Ok(Expr::Literal(build_literal(pair)?)),
         Rule::function_call => {

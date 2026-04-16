@@ -2096,27 +2096,45 @@ fn startnode_and_endnode_return_endpoints() {
     let rows = run(
         &store,
         "MATCH ()-[r:KNOWS]->() \
-         RETURN startNode(r) AS s, endNode(r) AS e",
+         RETURN startNode(r).name AS src, endNode(r).name AS dst",
     );
     assert_eq!(rows.len(), 1);
-    match rows[0].get("s") {
-        Some(Value::Node(n)) => {
-            assert_eq!(
-                n.properties.get("name"),
-                Some(&Property::String("Ada".into()))
-            );
-        }
-        other => panic!("expected node, got: {other:?}"),
-    }
-    match rows[0].get("e") {
-        Some(Value::Node(n)) => {
-            assert_eq!(
-                n.properties.get("name"),
-                Some(&Property::String("Bob".into()))
-            );
-        }
-        other => panic!("expected node, got: {other:?}"),
-    }
+    assert_eq!(str_prop(&rows[0], "src"), "Ada");
+    assert_eq!(str_prop(&rows[0], "dst"), "Bob");
+}
+
+#[test]
+fn chained_property_access_on_parenthesized_expr() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(&store, "MATCH (p:Person) RETURN (p).name AS name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn chained_property_access_on_map_property() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada', age: 37})");
+    let rows = run(&store, "MATCH (p:Person) RETURN properties(p).name AS name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn chained_property_null_propagates() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:A {name: 'a'})");
+    let rows = run(
+        &store,
+        "MATCH (a:A) OPTIONAL MATCH (a)-[r:NOPE]->(b) \
+         RETURN startNode(r).name AS sn",
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(
+        rows[0].get("sn"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
 }
 
 #[test]

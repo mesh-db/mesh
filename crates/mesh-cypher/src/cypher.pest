@@ -289,7 +289,14 @@ op_ends_with   = @{ ^"ends" ~ (" " | "\t")+ ~ ^"with" ~ !id_cont }
 op_contains    = @{ ^"contains" ~ !id_cont }
 op_regex_match = { "=~" }
 
-primary = {
+// Property-access postfix: after any base primary, zero or more
+// `.identifier` suffixes chain property lookups. `x.name` resolves
+// via `property_access` inside `base_primary` (backward compat);
+// `startNode(r).name` and `(a).prop.sub` use the postfix chain.
+primary = { base_primary ~ property_chain* }
+property_chain = { "." ~ identifier }
+
+base_primary = {
     case_expr |
     reduce_expr |
     exists_subquery |

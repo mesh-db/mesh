@@ -78,6 +78,30 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 _ => Err(Error::NotNodeOrEdge),
             }
         }
+        Expr::PropertyAccess { base, key } => {
+            let v = eval_expr(base, ctx)?;
+            match v {
+                Value::Node(n) => Ok(n
+                    .properties
+                    .get(key)
+                    .cloned()
+                    .map(Value::Property)
+                    .unwrap_or(Value::Null)),
+                Value::Edge(e) => Ok(e
+                    .properties
+                    .get(key)
+                    .cloned()
+                    .map(Value::Property)
+                    .unwrap_or(Value::Null)),
+                Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                Value::Property(Property::Map(m)) => Ok(m
+                    .get(key)
+                    .cloned()
+                    .map(Value::Property)
+                    .unwrap_or(Value::Null)),
+                _ => Err(Error::NotNodeOrEdge),
+            }
+        }
         Expr::Not(inner) => {
             let v = eval_expr(inner, ctx)?;
             Ok(Value::Property(Property::Bool(!to_bool(&v)?)))

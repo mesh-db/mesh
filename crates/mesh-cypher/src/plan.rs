@@ -579,6 +579,7 @@ where
         Expr::Literal(_) | Expr::Identifier(_) | Expr::Parameter(_) | Expr::Property { .. } => {
             Ok(())
         }
+        Expr::PropertyAccess { base, .. } => walk_expr(base, visit),
         Expr::Not(e) => walk_expr(e, visit),
         Expr::And(a, b) | Expr::Or(a, b) => {
             walk_expr(a, visit)?;
@@ -779,6 +780,7 @@ fn render_expr_key(expr: &Expr) -> String {
     match expr {
         Expr::Identifier(name) => name.clone(),
         Expr::Property { var, key } => format!("{var}.{key}"),
+        Expr::PropertyAccess { base, key } => format!("{}.{key}", render_expr_key(base)),
         Expr::Parameter(name) => format!("${name}"),
         Expr::Literal(Literal::String(s)) => format!("'{s}'"),
         Expr::Literal(Literal::Integer(i)) => i.to_string(),

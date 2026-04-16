@@ -1956,6 +1956,9 @@ fn default_name(expr: &Expr, idx: usize) -> String {
     match expr {
         Expr::Identifier(s) => s.clone(),
         Expr::Property { var, key } => format!("{}.{}", var, key),
+        Expr::PropertyAccess { base, key } => {
+            format!("{}.{}", default_name(base, idx), key)
+        }
         _ => format!("col{}", idx),
     }
 }

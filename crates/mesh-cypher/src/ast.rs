@@ -341,6 +341,14 @@ pub enum Expr {
         negated: bool,
         inner: Box<Expr>,
     },
+    /// Chained property access on an arbitrary expression:
+    /// `startNode(r).name`, `(expr).prop`, `x.a.b` (second hop).
+    /// The simple `identifier.identifier` case is still handled by
+    /// [`Expr::Property`]; this variant covers everything else.
+    PropertyAccess {
+        base: Box<Expr>,
+        key: String,
+    },
     /// `element IN list` — list membership test. Evaluates
     /// `element` and `list`, then checks whether `element` is
     /// equal to any item in `list`. Null-propagating: null
