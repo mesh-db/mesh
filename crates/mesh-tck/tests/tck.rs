@@ -92,18 +92,51 @@ fn given_any_graph(world: &mut MeshWorld) {
 
 #[given("having executed:")]
 fn given_having_executed(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
-    let query = step.docstring.as_ref().expect("docstring").trim();
-    for line in query.split(';') {
-        let line = line.trim();
-        if line.is_empty() {
+    let text = step.docstring.as_ref().expect("docstring").trim();
+    // The TCK uses both semicolons and newlines to separate
+    // statements. Split on newline-then-keyword boundaries.
+    let stmts = split_statements(text);
+    for stmt in &stmts {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
             continue;
         }
         world.error = None;
-        world.run_cypher(line);
+        world.run_cypher(stmt);
         if let Some(err) = &world.error {
-            panic!("Setup query failed: {line}\nError: {err}");
+            panic!("Setup query failed: {stmt}\nError: {err}");
         }
     }
+}
+
+fn split_statements(text: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let starts_new = trimmed.to_uppercase().starts_with("CREATE")
+            || trimmed.to_uppercase().starts_with("MATCH")
+            || trimmed.to_uppercase().starts_with("MERGE")
+            || trimmed.to_uppercase().starts_with("UNWIND")
+            || trimmed.to_uppercase().starts_with("WITH")
+            || trimmed.to_uppercase().starts_with("CALL")
+            || trimmed.to_uppercase().starts_with("LOAD");
+        if starts_new && !current.is_empty() {
+            stmts.push(current.trim().trim_end_matches(';').to_string());
+            current = String::new();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(trimmed);
+    }
+    if !current.is_empty() {
+        stmts.push(current.trim().trim_end_matches(';').to_string());
+    }
+    stmts
 }
 
 #[given("parameters are:")]
