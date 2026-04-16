@@ -9,6 +9,7 @@ members = [
     "crates/mesh-cluster",
     "crates/mesh-bolt",
     "crates/mesh-server",
+    "crates/mesh-tck",
 ]
 
 [workspace.package]
