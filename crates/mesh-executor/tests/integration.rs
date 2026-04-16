@@ -2468,6 +2468,101 @@ fn slice_chained_with_index() {
 }
 
 #[test]
+fn optional_match_multi_hop_full_chain_matches() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Company {name: 'Acme'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'Bob'}), (c:Company {name: 'Acme'}) CREATE (b)-[:WORKS_AT]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}) \
+         OPTIONAL MATCH (a)-[:KNOWS]->(f)-[:WORKS_AT]->(c) \
+         RETURN a.name AS a, f.name AS f, c.name AS c",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "Ada");
+    assert_eq!(str_prop(&rows[0], "f"), "Bob");
+    assert_eq!(str_prop(&rows[0], "c"), "Acme");
+}
+
+#[test]
+fn optional_match_multi_hop_partial_chain_nulls_tail() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}) \
+         OPTIONAL MATCH (a)-[:KNOWS]->(f)-[:WORKS_AT]->(c) \
+         RETURN a.name AS a, f.name AS f, c IS NULL AS c_null",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "Ada");
+    assert_eq!(str_prop(&rows[0], "f"), "Bob");
+    match rows[0].get("c_null") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
+}
+
+#[test]
+fn optional_match_multi_hop_no_first_hop_all_null() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}) \
+         OPTIONAL MATCH (a)-[:KNOWS]->(f)-[:WORKS_AT]->(c) \
+         RETURN a.name AS a, f IS NULL AS f_null, c IS NULL AS c_null",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "Ada");
+    match rows[0].get("f_null") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
+    match rows[0].get("c_null") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
+}
+
+#[test]
+fn optional_match_three_hops() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:A {name: 'a'})");
+    run(&store, "CREATE (:B {name: 'b'})");
+    run(&store, "CREATE (:C {name: 'c'})");
+    run(&store, "CREATE (:D {name: 'd'})");
+    run(&store, "MATCH (a:A), (b:B) CREATE (a)-[:R]->(b)");
+    run(&store, "MATCH (b:B), (c:C) CREATE (b)-[:R]->(c)");
+    run(&store, "MATCH (c:C), (d:D) CREATE (c)-[:R]->(d)");
+    let rows = run(
+        &store,
+        "MATCH (a:A) \
+         OPTIONAL MATCH (a)-[:R]->(b)-[:R]->(c)-[:R]->(d) \
+         RETURN a.name AS a, b.name AS b, c.name AS c, d.name AS d",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "a");
+    assert_eq!(str_prop(&rows[0], "b"), "b");
+    assert_eq!(str_prop(&rows[0], "c"), "c");
+    assert_eq!(str_prop(&rows[0], "d"), "d");
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");

@@ -1369,15 +1369,12 @@ fn multiple_optional_match_clauses_parse() {
 }
 
 #[test]
-fn optional_match_multi_hop_rejected_at_plan_time() {
+fn optional_match_multi_hop_plans_successfully() {
     use mesh_cypher::plan;
-    let stmt = parse("MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f)-[:WORKS_AT]->(c) RETURN p")
-        .unwrap();
-    let err = plan(&stmt).unwrap_err();
-    assert!(
-        err.to_string().contains("single-hop"),
-        "expected single-hop error, got: {err}"
-    );
+    let stmt =
+        parse("MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f)-[:WORKS_AT]->(c) RETURN p, f, c")
+            .unwrap();
+    plan(&stmt).expect("multi-hop OPTIONAL MATCH should plan");
 }
 
 #[test]

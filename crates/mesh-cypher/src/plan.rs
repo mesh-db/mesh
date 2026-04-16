@@ -2035,11 +2035,9 @@ fn apply_optional_match(
         ));
     }
     let pattern = &clause.patterns[0];
-    if pattern.hops.len() != 1 {
+    if pattern.hops.is_empty() {
         return Err(Error::Plan(
-            "OPTIONAL MATCH currently supports only single-hop patterns — \
-             (bound)-[:T]->(new)"
-                .into(),
+            "OPTIONAL MATCH requires at least one relationship hop".into(),
         ));
     }
     let start_var = pattern
@@ -2056,46 +2054,44 @@ fn apply_optional_match(
             start_var
         )));
     }
-    let hop = &pattern.hops[0];
-    if hop.rel.var_length.is_some() {
-        return Err(Error::Plan(
-            "OPTIONAL MATCH does not yet support variable-length relationships".into(),
-        ));
-    }
-    let dst_var = hop
-        .target
-        .var
-        .clone()
-        .unwrap_or_else(|| format!("__opt_dst_{}", bound_vars.len()));
 
-    let mut plan = LogicalPlan::OptionalEdgeExpand {
-        input: Box::new(plan),
-        src_var: start_var,
-        edge_var: hop.rel.var.clone(),
-        dst_var: dst_var.clone(),
-        dst_labels: hop.target.labels.clone(),
-        edge_type: hop.rel.edge_type.clone(),
-        direction: hop.rel.direction,
-    };
+    let mut plan = plan;
+    let mut current_var = start_var;
 
-    // Register the newly-introduced bindings so downstream
-    // OPTIONAL MATCH clauses can reference them.
-    bound_vars.insert(dst_var);
-    if let Some(ev) = &hop.rel.var {
-        bound_vars.insert(ev.clone());
-    }
+    for (i, hop) in pattern.hops.iter().enumerate() {
+        if hop.rel.var_length.is_some() {
+            return Err(Error::Plan(
+                "OPTIONAL MATCH does not yet support variable-length relationships".into(),
+            ));
+        }
+        if !hop.target.properties.is_empty() {
+            return Err(Error::Plan(
+                "OPTIONAL MATCH with target-pattern properties is not yet supported — \
+                 move the equality into a WHERE clause"
+                    .into(),
+            ));
+        }
+        let dst_var = hop
+            .target
+            .var
+            .clone()
+            .unwrap_or_else(|| format!("__opt_dst_{}_{}", bound_vars.len(), i));
 
-    // Any pattern properties on the target node become a Filter
-    // above the optional expand — but applying them here would
-    // drop the Null-bound rows the caller expects. For v1 we
-    // reject pattern-property filters on the optional target to
-    // avoid that subtlety.
-    if !hop.target.properties.is_empty() {
-        return Err(Error::Plan(
-            "OPTIONAL MATCH with target-pattern properties is not yet supported — \
-             move the equality into a WHERE clause"
-                .into(),
-        ));
+        plan = LogicalPlan::OptionalEdgeExpand {
+            input: Box::new(plan),
+            src_var: current_var,
+            edge_var: hop.rel.var.clone(),
+            dst_var: dst_var.clone(),
+            dst_labels: hop.target.labels.clone(),
+            edge_type: hop.rel.edge_type.clone(),
+            direction: hop.rel.direction,
+        };
+
+        bound_vars.insert(dst_var.clone());
+        if let Some(ev) = &hop.rel.var {
+            bound_vars.insert(ev.clone());
+        }
+        current_var = dst_var;
     }
 
     if let Some(predicate) = &clause.where_clause {
