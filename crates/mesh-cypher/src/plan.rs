@@ -881,7 +881,7 @@ where
             Ok(())
         }
         Expr::Not(e) => walk_expr(e, visit),
-        Expr::And(a, b) | Expr::Or(a, b) => {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
             walk_expr(a, visit)?;
             walk_expr(b, visit)
         }
@@ -2569,7 +2569,9 @@ fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some() => true,
         Expr::Not(inner) => contains_aggregate(inner),
-        Expr::And(a, b) | Expr::Or(a, b) => contains_aggregate(a) || contains_aggregate(b),
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            contains_aggregate(a) || contains_aggregate(b)
+        }
         Expr::Compare { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         Expr::IsNull { inner, .. } => contains_aggregate(inner),
         Expr::Call {

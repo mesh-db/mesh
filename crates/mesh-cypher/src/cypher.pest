@@ -253,7 +253,8 @@ return_items = { return_item ~ ("," ~ return_item)* }
 return_item = { expression ~ (kw_as ~ identifier)? }
 
 expression = { or_expr }
-or_expr = { and_expr ~ (kw_or ~ and_expr)* }
+or_expr = { xor_expr ~ (kw_or ~ xor_expr)* }
+xor_expr = { and_expr ~ (kw_xor ~ and_expr)* }
 and_expr = { not_expr ~ (kw_and ~ not_expr)* }
 not_expr = { (kw_not ~ not_expr) | comparison }
 comparison = { add_expr ~ (null_predicate | in_predicate | (comparison_op ~ add_expr))? }
@@ -454,6 +455,7 @@ kw_as = @{ ^"as" ~ !id_cont }
 kw_or = @{ ^"or" ~ !id_cont }
 kw_and = @{ ^"and" ~ !id_cont }
 kw_not = @{ ^"not" ~ !id_cont }
+kw_xor = @{ ^"xor" ~ !id_cont }
 kw_set = _{ ^"set" }
 kw_delete = _{ ^"delete" }
 kw_detach = @{ ^"detach" ~ !id_cont }

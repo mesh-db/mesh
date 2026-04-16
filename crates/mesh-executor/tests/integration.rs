@@ -3356,6 +3356,68 @@ fn left_and_right_string_functions() {
     assert_eq!(str_prop(&rows[0], "r"), "llo");
 }
 
+#[test]
+fn xor_operator() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN (true XOR false) AS a, (true XOR true) AS b, (false XOR false) AS c",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("a") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
+    match rows[0].get("b") {
+        Some(Value::Property(Property::Bool(b))) => assert!(!b),
+        other => panic!("expected false, got: {other:?}"),
+    }
+    match rows[0].get("c") {
+        Some(Value::Property(Property::Bool(b))) => assert!(!b),
+        other => panic!("expected false, got: {other:?}"),
+    }
+}
+
+#[test]
+fn math_functions_e_exp_log_log10_rand() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN e() AS euler, exp(1) AS exp1, log(e()) AS ln_e, log10(100) AS log100, rand() AS r",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("euler") {
+        Some(Value::Property(Property::Float64(f))) => {
+            assert!((*f - std::f64::consts::E).abs() < 1e-9);
+        }
+        other => panic!("expected E, got: {other:?}"),
+    }
+    match rows[0].get("exp1") {
+        Some(Value::Property(Property::Float64(f))) => {
+            assert!((*f - std::f64::consts::E).abs() < 1e-9);
+        }
+        other => panic!("expected E, got: {other:?}"),
+    }
+    match rows[0].get("ln_e") {
+        Some(Value::Property(Property::Float64(f))) => {
+            assert!((*f - 1.0).abs() < 1e-9);
+        }
+        other => panic!("expected 1.0, got: {other:?}"),
+    }
+    match rows[0].get("log100") {
+        Some(Value::Property(Property::Float64(f))) => {
+            assert!((*f - 2.0).abs() < 1e-9);
+        }
+        other => panic!("expected 2.0, got: {other:?}"),
+    }
+    match rows[0].get("r") {
+        Some(Value::Property(Property::Float64(f))) => {
+            assert!(*f >= 0.0 && *f <= 1.0, "rand() should be in [0,1]: {f}");
+        }
+        other => panic!("expected float, got: {other:?}"),
+    }
+}
+
 // --- Parameter execution -----------------------------------------------
 
 #[test]

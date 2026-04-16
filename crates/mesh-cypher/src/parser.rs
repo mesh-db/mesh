@@ -1329,6 +1329,19 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             }
             Ok(left)
         }
+        Rule::xor_expr => {
+            let mut inner = pair.into_inner().filter(|p| p.as_rule() != Rule::kw_xor);
+            let mut left = build_expression(
+                inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty xor_expr".into()))?,
+            )?;
+            for right in inner {
+                let right_expr = build_expression(right)?;
+                left = Expr::Xor(Box::new(left), Box::new(right_expr));
+            }
+            Ok(left)
+        }
         Rule::and_expr => {
             let mut inner = pair.into_inner().filter(|p| p.as_rule() != Rule::kw_and);
             let mut left = build_expression(

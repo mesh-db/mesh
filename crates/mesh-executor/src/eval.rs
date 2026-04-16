@@ -207,6 +207,11 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let vb = to_bool(&eval_expr(b, ctx)?)?;
             Ok(Value::Property(Property::Bool(vb)))
         }
+        Expr::Xor(a, b) => {
+            let va = to_bool(&eval_expr(a, ctx)?)?;
+            let vb = to_bool(&eval_expr(b, ctx)?)?;
+            Ok(Value::Property(Property::Bool(va ^ vb)))
+        }
         Expr::Compare { op, left, right } => {
             let vl = eval_expr(left, ctx)?;
             let vr = eval_expr(right, ctx)?;
@@ -2155,6 +2160,35 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 ));
             }
             Ok(Value::Property(Property::Float64(std::f64::consts::PI)))
+        }
+        "e" => {
+            if !arg_exprs.is_empty() {
+                return Err(Error::UnknownScalarFunction(
+                    "e() takes no arguments".into(),
+                ));
+            }
+            Ok(Value::Property(Property::Float64(std::f64::consts::E)))
+        }
+        "exp" => math_unary(name, arg_exprs, ctx, |f| f.exp()),
+        "log" | "ln" => math_unary(name, arg_exprs, ctx, |f| f.ln()),
+        "log10" => math_unary(name, arg_exprs, ctx, |f| f.log10()),
+        "rand" => {
+            if !arg_exprs.is_empty() {
+                return Err(Error::UnknownScalarFunction(
+                    "rand() takes no arguments".into(),
+                ));
+            }
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .hash(&mut hasher);
+            let bits = hasher.finish();
+            let val = (bits as f64) / (u64::MAX as f64);
+            Ok(Value::Property(Property::Float64(val)))
         }
 
         // --- Temporal constructors ---
