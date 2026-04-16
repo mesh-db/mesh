@@ -1940,16 +1940,9 @@ fn pattern_predicate_in_boolean_and_tree_parses() {
 }
 
 #[test]
-fn pattern_predicate_rejects_var_length_at_plan_time() {
-    // Parser accepts the shape (var-length hops are valid inside
-    // a pattern in general); the planner rejects.
+fn pattern_predicate_with_var_length_plans_successfully() {
     let s = parse("MATCH (a:Person) WHERE (a)-[:KNOWS*1..3]->(b) RETURN a").unwrap();
-    let err = plan(&s).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("variable-length") && msg.contains("pattern predicate"),
-        "expected var-length rejection message, got: {msg}"
-    );
+    plan(&s).expect("var-length in pattern predicate should plan");
 }
 
 #[test]
@@ -2042,17 +2035,12 @@ fn exists_subquery_rejects_path_variable() {
 }
 
 #[test]
-fn exists_subquery_var_length_rejected_at_plan_time() {
+fn exists_subquery_with_var_length_plans_successfully() {
     let s = parse(
         "MATCH (a:Person) \
          WHERE EXISTS { MATCH (a)-[:KNOWS*1..3]->(b) } \
          RETURN a",
     )
     .unwrap();
-    let err = plan(&s).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("variable-length"),
-        "expected var-length rejection, got: {msg}"
-    );
+    plan(&s).expect("var-length in EXISTS subquery should plan");
 }

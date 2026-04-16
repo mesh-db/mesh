@@ -472,56 +472,13 @@ fn pattern_exists(pattern: &Pattern, ctx: &EvalCtx) -> Result<bool> {
     let mut frontier: Vec<NodeId> = vec![start_node.id];
     for hop in &pattern.hops {
         let mut next: Vec<NodeId> = Vec::new();
-        for node_id in &frontier {
-            let neighbors = match hop.rel.direction {
-                Direction::Outgoing => ctx.reader.outgoing(*node_id)?,
-                Direction::Incoming => ctx.reader.incoming(*node_id)?,
-                Direction::Both => {
-                    let mut out = ctx.reader.outgoing(*node_id)?;
-                    out.extend(ctx.reader.incoming(*node_id)?);
-                    out
-                }
-            };
-            for (edge_id, neighbor_id) in neighbors {
-                // Edge-type filter. Only pull the edge record when
-                // a type constraint is present; adjacency already
-                // encodes the neighbor, so unconstrained hops skip
-                // the extra lookup.
-                if let Some(t) = &hop.rel.edge_type {
-                    let edge = match ctx.reader.get_edge(edge_id)? {
-                        Some(e) => e,
-                        None => continue,
-                    };
-                    if &edge.edge_type != t {
-                        continue;
-                    }
-                }
-                // Target-side label + pattern-property filter. When
-                // the target pattern carries no constraints we skip
-                // the node lookup entirely and accept any neighbor.
-                if !hop.target.labels.is_empty() || !hop.target.properties.is_empty() {
-                    let neighbor = match ctx.reader.get_node(neighbor_id)? {
-                        Some(n) => n,
-                        None => continue,
-                    };
-                    if !node_pattern_matches(&neighbor, &hop.target, ctx)? {
-                        continue;
-                    }
-                }
-                // Correlated lookup: if the target has a variable
-                // that's already bound in the outer row, require
-                // the walked neighbor to BE that bound node. This
-                // lets `WHERE (a)-[:KNOWS]->(b)` check a specific
-                // edge between two outer-row nodes rather than
-                // wandering into unrelated neighbors.
-                if let Some(target_var) = &hop.target.var {
-                    if let Some(Value::Node(bound)) = ctx.row.get(target_var) {
-                        if bound.id != neighbor_id {
-                            continue;
-                        }
-                    }
-                }
-                next.push(neighbor_id);
+        if let Some(vl) = hop.rel.var_length {
+            for node_id in &frontier {
+                expand_var_length_predicate(*node_id, hop, vl.min, vl.max, ctx, &mut next)?;
+            }
+        } else {
+            for node_id in &frontier {
+                expand_single_hop_predicate(*node_id, hop, ctx, &mut next)?;
             }
         }
         if next.is_empty() {
@@ -530,6 +487,129 @@ fn pattern_exists(pattern: &Pattern, ctx: &EvalCtx) -> Result<bool> {
         frontier = next;
     }
     Ok(!frontier.is_empty())
+}
+
+fn expand_single_hop_predicate(
+    node_id: NodeId,
+    hop: &mesh_cypher::Hop,
+    ctx: &EvalCtx,
+    out: &mut Vec<NodeId>,
+) -> Result<()> {
+    let neighbors = match hop.rel.direction {
+        Direction::Outgoing => ctx.reader.outgoing(node_id)?,
+        Direction::Incoming => ctx.reader.incoming(node_id)?,
+        Direction::Both => {
+            let mut all = ctx.reader.outgoing(node_id)?;
+            all.extend(ctx.reader.incoming(node_id)?);
+            all
+        }
+    };
+    for (edge_id, neighbor_id) in neighbors {
+        if let Some(t) = &hop.rel.edge_type {
+            let edge = match ctx.reader.get_edge(edge_id)? {
+                Some(e) => e,
+                None => continue,
+            };
+            if &edge.edge_type != t {
+                continue;
+            }
+        }
+        if !hop.target.labels.is_empty() || !hop.target.properties.is_empty() {
+            let neighbor = match ctx.reader.get_node(neighbor_id)? {
+                Some(n) => n,
+                None => continue,
+            };
+            if !node_pattern_matches(&neighbor, &hop.target, ctx)? {
+                continue;
+            }
+        }
+        if let Some(target_var) = &hop.target.var {
+            if let Some(Value::Node(bound)) = ctx.row.get(target_var) {
+                if bound.id != neighbor_id {
+                    continue;
+                }
+            }
+        }
+        out.push(neighbor_id);
+    }
+    Ok(())
+}
+
+fn expand_var_length_predicate(
+    start: NodeId,
+    hop: &mesh_cypher::Hop,
+    min: u64,
+    max: u64,
+    ctx: &EvalCtx,
+    out: &mut Vec<NodeId>,
+) -> Result<()> {
+    let mut used = std::collections::HashSet::new();
+    vl_pred_dfs(start, hop, min, max, 0, ctx, &mut used, out)
+}
+
+fn vl_pred_dfs(
+    current: NodeId,
+    hop: &mesh_cypher::Hop,
+    min: u64,
+    max: u64,
+    depth: u64,
+    ctx: &EvalCtx,
+    used: &mut std::collections::HashSet<mesh_core::EdgeId>,
+    out: &mut Vec<NodeId>,
+) -> Result<()> {
+    if depth >= min && depth <= max {
+        let ok = if !hop.target.labels.is_empty() || !hop.target.properties.is_empty() {
+            match ctx.reader.get_node(current)? {
+                Some(n) => node_pattern_matches(&n, &hop.target, ctx)?,
+                None => false,
+            }
+        } else {
+            true
+        };
+        if ok {
+            if let Some(target_var) = &hop.target.var {
+                if let Some(Value::Node(bound)) = ctx.row.get(target_var) {
+                    if bound.id == current {
+                        out.push(current);
+                    }
+                } else {
+                    out.push(current);
+                }
+            } else {
+                out.push(current);
+            }
+        }
+    }
+    if depth >= max {
+        return Ok(());
+    }
+    let neighbors = match hop.rel.direction {
+        Direction::Outgoing => ctx.reader.outgoing(current)?,
+        Direction::Incoming => ctx.reader.incoming(current)?,
+        Direction::Both => {
+            let mut all = ctx.reader.outgoing(current)?;
+            all.extend(ctx.reader.incoming(current)?);
+            all
+        }
+    };
+    for (edge_id, neighbor_id) in neighbors {
+        if used.contains(&edge_id) {
+            continue;
+        }
+        if let Some(t) = &hop.rel.edge_type {
+            let edge = match ctx.reader.get_edge(edge_id)? {
+                Some(e) => e,
+                None => continue,
+            };
+            if &edge.edge_type != t {
+                continue;
+            }
+        }
+        used.insert(edge_id);
+        vl_pred_dfs(neighbor_id, hop, min, max, depth + 1, ctx, used, out)?;
+        used.remove(&edge_id);
+    }
+    Ok(())
 }
 
 /// Check whether `EXISTS { MATCH pattern [WHERE expr] }` has
@@ -648,6 +728,28 @@ fn count_walk_hops(
 ) -> Result<i64> {
     for hop in &pattern.hops {
         let mut next: Vec<(mesh_core::Node, Row)> = Vec::new();
+        if let Some(vl) = hop.rel.var_length {
+            for (node, row) in frontier.iter() {
+                let mut targets = Vec::new();
+                expand_var_length_predicate(node.id, hop, vl.min, vl.max, ctx, &mut targets)?;
+                for tid in targets {
+                    let target = match ctx.reader.get_node(tid)? {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let mut next_row = row.clone();
+                    if let Some(tv) = &hop.target.var {
+                        next_row.insert(tv.clone(), Value::Node(target.clone()));
+                    }
+                    next.push((target, next_row));
+                }
+            }
+            if next.is_empty() {
+                return Ok(0);
+            }
+            *frontier = next;
+            continue;
+        }
         for (node, row) in frontier.iter() {
             let neighbors = match hop.rel.direction {
                 Direction::Outgoing => ctx.reader.outgoing(node.id)?,
@@ -789,6 +891,28 @@ fn walk_exists_hops(
 ) -> Result<bool> {
     for hop in &pattern.hops {
         let mut next: Vec<(mesh_core::Node, Row)> = Vec::new();
+        if let Some(vl) = hop.rel.var_length {
+            for (node, row) in frontier.iter() {
+                let mut targets = Vec::new();
+                expand_var_length_predicate(node.id, hop, vl.min, vl.max, ctx, &mut targets)?;
+                for tid in targets {
+                    let target = match ctx.reader.get_node(tid)? {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let mut next_row = row.clone();
+                    if let Some(tv) = &hop.target.var {
+                        next_row.insert(tv.clone(), Value::Node(target.clone()));
+                    }
+                    next.push((target, next_row));
+                }
+            }
+            if next.is_empty() {
+                return Ok(false);
+            }
+            *frontier = next;
+            continue;
+        }
         for (node, row) in frontier.iter() {
             let neighbors = match hop.rel.direction {
                 Direction::Outgoing => ctx.reader.outgoing(node.id)?,
@@ -2319,7 +2443,7 @@ pub(crate) fn to_bool(v: &Value) -> Result<bool> {
     }
 }
 
-fn values_equal(a: &Value, b: &Value) -> bool {
+pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
     compare(CompareOp::Eq, a, b).unwrap_or(false)
 }
 

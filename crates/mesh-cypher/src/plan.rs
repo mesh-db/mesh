@@ -58,6 +58,7 @@ pub enum LogicalPlan {
         edge_var: Option<String>,
         dst_var: String,
         dst_labels: Vec<String>,
+        dst_properties: Vec<(String, Expr)>,
         edge_type: Option<String>,
         direction: Direction,
     },
@@ -718,13 +719,6 @@ fn validate_pattern_predicate(pattern: &Pattern) -> Result<()> {
             "pattern predicate's start node must reference a bound variable".into(),
         ));
     }
-    for hop in &pattern.hops {
-        if hop.rel.var_length.is_some() {
-            return Err(Error::Plan(
-                "variable-length hops (`*`) are not supported inside pattern predicates".into(),
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -747,13 +741,6 @@ fn validate_exists_pattern(pattern: &Pattern) -> Result<()> {
         return Err(Error::Plan(
             "path variable binding is not allowed inside EXISTS { ... }".into(),
         ));
-    }
-    for hop in &pattern.hops {
-        if hop.rel.var_length.is_some() {
-            return Err(Error::Plan(
-                "variable-length hops (`*`) are not supported inside EXISTS { ... }".into(),
-            ));
-        }
     }
     Ok(())
 }
@@ -1935,12 +1922,8 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                                 var
                             )));
                         }
-                        if !is_bound_start && !this_clause_vars.insert(var.clone()) {
-                            return Err(Error::Plan(format!(
-                                "variable '{}' appears in multiple MATCH patterns; \
-                                 not yet supported",
-                                var
-                            )));
+                        if !is_bound_start {
+                            this_clause_vars.insert(var.clone());
                         }
                     }
                 }
@@ -2397,73 +2380,78 @@ fn apply_return_pipeline(
 /// The clause's optional WHERE filter runs *after* the join —
 /// matching Neo4j, it drops rows rather than Null-ing them.
 fn apply_optional_match(
-    plan: LogicalPlan,
+    mut plan: LogicalPlan,
     clause: &crate::ast::OptionalMatchClause,
     bound_vars: &mut HashSet<String>,
 ) -> Result<LogicalPlan> {
-    if clause.patterns.len() != 1 {
-        return Err(Error::Plan(
-            "OPTIONAL MATCH with multiple comma-separated patterns is not yet supported".into(),
-        ));
-    }
-    let pattern = &clause.patterns[0];
-    if pattern.hops.is_empty() {
-        return Err(Error::Plan(
-            "OPTIONAL MATCH requires at least one relationship hop".into(),
-        ));
-    }
-    let start_var = pattern
-        .start
-        .var
-        .as_ref()
-        .ok_or_else(|| {
-            Error::Plan("OPTIONAL MATCH start node must name an already-bound variable".into())
-        })?
-        .clone();
-    if !bound_vars.contains(&start_var) {
-        return Err(Error::Plan(format!(
-            "OPTIONAL MATCH start variable `{}` must be bound by a prior MATCH",
-            start_var
-        )));
-    }
-
-    let mut plan = plan;
-    let mut current_var = start_var;
-
-    for (i, hop) in pattern.hops.iter().enumerate() {
-        if hop.rel.var_length.is_some() {
+    for pattern in &clause.patterns {
+        if pattern.hops.is_empty() {
             return Err(Error::Plan(
-                "OPTIONAL MATCH does not yet support variable-length relationships".into(),
+                "OPTIONAL MATCH requires at least one relationship hop".into(),
             ));
         }
-        if !hop.target.properties.is_empty() {
-            return Err(Error::Plan(
-                "OPTIONAL MATCH with target-pattern properties is not yet supported — \
-                 move the equality into a WHERE clause"
-                    .into(),
-            ));
-        }
-        let dst_var = hop
-            .target
+        let start_var = pattern
+            .start
             .var
-            .clone()
-            .unwrap_or_else(|| format!("__opt_dst_{}_{}", bound_vars.len(), i));
-
-        plan = LogicalPlan::OptionalEdgeExpand {
-            input: Box::new(plan),
-            src_var: current_var,
-            edge_var: hop.rel.var.clone(),
-            dst_var: dst_var.clone(),
-            dst_labels: hop.target.labels.clone(),
-            edge_type: hop.rel.edge_type.clone(),
-            direction: hop.rel.direction,
-        };
-
-        bound_vars.insert(dst_var.clone());
-        if let Some(ev) = &hop.rel.var {
-            bound_vars.insert(ev.clone());
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Plan("OPTIONAL MATCH start node must name an already-bound variable".into())
+            })?
+            .clone();
+        if !bound_vars.contains(&start_var) {
+            return Err(Error::Plan(format!(
+                "OPTIONAL MATCH start variable `{}` must be bound by a prior MATCH",
+                start_var
+            )));
         }
-        current_var = dst_var;
+
+        let mut current_var = start_var;
+
+        for (i, hop) in pattern.hops.iter().enumerate() {
+            let dst_var = hop
+                .target
+                .var
+                .clone()
+                .unwrap_or_else(|| format!("__opt_dst_{}_{}", bound_vars.len(), i));
+
+            if let Some(vl) = hop.rel.var_length {
+                if vl.min > vl.max {
+                    return Err(Error::Plan(format!(
+                        "variable-length path min ({}) > max ({})",
+                        vl.min, vl.max
+                    )));
+                }
+                plan = LogicalPlan::VarLengthExpand {
+                    input: Box::new(plan),
+                    src_var: current_var.clone(),
+                    edge_var: hop.rel.var.clone(),
+                    dst_var: dst_var.clone(),
+                    dst_labels: hop.target.labels.clone(),
+                    edge_type: hop.rel.edge_type.clone(),
+                    direction: hop.rel.direction,
+                    min_hops: vl.min,
+                    max_hops: vl.max,
+                    path_var: None,
+                };
+            } else {
+                plan = LogicalPlan::OptionalEdgeExpand {
+                    input: Box::new(plan),
+                    src_var: current_var.clone(),
+                    edge_var: hop.rel.var.clone(),
+                    dst_var: dst_var.clone(),
+                    dst_labels: hop.target.labels.clone(),
+                    dst_properties: hop.target.properties.clone(),
+                    edge_type: hop.rel.edge_type.clone(),
+                    direction: hop.rel.direction,
+                };
+            }
+
+            bound_vars.insert(dst_var.clone());
+            if let Some(ev) = &hop.rel.var {
+                bound_vars.insert(ev.clone());
+            }
+            current_var = dst_var;
+        }
     }
 
     if let Some(predicate) = &clause.where_clause {

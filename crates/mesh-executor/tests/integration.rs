@@ -805,13 +805,12 @@ fn multi_pattern_match_with_where_filters_join() {
 }
 
 #[test]
-fn multi_pattern_match_same_var_rejected() {
+fn multi_pattern_match_shared_variable() {
     let (store, _d) = open_store();
-    let _ = &store;
-    let stmt = parse("MATCH (a), (a) RETURN a").unwrap();
-    let err = plan(&stmt).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("multiple MATCH patterns"), "msg: {msg}");
+    run(&store, "CREATE (:N {name: 'A'})");
+    let rows = run(&store, "MATCH (a:N), (a) RETURN a.name AS name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "A");
 }
 
 #[test]
@@ -3160,6 +3159,146 @@ fn call_subquery_with_union_body() {
     assert_eq!(vals, vec!["x", "y"]);
 }
 
+// --- Lifted restrictions -----------------------------------------------
+
+#[test]
+fn pattern_predicate_with_var_length() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A'})");
+    run(&store, "CREATE (:N {name: 'B'})");
+    run(&store, "CREATE (:N {name: 'C'})");
+    run(&store, "CREATE (:N {name: 'D'})");
+    run(
+        &store,
+        "MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:R]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:N {name: 'B'}), (c:N {name: 'C'}) CREATE (b)-[:R]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (n:N) WHERE (n)-[:R*1..3]->(:N {name: 'C'}) RETURN n.name AS name ORDER BY name",
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["A", "B"]);
+}
+
+#[test]
+fn exists_subquery_with_var_length() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A'})");
+    run(&store, "CREATE (:N {name: 'B'})");
+    run(&store, "CREATE (:N {name: 'C'})");
+    run(
+        &store,
+        "MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:R]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:N {name: 'B'}), (c:N {name: 'C'}) CREATE (b)-[:R]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (n:N) \
+         WHERE EXISTS { MATCH (n)-[:R*1..3]->(t:N {name: 'C'}) } \
+         RETURN n.name AS name ORDER BY name",
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["A", "B"]);
+}
+
+#[test]
+fn count_subquery_with_var_length() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A'})");
+    run(&store, "CREATE (:N {name: 'B'})");
+    run(&store, "CREATE (:N {name: 'C'})");
+    run(
+        &store,
+        "MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:R]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:N {name: 'B'}), (c:N {name: 'C'}) CREATE (b)-[:R]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (n:N {name: 'A'}) \
+         RETURN count { MATCH (n)-[:R*1..3]->() } AS reachable",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "reachable"), 2);
+}
+
+#[test]
+fn optional_match_with_target_properties() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cara'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) CREATE (a)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) \
+         OPTIONAL MATCH (p)-[:KNOWS]->(f:Person {name: 'Bob'}) \
+         RETURN f.name AS friend",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "friend"), "Bob");
+}
+
+#[test]
+fn optional_match_with_var_length() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A'})");
+    run(&store, "CREATE (:N {name: 'B'})");
+    run(&store, "CREATE (:N {name: 'C'})");
+    run(
+        &store,
+        "MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:R]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:N {name: 'B'}), (c:N {name: 'C'}) CREATE (b)-[:R]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (n:N {name: 'A'}) \
+         OPTIONAL MATCH (n)-[:R*1..3]->(t:N) WHERE t.name = 'C' \
+         RETURN t.name AS reached",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "reached"), "C");
+}
+
+#[test]
+fn optional_match_multi_pattern() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Company {name: 'Acme'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}) \
+         OPTIONAL MATCH (a)-[:KNOWS]->(f), (a)-[:WORKS_AT]->(c) \
+         RETURN f.name AS friend, c IS NULL AS no_company",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "friend"), "Bob");
+}
+
 // --- Parameter execution -----------------------------------------------
 
 #[test]
@@ -5380,15 +5519,10 @@ fn where_pattern_predicate_combined_with_scalar_predicate_or() {
 }
 
 #[test]
-fn where_pattern_predicate_var_length_errors() {
+fn where_pattern_predicate_var_length_plans() {
     let parsed =
         mesh_cypher::parse("MATCH (p:Person) WHERE (p)-[:KNOWS*1..3]->(:Person) RETURN p").unwrap();
-    let err = mesh_cypher::plan(&parsed).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("variable-length") && msg.contains("pattern predicate"),
-        "expected var-length rejection message, got: {msg}"
-    );
+    mesh_cypher::plan(&parsed).expect("var-length in pattern predicate should plan");
 }
 
 #[test]

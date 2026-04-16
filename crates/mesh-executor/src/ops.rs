@@ -1,6 +1,6 @@
 use crate::{
     error::{Error, Result},
-    eval::{compare_values, eval_expr, row_key, to_bool, value_key, EvalCtx},
+    eval::{compare_values, eval_expr, row_key, to_bool, value_key, values_equal, EvalCtx},
     reader::GraphReader,
     value::{ParamMap, Row, Value},
     writer::GraphWriter,
@@ -287,6 +287,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             edge_var,
             dst_var,
             dst_labels,
+            dst_properties,
             edge_type,
             direction,
         } => Box::new(OptionalEdgeExpandOp::new(
@@ -295,6 +296,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             edge_var.clone(),
             dst_var.clone(),
             dst_labels.clone(),
+            dst_properties.clone(),
             edge_type.clone(),
             *direction,
         )),
@@ -1997,6 +1999,7 @@ struct OptionalEdgeExpandOp {
     edge_var: Option<String>,
     dst_var: String,
     dst_labels: Vec<String>,
+    dst_properties: Vec<(String, Expr)>,
     edge_type: Option<String>,
     direction: Direction,
     current_row: Option<Row>,
@@ -2006,12 +2009,14 @@ struct OptionalEdgeExpandOp {
 }
 
 impl OptionalEdgeExpandOp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         input: Box<dyn Operator>,
         src_var: String,
         edge_var: Option<String>,
         dst_var: String,
         dst_labels: Vec<String>,
+        dst_properties: Vec<(String, Expr)>,
         edge_type: Option<String>,
         direction: Direction,
     ) -> Self {
@@ -2021,6 +2026,7 @@ impl OptionalEdgeExpandOp {
             edge_var,
             dst_var,
             dst_labels,
+            dst_properties,
             edge_type,
             direction,
             current_row: None,
@@ -2054,6 +2060,30 @@ impl Operator for OptionalEdgeExpandOp {
                 };
                 if !has_all_labels(&neighbor, &self.dst_labels) {
                     continue;
+                }
+                if !self.dst_properties.is_empty() {
+                    let base = self
+                        .current_row
+                        .as_ref()
+                        .expect("pending without source row");
+                    let ectx = ctx.eval_ctx(base);
+                    let mut props_ok = true;
+                    for (key, expr) in &self.dst_properties {
+                        let expected = eval_expr(expr, &ectx)?;
+                        let actual = neighbor
+                            .properties
+                            .get(key)
+                            .cloned()
+                            .map(Value::Property)
+                            .unwrap_or(Value::Null);
+                        if !values_equal(&expected, &actual) {
+                            props_ok = false;
+                            break;
+                        }
+                    }
+                    if !props_ok {
+                        continue;
+                    }
                 }
 
                 let base = self
