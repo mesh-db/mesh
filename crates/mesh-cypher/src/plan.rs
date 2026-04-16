@@ -2360,14 +2360,21 @@ fn apply_return_pipeline(
             input: Box::new(plan),
         };
     } else {
-        let (group_keys, aggregates) = classify_return_items(return_items)?;
+        let (group_keys, aggregates, post_items) = classify_return_items(return_items)?;
 
         plan = if !aggregates.is_empty() {
-            LogicalPlan::Aggregate {
+            let mut agg = LogicalPlan::Aggregate {
                 input: Box::new(plan),
                 group_keys,
                 aggregates,
+            };
+            if !post_items.is_empty() {
+                agg = LogicalPlan::Project {
+                    input: Box::new(agg),
+                    items: post_items,
+                };
             }
+            agg
         } else {
             LogicalPlan::Project {
                 input: Box::new(plan),
@@ -2518,13 +2525,20 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
             input: Box::new(plan),
         };
     } else {
-        let (group_keys, aggregates) = classify_return_items(&w.items)?;
+        let (group_keys, aggregates, post_items) = classify_return_items(&w.items)?;
         plan = if !aggregates.is_empty() {
-            LogicalPlan::Aggregate {
+            let mut agg = LogicalPlan::Aggregate {
                 input: Box::new(plan),
                 group_keys,
                 aggregates,
+            };
+            if !post_items.is_empty() {
+                agg = LogicalPlan::Project {
+                    input: Box::new(agg),
+                    items: post_items,
+                };
             }
+            agg
         } else {
             LogicalPlan::Project {
                 input: Box::new(plan),
@@ -2570,9 +2584,13 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
     Ok(plan)
 }
 
-fn classify_return_items(items: &[ReturnItem]) -> Result<(Vec<ReturnItem>, Vec<AggregateSpec>)> {
+fn classify_return_items(
+    items: &[ReturnItem],
+) -> Result<(Vec<ReturnItem>, Vec<AggregateSpec>, Vec<ReturnItem>)> {
     let mut group_keys: Vec<ReturnItem> = Vec::new();
     let mut aggregates: Vec<AggregateSpec> = Vec::new();
+    let mut post_items: Vec<ReturnItem> = Vec::new();
+    let mut synth_idx = 0usize;
     for (idx, item) in items.iter().enumerate() {
         let is_top_aggregate = matches!(
             &item.expr,
@@ -2615,14 +2633,84 @@ fn classify_return_items(items: &[ReturnItem]) -> Result<(Vec<ReturnItem>, Vec<A
             });
         } else {
             if contains_aggregate(&item.expr) {
-                return Err(Error::Plan(
-                    "aggregates must appear at the top of RETURN items".into(),
-                ));
+                let mut rewrites: Vec<(String, AggregateFn, AggregateArg)> = Vec::new();
+                let rewritten =
+                    extract_nested_aggregates(&item.expr, &mut rewrites, &mut synth_idx);
+                for (alias, func, arg) in rewrites {
+                    aggregates.push(AggregateSpec {
+                        alias,
+                        function: func,
+                        arg,
+                    });
+                }
+                let alias = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| format!("__nested_agg_{}", idx));
+                post_items.push(ReturnItem {
+                    expr: rewritten,
+                    alias: Some(alias),
+                });
+            } else {
+                group_keys.push(item.clone());
             }
-            group_keys.push(item.clone());
         }
     }
-    Ok((group_keys, aggregates))
+    Ok((group_keys, aggregates, post_items))
+}
+
+fn extract_nested_aggregates(
+    expr: &Expr,
+    out: &mut Vec<(String, AggregateFn, AggregateArg)>,
+    idx: &mut usize,
+) -> Expr {
+    match expr {
+        Expr::Call { name, args } if aggregate_fn_from_name(name).is_some() => {
+            let func = aggregate_fn_from_name(name).unwrap();
+            let agg_arg = match args {
+                CallArgs::Star => AggregateArg::Star,
+                CallArgs::Exprs(es) if es.len() == 1 => AggregateArg::Expr(es[0].clone()),
+                CallArgs::Exprs(es) if es.is_empty() => AggregateArg::Star,
+                CallArgs::DistinctExprs(es) if es.len() == 1 => {
+                    AggregateArg::DistinctExpr(es[0].clone())
+                }
+                _ => AggregateArg::Star,
+            };
+            let alias = format!("__agg_{}_{}", name.to_lowercase(), *idx);
+            *idx += 1;
+            out.push((alias.clone(), func, agg_arg));
+            Expr::Identifier(alias)
+        }
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op: *op,
+            left: Box::new(extract_nested_aggregates(left, out, idx)),
+            right: Box::new(extract_nested_aggregates(right, out, idx)),
+        },
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op: *op,
+            operand: Box::new(extract_nested_aggregates(operand, out, idx)),
+        },
+        Expr::Call { name, args } => {
+            let new_args = match args {
+                CallArgs::Star => CallArgs::Star,
+                CallArgs::Exprs(es) => CallArgs::Exprs(
+                    es.iter()
+                        .map(|e| extract_nested_aggregates(e, out, idx))
+                        .collect(),
+                ),
+                CallArgs::DistinctExprs(es) => CallArgs::DistinctExprs(
+                    es.iter()
+                        .map(|e| extract_nested_aggregates(e, out, idx))
+                        .collect(),
+                ),
+            };
+            Expr::Call {
+                name: name.clone(),
+                args: new_args,
+            }
+        }
+        other => other.clone(),
+    }
 }
 
 fn contains_aggregate(expr: &Expr) -> bool {
@@ -2632,8 +2720,12 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
             contains_aggregate(a) || contains_aggregate(b)
         }
-        Expr::Compare { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
-        Expr::IsNull { inner, .. } => contains_aggregate(inner),
+        Expr::Compare { left, right, .. } | Expr::BinaryOp { left, right, .. } => {
+            contains_aggregate(left) || contains_aggregate(right)
+        }
+        Expr::IsNull { inner, .. } | Expr::UnaryOp { operand: inner, .. } => {
+            contains_aggregate(inner)
+        }
         Expr::Call {
             args: CallArgs::Exprs(es),
             ..

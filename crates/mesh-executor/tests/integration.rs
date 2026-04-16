@@ -7163,3 +7163,70 @@ fn with_star_preserves_bindings() {
     assert!(row.contains_key("n"), "row missing 'n': {row:?}");
     assert!(row.contains_key("m"), "row missing 'm': {row:?}");
 }
+
+#[test]
+fn nested_aggregate_count_plus_one() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N {v: 2})");
+    run(&store, "CREATE (:N {v: 3})");
+    let rows = run(&store, "MATCH (n:N) RETURN count(n) + 1 AS total");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "total"), 4);
+}
+
+#[test]
+fn nested_aggregate_tostring_count() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N {v: 2})");
+    let rows = run(&store, "MATCH (n:N) RETURN toString(count(n)) AS c");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "c"), "2");
+}
+
+#[test]
+fn any_all_none_single_list_predicates() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN any(x IN [1,2,3] WHERE x > 2) AS a, \
+                all(x IN [1,2,3] WHERE x > 0) AS b, \
+                none(x IN [1,2,3] WHERE x > 5) AS c, \
+                single(x IN [1,2,3] WHERE x = 2) AS d",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("a") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
+    match rows[0].get("b") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
+    match rows[0].get("c") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
+    match rows[0].get("d") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
+}
+
+#[test]
+fn backtick_identifier_as_label() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:`My Label` {name: 'test'})");
+    let rows = run(&store, "MATCH (n:`My Label`) RETURN n.name AS name");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "test");
+}
+
+#[test]
+fn string_escape_sequences() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN 'hello\\nworld' AS s");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "s"), "hello\nworld");
+}
