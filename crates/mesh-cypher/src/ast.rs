@@ -117,6 +117,10 @@ pub enum ReadingClause {
     With(WithClause),
     Merge(MergeClause),
     Unwind(UnwindClause),
+    /// `CALL { read_stmt }` — runs the body as a subquery per
+    /// input row. Correlated subqueries import outer bindings via
+    /// `WITH var1, var2` as the first clause inside the body.
+    Call(Box<Statement>),
 }
 
 /// A mid-query `UNWIND expression AS alias`. Evaluates the

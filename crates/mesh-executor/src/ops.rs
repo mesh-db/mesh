@@ -177,30 +177,48 @@ fn ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
 }
 
 fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
+    build_op_inner(plan, None)
+}
+
+fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
+    macro_rules! child {
+        ($p:expr) => {
+            build_op_inner($p, seed)
+        };
+    }
     match plan {
         LogicalPlan::CreatePath {
             input,
             nodes,
             edges,
         } => Box::new(CreatePathOp::new(
-            input.as_ref().map(|p| build_op(p)),
+            input.as_ref().map(|p| child!(p)),
             nodes.clone(),
             edges.clone(),
         )),
         LogicalPlan::CartesianProduct { left, right } => {
-            Box::new(CartesianProductOp::new(build_op(left), (**right).clone()))
+            Box::new(CartesianProductOp::new(child!(left), (**right).clone()))
         }
         LogicalPlan::Delete {
             input,
             detach,
             vars,
-        } => Box::new(DeleteOp::new(build_op(input), *detach, vars.clone())),
+        } => Box::new(DeleteOp::new(child!(input), *detach, vars.clone())),
         LogicalPlan::SetProperty { input, assignments } => {
-            Box::new(SetPropertyOp::new(build_op(input), assignments.clone()))
+            Box::new(SetPropertyOp::new(child!(input), assignments.clone()))
         }
         LogicalPlan::Remove { input, items } => {
-            Box::new(RemoveOp::new(build_op(input), items.clone()))
+            Box::new(RemoveOp::new(child!(input), items.clone()))
         }
+        LogicalPlan::CallSubquery { input, body } => {
+            Box::new(CallSubqueryOp::new(child!(input), (**body).clone()))
+        }
+        LogicalPlan::SeedRow => match seed {
+            Some(r) => Box::new(SeededRowOp {
+                row: Some(r.clone()),
+            }),
+            None => Box::new(SeedRowOp { done: false }),
+        },
         LogicalPlan::NodeScanAll { var } => Box::new(NodeScanAllOp::new(var.clone())),
         LogicalPlan::NodeScanByLabels { var, labels } => {
             Box::new(NodeScanByLabelsOp::new(var.clone(), labels.clone()))
@@ -214,7 +232,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             edge_type,
             direction,
         } => Box::new(EdgeExpandOp::new(
-            build_op(input),
+            child!(input),
             src_var.clone(),
             edge_var.clone(),
             dst_var.clone(),
@@ -231,7 +249,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             edge_type,
             direction,
         } => Box::new(OptionalEdgeExpandOp::new(
-            build_op(input),
+            child!(input),
             src_var.clone(),
             edge_var.clone(),
             dst_var.clone(),
@@ -251,7 +269,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             max_hops,
             path_var,
         } => Box::new(VarLengthExpandOp::new(
-            build_op(input),
+            child!(input),
             src_var.clone(),
             edge_var.clone(),
             dst_var.clone(),
@@ -263,26 +281,26 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             path_var.clone(),
         )),
         LogicalPlan::Filter { input, predicate } => {
-            Box::new(FilterOp::new(build_op(input), predicate.clone()))
+            Box::new(FilterOp::new(child!(input), predicate.clone()))
         }
         LogicalPlan::Project { input, items } => {
-            Box::new(ProjectOp::new(build_op(input), items.clone()))
+            Box::new(ProjectOp::new(child!(input), items.clone()))
         }
         LogicalPlan::Aggregate {
             input,
             group_keys,
             aggregates,
         } => Box::new(AggregateOp::new(
-            build_op(input),
+            child!(input),
             group_keys.clone(),
             aggregates.clone(),
         )),
-        LogicalPlan::Distinct { input } => Box::new(DistinctOp::new(build_op(input))),
+        LogicalPlan::Distinct { input } => Box::new(DistinctOp::new(child!(input))),
         LogicalPlan::OrderBy { input, sort_items } => {
-            Box::new(OrderByOp::new(build_op(input), sort_items.clone()))
+            Box::new(OrderByOp::new(child!(input), sort_items.clone()))
         }
-        LogicalPlan::Skip { input, count } => Box::new(SkipOp::new(build_op(input), *count)),
-        LogicalPlan::Limit { input, count } => Box::new(LimitOp::new(build_op(input), *count)),
+        LogicalPlan::Skip { input, count } => Box::new(SkipOp::new(child!(input), *count)),
+        LogicalPlan::Limit { input, count } => Box::new(LimitOp::new(child!(input), *count)),
         LogicalPlan::MergeNode {
             input,
             var,
@@ -291,7 +309,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             on_create,
             on_match,
         } => Box::new(MergeNodeOp::new(
-            input.as_ref().map(|p| build_op(p)),
+            input.as_ref().map(|p| child!(p)),
             var.clone(),
             labels.clone(),
             properties.clone(),
@@ -307,7 +325,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             on_create,
             on_match,
         } => Box::new(MergeEdgeOp::new(
-            build_op(input),
+            child!(input),
             edge_var.clone(),
             src_var.clone(),
             dst_var.clone(),
@@ -316,11 +334,9 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             on_match.clone(),
         )),
         LogicalPlan::Unwind { var, expr } => Box::new(UnwindOp::new(var.clone(), expr.clone())),
-        LogicalPlan::UnwindChain { input, var, expr } => Box::new(UnwindChainOp::new(
-            build_op(input),
-            var.clone(),
-            expr.clone(),
-        )),
+        LogicalPlan::UnwindChain { input, var, expr } => {
+            Box::new(UnwindChainOp::new(child!(input), var.clone(), expr.clone()))
+        }
         LogicalPlan::IndexSeek {
             var,
             label,
@@ -337,7 +353,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
         // this point. An assertion here catches any future
         // refactor that forgets to gate them.
         LogicalPlan::Union { branches, all } => {
-            let branch_ops: Vec<Box<dyn Operator>> = branches.iter().map(build_op).collect();
+            let branch_ops: Vec<Box<dyn Operator>> = branches.iter().map(|b| child!(b)).collect();
             Box::new(UnionOp::new(branch_ops, *all))
         }
         LogicalPlan::BindPath {
@@ -346,7 +362,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             node_vars,
             edge_vars,
         } => Box::new(BindPathOp::new(
-            build_op(input),
+            child!(input),
             path_var.clone(),
             node_vars.clone(),
             edge_vars.clone(),
@@ -361,7 +377,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
             max_hops,
             kind,
         } => Box::new(ShortestPathOp::new(
-            build_op(input),
+            child!(input),
             src_var.clone(),
             dst_var.clone(),
             path_var.clone(),
@@ -920,6 +936,78 @@ impl Operator for RemoveOp {
                 }
                 Ok(Some(row))
             }
+        }
+    }
+}
+
+struct SeedRowOp {
+    done: bool,
+}
+
+impl Operator for SeedRowOp {
+    fn next(&mut self, _ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        Ok(Some(Row::new()))
+    }
+}
+
+struct SeededRowOp {
+    row: Option<Row>,
+}
+
+impl Operator for SeededRowOp {
+    fn next(&mut self, _ctx: &ExecCtx) -> Result<Option<Row>> {
+        Ok(self.row.take())
+    }
+}
+
+struct CallSubqueryOp {
+    input: Box<dyn Operator>,
+    body_plan: LogicalPlan,
+    pending: Vec<Row>,
+    pending_idx: usize,
+}
+
+impl CallSubqueryOp {
+    fn new(input: Box<dyn Operator>, body_plan: LogicalPlan) -> Self {
+        Self {
+            input,
+            body_plan,
+            pending: Vec::new(),
+            pending_idx: 0,
+        }
+    }
+}
+
+impl Operator for CallSubqueryOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            if self.pending_idx < self.pending.len() {
+                let row = self.pending[self.pending_idx].clone();
+                self.pending_idx += 1;
+                return Ok(Some(row));
+            }
+            let outer_row = match self.input.next(ctx)? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            let mut body_op = build_op_inner(&self.body_plan, Some(&outer_row));
+            let mut results = Vec::new();
+            while let Some(body_row) = body_op.next(ctx)? {
+                let mut merged = outer_row.clone();
+                for (k, v) in body_row {
+                    merged.insert(k, v);
+                }
+                results.push(merged);
+            }
+            if results.is_empty() {
+                continue;
+            }
+            self.pending = results;
+            self.pending_idx = 0;
         }
     }
 }

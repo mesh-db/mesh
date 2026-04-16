@@ -2866,6 +2866,82 @@ fn count_function_still_works_as_aggregate() {
     assert_eq!(int_prop(&rows[0], "c"), 3);
 }
 
+// --- CALL { } subquery --------------------------------------------------
+
+#[test]
+fn call_subquery_uncorrelated() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         CALL { MATCH (q:Person) RETURN count(*) AS total } \
+         RETURN p.name AS name, total ORDER BY name",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+    assert_eq!(int_prop(&rows[0], "total"), 2);
+    assert_eq!(str_prop(&rows[1], "name"), "Bob");
+    assert_eq!(int_prop(&rows[1], "total"), 2);
+}
+
+#[test]
+fn call_subquery_correlated_with_importing_with() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cara'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (c:Person {name: 'Cara'}) CREATE (a)-[:KNOWS]->(c)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         CALL { WITH p MATCH (p)-[:KNOWS]->(f) RETURN f.name AS friend } \
+         RETURN p.name AS name, friend ORDER BY name, friend",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+    assert_eq!(str_prop(&rows[0], "friend"), "Bob");
+    assert_eq!(str_prop(&rows[1], "name"), "Ada");
+    assert_eq!(str_prop(&rows[1], "friend"), "Cara");
+}
+
+#[test]
+fn call_subquery_no_body_results_drops_outer_row() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         CALL { MATCH (:NonExistent) RETURN 1 AS x } \
+         RETURN p.name AS name",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn call_subquery_with_union_body() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:A {name: 'x'})");
+    run(&store, "CREATE (:B {name: 'y'})");
+    let rows = run(
+        &store,
+        "CALL { MATCH (a:A) RETURN a.name AS v \
+                UNION ALL \
+                MATCH (b:B) RETURN b.name AS v } \
+         RETURN v ORDER BY v",
+    );
+    let vals: Vec<String> = rows.iter().map(|r| str_prop(r, "v")).collect();
+    assert_eq!(vals, vec!["x", "y"]);
+}
+
 // --- Parameter execution -----------------------------------------------
 
 #[test]

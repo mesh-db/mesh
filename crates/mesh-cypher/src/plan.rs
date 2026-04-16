@@ -123,6 +123,15 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         items: Vec<RemoveSpec>,
     },
+    CallSubquery {
+        input: Box<LogicalPlan>,
+        body: Box<LogicalPlan>,
+    },
+    /// Placeholder leaf used as the seed producer inside CALL { }
+    /// bodies when the first clause is WITH (importing outer
+    /// bindings). At execution time, the `CallSubqueryOp` replaces
+    /// this with a single-row operator carrying the outer row.
+    SeedRow,
     /// Match-or-create a single node. If at least one node matches the
     /// `(labels, properties)` pattern, returns one row per match (binding
     /// the existing node to `var`). If none match, creates exactly one
@@ -533,6 +542,13 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             buf.push_str(&format!("{indent}Remove\n"));
             format_plan_inner(input, buf, depth + 1);
         }
+        LogicalPlan::CallSubquery { input, body } => {
+            buf.push_str(&format!("{indent}CallSubquery\n"));
+            buf.push_str(&format!("{indent}  body:\n"));
+            format_plan_inner(body, buf, depth + 2);
+            buf.push_str(&format!("{indent}  input:\n"));
+            format_plan_inner(input, buf, depth + 2);
+        }
         LogicalPlan::IndexSeek {
             var,
             label,
@@ -540,6 +556,9 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             ..
         } => {
             buf.push_str(&format!("{indent}IndexSeek({var}:{label}.{property})\n"));
+        }
+        LogicalPlan::SeedRow => {
+            buf.push_str(&format!("{indent}SeedRow\n"));
         }
         LogicalPlan::Unwind { var, .. } => {
             buf.push_str(&format!("{indent}Unwind(AS {var})\n"));
@@ -780,6 +799,7 @@ where
         | LogicalPlan::Delete { input, .. }
         | LogicalPlan::Remove { input, .. }
         | LogicalPlan::MergeEdge { input, .. }
+        | LogicalPlan::CallSubquery { input, .. }
         | LogicalPlan::BindPath { input, .. }
         | LogicalPlan::ShortestPath { input, .. } => walk_plan_exprs(input, visit),
         LogicalPlan::CartesianProduct { left, right } => {
@@ -802,6 +822,7 @@ where
         },
         LogicalPlan::NodeScanAll { .. }
         | LogicalPlan::NodeScanByLabels { .. }
+        | LogicalPlan::SeedRow
         | LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
         | LogicalPlan::ShowPropertyIndexes => Ok(()),
@@ -1944,17 +1965,18 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 plan = Some(apply_optional_match(current, o, &mut bound_vars)?);
             }
             ReadingClause::With(w) => {
-                let current = plan.ok_or_else(|| {
-                    Error::Plan("WITH requires a preceding producer clause".into())
-                })?;
+                let current = match plan.take() {
+                    Some(p) => p,
+                    None => LogicalPlan::SeedRow,
+                };
                 plan = Some(apply_with_clause(current, w)?);
-                // A WITH doesn't introduce new name bindings
-                // to enforce against — downstream clauses reach
-                // the projected aliases via the row dict at
-                // runtime. Intentionally leave `bound_vars`
-                // alone so a later `OPTIONAL MATCH` that
-                // references a projected name still passes its
-                // "already bound" check on the old name.
+                // Register the WITH's projected aliases so a
+                // downstream MATCH can use them as rebind
+                // references (e.g. CALL { WITH a MATCH (a)-[...]-> }).
+                for item in &w.items {
+                    let alias = return_item_column_name(item);
+                    bound_vars.insert(alias);
+                }
             }
             ReadingClause::Merge(mc) => {
                 // Lower a MERGE clause. Dispatch on whether
@@ -2125,6 +2147,20 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     },
                 });
                 bound_vars.insert(u.alias.clone());
+            }
+            ReadingClause::Call(body_stmt) => {
+                let body_plan = plan_with_context(body_stmt, ctx)?;
+                let current = match plan.take() {
+                    Some(p) => p,
+                    None => LogicalPlan::Unwind {
+                        var: "__call_seed".to_string(),
+                        expr: Expr::List(vec![Expr::Literal(Literal::Integer(0))]),
+                    },
+                };
+                plan = Some(LogicalPlan::CallSubquery {
+                    input: Box::new(current),
+                    body: Box::new(body_plan),
+                });
             }
         }
     }

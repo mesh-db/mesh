@@ -842,7 +842,8 @@ fn count_index_seeks(plan: &mesh_cypher::LogicalPlan) -> u64 {
         | P::VarLengthExpand { input, .. }
         | P::MergeEdge { input, .. }
         | P::UnwindChain { input, .. }
-        | P::Remove { input, .. } => count_index_seeks(input),
+        | P::Remove { input, .. }
+        | P::CallSubquery { input, .. } => count_index_seeks(input),
         P::CartesianProduct { left, right } => count_index_seeks(left) + count_index_seeks(right),
         P::Union { branches, .. } => branches.iter().map(count_index_seeks).sum(),
         P::BindPath { input, .. } | P::ShortestPath { input, .. } => count_index_seeks(input),
@@ -851,6 +852,7 @@ fn count_index_seeks(plan: &mesh_cypher::LogicalPlan) -> u64 {
         P::NodeScanAll { .. }
         | P::NodeScanByLabels { .. }
         | P::Unwind { .. }
+        | P::SeedRow
         | P::CreatePropertyIndex { .. }
         | P::DropPropertyIndex { .. }
         | P::ShowPropertyIndexes => 0,

@@ -462,6 +462,14 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                     Rule::unwind_clause => {
                         clauses.push(ReadingClause::Unwind(build_unwind_clause(inner)?));
                     }
+                    Rule::call_subquery => {
+                        let body = inner
+                            .into_inner()
+                            .find(|p| p.as_rule() == Rule::union_query)
+                            .ok_or_else(|| Error::Parse("CALL missing body".into()))?;
+                        let stmt = build_union_query(body)?;
+                        clauses.push(ReadingClause::Call(Box::new(stmt)));
+                    }
                     r => {
                         return Err(Error::Parse(format!(
                             "unexpected rule inside reading_clause: {:?}",
@@ -493,12 +501,14 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     // a row stream. OPTIONAL MATCH and WITH both depend on an
     // existing row stream, so they can't be the first clause.
     match &clauses[0] {
-        ReadingClause::Match(_) | ReadingClause::Merge(_) | ReadingClause::Unwind(_) => {}
-        ReadingClause::OptionalMatch(_) | ReadingClause::With(_) => {
+        ReadingClause::Match(_)
+        | ReadingClause::Merge(_)
+        | ReadingClause::Unwind(_)
+        | ReadingClause::With(_)
+        | ReadingClause::Call(_) => {}
+        ReadingClause::OptionalMatch(_) => {
             return Err(Error::Parse(
-                "OPTIONAL MATCH and WITH can only appear after an initial producer \
-                 (MATCH, MERGE, or UNWIND)"
-                    .into(),
+                "OPTIONAL MATCH can only appear after an initial producer clause".into(),
             ));
         }
     }
