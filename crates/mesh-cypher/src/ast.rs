@@ -51,6 +51,9 @@ pub struct UnionStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReturnStmt {
     pub return_items: Vec<ReturnItem>,
+    /// `true` when the RETURN clause used `*` — pass all row
+    /// bindings through as-is instead of projecting explicit items.
+    pub star: bool,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,
     pub skip: Option<i64>,
@@ -73,6 +76,7 @@ pub struct UnwindStmt {
     pub alias: String,
     pub where_clause: Option<Expr>,
     pub return_items: Vec<ReturnItem>,
+    pub star: bool,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,
     pub skip: Option<i64>,
@@ -83,6 +87,7 @@ pub struct UnwindStmt {
 pub struct CreateStmt {
     pub patterns: Vec<Pattern>,
     pub return_items: Vec<ReturnItem>,
+    pub star: bool,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,
     pub skip: Option<i64>,
@@ -182,6 +187,8 @@ pub struct MatchClause {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TerminalTail {
     pub return_items: Vec<ReturnItem>,
+    /// `true` when the RETURN clause used `*`.
+    pub star: bool,
     pub distinct: bool,
     pub order_by: Vec<SortItem>,
     pub skip: Option<i64>,
@@ -224,6 +231,8 @@ pub struct OptionalMatchClause {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WithClause {
     pub items: Vec<ReturnItem>,
+    /// `true` when the WITH clause used `*`.
+    pub star: bool,
     pub distinct: bool,
     /// Post-projection filter. Applies to the row stream *after*
     /// the WITH projection and before its ORDER BY / SKIP / LIMIT,

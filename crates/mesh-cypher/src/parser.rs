@@ -121,6 +121,7 @@ fn build_read_stmt(pair: Pair<Rule>) -> Result<Statement> {
 /// skip / limit fields.
 fn build_return_only(pair: Pair<Rule>) -> Result<crate::ast::ReturnStmt> {
     let mut return_items = Vec::new();
+    let mut star = false;
     let mut distinct = false;
     let mut order_by = Vec::new();
     let mut skip = None;
@@ -132,6 +133,7 @@ fn build_return_only(pair: Pair<Rule>) -> Result<crate::ast::ReturnStmt> {
     parse_return_tail(
         tail,
         &mut return_items,
+        &mut star,
         &mut distinct,
         &mut order_by,
         &mut skip,
@@ -139,6 +141,7 @@ fn build_return_only(pair: Pair<Rule>) -> Result<crate::ast::ReturnStmt> {
     )?;
     Ok(crate::ast::ReturnStmt {
         return_items,
+        star,
         distinct,
         order_by,
         skip,
@@ -193,6 +196,7 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
     let mut alias: Option<String> = None;
     let mut where_clause = None;
     let mut return_items = Vec::new();
+    let mut star = false;
     let mut distinct = false;
     let mut order_by: Vec<SortItem> = Vec::new();
     let mut skip = None;
@@ -217,6 +221,7 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
                 parse_return_tail(
                     p,
                     &mut return_items,
+                    &mut star,
                     &mut distinct,
                     &mut order_by,
                     &mut skip,
@@ -230,7 +235,7 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
 
     let expr = expr.ok_or_else(|| Error::Parse("UNWIND requires a source expression".into()))?;
     let alias = alias.ok_or_else(|| Error::Parse("UNWIND requires an AS alias".into()))?;
-    if return_items.is_empty() {
+    if return_items.is_empty() && !star {
         return Err(Error::Parse("UNWIND requires a RETURN clause".into()));
     }
     Ok(UnwindStmt {
@@ -238,6 +243,7 @@ fn build_unwind(pair: Pair<Rule>) -> Result<UnwindStmt> {
         alias,
         where_clause,
         return_items,
+        star,
         distinct,
         order_by,
         skip,
@@ -350,6 +356,7 @@ fn build_merge_action(pair: Pair<Rule>) -> Result<(MergeActionKind, Vec<crate::a
 fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
     let mut patterns: Vec<Pattern> = Vec::new();
     let mut return_items = Vec::new();
+    let mut star = false;
     let mut distinct = false;
     let mut order_by: Vec<SortItem> = Vec::new();
     let mut skip = None;
@@ -362,6 +369,7 @@ fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
                 parse_return_tail(
                     p,
                     &mut return_items,
+                    &mut star,
                     &mut distinct,
                     &mut order_by,
                     &mut skip,
@@ -379,6 +387,7 @@ fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
     Ok(CreateStmt {
         patterns,
         return_items,
+        star,
         distinct,
         order_by,
         skip,
@@ -389,6 +398,7 @@ fn build_create(pair: Pair<Rule>) -> Result<CreateStmt> {
 fn parse_return_tail(
     pair: Pair<Rule>,
     return_items: &mut Vec<ReturnItem>,
+    star: &mut bool,
     distinct: &mut bool,
     order_by: &mut Vec<SortItem>,
     skip: &mut Option<i64>,
@@ -397,7 +407,11 @@ fn parse_return_tail(
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::kw_distinct => *distinct = true,
-            Rule::return_items => *return_items = build_return_items(inner)?,
+            Rule::return_items => {
+                let (items, is_star) = build_return_items(inner)?;
+                *return_items = items;
+                *star = is_star;
+            }
             Rule::order_by_clause => *order_by = build_order_by(inner)?,
             Rule::skip_clause => {
                 let int_pair = inner
@@ -597,6 +611,7 @@ fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail
                 parse_return_tail(
                     p,
                     &mut terminal.return_items,
+                    &mut terminal.star,
                     &mut terminal.distinct,
                     &mut terminal.order_by,
                     &mut terminal.skip,
@@ -845,6 +860,7 @@ fn build_optional_match(pair: Pair<Rule>) -> Result<crate::ast::OptionalMatchCla
 /// in grammar order and fills each optional slot as it goes.
 fn build_with_tail(pair: Pair<Rule>) -> Result<crate::ast::WithClause> {
     let mut items = Vec::new();
+    let mut star = false;
     let mut distinct = false;
     let mut where_clause: Option<Expr> = None;
     let mut order_by: Vec<SortItem> = Vec::new();
@@ -856,7 +872,11 @@ fn build_with_tail(pair: Pair<Rule>) -> Result<crate::ast::WithClause> {
             // pair; other atomic keywords do the same. Just skip.
             Rule::kw_with => {}
             Rule::kw_distinct => distinct = true,
-            Rule::return_items => items = build_return_items(inner)?,
+            Rule::return_items => {
+                let (parsed_items, is_star) = build_return_items(inner)?;
+                items = parsed_items;
+                star = is_star;
+            }
             Rule::where_clause => {
                 let expr_pair = inner
                     .into_inner()
@@ -889,6 +909,7 @@ fn build_with_tail(pair: Pair<Rule>) -> Result<crate::ast::WithClause> {
     }
     Ok(crate::ast::WithClause {
         items,
+        star,
         distinct,
         where_clause,
         order_by,
@@ -1291,9 +1312,14 @@ fn parameter_name(pair: Pair<Rule>) -> String {
     raw[1..].to_string()
 }
 
-fn build_return_items(pair: Pair<Rule>) -> Result<Vec<ReturnItem>> {
+/// Returns `(items, is_star)`. When `return_star` is matched the
+/// items vec is empty and `is_star` is `true`.
+fn build_return_items(pair: Pair<Rule>) -> Result<(Vec<ReturnItem>, bool)> {
     let mut items = Vec::new();
     for item_pair in pair.into_inner() {
+        if item_pair.as_rule() == Rule::return_star {
+            return Ok((Vec::new(), true));
+        }
         debug_assert_eq!(item_pair.as_rule(), Rule::return_item);
         let mut inner = item_pair
             .into_inner()
@@ -1306,7 +1332,7 @@ fn build_return_items(pair: Pair<Rule>) -> Result<Vec<ReturnItem>> {
         let alias = inner.next().map(|p| p.as_str().to_string());
         items.push(ReturnItem { expr, alias });
     }
-    Ok(items)
+    Ok((items, false))
 }
 
 fn build_expression(pair: Pair<Rule>) -> Result<Expr> {

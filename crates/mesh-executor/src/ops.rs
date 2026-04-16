@@ -338,6 +338,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             group_keys.clone(),
             aggregates.clone(),
         )),
+        LogicalPlan::Identity { input } => Box::new(IdentityOp::new(child!(input))),
         LogicalPlan::Distinct { input } => Box::new(DistinctOp::new(child!(input))),
         LogicalPlan::OrderBy { input, sort_items } => {
             Box::new(OrderByOp::new(child!(input), sort_items.clone()))
@@ -2382,6 +2383,24 @@ impl Operator for FilterOp {
             }
         }
         Ok(None)
+    }
+}
+
+/// Pass-through operator for `RETURN *` / `WITH *`. Forwards every
+/// row from the input unchanged.
+struct IdentityOp {
+    input: Box<dyn Operator>,
+}
+
+impl IdentityOp {
+    fn new(input: Box<dyn Operator>) -> Self {
+        Self { input }
+    }
+}
+
+impl Operator for IdentityOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        self.input.next(ctx)
     }
 }
 
