@@ -345,11 +345,12 @@ fn format_property(p: &Property) -> String {
             format!("[{}]", inner.join(", "))
         }
         Property::Map(m) => {
-            let mut entries: Vec<String> = m
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let entries: Vec<String> = keys
                 .iter()
-                .map(|(k, v)| format!("{k}: {}", format_property(v)))
+                .map(|k| format!("{k}: {}", format_property(m.get(*k).unwrap())))
                 .collect();
-            entries.sort();
             format!("{{{}}}", entries.join(", "))
         }
         Property::DateTime(_) | Property::Date(_) | Property::Duration(_) => {
@@ -362,11 +363,12 @@ fn format_props_inline(props: &HashMap<String, Property>) -> String {
     if props.is_empty() {
         return String::new();
     }
-    let mut entries: Vec<String> = props
+    let mut keys: Vec<&String> = props.keys().collect();
+    keys.sort();
+    let entries: Vec<String> = keys
         .iter()
-        .map(|(k, v)| format!("{k}: {}", format_property(v)))
+        .map(|k| format!("{k}: {}", format_property(props.get(*k).unwrap())))
         .collect();
-    entries.sort();
     format!("{{{}}}", entries.join(", "))
 }
 
