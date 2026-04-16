@@ -1889,6 +1889,15 @@ fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarTy
     Ok(())
 }
 
+fn infer_expr_type(expr: &Expr, bound_vars: &HashMap<String, VarType>) -> VarType {
+    match expr {
+        Expr::Identifier(name) => bound_vars.get(name).copied().unwrap_or(VarType::Node),
+        Expr::Literal(_) | Expr::Parameter(_) => VarType::Scalar,
+        Expr::Call { .. } | Expr::BinaryOp { .. } | Expr::UnaryOp { .. } => VarType::Scalar,
+        _ => VarType::Node,
+    }
+}
+
 fn check_var_type_conflict(
     var: &str,
     new_type: VarType,
@@ -2060,7 +2069,8 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // references (e.g. CALL { WITH a MATCH (a)-[...]-> }).
                 for item in &w.items {
                     let alias = return_item_column_name(item);
-                    bound_vars.insert(alias, VarType::Node);
+                    let vtype = infer_expr_type(&item.expr, &bound_vars);
+                    bound_vars.insert(alias, vtype);
                 }
             }
             ReadingClause::Merge(mc) => {
