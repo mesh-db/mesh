@@ -3344,6 +3344,18 @@ fn path_binding_mixed_fixed_and_var_length() {
     assert_eq!(int_prop(&rows[0], "len"), 3);
 }
 
+#[test]
+fn left_and_right_string_functions() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "RETURN left('hello', 2) AS l, right('hello', 3) AS r",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "l"), "he");
+    assert_eq!(str_prop(&rows[0], "r"), "llo");
+}
+
 // --- Parameter execution -----------------------------------------------
 
 #[test]

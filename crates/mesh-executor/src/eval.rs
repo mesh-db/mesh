@@ -1825,6 +1825,52 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             let result: String = chars[start..end].iter().collect();
             Ok(Value::Property(Property::String(result)))
         }
+        "left" => {
+            if arg_exprs.len() != 2 {
+                return Err(Error::UnknownScalarFunction(format!(
+                    "{name}() requires 2 arguments"
+                )));
+            }
+            let s = eval_expr(&arg_exprs[0], ctx)?;
+            let n = eval_expr(&arg_exprs[1], ctx)?;
+            match (s, n) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Property(Property::Null), _) | (_, Value::Property(Property::Null)) => {
+                    Ok(Value::Null)
+                }
+                (Value::Property(Property::String(s)), Value::Property(Property::Int64(n))) => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let take = (n as usize).min(chars.len());
+                    Ok(Value::Property(Property::String(
+                        chars[..take].iter().collect(),
+                    )))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "right" => {
+            if arg_exprs.len() != 2 {
+                return Err(Error::UnknownScalarFunction(format!(
+                    "{name}() requires 2 arguments"
+                )));
+            }
+            let s = eval_expr(&arg_exprs[0], ctx)?;
+            let n = eval_expr(&arg_exprs[1], ctx)?;
+            match (s, n) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Property(Property::Null), _) | (_, Value::Property(Property::Null)) => {
+                    Ok(Value::Null)
+                }
+                (Value::Property(Property::String(s)), Value::Property(Property::Int64(n))) => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let skip = chars.len().saturating_sub(n as usize);
+                    Ok(Value::Property(Property::String(
+                        chars[skip..].iter().collect(),
+                    )))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
         "trim" | "ltrim" | "rtrim" => {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
