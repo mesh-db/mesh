@@ -248,7 +248,7 @@ property_entry = { identifier ~ ":" ~ property_value }
 // expressions: only literals or parameters are allowed. This statically
 // rejects things like `{name: m.y}` (free row references in pattern
 // properties) without needing a planner-side scope check.
-property_value = { literal | parameter }
+property_value = { list_literal | literal | parameter }
 
 return_items = { return_star | (return_item ~ ("," ~ return_item)*) }
 return_star = { "*" }
