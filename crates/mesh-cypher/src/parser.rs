@@ -1163,6 +1163,17 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             // the binary form.
             match inner.next() {
                 None => Ok(left),
+                Some(tail) if tail.as_rule() == Rule::in_predicate => {
+                    let rhs_pair = tail
+                        .into_inner()
+                        .find(|p| p.as_rule() != Rule::kw_in)
+                        .ok_or_else(|| Error::Parse("IN missing list expression".into()))?;
+                    let list = build_expression(rhs_pair)?;
+                    Ok(Expr::InList {
+                        element: Box::new(left),
+                        list: Box::new(list),
+                    })
+                }
                 Some(tail) if tail.as_rule() == Rule::null_predicate => {
                     let kind = tail
                         .into_inner()

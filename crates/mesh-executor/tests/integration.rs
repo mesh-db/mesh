@@ -1964,6 +1964,88 @@ fn regex_match_null_propagates() {
 }
 
 #[test]
+fn in_list_filters_matching_values() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:User {name: 'Ada', status: 'active'})");
+    run(&store, "CREATE (:User {name: 'Bob', status: 'pending'})");
+    run(&store, "CREATE (:User {name: 'Cara', status: 'banned'})");
+    let rows = run(
+        &store,
+        "MATCH (u:User) WHERE u.status IN ['active', 'pending'] \
+         RETURN u.name AS name ORDER BY name",
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Ada", "Bob"]);
+}
+
+#[test]
+fn in_list_with_integers() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N {v: 2})");
+    run(&store, "CREATE (:N {v: 3})");
+    run(&store, "CREATE (:N {v: 4})");
+    let rows = run(
+        &store,
+        "MATCH (n:N) WHERE n.v IN [2, 4] RETURN n.v AS v ORDER BY v",
+    );
+    let vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "v")).collect();
+    assert_eq!(vals, vec![2, 4]);
+}
+
+#[test]
+fn in_list_with_parameter() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N {v: 2})");
+    run(&store, "CREATE (:N {v: 3})");
+    let mut params = ParamMap::new();
+    params.insert(
+        "ids".into(),
+        Value::Property(Property::List(vec![Property::Int64(1), Property::Int64(3)])),
+    );
+    let rows = run_with_params(
+        &store,
+        "MATCH (n:N) WHERE n.v IN $ids RETURN n.v AS v ORDER BY v",
+        &params,
+    );
+    let vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "v")).collect();
+    assert_eq!(vals, vec![1, 3]);
+}
+
+#[test]
+fn not_in_list_excludes() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N {v: 2})");
+    run(&store, "CREATE (:N {v: 3})");
+    let rows = run(
+        &store,
+        "MATCH (n:N) WHERE NOT n.v IN [2] RETURN n.v AS v ORDER BY v",
+    );
+    let vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "v")).collect();
+    assert_eq!(vals, vec![1, 3]);
+}
+
+#[test]
+fn in_list_null_element_returns_false() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    run(&store, "CREATE (:N)");
+    let rows = run(&store, "MATCH (n:N) WHERE n.v IN [1, 2] RETURN n.v AS v");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "v"), 1);
+}
+
+#[test]
+fn in_empty_list_returns_no_rows() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {v: 1})");
+    let rows = run(&store, "MATCH (n:N) WHERE n.v IN [] RETURN n.v AS v");
+    assert!(rows.is_empty());
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");

@@ -112,6 +112,25 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 is_null
             })))
         }
+        Expr::InList { element, list } => {
+            let elem = eval_expr(element, ctx)?;
+            if matches!(elem, Value::Null | Value::Property(Property::Null)) {
+                return Ok(Value::Property(Property::Bool(false)));
+            }
+            let list_val = eval_expr(list, ctx)?;
+            let items = match list_val {
+                Value::List(items) => items,
+                Value::Property(Property::List(props)) => {
+                    props.into_iter().map(Value::Property).collect()
+                }
+                Value::Null | Value::Property(Property::Null) => {
+                    return Ok(Value::Property(Property::Bool(false)));
+                }
+                _ => return Err(Error::TypeMismatch),
+            };
+            let found = items.iter().any(|item| values_equal(&elem, item));
+            Ok(Value::Property(Property::Bool(found)))
+        }
         Expr::Call { name, args } => call_scalar(name, args, ctx),
         Expr::List(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -2004,6 +2023,10 @@ pub(crate) fn to_bool(v: &Value) -> Result<bool> {
         Value::Null => Ok(false),
         _ => Err(Error::NotBoolean),
     }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    compare(CompareOp::Eq, a, b).unwrap_or(false)
 }
 
 fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {

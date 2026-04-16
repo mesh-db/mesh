@@ -589,6 +589,10 @@ where
             walk_expr(right, visit)
         }
         Expr::IsNull { inner, .. } => walk_expr(inner, visit),
+        Expr::InList { element, list } => {
+            walk_expr(element, visit)?;
+            walk_expr(list, visit)
+        }
         Expr::Call { args, .. } => match args {
             CallArgs::Star => Ok(()),
             CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) => {

@@ -341,6 +341,14 @@ pub enum Expr {
         negated: bool,
         inner: Box<Expr>,
     },
+    /// `element IN list` — list membership test. Evaluates
+    /// `element` and `list`, then checks whether `element` is
+    /// equal to any item in `list`. Null-propagating: null
+    /// element or null list → false in filter context.
+    InList {
+        element: Box<Expr>,
+        list: Box<Expr>,
+    },
     Call {
         name: String,
         args: CallArgs,
