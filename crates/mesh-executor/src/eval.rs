@@ -1308,6 +1308,46 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 _ => Err(Error::TypeMismatch),
             }
         }
+        "id" | "elementid" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Node(n) => Ok(Value::Property(Property::String(n.id.to_string()))),
+                Value::Edge(e) => Ok(Value::Property(Property::String(e.id.to_string()))),
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "startnode" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Edge(e) => match ctx.reader.get_node(e.source)? {
+                    Some(n) => Ok(Value::Node(n)),
+                    None => Ok(Value::Null),
+                },
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "endnode" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Edge(e) => match ctx.reader.get_node(e.target)? {
+                    Some(n) => Ok(Value::Node(n)),
+                    None => Ok(Value::Null),
+                },
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "properties" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Node(n) => Ok(Value::Property(Property::Map(n.properties))),
+                Value::Edge(e) => Ok(Value::Property(Property::Map(e.properties))),
+                _ => Err(Error::TypeMismatch),
+            }
+        }
         "tolower" => {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {

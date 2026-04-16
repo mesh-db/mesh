@@ -2046,6 +2046,111 @@ fn in_empty_list_returns_no_rows() {
 }
 
 #[test]
+fn id_returns_uuid_string_for_node() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN id(p) AS nid, p.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    let nid = str_prop(&rows[0], "nid");
+    assert_eq!(nid.len(), 36, "UUID string is 36 chars: {nid}");
+}
+
+#[test]
+fn id_returns_uuid_string_for_edge() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:A {name: 'a'}), (:B {name: 'b'})");
+    run(&store, "MATCH (a:A), (b:B) CREATE (a)-[:KNOWS]->(b)");
+    let rows = run(&store, "MATCH ()-[r:KNOWS]->() RETURN id(r) AS eid");
+    assert_eq!(rows.len(), 1);
+    let eid = str_prop(&rows[0], "eid");
+    assert_eq!(eid.len(), 36);
+}
+
+#[test]
+fn elementid_is_alias_for_id() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) RETURN id(p) AS a, elementId(p) AS b",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), str_prop(&rows[0], "b"));
+}
+
+#[test]
+fn startnode_and_endnode_return_endpoints() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH ()-[r:KNOWS]->() \
+         RETURN startNode(r) AS s, endNode(r) AS e",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("s") {
+        Some(Value::Node(n)) => {
+            assert_eq!(
+                n.properties.get("name"),
+                Some(&Property::String("Ada".into()))
+            );
+        }
+        other => panic!("expected node, got: {other:?}"),
+    }
+    match rows[0].get("e") {
+        Some(Value::Node(n)) => {
+            assert_eq!(
+                n.properties.get("name"),
+                Some(&Property::String("Bob".into()))
+            );
+        }
+        other => panic!("expected node, got: {other:?}"),
+    }
+}
+
+#[test]
+fn properties_returns_map() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada', age: 37})");
+    let rows = run(&store, "MATCH (p:Person) RETURN properties(p) AS props");
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("props") {
+        Some(Value::Property(Property::Map(m))) => {
+            assert_eq!(m.get("name"), Some(&Property::String("Ada".into())));
+            assert_eq!(m.get("age"), Some(&Property::Int64(37)));
+        }
+        other => panic!("expected map, got: {other:?}"),
+    }
+}
+
+#[test]
+fn id_on_null_returns_null() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:A {name: 'a'})");
+    let rows = run(
+        &store,
+        "MATCH (a:A) OPTIONAL MATCH (a)-[r:NOPE]->(b) \
+         RETURN a.name AS name, id(r) AS rid",
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(
+        rows[0].get("rid"),
+        Some(Value::Null) | Some(Value::Property(Property::Null))
+    ));
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");
