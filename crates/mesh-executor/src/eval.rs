@@ -253,7 +253,11 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::Compare { op, left, right } => {
             let vl = eval_expr(left, ctx)?;
             let vr = eval_expr(right, ctx)?;
-            Ok(Value::Property(Property::Bool(compare(*op, &vl, &vr)?)))
+            match compare(*op, &vl, &vr) {
+                Ok(b) => Ok(Value::Property(Property::Bool(b))),
+                Err(Error::TypeMismatch) | Err(Error::UnsupportedComparison) => Ok(Value::Null),
+                Err(e) => Err(e),
+            }
         }
         Expr::IsNull { negated, inner } => {
             let v = eval_expr(inner, ctx)?;
@@ -1112,6 +1116,14 @@ fn to_number(v: &Value) -> Result<Num> {
 /// so tests can eventually mock it (e.g. via a trait injected
 /// into `EvalCtx`) without scattering `SystemTime::now()` calls
 /// across the temporal scalar implementations.
+fn map_int(m: &std::collections::HashMap<String, Property>, key: &str) -> Option<i64> {
+    match m.get(key)? {
+        Property::Int64(n) => Some(*n),
+        Property::Float64(f) => Some(*f as i64),
+        _ => None,
+    }
+}
+
 fn now_epoch_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let duration = SystemTime::now()
@@ -2142,56 +2154,111 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         // need to build a specific DateTime from components should
         // send it as a Bolt parameter, which goes through the
         // wire-format path (Bolt LocalDateTime struct).
-        "datetime" => {
-            // Zero args → current UTC epoch millis.
-            // One string arg → parse ISO 8601 / RFC 3339 and convert
-            // to UTC epoch millis. Timezone offsets are respected
-            // during conversion; naive strings (no `Z` or offset)
-            // are interpreted as UTC, matching the rest of the
-            // temporal surface's UTC-only v1.
-            match arg_exprs.len() {
-                0 => Ok(Value::Property(Property::DateTime(now_epoch_millis()))),
-                1 => {
-                    let v = eval_expr(&arg_exprs[0], ctx)?;
-                    match v {
-                        Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
-                        Value::Property(Property::String(s)) => {
-                            Ok(Value::Property(Property::DateTime(parse_datetime(&s)?)))
-                        }
-                        _ => Err(Error::TypeMismatch),
+        "datetime" | "localdatetime" => match arg_exprs.len() {
+            0 => Ok(Value::Property(Property::DateTime(now_epoch_millis()))),
+            1 => {
+                let v = eval_expr(&arg_exprs[0], ctx)?;
+                match v {
+                    Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                    Value::Property(Property::String(s)) => {
+                        Ok(Value::Property(Property::DateTime(parse_datetime(&s)?)))
                     }
-                }
-                _ => Err(Error::UnknownScalarFunction(
-                    "datetime() takes zero or one argument".into(),
-                )),
-            }
-        }
-        "date" => {
-            // Zero args → today (UTC). One string arg → parse
-            // `YYYY-MM-DD` into days-since-epoch.
-            match arg_exprs.len() {
-                0 => {
-                    let days = now_epoch_millis().div_euclid(86_400_000);
-                    let clamped = i32::try_from(days).map_err(|_| {
-                        Error::UnknownScalarFunction(format!("date() overflowed i32 days: {days}"))
-                    })?;
-                    Ok(Value::Property(Property::Date(clamped)))
-                }
-                1 => {
-                    let v = eval_expr(&arg_exprs[0], ctx)?;
-                    match v {
-                        Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
-                        Value::Property(Property::String(s)) => {
-                            Ok(Value::Property(Property::Date(parse_date(&s)?)))
-                        }
-                        _ => Err(Error::TypeMismatch),
+                    Value::Property(Property::Map(m)) => {
+                        let year = map_int(&m, "year").unwrap_or(1970);
+                        let month = map_int(&m, "month").unwrap_or(1);
+                        let day = map_int(&m, "day").unwrap_or(1);
+                        let hour = map_int(&m, "hour").unwrap_or(0);
+                        let minute = map_int(&m, "minute").unwrap_or(0);
+                        let second = map_int(&m, "second").unwrap_or(0);
+                        let nanos = map_int(&m, "nanosecond").unwrap_or(0);
+                        let days_since_epoch =
+                            chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
+                                .map(|d| {
+                                    d.signed_duration_since(
+                                        chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                                    )
+                                    .num_days()
+                                })
+                                .unwrap_or(0);
+                        let millis = days_since_epoch * 86_400_000
+                            + hour * 3_600_000
+                            + minute * 60_000
+                            + second * 1000
+                            + nanos / 1_000_000;
+                        Ok(Value::Property(Property::DateTime(millis)))
                     }
+                    _ => Err(Error::TypeMismatch),
                 }
-                _ => Err(Error::UnknownScalarFunction(
-                    "date() takes zero or one argument".into(),
-                )),
             }
-        }
+            _ => Err(Error::UnknownScalarFunction(
+                "datetime() takes zero or one argument".into(),
+            )),
+        },
+        "date" => match arg_exprs.len() {
+            0 => {
+                let days = now_epoch_millis().div_euclid(86_400_000);
+                let clamped = i32::try_from(days).map_err(|_| {
+                    Error::UnknownScalarFunction(format!("date() overflowed i32 days: {days}"))
+                })?;
+                Ok(Value::Property(Property::Date(clamped)))
+            }
+            1 => {
+                let v = eval_expr(&arg_exprs[0], ctx)?;
+                match v {
+                    Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                    Value::Property(Property::String(s)) => {
+                        Ok(Value::Property(Property::Date(parse_date(&s)?)))
+                    }
+                    Value::Property(Property::Map(m)) => {
+                        let year = map_int(&m, "year").unwrap_or(1970);
+                        let month = map_int(&m, "month").unwrap_or(1);
+                        let day = map_int(&m, "day").unwrap_or(1);
+                        let days =
+                            chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
+                                .map(|d| {
+                                    d.signed_duration_since(
+                                        chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                                    )
+                                    .num_days()
+                                })
+                                .unwrap_or(0);
+                        Ok(Value::Property(Property::Date(days as i32)))
+                    }
+                    _ => Err(Error::TypeMismatch),
+                }
+            }
+            _ => Err(Error::UnknownScalarFunction(
+                "date() takes zero or one argument".into(),
+            )),
+        },
+        "time" | "localtime" => match arg_exprs.len() {
+            0 => {
+                let millis = now_epoch_millis() % 86_400_000;
+                Ok(Value::Property(Property::DateTime(millis)))
+            }
+            1 => {
+                let v = eval_expr(&arg_exprs[0], ctx)?;
+                match v {
+                    Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                    Value::Property(Property::Map(m)) => {
+                        let hour = map_int(&m, "hour").unwrap_or(0);
+                        let minute = map_int(&m, "minute").unwrap_or(0);
+                        let second = map_int(&m, "second").unwrap_or(0);
+                        let nanos = map_int(&m, "nanosecond").unwrap_or(0);
+                        let millis =
+                            hour * 3_600_000 + minute * 60_000 + second * 1000 + nanos / 1_000_000;
+                        Ok(Value::Property(Property::DateTime(millis)))
+                    }
+                    Value::Property(Property::String(s)) => Ok(Value::Property(
+                        Property::DateTime(parse_datetime(&s).unwrap_or(0)),
+                    )),
+                    _ => Err(Error::TypeMismatch),
+                }
+            }
+            _ => Err(Error::UnknownScalarFunction(
+                "time() takes zero or one argument".into(),
+            )),
+        },
         "timestamp" => {
             if !arg_exprs.is_empty() {
                 return Err(Error::UnknownScalarFunction(

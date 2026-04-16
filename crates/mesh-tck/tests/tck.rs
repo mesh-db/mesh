@@ -113,18 +113,27 @@ fn split_statements(text: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut current = String::new();
     for line in text.lines() {
-        let trimmed = line.trim();
+        // Strip inline comments before processing
+        let trimmed = if let Some(idx) = line.find("//") {
+            line[..idx].trim()
+        } else {
+            line.trim()
+        };
         if trimmed.is_empty() {
             continue;
         }
-        let starts_new = trimmed.to_uppercase().starts_with("CREATE")
-            || trimmed.to_uppercase().starts_with("MATCH")
-            || trimmed.to_uppercase().starts_with("MERGE")
-            || trimmed.to_uppercase().starts_with("UNWIND")
-            || trimmed.to_uppercase().starts_with("WITH")
-            || trimmed.to_uppercase().starts_with("CALL")
-            || trimmed.to_uppercase().starts_with("LOAD");
-        if starts_new && !current.is_empty() {
+        let upper = trimmed.to_uppercase();
+        let starts_new = upper.starts_with("CREATE")
+            || upper.starts_with("MATCH")
+            || upper.starts_with("MERGE")
+            || upper.starts_with("UNWIND")
+            || upper.starts_with("WITH")
+            || upper.starts_with("CALL")
+            || upper.starts_with("LOAD");
+        // Don't split if the current statement ends with a comma
+        // (continuation, e.g., CREATE (:A {x: 1}),\n(:B {y: 2}))
+        let is_continuation = current.trim_end().ends_with(',');
+        if starts_new && !current.is_empty() && !is_continuation {
             stmts.push(current.trim().trim_end_matches(';').to_string());
             current = String::new();
         }
