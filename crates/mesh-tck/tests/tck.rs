@@ -244,21 +244,28 @@ fn format_value(val: &Value) -> String {
         Value::Null => "null".to_string(),
         Value::Property(p) => format_property(p),
         Value::Node(n) => {
-            let labels = if n.labels.is_empty() {
+            let mut labels: Vec<&str> = n.labels.iter().map(|s| s.as_str()).collect();
+            labels.sort();
+            let label_str = if labels.is_empty() {
                 String::new()
             } else {
-                format!(":{}", n.labels.join(":"))
+                format!(":{}", labels.join(":"))
             };
-            let props = format_props(&n.properties);
-            if labels.is_empty() && props.is_empty() {
-                "()".to_string()
-            } else {
-                format!("({labels}{props})")
+            let props = format_props_inline(&n.properties);
+            match (label_str.is_empty(), props.is_empty()) {
+                (true, true) => "()".to_string(),
+                (true, false) => format!("({props})"),
+                (false, true) => format!("({label_str})"),
+                (false, false) => format!("({label_str} {props})"),
             }
         }
         Value::Edge(e) => {
-            let props = format_props(&e.properties);
-            format!("[:{}{props}]", e.edge_type)
+            let props = format_props_inline(&e.properties);
+            if props.is_empty() {
+                format!("[:{}]", e.edge_type)
+            } else {
+                format!("[:{} {props}]", e.edge_type)
+            }
         }
         Value::List(items) => {
             let inner: Vec<String> = items.iter().map(format_value).collect();
@@ -309,7 +316,7 @@ fn format_property(p: &Property) -> String {
     }
 }
 
-fn format_props(props: &HashMap<String, Property>) -> String {
+fn format_props_inline(props: &HashMap<String, Property>) -> String {
     if props.is_empty() {
         return String::new();
     }
@@ -318,7 +325,7 @@ fn format_props(props: &HashMap<String, Property>) -> String {
         .map(|(k, v)| format!("{k}: {}", format_property(v)))
         .collect();
     entries.sort();
-    format!(" {{{}}}", entries.join(", "))
+    format!("{{{}}}", entries.join(", "))
 }
 
 fn format_results(rows: &[Row], headers: &[&str]) -> Vec<Vec<String>> {
@@ -358,8 +365,9 @@ fn parse_tck_value(s: &str) -> Value {
 // --- Main ---
 
 fn main() {
-    let features = std::env::var("TCK_FEATURES")
-        .unwrap_or_else(|_| "../../tck/opencypher/tck/features/clauses/match/Match1.feature".to_string());
+    let features = std::env::var("TCK_FEATURES").unwrap_or_else(|_| {
+        "../../tck/opencypher/tck/features/clauses/match/Match1.feature".to_string()
+    });
 
     futures::executor::block_on(
         MeshWorld::cucumber()

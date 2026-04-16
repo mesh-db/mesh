@@ -5,6 +5,14 @@ use crate::ast::{
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarType {
+    Node,
+    Edge,
+    Path,
+    Scalar,
+}
+
 /// What the planner needs to know about the current store beyond the
 /// statement itself — right now just the registered property indexes,
 /// which gate whether `plan_pattern` rewrites a label-scan-plus-filter
@@ -1203,7 +1211,7 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
     let mut nodes: Vec<CreateNodeSpec> = Vec::new();
     let mut edges: Vec<CreateEdgeSpec> = Vec::new();
     let mut var_idx: HashMap<String, usize> = HashMap::new();
-    let no_bindings: HashSet<String> = HashSet::new();
+    let no_bindings: HashMap<String, VarType> = HashMap::new();
 
     for pattern in &stmt.patterns {
         build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &no_bindings)?;
@@ -1235,7 +1243,7 @@ fn build_create_pattern(
     nodes: &mut Vec<CreateNodeSpec>,
     edges: &mut Vec<CreateEdgeSpec>,
     var_idx: &mut HashMap<String, usize>,
-    bound_vars: &HashSet<String>,
+    bound_vars: &HashMap<String, VarType>,
 ) -> Result<()> {
     let start_idx = add_create_node(nodes, var_idx, bound_vars, &pattern.start);
     let mut prev_idx = start_idx;
@@ -1274,7 +1282,7 @@ fn build_create_pattern(
 fn add_create_node(
     nodes: &mut Vec<CreateNodeSpec>,
     var_idx: &mut HashMap<String, usize>,
-    bound_vars: &HashSet<String>,
+    bound_vars: &HashMap<String, VarType>,
     pattern: &NodePattern,
 ) -> usize {
     if let Some(name) = &pattern.var {
@@ -1284,7 +1292,7 @@ fn add_create_node(
     }
     let idx = nodes.len();
     let spec = match &pattern.var {
-        Some(name) if bound_vars.contains(name) => CreateNodeSpec::Reference(name.clone()),
+        Some(name) if bound_vars.contains_key(name) => CreateNodeSpec::Reference(name.clone()),
         _ => CreateNodeSpec::New {
             var: pattern.var.clone(),
             labels: pattern.labels.clone(),
@@ -1859,6 +1867,44 @@ fn collect_pattern_vars(pattern: &Pattern, out: &mut HashSet<String>) {
     }
 }
 
+fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarType>) -> Result<()> {
+    if let Some(var) = &pattern.start.var {
+        check_var_type_conflict(var, VarType::Node, out)?;
+        out.insert(var.clone(), VarType::Node);
+    }
+    if let Some(pv) = &pattern.path_var {
+        check_var_type_conflict(pv, VarType::Path, out)?;
+        out.insert(pv.clone(), VarType::Path);
+    }
+    for hop in &pattern.hops {
+        if let Some(var) = &hop.rel.var {
+            check_var_type_conflict(var, VarType::Edge, out)?;
+            out.insert(var.clone(), VarType::Edge);
+        }
+        if let Some(var) = &hop.target.var {
+            check_var_type_conflict(var, VarType::Node, out)?;
+            out.insert(var.clone(), VarType::Node);
+        }
+    }
+    Ok(())
+}
+
+fn check_var_type_conflict(
+    var: &str,
+    new_type: VarType,
+    bound_vars: &HashMap<String, VarType>,
+) -> Result<()> {
+    if let Some(&existing) = bound_vars.get(var) {
+        if existing != new_type {
+            return Err(Error::Plan(format!(
+                "variable '{}' already defined with a different type",
+                var
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     use crate::ast::ReadingClause;
 
@@ -1879,7 +1925,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     // downstream clauses can enforce variable-scoping rules
     // against every earlier stage.
     let mut plan: Option<LogicalPlan> = None;
-    let mut bound_vars: HashSet<String> = HashSet::new();
+    let mut bound_vars: HashMap<String, VarType> = HashMap::new();
     let mut stage_pattern_offset: usize = 0;
 
     for clause in &stmt.clauses {
@@ -1923,7 +1969,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     collect_pattern_vars(pattern, &mut this_pattern_vars);
                     for var in &this_pattern_vars {
                         let is_bound_start =
-                            start_var_name == Some(var.as_str()) && bound_vars.contains(var);
+                            start_var_name == Some(var.as_str()) && bound_vars.contains_key(var);
                         if is_bound_start && !start_is_pure_reference {
                             return Err(Error::Plan(format!(
                                 "re-referencing already-bound variable '{}' in a \
@@ -1933,7 +1979,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                                 var
                             )));
                         }
-                        if bound_vars.contains(var) && !is_bound_start {
+                        if bound_vars.contains_key(var) && !is_bound_start {
                             return Err(Error::Plan(format!(
                                 "variable '{}' is already bound by an earlier clause; \
                                  only the pattern's start variable may be re-referenced \
@@ -1960,7 +2006,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     let pattern_offset = stage_pattern_offset + i;
                     let start_var_name = pattern.start.var.as_deref();
                     let is_rebind = start_var_name
-                        .map(|v| bound_vars.contains(v))
+                        .map(|v| bound_vars.contains_key(v))
                         .unwrap_or(false);
 
                     plan = if is_rebind {
@@ -1978,7 +2024,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             },
                         })
                     };
-                    collect_pattern_vars(pattern, &mut bound_vars);
+                    collect_pattern_vars_typed(pattern, &mut bound_vars)?;
                 }
                 stage_pattern_offset += m.patterns.len();
 
@@ -2013,7 +2059,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // references (e.g. CALL { WITH a MATCH (a)-[...]-> }).
                 for item in &w.items {
                     let alias = return_item_column_name(item);
-                    bound_vars.insert(alias);
+                    bound_vars.insert(alias, VarType::Node);
                 }
             }
             ReadingClause::Merge(mc) => {
@@ -2048,7 +2094,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         .var
                         .clone()
                         .unwrap_or_else(|| format!("__merge_stage{}", stage_pattern_offset));
-                    if bound_vars.contains(&var) {
+                    if bound_vars.contains_key(&var) {
                         return Err(Error::Plan(format!(
                             "variable '{}' is already bound; MERGE cannot rebind \
                              an existing variable in a chained clause",
@@ -2063,7 +2109,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         on_create,
                         on_match,
                     });
-                    bound_vars.insert(var);
+                    bound_vars.insert(var, VarType::Node);
                 } else {
                     // --- edge merge (single or multi-hop) ---
                     // Decompose: first MergeNode for each intermediate
@@ -2078,7 +2124,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         .var
                         .clone()
                         .unwrap_or_else(|| format!("__merge_s{}", stage_pattern_offset));
-                    if !bound_vars.contains(&start_var) {
+                    if !bound_vars.contains_key(&start_var) {
                         if !mc.pattern.start.labels.is_empty()
                             || !mc.pattern.start.properties.is_empty()
                         {
@@ -2090,7 +2136,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                                 on_create: on_create.clone(),
                                 on_match: on_match.clone(),
                             });
-                            bound_vars.insert(start_var.clone());
+                            bound_vars.insert(start_var.clone(), VarType::Node);
                         }
                     }
 
@@ -2101,7 +2147,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             hop.target.var.clone().unwrap_or_else(|| {
                                 format!("__merge_t{}_{}", stage_pattern_offset, hi)
                             });
-                        if !bound_vars.contains(&target_var)
+                        if !bound_vars.contains_key(&target_var)
                             && (!hop.target.labels.is_empty() || !hop.target.properties.is_empty())
                         {
                             plan = Some(LogicalPlan::MergeNode {
@@ -2112,7 +2158,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                                 on_create: on_create.clone(),
                                 on_match: on_match.clone(),
                             });
-                            bound_vars.insert(target_var);
+                            bound_vars.insert(target_var, VarType::Node);
                         }
                     }
 
@@ -2155,8 +2201,8 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             on_create: on_create.clone(),
                             on_match: on_match.clone(),
                         });
-                        bound_vars.insert(edge_var);
-                        bound_vars.insert(dst_var.clone());
+                        bound_vars.insert(edge_var, VarType::Node);
+                        bound_vars.insert(dst_var.clone(), VarType::Node);
                         current_src = dst_var;
                     }
                 }
@@ -2171,7 +2217,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // chained case, each input row cross-products with
                 // the list the expression produces, binding `alias`
                 // per element.
-                if bound_vars.contains(&u.alias) {
+                if bound_vars.contains_key(&u.alias) {
                     return Err(Error::Plan(format!(
                         "variable '{}' is already bound; UNWIND cannot rebind \
                          an existing variable",
@@ -2189,7 +2235,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         expr: u.expr.clone(),
                     },
                 });
-                bound_vars.insert(u.alias.clone());
+                bound_vars.insert(u.alias.clone(), VarType::Scalar);
             }
             ReadingClause::Call(body_stmt) => {
                 let body_plan = plan_with_context(body_stmt, ctx)?;
@@ -2212,7 +2258,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     var: lc.alias.clone(),
                     with_headers: lc.with_headers,
                 });
-                bound_vars.insert(lc.alias.clone());
+                bound_vars.insert(lc.alias.clone(), VarType::Scalar);
             }
         }
     }
@@ -2421,7 +2467,7 @@ fn apply_return_pipeline(
 fn apply_optional_match(
     mut plan: LogicalPlan,
     clause: &crate::ast::OptionalMatchClause,
-    bound_vars: &mut HashSet<String>,
+    bound_vars: &mut HashMap<String, VarType>,
 ) -> Result<LogicalPlan> {
     for pattern in &clause.patterns {
         if pattern.hops.is_empty() {
@@ -2437,7 +2483,7 @@ fn apply_optional_match(
                 Error::Plan("OPTIONAL MATCH start node must name an already-bound variable".into())
             })?
             .clone();
-        if !bound_vars.contains(&start_var) {
+        if !bound_vars.contains_key(&start_var) {
             return Err(Error::Plan(format!(
                 "OPTIONAL MATCH start variable `{}` must be bound by a prior MATCH",
                 start_var
@@ -2485,9 +2531,9 @@ fn apply_optional_match(
                 };
             }
 
-            bound_vars.insert(dst_var.clone());
+            bound_vars.insert(dst_var.clone(), VarType::Node);
             if let Some(ev) = &hop.rel.var {
-                bound_vars.insert(ev.clone());
+                bound_vars.insert(ev.clone(), VarType::Edge);
             }
             current_var = dst_var;
         }
