@@ -7,6 +7,6 @@ pub use ast::*;
 pub use error::{Error, Result};
 pub use parser::parse;
 pub use plan::{
-    plan, plan_with_context, AggregateArg, AggregateFn, AggregateSpec, CreateEdgeSpec,
+    format_plan, plan, plan_with_context, AggregateArg, AggregateFn, AggregateSpec, CreateEdgeSpec,
     CreateNodeSpec, LogicalPlan, PlannerContext, SetAssignment,
 };

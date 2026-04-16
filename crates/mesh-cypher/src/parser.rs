@@ -16,11 +16,22 @@ pub fn parse(input: &str) -> Result<Statement> {
     let query = pairs
         .next()
         .ok_or_else(|| Error::Parse("empty input".into()))?;
-    let body = query
-        .into_inner()
-        .find(|p| p.as_rule() == Rule::query_body)
-        .ok_or_else(|| Error::Parse("missing query_body".into()))?;
-    build_query_body(body)
+    let mut explain = false;
+    let mut body_pair = None;
+    for p in query.into_inner() {
+        match p.as_rule() {
+            Rule::kw_explain => explain = true,
+            Rule::query_body => body_pair = Some(p),
+            _ => {}
+        }
+    }
+    let body = body_pair.ok_or_else(|| Error::Parse("missing query_body".into()))?;
+    let stmt = build_query_body(body)?;
+    if explain {
+        Ok(Statement::Explain(Box::new(stmt)))
+    } else {
+        Ok(stmt)
+    }
 }
 
 fn build_query_body(pair: Pair<Rule>) -> Result<Statement> {

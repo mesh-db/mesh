@@ -24,6 +24,11 @@ pub enum Statement {
     /// `Union` with three branches. Mixing `UNION` and
     /// `UNION ALL` in the same chain is rejected at parse time.
     Union(UnionStmt),
+    /// `EXPLAIN <query>` — return the logical plan as text instead
+    /// of executing the query. The inner statement is planned
+    /// normally; the executor formats the plan tree as a
+    /// single-column result.
+    Explain(Box<Statement>),
 }
 
 /// `query1 UNION [ALL] query2 [UNION [ALL] query3 ...]`. Each

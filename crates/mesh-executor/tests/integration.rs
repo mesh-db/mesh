@@ -1,6 +1,8 @@
 use mesh_core::{Edge, Node, NodeId, Property};
 use mesh_cypher::{parse, plan, plan_with_context, PlannerContext};
-use mesh_executor::{execute, execute_with_reader, GraphReader, GraphWriter, ParamMap, Row, Value};
+use mesh_executor::{
+    execute, execute_with_reader, explain, GraphReader, GraphWriter, ParamMap, Row, Value,
+};
 use mesh_storage::RocksDbStorageEngine as Store;
 use tempfile::TempDir;
 
@@ -12,8 +14,12 @@ fn open_store() -> (Store, TempDir) {
 
 fn run(store: &Store, q: &str) -> Vec<Row> {
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
-    let plan = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
-    execute(&plan, store).unwrap_or_else(|e| panic!("exec {q}: {e}"))
+    if let mesh_cypher::Statement::Explain(inner) = &stmt {
+        let p = plan(inner).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+        return explain(&p);
+    }
+    let p = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+    execute(&p, store).unwrap_or_else(|e| panic!("exec {q}: {e}"))
 }
 
 /// Same as `run` but threads a `ParamMap` through to the executor —
@@ -2574,6 +2580,54 @@ fn float_comparison_works() {
         Some(Value::Property(Property::Float64(f))) => assert!((*f - 3.14).abs() < 1e-9),
         other => panic!("{other:?}"),
     }
+}
+
+// --- EXPLAIN ---------------------------------------------------------------
+
+#[test]
+fn explain_returns_plan_text() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "EXPLAIN MATCH (n:Person) RETURN n.name AS name");
+    assert_eq!(rows.len(), 1);
+    let plan_text = str_prop(&rows[0], "plan");
+    assert!(plan_text.contains("NodeScanByLabels"), "got: {plan_text}");
+    assert!(plan_text.contains("Project"), "got: {plan_text}");
+}
+
+#[test]
+fn explain_with_filter_shows_filter_node() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "EXPLAIN MATCH (n:Person) WHERE n.age > 18 RETURN n.name",
+    );
+    assert_eq!(rows.len(), 1);
+    let plan_text = str_prop(&rows[0], "plan");
+    assert!(plan_text.contains("Filter"), "got: {plan_text}");
+}
+
+#[test]
+fn explain_does_not_execute_mutations() {
+    let (store, _d) = open_store();
+    run(&store, "EXPLAIN CREATE (:Person {name: 'Ghost'})");
+    let rows = run(&store, "MATCH (n:Person) RETURN n.name AS name");
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn explain_multi_hop_shows_expand_chain() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "EXPLAIN MATCH (a:Person)-[:KNOWS]->(b)-[:WORKS_AT]->(c) RETURN a, b, c",
+    );
+    assert_eq!(rows.len(), 1);
+    let plan_text = str_prop(&rows[0], "plan");
+    let expand_count = plan_text.matches("EdgeExpand").count();
+    assert!(
+        expand_count >= 2,
+        "expected 2+ EdgeExpand, got: {plan_text}"
+    );
 }
 
 // --- Parameter execution -----------------------------------------------

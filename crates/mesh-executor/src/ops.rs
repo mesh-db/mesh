@@ -76,6 +76,13 @@ pub fn execute_with_writer(
 /// parameter map for `$param` resolution. Routing mode uses a
 /// partitioned reader that fans out reads across peers; the Bolt
 /// listener supplies the driver-bound param map.
+pub fn explain(plan: &LogicalPlan) -> Vec<Row> {
+    let text = mesh_cypher::format_plan(plan);
+    let mut row = Row::new();
+    row.insert("plan".to_string(), Value::Property(Property::String(text)));
+    vec![row]
+}
+
 pub fn execute_with_reader(
     plan: &LogicalPlan,
     reader: &dyn GraphReader,

@@ -379,9 +379,235 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
         },
         Statement::ShowIndexes => LogicalPlan::ShowPropertyIndexes,
         Statement::Union(u) => plan_union(u, ctx)?,
+        Statement::Explain(inner) => return plan_with_context(inner, ctx),
     };
     validate_pattern_predicates(&plan)?;
     Ok(plan)
+}
+
+pub fn format_plan(plan: &LogicalPlan) -> String {
+    let mut buf = String::new();
+    format_plan_inner(plan, &mut buf, 0);
+    buf
+}
+
+fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
+    let indent = "  ".repeat(depth);
+    match plan {
+        LogicalPlan::NodeScanAll { var } => {
+            buf.push_str(&format!("{indent}NodeScanAll({var})\n"));
+        }
+        LogicalPlan::NodeScanByLabels { var, labels } => {
+            buf.push_str(&format!(
+                "{indent}NodeScanByLabels({var}:{labels})\n",
+                labels = labels.join(":")
+            ));
+        }
+        LogicalPlan::EdgeExpand {
+            input,
+            src_var,
+            dst_var,
+            edge_type,
+            direction,
+            ..
+        } => {
+            let dir = format_dir(direction);
+            let et = edge_type.as_deref().unwrap_or("*");
+            buf.push_str(&format!(
+                "{indent}EdgeExpand({src_var}){dir}[:{et}]{dir_end}({dst_var})\n",
+                dir_end = if matches!(direction, Direction::Incoming) {
+                    ""
+                } else {
+                    ">"
+                }
+            ));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::OptionalEdgeExpand {
+            input,
+            src_var,
+            dst_var,
+            edge_type,
+            direction,
+            ..
+        } => {
+            let et = edge_type.as_deref().unwrap_or("*");
+            buf.push_str(&format!(
+                "{indent}OptionalEdgeExpand({src_var})-[:{et}]->({dst_var})\n"
+            ));
+            let _ = direction;
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::VarLengthExpand {
+            input,
+            src_var,
+            dst_var,
+            edge_type,
+            min_hops,
+            max_hops,
+            ..
+        } => {
+            let et = edge_type.as_deref().unwrap_or("*");
+            buf.push_str(&format!(
+                "{indent}VarLengthExpand({src_var})-[:{et}*{min_hops}..{max_hops}]->({dst_var})\n"
+            ));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            buf.push_str(&format!("{indent}Filter({predicate:?})\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::Project { input, items } => {
+            let cols: Vec<String> = items.iter().map(|i| render_expr_key(&i.expr)).collect();
+            buf.push_str(&format!("{indent}Project({})\n", cols.join(", ")));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_keys,
+            aggregates,
+            ..
+        } => {
+            let gk: Vec<String> = group_keys
+                .iter()
+                .map(|i| render_expr_key(&i.expr))
+                .collect();
+            buf.push_str(&format!(
+                "{indent}Aggregate(keys=[{}], aggs={})\n",
+                gk.join(", "),
+                aggregates.len()
+            ));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::OrderBy { input, sort_items } => {
+            buf.push_str(&format!("{indent}OrderBy({} items)\n", sort_items.len()));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::Skip { input, count } => {
+            buf.push_str(&format!("{indent}Skip({count})\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::Limit { input, count } => {
+            buf.push_str(&format!("{indent}Limit({count})\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::Distinct { input } => {
+            buf.push_str(&format!("{indent}Distinct\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::CartesianProduct { left, right } => {
+            buf.push_str(&format!("{indent}CartesianProduct\n"));
+            format_plan_inner(left, buf, depth + 1);
+            format_plan_inner(right, buf, depth + 1);
+        }
+        LogicalPlan::CreatePath { input, .. } => {
+            buf.push_str(&format!("{indent}CreatePath\n"));
+            if let Some(i) = input {
+                format_plan_inner(i, buf, depth + 1);
+            }
+        }
+        LogicalPlan::Delete {
+            input,
+            detach,
+            vars,
+        } => {
+            let kind = if *detach { "DetachDelete" } else { "Delete" };
+            buf.push_str(&format!("{indent}{kind}({})\n", vars.join(", ")));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::SetProperty { input, .. } => {
+            buf.push_str(&format!("{indent}SetProperty\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::IndexSeek {
+            var,
+            label,
+            property,
+            ..
+        } => {
+            buf.push_str(&format!("{indent}IndexSeek({var}:{label}.{property})\n"));
+        }
+        LogicalPlan::Unwind { var, .. } => {
+            buf.push_str(&format!("{indent}Unwind(AS {var})\n"));
+        }
+        LogicalPlan::UnwindChain { input, var, .. } => {
+            buf.push_str(&format!("{indent}UnwindChain(AS {var})\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::Union { branches, all } => {
+            let kind = if *all { "UnionAll" } else { "Union" };
+            buf.push_str(&format!("{indent}{kind}({} branches)\n", branches.len()));
+            for b in branches {
+                format_plan_inner(b, buf, depth + 1);
+            }
+        }
+        LogicalPlan::BindPath {
+            input, path_var, ..
+        } => {
+            buf.push_str(&format!("{indent}BindPath({path_var})\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::ShortestPath {
+            input,
+            src_var,
+            dst_var,
+            path_var,
+            kind,
+            max_hops,
+            ..
+        } => {
+            let kind_str = match kind {
+                ShortestKind::Shortest => "shortestPath",
+                ShortestKind::AllShortest => "allShortestPaths",
+            };
+            buf.push_str(&format!(
+                "{indent}{kind_str}({src_var})->({dst_var}) AS {path_var} [..{max_hops}]\n"
+            ));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::MergeNode {
+            input, var, labels, ..
+        } => {
+            buf.push_str(&format!(
+                "{indent}MergeNode({var}:{labels})\n",
+                labels = labels.join(":")
+            ));
+            if let Some(i) = input {
+                format_plan_inner(i, buf, depth + 1);
+            }
+        }
+        LogicalPlan::MergeEdge {
+            input,
+            src_var,
+            dst_var,
+            edge_type,
+            ..
+        } => {
+            buf.push_str(&format!(
+                "{indent}MergeEdge({src_var})-[:{edge_type}]->({dst_var})\n"
+            ));
+            format_plan_inner(input, buf, depth + 1);
+        }
+        LogicalPlan::CreatePropertyIndex { label, property } => {
+            buf.push_str(&format!(
+                "{indent}CreatePropertyIndex({label}.{property})\n"
+            ));
+        }
+        LogicalPlan::DropPropertyIndex { label, property } => {
+            buf.push_str(&format!("{indent}DropPropertyIndex({label}.{property})\n"));
+        }
+        LogicalPlan::ShowPropertyIndexes => {
+            buf.push_str(&format!("{indent}ShowPropertyIndexes\n"));
+        }
+    }
+}
+
+fn format_dir(d: &Direction) -> &'static str {
+    match d {
+        Direction::Outgoing => "-",
+        Direction::Incoming => "<-",
+        Direction::Both => "-",
+    }
 }
 
 /// Walk the lowered plan and check every `Expr::PatternExists`
@@ -765,6 +991,7 @@ fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
                 .map(union_branch_columns)
                 .unwrap_or_else(|| Err(Error::Plan("empty nested UNION".into())))
         }
+        Statement::Explain(inner) => union_branch_columns(inner),
         Statement::Create(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
