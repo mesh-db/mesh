@@ -1389,15 +1389,11 @@ fn optional_match_multi_hop_plans_successfully() {
 }
 
 #[test]
-fn optional_match_unbound_start_rejected_at_plan_time() {
+fn optional_match_unbound_start_plans_successfully() {
     use mesh_cypher::plan;
     let stmt =
         parse("MATCH (p:Person) OPTIONAL MATCH (other:Person)-[:KNOWS]->(f) RETURN p").unwrap();
-    let err = plan(&stmt).unwrap_err();
-    assert!(
-        err.to_string().contains("must be bound"),
-        "expected unbound-start error, got: {err}"
-    );
+    plan(&stmt).expect("OPTIONAL MATCH with unbound start should plan");
 }
 
 /// Extract the first MERGE clause out of a MatchStmt. Used by

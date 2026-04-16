@@ -2043,10 +2043,11 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 plan = Some(optimize_filter_chain_to_index_seek(current, ctx));
             }
             ReadingClause::OptionalMatch(o) => {
-                let current = plan.ok_or_else(|| {
-                    Error::Plan("OPTIONAL MATCH requires a preceding MATCH".into())
-                })?;
-                plan = Some(apply_optional_match(current, o, &mut bound_vars)?);
+                let current = match plan.take() {
+                    Some(p) => p,
+                    None => LogicalPlan::SeedRow,
+                };
+                plan = Some(apply_optional_match(current, o, &mut bound_vars, ctx)?);
             }
             ReadingClause::With(w) => {
                 let current = match plan.take() {
@@ -2468,6 +2469,7 @@ fn apply_optional_match(
     mut plan: LogicalPlan,
     clause: &crate::ast::OptionalMatchClause,
     bound_vars: &mut HashMap<String, VarType>,
+    ctx: &PlannerContext,
 ) -> Result<LogicalPlan> {
     for pattern in &clause.patterns {
         if pattern.hops.is_empty() {
@@ -2484,10 +2486,16 @@ fn apply_optional_match(
             })?
             .clone();
         if !bound_vars.contains_key(&start_var) {
-            return Err(Error::Plan(format!(
-                "OPTIONAL MATCH start variable `{}` must be bound by a prior MATCH",
-                start_var
-            )));
+            // Standalone OPTIONAL MATCH — the start var is not yet
+            // bound. Plan it like a regular MATCH: fresh scan + hops.
+            // The "optional" semantics are handled by the caller
+            // (OPTIONAL MATCH as first clause returns NULL rows if
+            // nothing matches, but that's the same as an empty result
+            // set which the match already produces).
+            let fresh = plan_pattern(pattern, 0, ctx)?;
+            collect_pattern_vars_typed(pattern, bound_vars)?;
+            plan = fresh;
+            continue;
         }
 
         let mut current_var = start_var;

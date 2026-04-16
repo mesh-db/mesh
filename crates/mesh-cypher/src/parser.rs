@@ -547,12 +547,8 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         | ReadingClause::Unwind(_)
         | ReadingClause::With(_)
         | ReadingClause::Call(_)
-        | ReadingClause::LoadCsv(_) => {}
-        ReadingClause::OptionalMatch(_) => {
-            return Err(Error::Parse(
-                "OPTIONAL MATCH can only appear after an initial producer clause".into(),
-            ));
-        }
+        | ReadingClause::LoadCsv(_)
+        | ReadingClause::OptionalMatch(_) => {}
     }
 
     Ok(MatchStmt { clauses, terminal })
