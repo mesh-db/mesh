@@ -2630,6 +2630,50 @@ fn explain_multi_hop_shows_expand_chain() {
     );
 }
 
+// --- CREATE with RETURN ------------------------------------------------
+
+#[test]
+fn create_with_return_echoes_node() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "CREATE (n:Person {name: 'Ada'}) RETURN n");
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("n") {
+        Some(Value::Node(n)) => {
+            assert_eq!(
+                n.properties.get("name"),
+                Some(&Property::String("Ada".into()))
+            );
+            assert!(n.labels.contains(&"Person".to_string()));
+        }
+        other => panic!("expected node, got: {other:?}"),
+    }
+}
+
+#[test]
+fn create_with_return_property_access() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "CREATE (n:Person {name: 'Ada'}) RETURN n.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+}
+
+#[test]
+fn create_with_return_edge() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
+         RETURN a.name AS a, type(r) AS t, b.name AS b",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "Ada");
+    assert_eq!(str_prop(&rows[0], "t"), "KNOWS");
+    assert_eq!(str_prop(&rows[0], "b"), "Bob");
+}
+
 // --- Parameter execution -----------------------------------------------
 
 #[test]
