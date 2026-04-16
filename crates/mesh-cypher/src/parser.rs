@@ -1646,6 +1646,7 @@ fn build_compare_op(pair: Pair<Rule>) -> Result<CompareOp> {
         Rule::op_starts_with => CompareOp::StartsWith,
         Rule::op_ends_with => CompareOp::EndsWith,
         Rule::op_contains => CompareOp::Contains,
+        Rule::op_regex_match => CompareOp::RegexMatch,
         r => return Err(Error::Parse(format!("unexpected op: {:?}", r))),
     })
 }

@@ -271,6 +271,7 @@ is_null_op     = @{ ^"is" ~ (" " | "\t" | "\r" | "\n")+ ~ ^"null" ~ !id_cont }
 
 comparison_op = {
     op_starts_with | op_ends_with | op_contains |
+    op_regex_match |
     op_neq | op_leq | op_geq | op_eq | op_lt | op_gt
 }
 op_eq = { "=" }
@@ -285,6 +286,7 @@ op_gt = { ">" }
 op_starts_with = @{ ^"starts" ~ (" " | "\t")+ ~ ^"with" ~ !id_cont }
 op_ends_with   = @{ ^"ends" ~ (" " | "\t")+ ~ ^"with" ~ !id_cont }
 op_contains    = @{ ^"contains" ~ !id_cont }
+op_regex_match = { "=~" }
 
 primary = {
     case_expr |

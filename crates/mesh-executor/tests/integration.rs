@@ -1896,6 +1896,74 @@ fn chained_unwind_rejects_alias_collision() {
 }
 
 #[test]
+fn regex_match_full_string() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:User {email: 'ada@example.com'})");
+    run(&store, "CREATE (:User {email: 'bob@other.org'})");
+    run(&store, "CREATE (:User {email: 'cara@example.net'})");
+    let rows = run(
+        &store,
+        "MATCH (u:User) WHERE u.email =~ '.*@example\\.com' \
+         RETURN u.email AS email",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "email"), "ada@example.com");
+}
+
+#[test]
+fn regex_match_is_full_not_substring() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Tag {name: 'hello'})");
+    let rows = run(
+        &store,
+        "MATCH (t:Tag) WHERE t.name =~ 'ell' RETURN t.name AS n",
+    );
+    assert!(rows.is_empty());
+    let rows = run(
+        &store,
+        "MATCH (t:Tag) WHERE t.name =~ '.*ell.*' RETURN t.name AS n",
+    );
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn regex_match_case_insensitive_flag() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Tag {name: 'Hello'})");
+    let rows = run(
+        &store,
+        "MATCH (t:Tag) WHERE t.name =~ '(?i)hello' RETURN t.name AS n",
+    );
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn regex_match_with_not() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:User {name: 'Ada'})");
+    run(&store, "CREATE (:User {name: 'Bob'})");
+    let rows = run(
+        &store,
+        "MATCH (u:User) WHERE NOT u.name =~ 'A.*' RETURN u.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Bob");
+}
+
+#[test]
+fn regex_match_null_propagates() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Tag {name: 'x'})");
+    run(&store, "CREATE (:Tag)");
+    let rows = run(
+        &store,
+        "MATCH (t:Tag) WHERE t.name =~ '.*' RETURN t.name AS n",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "x");
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");

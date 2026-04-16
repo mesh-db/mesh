@@ -2028,6 +2028,20 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
                 _ => unreachable!(),
             });
         }
+        CompareOp::RegexMatch => {
+            let (ls, rs) = match (l, r) {
+                (Value::Property(Property::String(a)), Value::Property(Property::String(b))) => {
+                    (a, b)
+                }
+                _ => return Err(Error::TypeMismatch),
+            };
+            // Cypher's =~ is a full-match operator (the entire
+            // string must match), so anchor the pattern.
+            let anchored = format!("^(?:{})$", rs);
+            let re =
+                regex::Regex::new(&anchored).map_err(|_| Error::InvalidRegex(rs.to_string()))?;
+            return Ok(re.is_match(ls));
+        }
         _ => {}
     }
     let (lp, rp) = match (l, r) {
@@ -2077,6 +2091,9 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
         CompareOp::Ge => ord != Ordering::Less,
         // String-predicate ops handled in the early-return
         // branch above.
-        CompareOp::StartsWith | CompareOp::EndsWith | CompareOp::Contains => unreachable!(),
+        CompareOp::StartsWith
+        | CompareOp::EndsWith
+        | CompareOp::Contains
+        | CompareOp::RegexMatch => unreachable!(),
     })
 }

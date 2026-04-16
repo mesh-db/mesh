@@ -46,6 +46,9 @@ pub enum Error {
 
     #[error("integer division or modulo by zero")]
     DivideByZero,
+
+    #[error("invalid regular expression: {0}")]
+    InvalidRegex(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

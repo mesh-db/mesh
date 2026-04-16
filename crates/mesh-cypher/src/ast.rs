@@ -475,6 +475,10 @@ pub enum CompareOp {
     EndsWith,
     /// `left CONTAINS right` — same semantics as StartsWith.
     Contains,
+    /// `left =~ right` — regex match. `right` must be a string
+    /// containing a valid regular expression; returns Bool. Both
+    /// sides Null → Null (null-propagating).
+    RegexMatch,
 }
 
 #[derive(Debug, Clone, PartialEq)]
