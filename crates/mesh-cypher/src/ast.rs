@@ -357,6 +357,14 @@ pub enum Expr {
         base: Box<Expr>,
         index: Box<Expr>,
     },
+    /// `expr[start..end]` — list slice. Both bounds are optional:
+    /// `[1..3]`, `[..2]`, `[2..]`, `[..]`. Zero-based; negative
+    /// indices count from the end. Out-of-range bounds are clamped.
+    SliceAccess {
+        base: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+    },
     /// `element IN list` — list membership test. Evaluates
     /// `element` and `list`, then checks whether `element` is
     /// equal to any item in `list`. Null-propagating: null

@@ -2376,6 +2376,98 @@ fn var_length_path_no_match_produces_no_rows() {
 }
 
 #[test]
+fn slice_both_bounds() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20, 30, 40, 50][1..3] AS s");
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("s") {
+        Some(Value::List(items)) => {
+            let vals: Vec<i64> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::Int64(i)) => *i,
+                    _ => panic!("expected int"),
+                })
+                .collect();
+            assert_eq!(vals, vec![20, 30]);
+        }
+        other => panic!("expected list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn slice_from_start() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20, 30, 40][2..] AS s");
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("s") {
+        Some(Value::List(items)) => assert_eq!(items.len(), 2),
+        other => panic!("expected list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn slice_to_end() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20, 30, 40][..2] AS s");
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("s") {
+        Some(Value::List(items)) => assert_eq!(items.len(), 2),
+        other => panic!("expected list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn slice_negative_indices() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20, 30, 40, 50][1..-1] AS s");
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("s") {
+        Some(Value::List(items)) => {
+            let vals: Vec<i64> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::Int64(i)) => *i,
+                    _ => panic!("expected int"),
+                })
+                .collect();
+            assert_eq!(vals, vec![20, 30, 40]);
+        }
+        other => panic!("expected list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn slice_out_of_range_clamps() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20][0..100] AS s");
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("s") {
+        Some(Value::List(items)) => assert_eq!(items.len(), 2),
+        other => panic!("expected list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn slice_empty_range_returns_empty() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20, 30][2..1] AS s");
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("s") {
+        Some(Value::List(items)) => assert!(items.is_empty()),
+        other => panic!("expected empty list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn slice_chained_with_index() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "RETURN [10, 20, 30, 40][1..3][0] AS v");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "v"), 20);
+}
+
+#[test]
 fn float_comparison_works() {
     let (store, _d) = open_store();
     run(&store, "CREATE (n:Meas {val: 3.14})");

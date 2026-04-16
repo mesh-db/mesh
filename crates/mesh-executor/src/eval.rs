@@ -134,6 +134,54 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             };
             Ok(resolved.unwrap_or(Value::Null))
         }
+        Expr::SliceAccess { base, start, end } => {
+            let base_val = eval_expr(base, ctx)?;
+            if matches!(base_val, Value::Null | Value::Property(Property::Null)) {
+                return Ok(Value::Null);
+            }
+            let items: Vec<Value> = match base_val {
+                Value::List(items) => items,
+                Value::Property(Property::List(props)) => {
+                    props.into_iter().map(Value::Property).collect()
+                }
+                _ => return Err(Error::TypeMismatch),
+            };
+            let len = items.len() as i64;
+            let resolve = |expr: &Expr| -> Result<i64> {
+                match eval_expr(expr, ctx)? {
+                    Value::Property(Property::Int64(i)) => Ok(i),
+                    _ => Err(Error::TypeMismatch),
+                }
+            };
+            let s = match start {
+                Some(e) => {
+                    let raw = resolve(e)?;
+                    let abs = if raw < 0 {
+                        (len + raw).max(0)
+                    } else {
+                        raw.min(len)
+                    };
+                    abs as usize
+                }
+                None => 0,
+            };
+            let e = match end {
+                Some(e) => {
+                    let raw = resolve(e)?;
+                    let abs = if raw < 0 {
+                        (len + raw).max(0)
+                    } else {
+                        raw.min(len)
+                    };
+                    abs as usize
+                }
+                None => len as usize,
+            };
+            if s >= e {
+                return Ok(Value::List(Vec::new()));
+            }
+            Ok(Value::List(items[s..e].to_vec()))
+        }
         Expr::Not(inner) => {
             let v = eval_expr(inner, ctx)?;
             Ok(Value::Property(Property::Bool(!to_bool(&v)?)))

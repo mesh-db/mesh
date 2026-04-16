@@ -1323,17 +1323,52 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                         };
                     }
                     Rule::index_access => {
-                        let idx_expr = inner_rule
+                        let child = inner_rule
                             .into_inner()
-                            .find(|p| p.as_rule() == Rule::expression)
-                            .ok_or_else(|| {
-                                Error::Parse("index_access missing expression".into())
-                            })?;
-                        let index = build_expression(idx_expr)?;
-                        expr = Expr::IndexAccess {
-                            base: Box::new(expr),
-                            index: Box::new(index),
-                        };
+                            .next()
+                            .ok_or_else(|| Error::Parse("index_access missing content".into()))?;
+                        match child.as_rule() {
+                            Rule::slice_both => {
+                                let mut exprs = child.into_inner();
+                                let s = build_expression(exprs.next().unwrap())?;
+                                let e = build_expression(exprs.next().unwrap())?;
+                                expr = Expr::SliceAccess {
+                                    base: Box::new(expr),
+                                    start: Some(Box::new(s)),
+                                    end: Some(Box::new(e)),
+                                };
+                            }
+                            Rule::slice_from => {
+                                let s = build_expression(child.into_inner().next().unwrap())?;
+                                expr = Expr::SliceAccess {
+                                    base: Box::new(expr),
+                                    start: Some(Box::new(s)),
+                                    end: None,
+                                };
+                            }
+                            Rule::slice_to => {
+                                let e = build_expression(child.into_inner().next().unwrap())?;
+                                expr = Expr::SliceAccess {
+                                    base: Box::new(expr),
+                                    start: None,
+                                    end: Some(Box::new(e)),
+                                };
+                            }
+                            Rule::slice_all => {
+                                expr = Expr::SliceAccess {
+                                    base: Box::new(expr),
+                                    start: None,
+                                    end: None,
+                                };
+                            }
+                            _ => {
+                                let index = build_expression(child)?;
+                                expr = Expr::IndexAccess {
+                                    base: Box::new(expr),
+                                    index: Box::new(index),
+                                };
+                            }
+                        }
                     }
                     r => {
                         return Err(Error::Parse(format!(

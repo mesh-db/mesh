@@ -296,7 +296,11 @@ op_regex_match = { "=~" }
 primary = { base_primary ~ postfix_chain* }
 postfix_chain = { property_chain | index_access }
 property_chain = { "." ~ identifier }
-index_access = { "[" ~ expression ~ "]" }
+index_access = { "[" ~ (slice_both | slice_from | slice_to | slice_all | expression) ~ "]" }
+slice_both = { expression ~ ".." ~ expression }
+slice_from = { expression ~ ".." }
+slice_to   = { ".." ~ expression }
+slice_all  = { ".." }
 
 base_primary = {
     case_expr |

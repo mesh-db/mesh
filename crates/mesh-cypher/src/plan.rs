@@ -585,6 +585,16 @@ where
             walk_expr(base, visit)?;
             walk_expr(index, visit)
         }
+        Expr::SliceAccess { base, start, end } => {
+            walk_expr(base, visit)?;
+            if let Some(s) = start {
+                walk_expr(s, visit)?;
+            }
+            if let Some(e) = end {
+                walk_expr(e, visit)?;
+            }
+            Ok(())
+        }
         Expr::Not(e) => walk_expr(e, visit),
         Expr::And(a, b) | Expr::Or(a, b) => {
             walk_expr(a, visit)?;
