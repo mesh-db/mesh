@@ -1,0 +1,22 @@
+= Cypher Design Philosophy Guidelines
+
+An informal manifesto was defined to ensure the consistent ongoing development of the Cypher language.
+The aim was to incorporate as many underlying principles as were deemed useful and relevant, and to distill these to no more than 15 or so rules to render the philosophy more useful and digestible.
+Suggestions for changing the language ought to be guided by the following rules:
+
+1. Follow these rules unless there’s a better way.
+2. Cypher is a high-level Graph Query Language.
+3. Design should be validated by user needs.
+4. Readability is better than terseness.
+5. Declarative is better than imperative.
+6. Composability is better than complexity.
+7. Explicit is better than implicit.
+8. Visual is better than textual.
+9. Familiar to users of SQL and inspired by Python.
+10. Prefer a single way to do things.
+11. Consistency is important. Learning one part of the language should help understanding other parts.
+12. Errors should never pass silently, unless explicitly silenced.
+13. Progress is more important than perfection, but consideration beats hastiness.
+14. Don’t leave holes in the specification that allow the implementation to leak through.
+15. Never be too proud to throw something away.
+16. Only raise errors if necessary; raised errors must not be opaque.

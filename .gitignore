@@ -1,0 +1,18 @@
+*~
+\#*
+*.bak
+*.html
+.idea/
+*.iml
+cip/*.html
+cip/*.pdf
+target/
+out/
+.DS_Store
+.DS_Store/
+# Generated grammar artifacts go here locally, but not to git.
+/grammar/generated
+.cache*
+.classpath
+.project
+.settings/
