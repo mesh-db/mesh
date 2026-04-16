@@ -24,6 +24,22 @@ pub struct ExecCtx<'a> {
     pub params: &'a ParamMap,
 }
 
+pub(crate) struct NoOpWriter;
+impl GraphWriter for NoOpWriter {
+    fn put_node(&self, _: &Node) -> Result<()> {
+        Ok(())
+    }
+    fn put_edge(&self, _: &Edge) -> Result<()> {
+        Ok(())
+    }
+    fn delete_edge(&self, _: EdgeId) -> Result<()> {
+        Ok(())
+    }
+    fn detach_delete_node(&self, _: NodeId) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl<'a> ExecCtx<'a> {
     /// Build an `EvalCtx` wrapping the given row alongside this
     /// exec context's params and reader. Used by operators to
@@ -197,7 +213,7 @@ fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
     build_op_inner(plan, None)
 }
 
-fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
+pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
     macro_rules! child {
         ($p:expr) => {
             build_op_inner($p, seed)

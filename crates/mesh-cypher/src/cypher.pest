@@ -349,12 +349,15 @@ base_primary = {
 // inside the MATCH are also deferred — v1 takes exactly one
 // pattern.
 count_subquery = {
-    kw_count ~ "{" ~ kw_match ~ pattern ~ where_clause? ~ "}"
+    kw_count ~ "{" ~ subquery_body ~ "}"
 }
 
 exists_subquery = {
-    kw_exists ~ "{" ~ kw_match ~ pattern ~ where_clause? ~ "}"
+    kw_exists ~ "{" ~ subquery_body ~ "}"
 }
+
+subquery_body = { read_stmt | bare_match_body }
+bare_match_body = { kw_match ~ pattern_list ~ where_clause? }
 
 // A `pattern` used as a boolean expression — `(a)-[:KNOWS]->(b)`
 // in a WHERE clause. Distinct from the top-level `pattern` rule

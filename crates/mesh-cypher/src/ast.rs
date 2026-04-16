@@ -491,16 +491,16 @@ pub enum Expr {
     /// v1 restrictions: single pattern (no comma lists), same
     /// pattern-shape rules as [`Expr::PatternExists`] (bound
     /// start, no var-length, no path var, at least one hop).
+    /// `EXISTS { read_stmt }` — true if the subquery produces at
+    /// least one row. The body is a full read statement that can
+    /// reference outer-row bindings.
     ExistsSubquery {
-        pattern: Pattern,
-        where_clause: Option<Box<Expr>>,
+        body: Box<Statement>,
     },
-    /// `count { MATCH pattern [WHERE expr] }` — returns the number
-    /// of matches as an Int64. Same semantics as ExistsSubquery but
-    /// counts all matches instead of short-circuiting on the first.
+    /// `count { read_stmt }` — returns the number of rows the
+    /// subquery produces as an Int64.
     CountSubquery {
-        pattern: Pattern,
-        where_clause: Option<Box<Expr>>,
+        body: Box<Statement>,
     },
     /// `any(x IN list WHERE pred)`, `all(...)`, `none(...)`, `single(...)`
     ListPredicate {

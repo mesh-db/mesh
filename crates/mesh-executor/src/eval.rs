@@ -460,19 +460,23 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let b = pattern_exists(pattern, ctx)?;
             Ok(Value::Property(Property::Bool(b)))
         }
-        Expr::ExistsSubquery {
-            pattern,
-            where_clause,
-        } => {
-            let b = exists_subquery_matches(pattern, where_clause.as_deref(), ctx)?;
-            Ok(Value::Property(Property::Bool(b)))
+        Expr::ExistsSubquery { body } => {
+            if let Some((pattern, where_clause)) = extract_simple_match(body) {
+                let b = exists_subquery_matches(pattern, where_clause, ctx)?;
+                Ok(Value::Property(Property::Bool(b)))
+            } else {
+                let n = execute_subquery_body(body, ctx)?;
+                Ok(Value::Property(Property::Bool(n > 0)))
+            }
         }
-        Expr::CountSubquery {
-            pattern,
-            where_clause,
-        } => {
-            let n = count_subquery_matches(pattern, where_clause.as_deref(), ctx)?;
-            Ok(Value::Property(Property::Int64(n)))
+        Expr::CountSubquery { body } => {
+            if let Some((pattern, where_clause)) = extract_simple_match(body) {
+                let n = count_subquery_matches(pattern, where_clause, ctx)?;
+                Ok(Value::Property(Property::Int64(n)))
+            } else {
+                let n = execute_subquery_body(body, ctx)?;
+                Ok(Value::Property(Property::Int64(n)))
+            }
         }
     }
 }
@@ -490,6 +494,278 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
 /// - `pattern.hops` is non-empty
 /// - `pattern.start.var` is `Some(_)`
 /// - No `hop.rel.var_length` is set
+fn extract_simple_match(
+    body: &mesh_cypher::Statement,
+) -> Option<(&mesh_cypher::Pattern, Option<&mesh_cypher::Expr>)> {
+    if let mesh_cypher::Statement::Match(m) = body {
+        if m.clauses.len() == 1 {
+            if let mesh_cypher::ReadingClause::Match(mc) = &m.clauses[0] {
+                if mc.patterns.len() == 1 {
+                    return Some((&mc.patterns[0], mc.where_clause.as_ref()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn exists_subquery_matches(
+    pattern: &mesh_cypher::Pattern,
+    where_clause: Option<&mesh_cypher::Expr>,
+    ctx: &EvalCtx,
+) -> Result<bool> {
+    let start_candidates = resolve_exists_start_candidates(&pattern.start, ctx)?;
+    for start_node in start_candidates {
+        if !start_node_matches(&start_node, &pattern.start, ctx)? {
+            continue;
+        }
+        let mut seed = ctx.row.clone();
+        if let Some(start_var) = &pattern.start.var {
+            seed.insert(start_var.clone(), Value::Node(start_node.clone()));
+        }
+        if pattern.hops.is_empty() {
+            match where_clause {
+                None => return Ok(true),
+                Some(w) => {
+                    let sub_ctx = ctx.with_row(&seed);
+                    if to_bool(&eval_expr(w, &sub_ctx)?).unwrap_or(false) {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+            }
+        }
+        let mut frontier: Vec<(mesh_core::Node, Row)> = vec![(start_node.clone(), seed)];
+        if walk_subquery_hops(pattern, where_clause, &mut frontier, ctx, true)? > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn count_subquery_matches(
+    pattern: &mesh_cypher::Pattern,
+    where_clause: Option<&mesh_cypher::Expr>,
+    ctx: &EvalCtx,
+) -> Result<i64> {
+    let mut total = 0i64;
+    let start_candidates = resolve_exists_start_candidates(&pattern.start, ctx)?;
+    for start_node in start_candidates {
+        if !start_node_matches(&start_node, &pattern.start, ctx)? {
+            continue;
+        }
+        let mut seed = ctx.row.clone();
+        if let Some(start_var) = &pattern.start.var {
+            seed.insert(start_var.clone(), Value::Node(start_node.clone()));
+        }
+        if pattern.hops.is_empty() {
+            match where_clause {
+                None => total += 1,
+                Some(w) => {
+                    let sub_ctx = ctx.with_row(&seed);
+                    if to_bool(&eval_expr(w, &sub_ctx)?).unwrap_or(false) {
+                        total += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        let mut frontier: Vec<(mesh_core::Node, Row)> = vec![(start_node.clone(), seed)];
+        total += walk_subquery_hops(pattern, where_clause, &mut frontier, ctx, false)?;
+    }
+    Ok(total)
+}
+
+fn resolve_exists_start_candidates(
+    start: &mesh_cypher::NodePattern,
+    ctx: &EvalCtx,
+) -> Result<Vec<mesh_core::Node>> {
+    if let Some(var) = &start.var {
+        if let Some(Value::Node(n)) = ctx.row.get(var) {
+            return Ok(vec![n.clone()]);
+        }
+    }
+    if !start.labels.is_empty() {
+        let label = &start.labels[0];
+        let ids = ctx.reader.nodes_by_label(label)?;
+        let mut nodes = Vec::new();
+        for id in ids {
+            if let Some(n) = ctx.reader.get_node(id)? {
+                nodes.push(n);
+            }
+        }
+        return Ok(nodes);
+    }
+    let ids = ctx.reader.all_node_ids()?;
+    let mut nodes = Vec::new();
+    for id in ids {
+        if let Some(n) = ctx.reader.get_node(id)? {
+            nodes.push(n);
+        }
+    }
+    Ok(nodes)
+}
+
+fn walk_subquery_hops(
+    pattern: &mesh_cypher::Pattern,
+    where_clause: Option<&mesh_cypher::Expr>,
+    frontier: &mut Vec<(mesh_core::Node, Row)>,
+    ctx: &EvalCtx,
+    short_circuit: bool,
+) -> Result<i64> {
+    use mesh_cypher::Direction;
+    for hop in &pattern.hops {
+        let mut next: Vec<(mesh_core::Node, Row)> = Vec::new();
+        if let Some(vl) = hop.rel.var_length {
+            for (node, row) in frontier.iter() {
+                let mut targets = Vec::new();
+                expand_var_length_predicate(node.id, hop, vl.min, vl.max, ctx, &mut targets)?;
+                for tid in targets {
+                    let target = match ctx.reader.get_node(tid)? {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let mut next_row = row.clone();
+                    if let Some(tv) = &hop.target.var {
+                        next_row.insert(tv.clone(), Value::Node(target.clone()));
+                    }
+                    next.push((target, next_row));
+                }
+            }
+        } else {
+            for (node, row) in frontier.iter() {
+                let neighbors = match hop.rel.direction {
+                    Direction::Outgoing => ctx.reader.outgoing(node.id)?,
+                    Direction::Incoming => ctx.reader.incoming(node.id)?,
+                    Direction::Both => {
+                        let mut all = ctx.reader.outgoing(node.id)?;
+                        all.extend(ctx.reader.incoming(node.id)?);
+                        all
+                    }
+                };
+                for (edge_id, neighbor_id) in neighbors {
+                    if !hop.rel.edge_types.is_empty() {
+                        let edge = match ctx.reader.get_edge(edge_id)? {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        if !hop.rel.edge_types.iter().any(|t| t == &edge.edge_type) {
+                            continue;
+                        }
+                    }
+                    let need_target = !hop.target.labels.is_empty()
+                        || !hop.target.properties.is_empty()
+                        || hop.target.var.is_some();
+                    let target = if need_target {
+                        match ctx.reader.get_node(neighbor_id)? {
+                            Some(n) => n,
+                            None => continue,
+                        }
+                    } else {
+                        match ctx.reader.get_node(neighbor_id)? {
+                            Some(n) => n,
+                            None => continue,
+                        }
+                    };
+                    if (!hop.target.labels.is_empty() || !hop.target.properties.is_empty())
+                        && !node_pattern_matches(&target, &hop.target, ctx)?
+                    {
+                        continue;
+                    }
+                    if let Some(tv) = &hop.target.var {
+                        if let Some(Value::Node(bound)) = row.get(tv) {
+                            if bound.id != neighbor_id {
+                                continue;
+                            }
+                        }
+                    }
+                    let mut next_row = row.clone();
+                    if let Some(ev) = &hop.rel.var {
+                        if let Some(edge) = ctx.reader.get_edge(edge_id)? {
+                            next_row.insert(ev.clone(), Value::Edge(edge));
+                        }
+                    }
+                    if let Some(tv) = &hop.target.var {
+                        next_row.insert(tv.clone(), Value::Node(target.clone()));
+                    }
+                    next.push((target, next_row));
+                }
+            }
+        }
+        if next.is_empty() {
+            return Ok(0);
+        }
+        *frontier = next;
+    }
+    match where_clause {
+        None => Ok(if short_circuit && !frontier.is_empty() {
+            1
+        } else {
+            frontier.len() as i64
+        }),
+        Some(w) => {
+            let mut count = 0i64;
+            for (_, row) in frontier.iter() {
+                let sub_ctx = ctx.with_row(row);
+                if to_bool(&eval_expr(w, &sub_ctx)?).unwrap_or(false) {
+                    count += 1;
+                    if short_circuit {
+                        return Ok(1);
+                    }
+                }
+            }
+            Ok(count)
+        }
+    }
+}
+
+fn execute_subquery_body(body: &mesh_cypher::Statement, ctx: &EvalCtx) -> Result<i64> {
+    // If the body is a bare MATCH with no terminal, treat it as RETURN *.
+    let body = match body {
+        mesh_cypher::Statement::Match(m)
+            if m.terminal.return_items.is_empty()
+                && !m.terminal.star
+                && m.terminal.set_items.is_empty()
+                && m.terminal.delete.is_none()
+                && m.terminal.create_patterns.is_empty()
+                && m.terminal.remove_items.is_empty()
+                && m.terminal.foreach.is_none() =>
+        {
+            let mut patched = m.clone();
+            patched.terminal.star = true;
+            mesh_cypher::Statement::Match(patched)
+        }
+        other => other.clone(),
+    };
+    let plan = mesh_cypher::plan(&body).map_err(|e| Error::Unsupported(e.to_string()))?;
+
+    // Wrap the plan so the outer row's bindings are available.
+    // Insert a SeedRow → CartesianProduct with the planned body
+    // so that variables from the outer row (like `p` in
+    // `count { MATCH (p)-[:KNOWS]->() }`) resolve correctly.
+    // The build_op_inner with seed=Some(row) makes SeedRow emit
+    // the outer row; the plan itself runs as the right side of
+    // a CartesianProduct-like join.
+    //
+    // For simple plans (NodeScan-based), the outer variables
+    // need to be in the row for cross-stage rebind to work.
+    // We achieve this by building the operator with the outer
+    // row as seed — if the plan's leaf is SeedRow (from a WITH *
+    // or bare match), it emits the outer row.
+    let mut op = crate::ops::build_op_inner(&plan, Some(ctx.row));
+    let noop = crate::ops::NoOpWriter;
+    let exec_ctx = crate::ops::ExecCtx {
+        store: ctx.reader,
+        writer: &noop,
+        params: ctx.params,
+    };
+    let mut count = 0i64;
+    while op.next(&exec_ctx)?.is_some() {
+        count += 1;
+    }
+    Ok(count)
+}
+
 fn pattern_exists(pattern: &Pattern, ctx: &EvalCtx) -> Result<bool> {
     let start_var = pattern
         .start
@@ -655,428 +931,13 @@ fn vl_pred_dfs(
     Ok(())
 }
 
-/// Check whether `EXISTS { MATCH pattern [WHERE expr] }` has
-/// any satisfying assignment given the outer row's bindings.
-///
-/// Structurally a correlated-or-uncorrelated subquery:
-/// 1. Resolve the set of start-node candidates. If the pattern's
-///    start var is already bound in the outer row, there's
-///    exactly one candidate. Otherwise enumerate the graph
-///    (via a label index when available, else a full scan).
-/// 2. For each candidate, walk the pattern collecting
-///    `(edge, target)` pairs at each hop, materialize each
-///    complete binding as a scratch row, and evaluate the
-///    optional `where_clause` against it.
-/// 3. Return `true` on the first candidate × binding where the
-///    pattern matches and the WHERE evaluates truthy.
-///
-/// Uncorrelated EXISTS fires when the start var is `None` (the
-/// pattern has an anonymous start node) or when the named start
-/// var isn't present in the outer row. That's the
-/// `EXISTS { MATCH (:Person) }` and
-/// `EXISTS { MATCH (a:Person)-[:KNOWS]->(b) }` shapes — uses
-/// that don't reference any outer binding.
-///
-/// Compared to [`pattern_exists`], this version can't early-
-/// stop on the first complete walk per candidate — it needs to
-/// hold each candidate's full binding state long enough to
-/// evaluate WHERE. The frontier therefore carries
-/// `(node, scratch_row)` pairs instead of just node ids.
-fn exists_subquery_matches(
-    pattern: &Pattern,
-    where_clause: Option<&Expr>,
-    ctx: &EvalCtx,
-) -> Result<bool> {
-    let start_candidates = resolve_exists_start_candidates(&pattern.start, ctx)?;
-    for start_node in start_candidates {
-        if !start_node_matches(&start_node, &pattern.start, ctx)? {
-            continue;
-        }
-
-        // Build the seed scratch row, binding the start var if
-        // the pattern names one. Uncorrelated anonymous-start
-        // patterns don't leak any new binding into the row.
-        let mut seed = ctx.row.clone();
-        if let Some(start_var) = &pattern.start.var {
-            seed.insert(start_var.clone(), Value::Node(start_node.clone()));
-        }
-
-        // Zero-hop patterns: no frontier to walk. With no WHERE
-        // the mere existence of a matching start node is enough;
-        // with a WHERE we evaluate it against the seed.
-        if pattern.hops.is_empty() {
-            match where_clause {
-                None => return Ok(true),
-                Some(w) => {
-                    let sub_ctx = ctx.with_row(&seed);
-                    let v = eval_expr(w, &sub_ctx)?;
-                    if to_bool(&v).unwrap_or(false) {
-                        return Ok(true);
-                    }
-                    continue;
-                }
-            }
-        }
-
-        // Multi-hop: walk the frontier from this candidate,
-        // collecting every complete binding that matches the
-        // pattern shape, then check each against WHERE.
-        let mut frontier: Vec<(mesh_core::Node, Row)> = vec![(start_node.clone(), seed)];
-        if walk_exists_hops(pattern, where_clause, &mut frontier, ctx)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn count_subquery_matches(
-    pattern: &Pattern,
-    where_clause: Option<&Expr>,
-    ctx: &EvalCtx,
-) -> Result<i64> {
-    let mut total: i64 = 0;
-    let start_candidates = resolve_exists_start_candidates(&pattern.start, ctx)?;
-    for start_node in start_candidates {
-        if !start_node_matches(&start_node, &pattern.start, ctx)? {
-            continue;
-        }
-        let mut seed = ctx.row.clone();
-        if let Some(start_var) = &pattern.start.var {
-            seed.insert(start_var.clone(), Value::Node(start_node.clone()));
-        }
-        if pattern.hops.is_empty() {
-            match where_clause {
-                None => total += 1,
-                Some(w) => {
-                    let sub_ctx = ctx.with_row(&seed);
-                    let v = eval_expr(w, &sub_ctx)?;
-                    if to_bool(&v).unwrap_or(false) {
-                        total += 1;
-                    }
-                }
-            }
-            continue;
-        }
-        let mut frontier: Vec<(mesh_core::Node, Row)> = vec![(start_node.clone(), seed)];
-        total += count_walk_hops(pattern, where_clause, &mut frontier, ctx)?;
-    }
-    Ok(total)
-}
-
-fn count_walk_hops(
-    pattern: &Pattern,
-    where_clause: Option<&Expr>,
-    frontier: &mut Vec<(mesh_core::Node, Row)>,
-    ctx: &EvalCtx,
-) -> Result<i64> {
-    for hop in &pattern.hops {
-        let mut next: Vec<(mesh_core::Node, Row)> = Vec::new();
-        if let Some(vl) = hop.rel.var_length {
-            for (node, row) in frontier.iter() {
-                let mut targets = Vec::new();
-                expand_var_length_predicate(node.id, hop, vl.min, vl.max, ctx, &mut targets)?;
-                for tid in targets {
-                    let target = match ctx.reader.get_node(tid)? {
-                        Some(n) => n,
-                        None => continue,
-                    };
-                    let mut next_row = row.clone();
-                    if let Some(tv) = &hop.target.var {
-                        next_row.insert(tv.clone(), Value::Node(target.clone()));
-                    }
-                    next.push((target, next_row));
-                }
-            }
-            if next.is_empty() {
-                return Ok(0);
-            }
-            *frontier = next;
-            continue;
-        }
-        for (node, row) in frontier.iter() {
-            let neighbors = match hop.rel.direction {
-                Direction::Outgoing => ctx.reader.outgoing(node.id)?,
-                Direction::Incoming => ctx.reader.incoming(node.id)?,
-                Direction::Both => {
-                    let mut out = ctx.reader.outgoing(node.id)?;
-                    out.extend(ctx.reader.incoming(node.id)?);
-                    out
-                }
-            };
-            for (edge_id, neighbor_id) in neighbors {
-                let edge_record = if !hop.rel.edge_types.is_empty() || hop.rel.var.is_some() {
-                    match ctx.reader.get_edge(edge_id)? {
-                        Some(e) => Some(e),
-                        None => continue,
-                    }
-                } else {
-                    None
-                };
-                if !hop.rel.edge_types.is_empty() {
-                    if let Some(e) = &edge_record {
-                        if !hop.rel.edge_types.iter().any(|t| t == &e.edge_type) {
-                            continue;
-                        }
-                    }
-                }
-                let need_target = !hop.target.labels.is_empty()
-                    || !hop.target.properties.is_empty()
-                    || hop.target.var.is_some();
-                let target_node = if need_target {
-                    match ctx.reader.get_node(neighbor_id)? {
-                        Some(n) => Some(n),
-                        None => continue,
-                    }
-                } else {
-                    None
-                };
-                if let Some(n) = &target_node {
-                    if (!hop.target.labels.is_empty() || !hop.target.properties.is_empty())
-                        && !node_pattern_matches(n, &hop.target, ctx)?
-                    {
-                        continue;
-                    }
-                }
-                if let Some(target_var) = &hop.target.var {
-                    if let Some(Value::Node(bound)) = row.get(target_var) {
-                        if bound.id != neighbor_id {
-                            continue;
-                        }
-                    }
-                }
-                let mut next_row = row.clone();
-                if let Some(edge_var) = &hop.rel.var {
-                    if let Some(e) = &edge_record {
-                        next_row.insert(edge_var.clone(), Value::Edge(e.clone()));
-                    }
-                }
-                let concrete = match target_node {
-                    Some(n) => n,
-                    None => match ctx.reader.get_node(neighbor_id)? {
-                        Some(n) => n,
-                        None => continue,
-                    },
-                };
-                if let Some(target_var) = &hop.target.var {
-                    next_row.insert(target_var.clone(), Value::Node(concrete.clone()));
-                }
-                next.push((concrete, next_row));
-            }
-        }
-        if next.is_empty() {
-            return Ok(0);
-        }
-        *frontier = next;
-    }
-    match where_clause {
-        None => Ok(frontier.len() as i64),
-        Some(w) => {
-            let mut count = 0i64;
-            for (_, row) in frontier.iter() {
-                let sub_ctx = ctx.with_row(row);
-                let v = eval_expr(w, &sub_ctx)?;
-                if to_bool(&v).unwrap_or(false) {
-                    count += 1;
-                }
-            }
-            Ok(count)
-        }
-    }
-}
-
-/// Compute the list of candidate start nodes for an
-/// `EXISTS { ... }` subquery. Correlated case (start var
-/// bound in outer row) returns a singleton; uncorrelated case
-/// enumerates the graph — preferring a label index when the
-/// pattern carries a label, otherwise falling back to
-/// `all_node_ids`.
-fn resolve_exists_start_candidates(
-    start: &NodePattern,
-    ctx: &EvalCtx,
-) -> Result<Vec<mesh_core::Node>> {
-    // Correlated: the outer row already has this variable
-    // bound to a Node. Return it as the sole candidate so the
-    // walk downstream sees the correlation constraint.
-    if let Some(var) = &start.var {
-        if let Some(Value::Node(n)) = ctx.row.get(var) {
-            return Ok(vec![n.clone()]);
-        }
-    }
-    // Uncorrelated: enumerate from the graph. Prefer a label
-    // index when available — most real EXISTS patterns carry a
-    // label and this is much cheaper than a full scan. The
-    // per-node `start_node_matches` check in the caller handles
-    // pattern properties and any additional labels.
-    let ids = match start.labels.first() {
-        Some(label) => ctx.reader.nodes_by_label(label)?,
-        None => ctx.reader.all_node_ids()?,
-    };
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(n) = ctx.reader.get_node(id)? {
-            out.push(n);
-        }
-    }
-    Ok(out)
-}
-
-/// Walk the hops of a subquery pattern from a single seeded
-/// frontier entry. Returns `true` on the first complete binding
-/// where `where_clause` (or `None`) evaluates truthy; returns
-/// `false` otherwise. Used only by `exists_subquery_matches` —
-/// extracted so the outer loop can iterate start candidates
-/// without duplicating the frontier-walk logic.
-fn walk_exists_hops(
-    pattern: &Pattern,
-    where_clause: Option<&Expr>,
-    frontier: &mut Vec<(mesh_core::Node, Row)>,
-    ctx: &EvalCtx,
-) -> Result<bool> {
-    for hop in &pattern.hops {
-        let mut next: Vec<(mesh_core::Node, Row)> = Vec::new();
-        if let Some(vl) = hop.rel.var_length {
-            for (node, row) in frontier.iter() {
-                let mut targets = Vec::new();
-                expand_var_length_predicate(node.id, hop, vl.min, vl.max, ctx, &mut targets)?;
-                for tid in targets {
-                    let target = match ctx.reader.get_node(tid)? {
-                        Some(n) => n,
-                        None => continue,
-                    };
-                    let mut next_row = row.clone();
-                    if let Some(tv) = &hop.target.var {
-                        next_row.insert(tv.clone(), Value::Node(target.clone()));
-                    }
-                    next.push((target, next_row));
-                }
-            }
-            if next.is_empty() {
-                return Ok(false);
-            }
-            *frontier = next;
-            continue;
-        }
-        for (node, row) in frontier.iter() {
-            let neighbors = match hop.rel.direction {
-                Direction::Outgoing => ctx.reader.outgoing(node.id)?,
-                Direction::Incoming => ctx.reader.incoming(node.id)?,
-                Direction::Both => {
-                    let mut out = ctx.reader.outgoing(node.id)?;
-                    out.extend(ctx.reader.incoming(node.id)?);
-                    out
-                }
-            };
-            for (edge_id, neighbor_id) in neighbors {
-                // Fetch the edge when we need its type or when
-                // the WHERE clause will bind it by variable.
-                let edge_record = if !hop.rel.edge_types.is_empty() || hop.rel.var.is_some() {
-                    match ctx.reader.get_edge(edge_id)? {
-                        Some(e) => Some(e),
-                        None => continue,
-                    }
-                } else {
-                    None
-                };
-                if !hop.rel.edge_types.is_empty() {
-                    if let Some(e) = &edge_record {
-                        if !hop.rel.edge_types.iter().any(|t| t == &e.edge_type) {
-                            continue;
-                        }
-                    }
-                }
-                // Fetch the target node when we need its
-                // labels/properties or the WHERE binds it.
-                let need_target = !hop.target.labels.is_empty()
-                    || !hop.target.properties.is_empty()
-                    || hop.target.var.is_some();
-                let target_node = if need_target {
-                    match ctx.reader.get_node(neighbor_id)? {
-                        Some(n) => Some(n),
-                        None => continue,
-                    }
-                } else {
-                    None
-                };
-                if let Some(n) = &target_node {
-                    if (!hop.target.labels.is_empty() || !hop.target.properties.is_empty())
-                        && !node_pattern_matches(n, &hop.target, ctx)?
-                    {
-                        continue;
-                    }
-                }
-                // Correlated constraint: if the target var is
-                // already bound in the scratch row (from an
-                // outer row OR an earlier hop), require the
-                // walked neighbor to match it.
-                if let Some(target_var) = &hop.target.var {
-                    if let Some(Value::Node(bound)) = row.get(target_var) {
-                        if bound.id != neighbor_id {
-                            continue;
-                        }
-                    }
-                }
-                // Extend the scratch row. Bind the edge var
-                // (if named) and the target var (if named) so
-                // the WHERE clause can touch them.
-                let mut next_row = row.clone();
-                if let Some(edge_var) = &hop.rel.var {
-                    if let Some(e) = &edge_record {
-                        next_row.insert(edge_var.clone(), Value::Edge(e.clone()));
-                    }
-                }
-                // We need a concrete target node for the next
-                // hop's frontier regardless of whether we
-                // fetched it above.
-                let concrete = match target_node {
-                    Some(n) => n,
-                    None => match ctx.reader.get_node(neighbor_id)? {
-                        Some(n) => n,
-                        None => continue,
-                    },
-                };
-                if let Some(target_var) = &hop.target.var {
-                    next_row.insert(target_var.clone(), Value::Node(concrete.clone()));
-                }
-                next.push((concrete, next_row));
-            }
-        }
-        if next.is_empty() {
-            return Ok(false);
-        }
-        *frontier = next;
-    }
-
-    // Every frontier entry now represents a complete walk
-    // matching the pattern shape. With no WHERE we return true
-    // on the first one; with a WHERE we evaluate it against
-    // each candidate's scratch row until one passes.
-    match where_clause {
-        None => Ok(true),
-        Some(w) => {
-            for (_, row) in frontier.iter() {
-                let sub_ctx = ctx.with_row(row);
-                let v = eval_expr(w, &sub_ctx)?;
-                if to_bool(&v).unwrap_or(false) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-    }
-}
-
-/// Check whether the bound start node satisfies its pattern's
-/// label and property constraints. Pattern properties on a start
-/// node are `Expr::Literal` / `Expr::Parameter` per the grammar's
-/// `property_value` rule, so evaluation is cheap and side-effect
-/// free.
 fn start_node_matches(
     node: &mesh_core::Node,
     pattern: &NodePattern,
     ctx: &EvalCtx,
 ) -> Result<bool> {
-    for required in &pattern.labels {
-        if !node.labels.contains(required) {
+    for label in &pattern.labels {
+        if !node.labels.contains(label) {
             return Ok(false);
         }
     }
@@ -1088,17 +949,13 @@ fn start_node_matches(
             .cloned()
             .map(Value::Property)
             .unwrap_or(Value::Null);
-        if !case_equals(&expected, &actual) {
+        if !values_equal(&expected, &actual) {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// Same as [`start_node_matches`] but for target nodes on a hop's
-/// far end. Separate function for symmetry; the logic is identical
-/// today but the two sides may diverge in future (e.g. if target
-/// patterns gain constraints the start side can't express).
 fn node_pattern_matches(
     node: &mesh_core::Node,
     pattern: &NodePattern,

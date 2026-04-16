@@ -1973,16 +1973,10 @@ fn exists_subquery_simple_match_parses() {
     )
     .unwrap();
     let m = unwrap_match(s);
-    let Expr::ExistsSubquery {
-        pattern,
-        where_clause,
-    } = first_match(&m).where_clause.clone().unwrap()
-    else {
+    let Expr::ExistsSubquery { body } = first_match(&m).where_clause.clone().unwrap() else {
         panic!("expected Expr::ExistsSubquery");
     };
-    assert_eq!(pattern.start.var.as_deref(), Some("a"));
-    assert_eq!(pattern.hops.len(), 1);
-    assert!(where_clause.is_none());
+    assert!(matches!(*body, Statement::Match(_)));
 }
 
 #[test]
@@ -1994,16 +1988,10 @@ fn exists_subquery_with_inner_where_parses() {
     )
     .unwrap();
     let m = unwrap_match(s);
-    let Expr::ExistsSubquery {
-        pattern,
-        where_clause,
-    } = first_match(&m).where_clause.clone().unwrap()
-    else {
+    let Expr::ExistsSubquery { body } = first_match(&m).where_clause.clone().unwrap() else {
         panic!("expected Expr::ExistsSubquery");
     };
-    assert_eq!(pattern.hops.len(), 1);
-    let w = where_clause.expect("inner WHERE");
-    assert!(matches!(w.as_ref(), Expr::Compare { .. }));
+    assert!(matches!(*body, Statement::Match(_)));
 }
 
 #[test]
@@ -2022,17 +2010,13 @@ fn not_exists_subquery_parses() {
 }
 
 #[test]
-fn exists_subquery_rejects_path_variable() {
-    let err = parse(
+fn exists_subquery_accepts_full_body() {
+    parse(
         "MATCH (a:Person) \
-         WHERE EXISTS { MATCH p = (a)-[:KNOWS]->(b) } \
+         WHERE EXISTS { MATCH p = (a)-[:KNOWS]->(b) RETURN b } \
          RETURN a",
     )
-    .unwrap_err();
-    assert!(
-        format!("{err}").contains("path variable"),
-        "expected path-var rejection, got: {err}"
-    );
+    .expect("EXISTS with full read_stmt body should parse");
 }
 
 #[test]

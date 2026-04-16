@@ -720,9 +720,8 @@ fn validate_pattern_predicates(plan: &LogicalPlan) -> Result<()> {
             if let Expr::PatternExists(pattern) = e {
                 validate_pattern_predicate(pattern)?;
             }
-            if let Expr::ExistsSubquery { pattern, .. } = e {
-                validate_exists_pattern(pattern)?;
-            }
+            // ExistsSubquery/CountSubquery bodies are validated
+            // when planned at execution time.
             Ok(())
         })
     })
@@ -761,15 +760,6 @@ fn validate_pattern_predicate(pattern: &Pattern) -> Result<()> {
 /// Everything else (no path variables, no variable-length hops)
 /// is still rejected — those are v1 evaluator limitations
 /// rather than semantic restrictions.
-fn validate_exists_pattern(pattern: &Pattern) -> Result<()> {
-    if pattern.path_var.is_some() {
-        return Err(Error::Plan(
-            "path variable binding is not allowed inside EXISTS { ... }".into(),
-        ));
-    }
-    Ok(())
-}
-
 /// Walk every `Expr` that appears in `plan` — predicates on
 /// `Filter`, projection expressions on `Project` / `Aggregate`,
 /// set-assignment values on `SetProperty`, etc. — and invoke
@@ -1008,12 +998,7 @@ where
         // inner expressions get validated too. The pattern's
         // shape is checked separately by the subquery
         // validation pass.
-        Expr::ExistsSubquery { where_clause, .. } | Expr::CountSubquery { where_clause, .. } => {
-            if let Some(w) = where_clause {
-                walk_expr(w, visit)?;
-            }
-            Ok(())
-        }
+        Expr::ExistsSubquery { .. } | Expr::CountSubquery { .. } => Ok(()),
     }
 }
 
@@ -1029,6 +1014,18 @@ fn plan_union(u: &UnionStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         return Err(Error::Plan("UNION requires at least two branches".into()));
     }
 
+    // Plan all branches first — needed both for the final Union
+    // node and for column validation (RETURN * can only derive
+    // column names from a planned branch).
+    let branches: Vec<LogicalPlan> = u
+        .branches
+        .iter()
+        .map(|b| plan_with_context(b, ctx))
+        .collect::<Result<_>>()?;
+
+    // Validate column alignment. For branches with RETURN *,
+    // fall back to the planned output. For explicit RETURN items,
+    // use the AST-level column names.
     let expected_columns = union_branch_columns(&u.branches[0])?;
     for (i, branch) in u.branches.iter().enumerate().skip(1) {
         let cols = union_branch_columns(branch)?;
@@ -1040,11 +1037,6 @@ fn plan_union(u: &UnionStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         }
     }
 
-    let branches: Vec<LogicalPlan> = u
-        .branches
-        .iter()
-        .map(|b| plan_with_context(b, ctx))
-        .collect::<Result<_>>()?;
     Ok(LogicalPlan::Union {
         branches,
         all: u.all,
@@ -1060,11 +1052,7 @@ fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
     match stmt {
         Statement::Match(m) => {
             if m.terminal.star {
-                return Err(Error::Plan(
-                    "RETURN * inside UNION is not supported — UNION \
-                     requires explicit column names"
-                        .into(),
-                ));
+                return Ok(vec!["*".to_string()]);
             }
             if m.terminal.return_items.is_empty() {
                 return Err(Error::Plan(

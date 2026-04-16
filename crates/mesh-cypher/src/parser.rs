@@ -1754,74 +1754,23 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             })
         }
         Rule::count_subquery => {
-            let mut pat: Option<Pattern> = None;
-            let mut where_expr: Option<Box<Expr>> = None;
-            for p in pair.into_inner() {
-                match p.as_rule() {
-                    Rule::kw_count | Rule::kw_match => {}
-                    Rule::pattern => pat = Some(build_pattern(p)?),
-                    Rule::where_clause => {
-                        let ep = p
-                            .into_inner()
-                            .next()
-                            .ok_or_else(|| Error::Parse("empty count where".into()))?;
-                        where_expr = Some(Box::new(build_expression(ep)?));
-                    }
-                    r => {
-                        return Err(Error::Parse(format!(
-                            "unexpected rule in count_subquery: {r:?}"
-                        )))
-                    }
-                }
-            }
-            let pattern =
-                pat.ok_or_else(|| Error::Parse("count_subquery missing pattern".into()))?;
-            if pattern.path_var.is_some() {
-                return Err(Error::Parse(
-                    "path variable binding is not allowed inside count { ... }".into(),
-                ));
-            }
+            let inner = pair
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::subquery_body)
+                .ok_or_else(|| Error::Parse("count subquery missing body".into()))?;
+            let stmt = build_subquery_body(inner)?;
             Ok(Expr::CountSubquery {
-                pattern,
-                where_clause: where_expr,
+                body: Box::new(stmt),
             })
         }
         Rule::exists_subquery => {
-            // Children (silent `kw_exists` / `kw_match` filtered
-            // out): a single `pattern`, then an optional
-            // `where_clause`. v1 enforces no path var on the
-            // pattern — the `p =` prefix is a pattern-binding
-            // form, not a predicate form.
-            let mut pat: Option<Pattern> = None;
-            let mut where_expr: Option<Box<Expr>> = None;
-            for p in pair.into_inner() {
-                match p.as_rule() {
-                    Rule::kw_exists | Rule::kw_match => {}
-                    Rule::pattern => pat = Some(build_pattern(p)?),
-                    Rule::where_clause => {
-                        let ep = p
-                            .into_inner()
-                            .next()
-                            .ok_or_else(|| Error::Parse("empty exists where".into()))?;
-                        where_expr = Some(Box::new(build_expression(ep)?));
-                    }
-                    r => {
-                        return Err(Error::Parse(format!(
-                            "unexpected rule in exists_subquery: {r:?}"
-                        )))
-                    }
-                }
-            }
-            let pattern =
-                pat.ok_or_else(|| Error::Parse("exists_subquery missing pattern".into()))?;
-            if pattern.path_var.is_some() {
-                return Err(Error::Parse(
-                    "path variable binding is not allowed inside EXISTS { ... }".into(),
-                ));
-            }
+            let inner = pair
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::subquery_body)
+                .ok_or_else(|| Error::Parse("exists subquery missing body".into()))?;
+            let stmt = build_subquery_body(inner)?;
             Ok(Expr::ExistsSubquery {
-                pattern,
-                where_clause: where_expr,
+                body: Box::new(stmt),
             })
         }
         Rule::pattern_predicate => {
@@ -2042,6 +1991,46 @@ fn parse_ident(s: &str) -> String {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
+    }
+}
+
+fn build_subquery_body(pair: Pair<Rule>) -> Result<Statement> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty subquery_body".into()))?;
+    match inner.as_rule() {
+        Rule::read_stmt => build_read_stmt(inner),
+        Rule::bare_match_body => {
+            let mut patterns = Vec::new();
+            let mut where_clause = None;
+            for p in inner.into_inner() {
+                match p.as_rule() {
+                    Rule::pattern_list => patterns = build_pattern_list(p)?,
+                    Rule::where_clause => {
+                        let ep = p
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| Error::Parse("empty where".into()))?;
+                        where_clause = Some(build_expression(ep)?);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Statement::Match(crate::ast::MatchStmt {
+                clauses: vec![crate::ast::ReadingClause::Match(crate::ast::MatchClause {
+                    patterns,
+                    where_clause,
+                })],
+                terminal: crate::ast::TerminalTail {
+                    star: true,
+                    ..Default::default()
+                },
+            }))
+        }
+        r => Err(Error::Parse(format!(
+            "unexpected subquery_body child: {r:?}"
+        ))),
     }
 }
 
