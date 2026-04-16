@@ -249,7 +249,8 @@ property_entry = { identifier ~ ":" ~ property_value }
 // properties) without needing a planner-side scope check.
 property_value = { literal | parameter }
 
-return_items = { return_item ~ ("," ~ return_item)* }
+return_items = { return_star | (return_item ~ ("," ~ return_item)*) }
+return_star = { "*" }
 return_item = { expression ~ (kw_as ~ identifier)? }
 
 expression = { or_expr }

@@ -7011,4 +7011,52 @@ fn stdev_and_stdevp_aggregates() {
         (sd - expected_sd).abs() < 1e-6,
         "stDev should be ~{expected_sd}, got {sd}"
     );
+// ── RETURN * / WITH * ─────────────────────────────────────────────
+
+#[test]
+fn return_star_single_node() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (n:Person {name: 'Ada'})");
+    run(&store, "CREATE (n:Person {name: 'Alan'})");
+
+    let rows = run(&store, "MATCH (n:Person) RETURN *");
+    assert_eq!(rows.len(), 2);
+    // Every row should have a binding for `n`
+    for row in &rows {
+        assert!(row.contains_key("n"), "row missing 'n' binding: {row:?}");
+    }
+}
+
+#[test]
+fn return_star_node_rel_node() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Alan'})",
+    );
+
+    let rows = run(&store, "MATCH (n)-[r]->(m) RETURN *");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert!(row.contains_key("n"), "row missing 'n': {row:?}");
+    assert!(row.contains_key("r"), "row missing 'r': {row:?}");
+    assert!(row.contains_key("m"), "row missing 'm': {row:?}");
+}
+
+#[test]
+fn with_star_preserves_bindings() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Alan'})",
+    );
+
+    let rows = run(
+        &store,
+        "MATCH (n:Person) WITH * MATCH (n)-[:KNOWS]->(m) RETURN *",
+    );
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert!(row.contains_key("n"), "row missing 'n': {row:?}");
+    assert!(row.contains_key("m"), "row missing 'm': {row:?}");
 }

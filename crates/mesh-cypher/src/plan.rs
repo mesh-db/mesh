@@ -146,6 +146,11 @@ pub enum LogicalPlan {
     /// bindings). At execution time, the `CallSubqueryOp` replaces
     /// this with a single-row operator carrying the outer row.
     SeedRow,
+    /// Pass-through projection emitted for `RETURN *` and `WITH *`.
+    /// Forwards every row from `input` unchanged.
+    Identity {
+        input: Box<LogicalPlan>,
+    },
     /// Match-or-create a single node. If at least one node matches the
     /// `(labels, properties)` pattern, returns one row per match (binding
     /// the existing node to `var`). If none match, creates exactly one
@@ -596,6 +601,10 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         LogicalPlan::SeedRow => {
             buf.push_str(&format!("{indent}SeedRow\n"));
         }
+        LogicalPlan::Identity { input } => {
+            buf.push_str(&format!("{indent}Identity(*)\n"));
+            format_plan_inner(input, buf, depth + 1);
+        }
         LogicalPlan::Unwind { var, .. } => {
             buf.push_str(&format!("{indent}Unwind(AS {var})\n"));
         }
@@ -827,7 +836,8 @@ where
             input: Some(input), ..
         }
         | LogicalPlan::BindPath { input, .. }
-        | LogicalPlan::ShortestPath { input, .. } => walk_plan_exprs(input, visit),
+        | LogicalPlan::ShortestPath { input, .. }
+        | LogicalPlan::Identity { input } => walk_plan_exprs(input, visit),
         LogicalPlan::CartesianProduct { left, right } => {
             walk_plan_exprs(left, visit)?;
             walk_plan_exprs(right, visit)
@@ -1029,6 +1039,13 @@ fn plan_union(u: &UnionStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
 fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
     match stmt {
         Statement::Match(m) => {
+            if m.terminal.star {
+                return Err(Error::Plan(
+                    "RETURN * inside UNION is not supported — UNION \
+                     requires explicit column names"
+                        .into(),
+                ));
+            }
             if m.terminal.return_items.is_empty() {
                 return Err(Error::Plan(
                     "UNION branches must end with RETURN; a bare effectful \
@@ -1116,6 +1133,7 @@ fn plan_return_only(stmt: &ReturnStmt) -> Result<LogicalPlan> {
     apply_return_pipeline(
         producer,
         &stmt.return_items,
+        stmt.star,
         stmt.distinct,
         &stmt.order_by,
         stmt.skip,
@@ -1139,6 +1157,7 @@ fn plan_unwind(stmt: &UnwindStmt) -> Result<LogicalPlan> {
     apply_return_pipeline(
         plan,
         &stmt.return_items,
+        stmt.star,
         stmt.distinct,
         &stmt.order_by,
         stmt.skip,
@@ -1188,12 +1207,13 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
         edges,
     };
 
-    if stmt.return_items.is_empty() {
+    if stmt.return_items.is_empty() && !stmt.star {
         Ok(plan)
     } else {
         apply_return_pipeline(
             plan,
             &stmt.return_items,
+            stmt.star,
             stmt.distinct,
             &stmt.order_by,
             stmt.skip,
@@ -2285,10 +2305,11 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         .iter()
         .any(|c| matches!(c, crate::ast::ReadingClause::Merge(_)));
 
-    if !terminal.return_items.is_empty() {
+    if terminal.star || !terminal.return_items.is_empty() {
         plan = apply_return_pipeline(
             plan,
             &terminal.return_items,
+            terminal.star,
             terminal.distinct,
             &terminal.order_by,
             terminal.skip,
@@ -2306,25 +2327,32 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
 fn apply_return_pipeline(
     mut plan: LogicalPlan,
     return_items: &[ReturnItem],
+    star: bool,
     distinct: bool,
     order_by: &[SortItem],
     skip: Option<i64>,
     limit: Option<i64>,
 ) -> Result<LogicalPlan> {
-    let (group_keys, aggregates) = classify_return_items(return_items)?;
-
-    plan = if !aggregates.is_empty() {
-        LogicalPlan::Aggregate {
+    if star {
+        plan = LogicalPlan::Identity {
             input: Box::new(plan),
-            group_keys,
-            aggregates,
-        }
+        };
     } else {
-        LogicalPlan::Project {
-            input: Box::new(plan),
-            items: return_items.to_vec(),
-        }
-    };
+        let (group_keys, aggregates) = classify_return_items(return_items)?;
+
+        plan = if !aggregates.is_empty() {
+            LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                group_keys,
+                aggregates,
+            }
+        } else {
+            LogicalPlan::Project {
+                input: Box::new(plan),
+                items: return_items.to_vec(),
+            }
+        };
+    }
 
     if distinct {
         plan = LogicalPlan::Distinct {
@@ -2463,19 +2491,25 @@ fn apply_optional_match(
 /// LIMIT. Downstream clauses (RETURN, another MATCH) then see
 /// only the names introduced by this WITH's items.
 fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Result<LogicalPlan> {
-    let (group_keys, aggregates) = classify_return_items(&w.items)?;
-    plan = if !aggregates.is_empty() {
-        LogicalPlan::Aggregate {
+    if w.star {
+        plan = LogicalPlan::Identity {
             input: Box::new(plan),
-            group_keys,
-            aggregates,
-        }
+        };
     } else {
-        LogicalPlan::Project {
-            input: Box::new(plan),
-            items: w.items.clone(),
-        }
-    };
+        let (group_keys, aggregates) = classify_return_items(&w.items)?;
+        plan = if !aggregates.is_empty() {
+            LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                group_keys,
+                aggregates,
+            }
+        } else {
+            LogicalPlan::Project {
+                input: Box::new(plan),
+                items: w.items.clone(),
+            }
+        };
+    }
 
     if w.distinct {
         plan = LogicalPlan::Distinct {
