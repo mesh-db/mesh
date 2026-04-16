@@ -2499,22 +2499,47 @@ impl Operator for BindPathOp {
         // Extract the ordered node + edge sequence from the row.
         // Any missing or wrong-shaped entry collapses the whole
         // path binding to null and falls through.
-        let mut nodes: Vec<mesh_core::Node> = Vec::with_capacity(self.node_vars.len());
-        let mut edges: Vec<mesh_core::Edge> = Vec::with_capacity(self.edge_vars.len());
+        let mut nodes: Vec<mesh_core::Node> = Vec::new();
+        let mut edges: Vec<mesh_core::Edge> = Vec::new();
         let mut abort = false;
-        for name in &self.node_vars {
-            match row.get(name) {
-                Some(Value::Node(n)) => nodes.push(n.clone()),
-                _ => {
-                    abort = true;
-                    break;
-                }
-            }
+        // Interleave node/edge vars. For each hop i:
+        //   node_vars[i] = start/intermediate node
+        //   edge_vars[i] = edge (or sub-path for var-length)
+        //   node_vars[i+1] = target node
+        // For var-length hops, edge_vars[i] may contain a
+        // Value::Path — splice its interior into the running path.
+        if let Some(Value::Node(n)) = row.get(&self.node_vars[0]) {
+            nodes.push(n.clone());
+        } else {
+            abort = true;
         }
         if !abort {
-            for name in &self.edge_vars {
-                match row.get(name) {
-                    Some(Value::Edge(e)) => edges.push(e.clone()),
+            for (i, ev) in self.edge_vars.iter().enumerate() {
+                match row.get(ev) {
+                    Some(Value::Edge(e)) => {
+                        edges.push(e.clone());
+                        match row.get(&self.node_vars[i + 1]) {
+                            Some(Value::Node(n)) => nodes.push(n.clone()),
+                            _ => {
+                                abort = true;
+                                break;
+                            }
+                        }
+                    }
+                    Some(Value::Path {
+                        nodes: sub_nodes,
+                        edges: sub_edges,
+                    }) => {
+                        // Splice the sub-path. The sub-path's first
+                        // node is the same as nodes.last() (already
+                        // pushed), so skip it. All sub-edges go in.
+                        // Sub-path interior nodes go in. The sub-path's
+                        // last node is the target for this hop.
+                        edges.extend(sub_edges.iter().cloned());
+                        if sub_nodes.len() > 1 {
+                            nodes.extend(sub_nodes[1..].iter().cloned());
+                        }
+                    }
                     _ => {
                         abort = true;
                         break;

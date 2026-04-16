@@ -3299,6 +3299,51 @@ fn optional_match_multi_pattern() {
     assert_eq!(str_prop(&rows[0], "friend"), "Bob");
 }
 
+#[test]
+fn multi_hop_merge_decomposes_to_node_and_edge_merges() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "MERGE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Bob'}) \
+         RETURN a.name AS a, b.name AS b",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "a"), "Ada");
+    assert_eq!(str_prop(&rows[0], "b"), "Bob");
+}
+
+#[test]
+fn path_binding_mixed_fixed_and_var_length() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {name: 'A'})");
+    run(&store, "CREATE (:N {name: 'B'})");
+    run(&store, "CREATE (:N {name: 'C'})");
+    run(&store, "CREATE (:N {name: 'D'})");
+    run(
+        &store,
+        "MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:R]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:N {name: 'B'}), (c:N {name: 'C'}) CREATE (b)-[:R]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (c:N {name: 'C'}), (d:N {name: 'D'}) CREATE (c)-[:R]->(d)",
+    );
+    let rows = run(
+        &store,
+        "MATCH p = (a:N {name: 'A'})-[:R]->(b)-[:R*1..3]->(d:N {name: 'D'}) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 3);
+}
+
 // --- Parameter execution -----------------------------------------------
 
 #[test]

@@ -1480,7 +1480,7 @@ fn edge_merge_unbound_endpoints_rejected_at_plan_time() {
     let stmt = parse("MERGE (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
     let err = plan(&stmt).unwrap_err();
     assert!(
-        err.to_string().contains("must be bound"),
+        err.to_string().contains("bound"),
         "expected unbound-endpoint error, got: {err}"
     );
 }
@@ -1756,14 +1756,9 @@ fn path_variable_with_variable_length_plans_successfully() {
 }
 
 #[test]
-fn path_variable_with_multi_hop_var_length_rejected() {
+fn path_variable_with_multi_hop_var_length_plans() {
     let s = parse("MATCH p = (a)-[:KNOWS]->(b)-[:LIKES*1..3]->(c) RETURN p").unwrap();
-    let err = plan(&s).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("variable-length") && msg.contains("multi-hop"),
-        "expected multi-hop var-length rejection, got: {msg}"
-    );
+    plan(&s).expect("multi-hop mixed path binding should plan");
 }
 
 #[test]

@@ -1305,7 +1305,7 @@ fn plan_pattern(
     plan = wrap_with_pattern_prop_filter(plan, &start_var, &remaining_props);
 
     let plan = chain_hops(plan, &working, &start_var, pattern_idx)?;
-    Ok(wrap_with_bind_path(plan, &working, &start_var))
+    Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
 
 /// Lower a pattern that starts from an already-bound row-stream
@@ -1349,7 +1349,7 @@ fn plan_pattern_from_bound(
         ensure_path_bindings(&mut working, pattern_idx)?;
     }
     let plan = chain_hops(input, &working, &start_var, pattern_idx)?;
-    Ok(wrap_with_bind_path(plan, &working, &start_var))
+    Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
 
 /// Lower a `shortestPath((a)-[:R*..N]->(b))` pattern to a
@@ -1448,24 +1448,6 @@ fn plan_shortest_path(
 /// (`[*2..2]` → unrolled as two fixed hops) or wait for a
 /// follow-up that extends `VarLengthExpand` to retain the walk.
 fn ensure_path_bindings(pattern: &mut Pattern, pattern_idx: usize) -> Result<()> {
-    // Single var-length hop with a path variable is handled
-    // directly by the VarLengthExpand operator — it builds the
-    // Value::Path from the DFS walk. Multi-hop patterns where
-    // any hop is var-length are still rejected because the
-    // BindPath operator can't interleave fixed and var-length
-    // node/edge sequences.
-    let has_var_length = pattern.hops.iter().any(|h| h.rel.var_length.is_some());
-    if has_var_length {
-        if pattern.hops.len() != 1 {
-            return Err(Error::Plan(
-                "variable-length patterns (`*`) in multi-hop path bindings \
-                 are not yet supported; use a single-hop variable-length \
-                 pattern or drop the path binding"
-                    .into(),
-            ));
-        }
-        return Ok(());
-    }
     for (i, hop) in pattern.hops.iter_mut().enumerate() {
         if hop.rel.var.is_none() {
             hop.rel.var = Some(format!("__p{}_e{}", pattern_idx, i + 1));
@@ -1481,25 +1463,34 @@ fn ensure_path_bindings(pattern: &mut Pattern, pattern_idx: usize) -> Result<()>
 /// a path variable. The collected `node_vars` / `edge_vars`
 /// reference the per-hop bindings `ensure_path_bindings` filled
 /// in, plus the pattern's start variable as the first node.
-fn wrap_with_bind_path(plan: LogicalPlan, pattern: &Pattern, start_var: &str) -> LogicalPlan {
+fn wrap_with_bind_path(
+    plan: LogicalPlan,
+    pattern: &Pattern,
+    start_var: &str,
+    pattern_idx: usize,
+) -> LogicalPlan {
     let Some(path_var) = pattern.path_var.clone() else {
         return plan;
     };
-    // Single var-length hop patterns have their path_var handled
-    // directly by VarLengthExpand — no BindPath wrapper needed.
     if pattern.hops.len() == 1 && pattern.hops[0].rel.var_length.is_some() {
         return plan;
     }
     let mut node_vars = Vec::with_capacity(pattern.hops.len() + 1);
     let mut edge_vars = Vec::with_capacity(pattern.hops.len());
     node_vars.push(start_var.to_string());
-    for hop in &pattern.hops {
-        edge_vars.push(
-            hop.rel
-                .var
-                .clone()
-                .expect("ensure_path_bindings must have filled edge var"),
-        );
+    for (i, hop) in pattern.hops.iter().enumerate() {
+        if hop.rel.var_length.is_some() {
+            // Var-length hop: the VarLengthExpand stores a sub-path
+            // under this synthetic name. BindPathOp splices it.
+            edge_vars.push(format!("__p{}_subpath{}", pattern_idx, i + 1));
+        } else {
+            edge_vars.push(
+                hop.rel
+                    .var
+                    .clone()
+                    .expect("ensure_path_bindings must have filled edge var"),
+            );
+        }
         node_vars.push(
             hop.target
                 .var
@@ -1534,19 +1525,6 @@ fn chain_hops(
     start_var: &str,
     pattern_idx: usize,
 ) -> Result<LogicalPlan> {
-    // When the pattern is a single var-length hop with a path_var,
-    // pass the path_var into VarLengthExpand so it builds the
-    // Value::Path directly. Multi-hop patterns use BindPath instead
-    // (with var-length rejected at ensure_path_bindings time).
-    let vl_path_var = if pattern.hops.len() == 1
-        && pattern.hops[0].rel.var_length.is_some()
-        && pattern.path_var.is_some()
-    {
-        pattern.path_var.clone()
-    } else {
-        None
-    };
-
     let mut current_var = start_var.to_string();
     for (i, hop) in pattern.hops.iter().enumerate() {
         let dst_var = hop
@@ -1571,7 +1549,13 @@ fn chain_hops(
                 direction: hop.rel.direction,
                 min_hops: vl.min,
                 max_hops: vl.max,
-                path_var: vl_path_var.clone(),
+                path_var: if pattern.path_var.is_some() && pattern.hops.len() == 1 {
+                    pattern.path_var.clone()
+                } else if pattern.path_var.is_some() {
+                    Some(format!("__p{}_subpath{}", pattern_idx, i + 1))
+                } else {
+                    None
+                },
             }
         } else {
             LogicalPlan::EdgeExpand {
@@ -2046,95 +2030,99 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     });
                     bound_vars.insert(var);
                 } else {
-                    // --- edge merge ---
-                    if mc.pattern.hops.len() != 1 {
-                        return Err(Error::Plan(
-                            "MERGE with multi-hop paths is not yet supported; split \
-                             into multiple single-hop MERGE clauses"
-                                .into(),
-                        ));
-                    }
-                    let hop = &mc.pattern.hops[0];
-                    if hop.rel.var_length.is_some() {
-                        return Err(Error::Plan(
-                            "MERGE does not support variable-length relationships".into(),
-                        ));
-                    }
-                    let edge_type = hop.rel.edge_type.clone().ok_or_else(|| {
-                        Error::Plan(
-                            "MERGE edge pattern requires an explicit relationship type, \
-                             e.g. `MERGE (a)-[:KNOWS]->(b)`"
-                                .into(),
-                        )
-                    })?;
-                    if !matches!(hop.rel.direction, Direction::Outgoing) {
-                        return Err(Error::Plan(
-                            "MERGE currently supports only directed outgoing edges \
-                             (`(a)-[:T]->(b)`)"
-                                .into(),
-                        ));
-                    }
-                    if !mc.pattern.start.labels.is_empty()
-                        || !mc.pattern.start.properties.is_empty()
-                        || !hop.target.labels.is_empty()
-                        || !hop.target.properties.is_empty()
-                    {
-                        return Err(Error::Plan(
-                            "MERGE edge endpoints must be pure references to \
-                             already-bound variables; move any label or property \
-                             assertions into a WHERE clause on the previous MATCH"
-                                .into(),
-                        ));
-                    }
-                    let src_var = mc.pattern.start.var.clone().ok_or_else(|| {
-                        Error::Plan("MERGE edge source must be a named bound variable".into())
-                    })?;
-                    let dst_var = hop.target.var.clone().ok_or_else(|| {
-                        Error::Plan("MERGE edge target must be a named bound variable".into())
-                    })?;
-                    if !bound_vars.contains(&src_var) {
-                        return Err(Error::Plan(format!(
-                            "MERGE edge source variable '{}' must be bound by an \
-                             earlier clause",
-                            src_var
-                        )));
-                    }
-                    if !bound_vars.contains(&dst_var) {
-                        return Err(Error::Plan(format!(
-                            "MERGE edge target variable '{}' must be bound by an \
-                             earlier clause",
-                            dst_var
-                        )));
-                    }
-                    let edge_var = hop
-                        .rel
+                    // --- edge merge (single or multi-hop) ---
+                    // Decompose: first MergeNode for each intermediate
+                    // and target node that carries labels/properties,
+                    // then MergeEdge for each hop.
+
+                    // Phase 1: MergeNode for the start node if it has
+                    // labels/properties and isn't already bound.
+                    let start_var = mc
+                        .pattern
+                        .start
                         .var
                         .clone()
-                        .unwrap_or_else(|| format!("__merge_edge{}", stage_pattern_offset));
-                    if bound_vars.contains(&edge_var) {
-                        return Err(Error::Plan(format!(
-                            "variable '{}' is already bound; MERGE cannot rebind \
-                             an existing edge variable",
-                            edge_var
-                        )));
+                        .unwrap_or_else(|| format!("__merge_s{}", stage_pattern_offset));
+                    if !bound_vars.contains(&start_var) {
+                        if !mc.pattern.start.labels.is_empty()
+                            || !mc.pattern.start.properties.is_empty()
+                        {
+                            plan = Some(LogicalPlan::MergeNode {
+                                input: plan.take().map(Box::new),
+                                var: start_var.clone(),
+                                labels: mc.pattern.start.labels.clone(),
+                                properties: mc.pattern.start.properties.clone(),
+                                on_create: on_create.clone(),
+                                on_match: on_match.clone(),
+                            });
+                            bound_vars.insert(start_var.clone());
+                        }
                     }
-                    let current = plan.take().ok_or_else(|| {
-                        Error::Plan(
-                            "MERGE on an edge pattern requires a preceding producer \
-                             clause that binds the endpoints"
-                                .into(),
-                        )
-                    })?;
-                    plan = Some(LogicalPlan::MergeEdge {
-                        input: Box::new(current),
-                        edge_var: edge_var.clone(),
-                        src_var,
-                        dst_var,
-                        edge_type,
-                        on_create,
-                        on_match,
-                    });
-                    bound_vars.insert(edge_var);
+
+                    // Phase 2: MergeNode for each hop's target that
+                    // has labels/properties and isn't bound.
+                    for (hi, hop) in mc.pattern.hops.iter().enumerate() {
+                        let target_var =
+                            hop.target.var.clone().unwrap_or_else(|| {
+                                format!("__merge_t{}_{}", stage_pattern_offset, hi)
+                            });
+                        if !bound_vars.contains(&target_var)
+                            && (!hop.target.labels.is_empty() || !hop.target.properties.is_empty())
+                        {
+                            plan = Some(LogicalPlan::MergeNode {
+                                input: plan.take().map(Box::new),
+                                var: target_var.clone(),
+                                labels: hop.target.labels.clone(),
+                                properties: hop.target.properties.clone(),
+                                on_create: on_create.clone(),
+                                on_match: on_match.clone(),
+                            });
+                            bound_vars.insert(target_var);
+                        }
+                    }
+
+                    // Phase 3: MergeEdge for each hop.
+                    let mut current_src = start_var;
+                    for (hi, hop) in mc.pattern.hops.iter().enumerate() {
+                        if hop.rel.var_length.is_some() {
+                            return Err(Error::Plan(
+                                "MERGE does not support variable-length relationships".into(),
+                            ));
+                        }
+                        let edge_type = hop.rel.edge_type.clone().ok_or_else(|| {
+                            Error::Plan(
+                                "MERGE edge pattern requires an explicit relationship type".into(),
+                            )
+                        })?;
+                        if !matches!(hop.rel.direction, Direction::Outgoing) {
+                            return Err(Error::Plan(
+                                "MERGE currently supports only directed outgoing edges".into(),
+                            ));
+                        }
+                        let dst_var =
+                            hop.target.var.clone().unwrap_or_else(|| {
+                                format!("__merge_t{}_{}", stage_pattern_offset, hi)
+                            });
+                        let edge_var =
+                            hop.rel.var.clone().unwrap_or_else(|| {
+                                format!("__merge_e{}_{}", stage_pattern_offset, hi)
+                            });
+                        let current = plan.take().ok_or_else(|| {
+                            Error::Plan("MERGE on an edge pattern requires bound endpoints".into())
+                        })?;
+                        plan = Some(LogicalPlan::MergeEdge {
+                            input: Box::new(current),
+                            edge_var: edge_var.clone(),
+                            src_var: current_src.clone(),
+                            dst_var: dst_var.clone(),
+                            edge_type,
+                            on_create: on_create.clone(),
+                            on_match: on_match.clone(),
+                        });
+                        bound_vars.insert(edge_var);
+                        bound_vars.insert(dst_var.clone());
+                        current_src = dst_var;
+                    }
                 }
                 stage_pattern_offset += 1;
             }
