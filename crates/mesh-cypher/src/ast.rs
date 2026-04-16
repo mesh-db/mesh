@@ -118,6 +118,9 @@ pub enum ReadingClause {
     With(WithClause),
     Merge(MergeClause),
     Unwind(UnwindClause),
+    /// `LOAD CSV [WITH HEADERS] FROM expr AS alias` — reads a CSV
+    /// file and produces one row per line, binding each to `alias`.
+    LoadCsv(LoadCsvClause),
     /// `CALL { read_stmt }` — runs the body as a subquery per
     /// input row. Correlated subqueries import outer bindings via
     /// `WITH var1, var2` as the first clause inside the body.
@@ -188,6 +191,13 @@ pub struct TerminalTail {
     pub create_patterns: Vec<Pattern>,
     pub remove_items: Vec<RemoveItem>,
     pub foreach: Option<ForeachClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadCsvClause {
+    pub path_expr: Expr,
+    pub alias: String,
+    pub with_headers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

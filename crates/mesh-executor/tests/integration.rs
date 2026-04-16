@@ -2722,6 +2722,69 @@ fn foreach_does_not_expand_row_stream() {
     assert_eq!(str_prop(&rows[0], "name"), "A");
 }
 
+// --- LOAD CSV ----------------------------------------------------------
+
+#[test]
+fn load_csv_without_headers_returns_lists() {
+    let (store, _d) = open_store();
+    let csv_path = _d.path().join("test.csv");
+    std::fs::write(&csv_path, "Alice,30\nBob,25\n").unwrap();
+    let mut params = ParamMap::new();
+    params.insert(
+        "path".into(),
+        Value::Property(Property::String(csv_path.to_str().unwrap().to_string())),
+    );
+    let rows = run_with_params(&store, "LOAD CSV FROM $path AS row RETURN row", &params);
+    assert_eq!(rows.len(), 2);
+    match rows[0].get("row") {
+        Some(Value::List(items)) => {
+            assert_eq!(items.len(), 2);
+        }
+        other => panic!("expected list, got: {other:?}"),
+    }
+}
+
+#[test]
+fn load_csv_with_headers_returns_maps() {
+    let (store, _d) = open_store();
+    let csv_path = _d.path().join("test.csv");
+    std::fs::write(&csv_path, "name,age\nAlice,30\nBob,25\n").unwrap();
+    let mut params = ParamMap::new();
+    params.insert(
+        "path".into(),
+        Value::Property(Property::String(csv_path.to_str().unwrap().to_string())),
+    );
+    let rows = run_with_params(
+        &store,
+        "LOAD CSV WITH HEADERS FROM $path AS row RETURN row.name AS name ORDER BY name",
+        &params,
+    );
+    let names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+#[test]
+fn load_csv_with_headers_field_access() {
+    let (store, _d) = open_store();
+    let csv_path = _d.path().join("people.csv");
+    std::fs::write(&csv_path, "name,age\nAda,37\nBob,25\n").unwrap();
+    let mut params = ParamMap::new();
+    params.insert(
+        "path".into(),
+        Value::Property(Property::String(csv_path.to_str().unwrap().to_string())),
+    );
+    let rows = run_with_params(
+        &store,
+        "LOAD CSV WITH HEADERS FROM $path AS row \
+         RETURN row.name AS name, row.age AS age ORDER BY name",
+        &params,
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(str_prop(&rows[0], "name"), "Ada");
+    assert_eq!(str_prop(&rows[0], "age"), "37");
+    assert_eq!(str_prop(&rows[1], "name"), "Bob");
+}
+
 // --- CREATE with RETURN ------------------------------------------------
 
 #[test]

@@ -75,6 +75,11 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 // didn't match). Matches SQL / openCypher
                 // left-join semantics.
                 Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                Value::Property(Property::Map(m)) => Ok(m
+                    .get(key)
+                    .cloned()
+                    .map(Value::Property)
+                    .unwrap_or(Value::Null)),
                 _ => Err(Error::NotNodeOrEdge),
             }
         }

@@ -463,6 +463,32 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                     Rule::unwind_clause => {
                         clauses.push(ReadingClause::Unwind(build_unwind_clause(inner)?));
                     }
+                    Rule::load_csv_clause => {
+                        let mut alias = String::new();
+                        let mut path_expr = None;
+                        let mut with_headers = false;
+                        for child in inner.into_inner() {
+                            match child.as_rule() {
+                                Rule::kw_load | Rule::kw_csv | Rule::kw_from | Rule::kw_as => {}
+                                Rule::kw_with => {}
+                                Rule::kw_headers => with_headers = true,
+                                Rule::expression if path_expr.is_none() => {
+                                    path_expr = Some(build_expression(child)?);
+                                }
+                                Rule::identifier if alias.is_empty() => {
+                                    alias = child.as_str().to_string();
+                                }
+                                _ => {}
+                            }
+                        }
+                        clauses.push(ReadingClause::LoadCsv(crate::ast::LoadCsvClause {
+                            path_expr: path_expr.ok_or_else(|| {
+                                Error::Parse("LOAD CSV missing path expression".into())
+                            })?,
+                            alias,
+                            with_headers,
+                        }));
+                    }
                     Rule::call_subquery => {
                         let body = inner
                             .into_inner()
@@ -506,7 +532,8 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         | ReadingClause::Merge(_)
         | ReadingClause::Unwind(_)
         | ReadingClause::With(_)
-        | ReadingClause::Call(_) => {}
+        | ReadingClause::Call(_)
+        | ReadingClause::LoadCsv(_) => {}
         ReadingClause::OptionalMatch(_) => {
             return Err(Error::Parse(
                 "OPTIONAL MATCH can only appear after an initial producer clause".into(),

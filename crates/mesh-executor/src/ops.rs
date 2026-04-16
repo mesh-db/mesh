@@ -227,6 +227,17 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
         LogicalPlan::Remove { input, items } => {
             Box::new(RemoveOp::new(child!(input), items.clone()))
         }
+        LogicalPlan::LoadCsv {
+            input,
+            path_expr,
+            var,
+            with_headers,
+        } => Box::new(LoadCsvOp::new(
+            input.as_ref().map(|p| child!(p)),
+            path_expr.clone(),
+            var.clone(),
+            *with_headers,
+        )),
         LogicalPlan::Foreach {
             input,
             var,
@@ -966,6 +977,103 @@ impl Operator for RemoveOp {
                 }
                 Ok(Some(row))
             }
+        }
+    }
+}
+
+struct LoadCsvOp {
+    input: Option<Box<dyn Operator>>,
+    path_expr: Expr,
+    var: String,
+    with_headers: bool,
+    rows: Option<Vec<Value>>,
+    cursor: usize,
+}
+
+impl LoadCsvOp {
+    fn new(
+        input: Option<Box<dyn Operator>>,
+        path_expr: Expr,
+        var: String,
+        with_headers: bool,
+    ) -> Self {
+        Self {
+            input,
+            path_expr,
+            var,
+            with_headers,
+            rows: None,
+            cursor: 0,
+        }
+    }
+
+    fn load(&mut self, ctx: &ExecCtx, base_row: &Row) -> Result<()> {
+        let ectx = ctx.eval_ctx(base_row);
+        let path_val = eval_expr(&self.path_expr, &ectx)?;
+        let path = match path_val {
+            Value::Property(Property::String(s)) => s,
+            _ => return Err(Error::TypeMismatch),
+        };
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            Error::Unsupported(format!("LOAD CSV: cannot read file '{}': {}", path, e))
+        })?;
+        let mut lines = content.lines();
+        let headers: Option<Vec<String>> = if self.with_headers {
+            lines
+                .next()
+                .map(|h| h.split(',').map(|s| s.trim().to_string()).collect())
+        } else {
+            None
+        };
+        let mut csv_rows = Vec::new();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let fields: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
+            if let Some(hdrs) = &headers {
+                let mut map = std::collections::HashMap::new();
+                for (i, h) in hdrs.iter().enumerate() {
+                    let val = fields.get(i).cloned().unwrap_or_default();
+                    map.insert(h.clone(), Property::String(val));
+                }
+                csv_rows.push(Value::Property(Property::Map(map)));
+            } else {
+                let list: Vec<Value> = fields
+                    .into_iter()
+                    .map(|f| Value::Property(Property::String(f)))
+                    .collect();
+                csv_rows.push(Value::List(list));
+            }
+        }
+        self.rows = Some(csv_rows);
+        self.cursor = 0;
+        Ok(())
+    }
+}
+
+impl Operator for LoadCsvOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.rows.is_none() {
+            let base = if let Some(input) = &mut self.input {
+                match input.next(ctx)? {
+                    Some(r) => r,
+                    None => return Ok(None),
+                }
+            } else {
+                Row::new()
+            };
+            self.load(ctx, &base)?;
+        }
+        let rows = self.rows.as_ref().unwrap();
+        if self.cursor < rows.len() {
+            let val = rows[self.cursor].clone();
+            self.cursor += 1;
+            let mut row = Row::new();
+            row.insert(self.var.clone(), val);
+            Ok(Some(row))
+        } else {
+            Ok(None)
         }
     }
 }

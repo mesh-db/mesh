@@ -1244,6 +1244,7 @@ fn three_match_stages_parse() {
             ReadingClause::Merge(_) => "G",
             ReadingClause::Unwind(_) => "U",
             ReadingClause::Call(_) => "C",
+            ReadingClause::LoadCsv(_) => "L",
         })
         .collect();
     assert_eq!(kinds, vec!["M", "W", "M", "W", "M"]);

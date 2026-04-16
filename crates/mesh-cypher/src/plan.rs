@@ -127,6 +127,12 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         body: Box<LogicalPlan>,
     },
+    LoadCsv {
+        input: Option<Box<LogicalPlan>>,
+        path_expr: Expr,
+        var: String,
+        with_headers: bool,
+    },
     Foreach {
         input: Box<LogicalPlan>,
         var: String,
@@ -551,6 +557,18 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             buf.push_str(&format!("{indent}Remove\n"));
             format_plan_inner(input, buf, depth + 1);
         }
+        LogicalPlan::LoadCsv {
+            input,
+            var,
+            with_headers,
+            ..
+        } => {
+            let h = if *with_headers { " WITH HEADERS" } else { "" };
+            buf.push_str(&format!("{indent}LoadCsv({var}{h})\n"));
+            if let Some(i) = input {
+                format_plan_inner(i, buf, depth + 1);
+            }
+        }
         LogicalPlan::Foreach { input, var, .. } => {
             buf.push_str(&format!("{indent}Foreach({var})\n"));
             format_plan_inner(input, buf, depth + 1);
@@ -814,6 +832,9 @@ where
         | LogicalPlan::MergeEdge { input, .. }
         | LogicalPlan::Foreach { input, .. }
         | LogicalPlan::CallSubquery { input, .. }
+        | LogicalPlan::LoadCsv {
+            input: Some(input), ..
+        }
         | LogicalPlan::BindPath { input, .. }
         | LogicalPlan::ShortestPath { input, .. } => walk_plan_exprs(input, visit),
         LogicalPlan::CartesianProduct { left, right } => {
@@ -837,6 +858,7 @@ where
         LogicalPlan::NodeScanAll { .. }
         | LogicalPlan::NodeScanByLabels { .. }
         | LogicalPlan::SeedRow
+        | LogicalPlan::LoadCsv { input: None, .. }
         | LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
         | LogicalPlan::ShowPropertyIndexes => Ok(()),
@@ -2175,6 +2197,15 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     input: Box::new(current),
                     body: Box::new(body_plan),
                 });
+            }
+            ReadingClause::LoadCsv(lc) => {
+                plan = Some(LogicalPlan::LoadCsv {
+                    input: plan.take().map(Box::new),
+                    path_expr: lc.path_expr.clone(),
+                    var: lc.alias.clone(),
+                    with_headers: lc.with_headers,
+                });
+                bound_vars.insert(lc.alias.clone());
             }
         }
     }

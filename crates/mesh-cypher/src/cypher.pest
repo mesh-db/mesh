@@ -100,7 +100,11 @@ match_stmt = {
 // query can't start with OPTIONAL MATCH or WITH without
 // something to pull rows from first.
 reading_clause = {
-    match_clause | optional_match_clause | with_tail | merge_clause | unwind_clause | call_subquery
+    match_clause | optional_match_clause | with_tail | merge_clause | unwind_clause | call_subquery | load_csv_clause
+}
+
+load_csv_clause = {
+    kw_load ~ kw_csv ~ (kw_with ~ kw_headers)? ~ kw_from ~ expression ~ kw_as ~ identifier
 }
 
 call_subquery = { kw_call ~ "{" ~ union_query ~ "}" }
@@ -482,5 +486,9 @@ kw_remove = _{ ^"remove" }
 kw_count = @{ ^"count" ~ !id_cont }
 kw_call = _{ ^"call" }
 kw_foreach = _{ ^"foreach" }
+kw_load = _{ ^"load" }
+kw_csv = @{ ^"csv" ~ !id_cont }
+kw_headers = @{ ^"headers" ~ !id_cont }
+kw_from = _{ ^"from" }
 kw_shortest_path = @{ ^"shortestPath" ~ !id_cont }
 kw_all_shortest_paths = @{ ^"allShortestPaths" ~ !id_cont }
