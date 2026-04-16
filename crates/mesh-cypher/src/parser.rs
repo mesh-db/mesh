@@ -1061,7 +1061,7 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
     };
 
     let mut var = None;
-    let mut edge_type = None;
+    let mut edge_types = Vec::new();
     let mut var_length = None;
     for p in inner.into_inner() {
         if p.as_rule() == Rule::rel_detail {
@@ -1069,11 +1069,11 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
                 match d.as_rule() {
                     Rule::identifier => var = Some(d.as_str().to_string()),
                     Rule::rel_type_spec => {
-                        let id = d
-                            .into_inner()
-                            .next()
-                            .ok_or_else(|| Error::Parse("empty rel type".into()))?;
-                        edge_type = Some(id.as_str().to_string());
+                        for id in d.into_inner() {
+                            if id.as_rule() == Rule::identifier {
+                                edge_types.push(id.as_str().to_string());
+                            }
+                        }
                     }
                     Rule::var_length => {
                         var_length = Some(build_var_length(d)?);
@@ -1086,7 +1086,7 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
 
     Ok(RelPattern {
         var,
-        edge_type,
+        edge_types,
         direction,
         var_length,
     })

@@ -324,7 +324,7 @@ pub struct Hop {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelPattern {
     pub var: Option<String>,
-    pub edge_type: Option<String>,
+    pub edge_types: Vec<String>,
     pub direction: Direction,
     pub var_length: Option<VarLength>,
 }

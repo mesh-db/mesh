@@ -42,7 +42,7 @@ pub enum LogicalPlan {
         edge_var: Option<String>,
         dst_var: String,
         dst_labels: Vec<String>,
-        edge_type: Option<String>,
+        edge_types: Vec<String>,
         direction: Direction,
     },
     /// Left-join expand. Behaves like `EdgeExpand` for input
@@ -59,7 +59,7 @@ pub enum LogicalPlan {
         dst_var: String,
         dst_labels: Vec<String>,
         dst_properties: Vec<(String, Expr)>,
-        edge_type: Option<String>,
+        edge_types: Vec<String>,
         direction: Direction,
     },
     VarLengthExpand {
@@ -68,7 +68,7 @@ pub enum LogicalPlan {
         edge_var: Option<String>,
         dst_var: String,
         dst_labels: Vec<String>,
-        edge_type: Option<String>,
+        edge_types: Vec<String>,
         direction: Direction,
         min_hops: u64,
         max_hops: u64,
@@ -297,7 +297,7 @@ pub enum LogicalPlan {
         src_var: String,
         dst_var: String,
         path_var: String,
-        edge_type: Option<String>,
+        edge_types: Vec<String>,
         direction: Direction,
         max_hops: u64,
         kind: ShortestKind,
@@ -451,12 +451,16 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             input,
             src_var,
             dst_var,
-            edge_type,
+            edge_types,
             direction,
             ..
         } => {
             let dir = format_dir(direction);
-            let et = edge_type.as_deref().unwrap_or("*");
+            let et = if edge_types.is_empty() {
+                "*".to_string()
+            } else {
+                edge_types.join("|")
+            };
             buf.push_str(&format!(
                 "{indent}EdgeExpand({src_var}){dir}[:{et}]{dir_end}({dst_var})\n",
                 dir_end = if matches!(direction, Direction::Incoming) {
@@ -471,11 +475,15 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             input,
             src_var,
             dst_var,
-            edge_type,
+            edge_types,
             direction,
             ..
         } => {
-            let et = edge_type.as_deref().unwrap_or("*");
+            let et = if edge_types.is_empty() {
+                "*".to_string()
+            } else {
+                edge_types.join("|")
+            };
             buf.push_str(&format!(
                 "{indent}OptionalEdgeExpand({src_var})-[:{et}]->({dst_var})\n"
             ));
@@ -486,12 +494,16 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             input,
             src_var,
             dst_var,
-            edge_type,
+            edge_types,
             min_hops,
             max_hops,
             ..
         } => {
-            let et = edge_type.as_deref().unwrap_or("*");
+            let et = if edge_types.is_empty() {
+                "*".to_string()
+            } else {
+                edge_types.join("|")
+            };
             buf.push_str(&format!(
                 "{indent}VarLengthExpand({src_var})-[:{et}*{min_hops}..{max_hops}]->({dst_var})\n"
             ));
@@ -1235,9 +1247,12 @@ fn build_create_pattern(
     for hop in &pattern.hops {
         let target_idx = add_create_node(nodes, var_idx, bound_vars, &hop.target);
 
-        let edge_type = hop.rel.edge_type.clone().ok_or_else(|| {
-            Error::Plan("CREATE relationship must specify a type (e.g. [:KNOWS])".into())
-        })?;
+        if hop.rel.edge_types.len() != 1 {
+            return Err(Error::Plan(
+                "CREATE relationship must specify exactly one type (e.g. [:KNOWS])".into(),
+            ));
+        }
+        let edge_type = hop.rel.edge_types[0].clone();
 
         let (src_idx, dst_idx) = match hop.rel.direction {
             Direction::Outgoing => (prev_idx, target_idx),
@@ -1451,7 +1466,7 @@ fn plan_shortest_path(
         src_var,
         dst_var,
         path_var,
-        edge_type: hop.rel.edge_type.clone(),
+        edge_types: hop.rel.edge_types.clone(),
         direction: hop.rel.direction,
         kind,
         max_hops: var_length.max,
@@ -1569,7 +1584,7 @@ fn chain_hops(
                 edge_var: hop.rel.var.clone(),
                 dst_var: dst_var.clone(),
                 dst_labels: hop.target.labels.clone(),
-                edge_type: hop.rel.edge_type.clone(),
+                edge_types: hop.rel.edge_types.clone(),
                 direction: hop.rel.direction,
                 min_hops: vl.min,
                 max_hops: vl.max,
@@ -1588,7 +1603,7 @@ fn chain_hops(
                 edge_var: hop.rel.var.clone(),
                 dst_var: dst_var.clone(),
                 dst_labels: hop.target.labels.clone(),
-                edge_type: hop.rel.edge_type.clone(),
+                edge_types: hop.rel.edge_types.clone(),
                 direction: hop.rel.direction,
             }
         };
@@ -2113,11 +2128,12 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                                 "MERGE does not support variable-length relationships".into(),
                             ));
                         }
-                        let edge_type = hop.rel.edge_type.clone().ok_or_else(|| {
-                            Error::Plan(
-                                "MERGE edge pattern requires an explicit relationship type".into(),
-                            )
-                        })?;
+                        if hop.rel.edge_types.len() != 1 {
+                            return Err(Error::Plan(
+                                "MERGE edge pattern requires exactly one relationship type".into(),
+                            ));
+                        }
+                        let edge_type = hop.rel.edge_types[0].clone();
                         if !matches!(hop.rel.direction, Direction::Outgoing) {
                             return Err(Error::Plan(
                                 "MERGE currently supports only directed outgoing edges".into(),
@@ -2447,7 +2463,7 @@ fn apply_optional_match(
                     edge_var: hop.rel.var.clone(),
                     dst_var: dst_var.clone(),
                     dst_labels: hop.target.labels.clone(),
-                    edge_type: hop.rel.edge_type.clone(),
+                    edge_types: hop.rel.edge_types.clone(),
                     direction: hop.rel.direction,
                     min_hops: vl.min,
                     max_hops: vl.max,
@@ -2461,7 +2477,7 @@ fn apply_optional_match(
                     dst_var: dst_var.clone(),
                     dst_labels: hop.target.labels.clone(),
                     dst_properties: hop.target.properties.clone(),
-                    edge_type: hop.rel.edge_type.clone(),
+                    edge_types: hop.rel.edge_types.clone(),
                     direction: hop.rel.direction,
                 };
             }

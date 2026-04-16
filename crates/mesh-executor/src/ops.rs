@@ -270,7 +270,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             edge_var,
             dst_var,
             dst_labels,
-            edge_type,
+            edge_types,
             direction,
         } => Box::new(EdgeExpandOp::new(
             child!(input),
@@ -278,7 +278,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             edge_var.clone(),
             dst_var.clone(),
             dst_labels.clone(),
-            edge_type.clone(),
+            edge_types.clone(),
             *direction,
         )),
         LogicalPlan::OptionalEdgeExpand {
@@ -288,7 +288,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             dst_var,
             dst_labels,
             dst_properties,
-            edge_type,
+            edge_types,
             direction,
         } => Box::new(OptionalEdgeExpandOp::new(
             child!(input),
@@ -297,7 +297,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             dst_var.clone(),
             dst_labels.clone(),
             dst_properties.clone(),
-            edge_type.clone(),
+            edge_types.clone(),
             *direction,
         )),
         LogicalPlan::VarLengthExpand {
@@ -306,7 +306,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             edge_var,
             dst_var,
             dst_labels,
-            edge_type,
+            edge_types,
             direction,
             min_hops,
             max_hops,
@@ -317,7 +317,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             edge_var.clone(),
             dst_var.clone(),
             dst_labels.clone(),
-            edge_type.clone(),
+            edge_types.clone(),
             *direction,
             *min_hops,
             *max_hops,
@@ -416,7 +416,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             src_var,
             dst_var,
             path_var,
-            edge_type,
+            edge_types,
             direction,
             max_hops,
             kind,
@@ -425,7 +425,7 @@ fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
             src_var.clone(),
             dst_var.clone(),
             path_var.clone(),
-            edge_type.clone(),
+            edge_types.clone(),
             *direction,
             *max_hops,
             *kind,
@@ -1887,7 +1887,7 @@ struct EdgeExpandOp {
     edge_var: Option<String>,
     dst_var: String,
     dst_labels: Vec<String>,
-    edge_type: Option<String>,
+    edge_types: Vec<String>,
     direction: Direction,
     current_row: Option<Row>,
     pending: Vec<(EdgeId, NodeId)>,
@@ -1901,7 +1901,7 @@ impl EdgeExpandOp {
         edge_var: Option<String>,
         dst_var: String,
         dst_labels: Vec<String>,
-        edge_type: Option<String>,
+        edge_types: Vec<String>,
         direction: Direction,
     ) -> Self {
         Self {
@@ -1910,7 +1910,7 @@ impl EdgeExpandOp {
             edge_var,
             dst_var,
             dst_labels,
-            edge_type,
+            edge_types,
             direction,
             current_row: None,
             pending: Vec::new(),
@@ -1930,10 +1930,10 @@ impl Operator for EdgeExpandOp {
                     Some(e) => e,
                     None => continue,
                 };
-                if let Some(t) = &self.edge_type {
-                    if &edge.edge_type != t {
-                        continue;
-                    }
+                if !self.edge_types.is_empty()
+                    && !self.edge_types.iter().any(|t| t == &edge.edge_type)
+                {
+                    continue;
                 }
 
                 let neighbor = match ctx.store.get_node(neighbor_id)? {
@@ -2001,7 +2001,7 @@ struct OptionalEdgeExpandOp {
     dst_var: String,
     dst_labels: Vec<String>,
     dst_properties: Vec<(String, Expr)>,
-    edge_type: Option<String>,
+    edge_types: Vec<String>,
     direction: Direction,
     current_row: Option<Row>,
     pending: Vec<(EdgeId, NodeId)>,
@@ -2018,7 +2018,7 @@ impl OptionalEdgeExpandOp {
         dst_var: String,
         dst_labels: Vec<String>,
         dst_properties: Vec<(String, Expr)>,
-        edge_type: Option<String>,
+        edge_types: Vec<String>,
         direction: Direction,
     ) -> Self {
         Self {
@@ -2028,7 +2028,7 @@ impl OptionalEdgeExpandOp {
             dst_var,
             dst_labels,
             dst_properties,
-            edge_type,
+            edge_types,
             direction,
             current_row: None,
             pending: Vec::new(),
@@ -2049,10 +2049,10 @@ impl Operator for OptionalEdgeExpandOp {
                     Some(e) => e,
                     None => continue,
                 };
-                if let Some(t) = &self.edge_type {
-                    if &edge.edge_type != t {
-                        continue;
-                    }
+                if !self.edge_types.is_empty()
+                    && !self.edge_types.iter().any(|t| t == &edge.edge_type)
+                {
+                    continue;
                 }
 
                 let neighbor = match ctx.store.get_node(neighbor_id)? {
@@ -2159,7 +2159,7 @@ struct VarLengthExpandOp {
     edge_var: Option<String>,
     dst_var: String,
     dst_labels: Vec<String>,
-    edge_type: Option<String>,
+    edge_types: Vec<String>,
     direction: Direction,
     min_hops: u64,
     max_hops: u64,
@@ -2179,7 +2179,7 @@ impl VarLengthExpandOp {
         edge_var: Option<String>,
         dst_var: String,
         dst_labels: Vec<String>,
-        edge_type: Option<String>,
+        edge_types: Vec<String>,
         direction: Direction,
         min_hops: u64,
         max_hops: u64,
@@ -2191,7 +2191,7 @@ impl VarLengthExpandOp {
             edge_var,
             dst_var,
             dst_labels,
-            edge_type,
+            edge_types,
             direction,
             min_hops,
             max_hops,
@@ -2276,10 +2276,9 @@ impl VarLengthExpandOp {
                 Some(e) => e,
                 None => continue,
             };
-            if let Some(t) = &self.edge_type {
-                if &edge.edge_type != t {
-                    continue;
-                }
+            if !self.edge_types.is_empty() && !self.edge_types.iter().any(|t| t == &edge.edge_type)
+            {
+                continue;
             }
             used.insert(eid);
             edge_buf.push(edge);
@@ -2598,7 +2597,7 @@ struct ShortestPathOp {
     src_var: String,
     dst_var: String,
     path_var: String,
-    edge_type: Option<String>,
+    edge_types: Vec<String>,
     direction: mesh_cypher::Direction,
     max_hops: u64,
     kind: mesh_cypher::ShortestKind,
@@ -2618,7 +2617,7 @@ impl ShortestPathOp {
         src_var: String,
         dst_var: String,
         path_var: String,
-        edge_type: Option<String>,
+        edge_types: Vec<String>,
         direction: mesh_cypher::Direction,
         max_hops: u64,
         kind: mesh_cypher::ShortestKind,
@@ -2628,7 +2627,7 @@ impl ShortestPathOp {
             src_var,
             dst_var,
             path_var,
-            edge_type,
+            edge_types,
             direction,
             max_hops,
             kind,
@@ -2662,7 +2661,7 @@ impl Operator for ShortestPathOp {
             let paths = bfs_shortest_paths(
                 &src,
                 &dst,
-                self.edge_type.as_deref(),
+                &self.edge_types,
                 self.direction,
                 self.max_hops,
                 self.kind,
@@ -2700,7 +2699,7 @@ impl Operator for ShortestPathOp {
 fn bfs_shortest_paths(
     src: &Node,
     dst: &Node,
-    edge_type: Option<&str>,
+    edge_types: &[String],
     direction: mesh_cypher::Direction,
     max_hops: u64,
     kind: mesh_cypher::ShortestKind,
@@ -2743,12 +2742,12 @@ fn bfs_shortest_paths(
             for (edge_id, neighbor_id) in neighbors {
                 // Edge-type filter. Only fetch the edge record
                 // when a type constraint is present.
-                if let Some(t) = edge_type {
+                if !edge_types.is_empty() {
                     let edge = match reader.get_edge(edge_id)? {
                         Some(e) => e,
                         None => continue,
                     };
-                    if edge.edge_type != t {
+                    if !edge_types.iter().any(|t| t == &edge.edge_type) {
                         continue;
                     }
                 }

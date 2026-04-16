@@ -114,7 +114,7 @@ fn single_hop_directed() {
     let hop = &first_match(&m).patterns[0].hops[0];
     assert_eq!(hop.rel.direction, Direction::Outgoing);
     assert_eq!(hop.rel.var.as_deref(), Some("r"));
-    assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(hop.rel.edge_types, vec!["KNOWS"]);
     assert_eq!(hop.target.var.as_deref(), Some("b"));
     assert_eq!(
         hop.target.labels.first().map(String::as_str),
@@ -128,7 +128,7 @@ fn single_hop_anonymous_rel() {
     let hop = &first_match(&m).patterns[0].hops[0];
     assert_eq!(hop.rel.direction, Direction::Outgoing);
     assert!(hop.rel.var.is_none());
-    assert!(hop.rel.edge_type.is_none());
+    assert!(hop.rel.edge_types.is_empty());
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn single_hop_type_only() {
     let m = unwrap_match(parse("MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap());
     let hop = &first_match(&m).patterns[0].hops[0];
     assert!(hop.rel.var.is_none());
-    assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(hop.rel.edge_types, vec!["KNOWS"]);
     assert_eq!(hop.rel.direction, Direction::Outgoing);
 }
 
@@ -146,7 +146,7 @@ fn single_hop_incoming() {
     let hop = &first_match(&m).patterns[0].hops[0];
     assert_eq!(hop.rel.direction, Direction::Incoming);
     assert_eq!(hop.rel.var.as_deref(), Some("r"));
-    assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(hop.rel.edge_types, vec!["KNOWS"]);
 }
 
 #[test]
@@ -154,7 +154,22 @@ fn single_hop_undirected() {
     let m = unwrap_match(parse("MATCH (a)-[:KNOWS]-(b) RETURN a, b").unwrap());
     let hop = &first_match(&m).patterns[0].hops[0];
     assert_eq!(hop.rel.direction, Direction::Both);
-    assert_eq!(hop.rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(hop.rel.edge_types, vec!["KNOWS"]);
+}
+
+#[test]
+fn multi_type_relationship_pattern() {
+    let m = unwrap_match(parse("MATCH (a)-[:KNOWS|FOLLOWS]->(b) RETURN b.name").unwrap());
+    let hop = &first_match(&m).patterns[0].hops[0];
+    assert_eq!(hop.rel.edge_types, vec!["KNOWS", "FOLLOWS"]);
+    assert_eq!(hop.rel.direction, Direction::Outgoing);
+}
+
+#[test]
+fn multi_type_with_optional_colon() {
+    let m = unwrap_match(parse("MATCH (a)-[:X|:Y|Z]->(b) RETURN b").unwrap());
+    let hop = &first_match(&m).patterns[0].hops[0];
+    assert_eq!(hop.rel.edge_types, vec!["X", "Y", "Z"]);
 }
 
 #[test]
@@ -255,11 +270,8 @@ fn match_create_tail_parses() {
     assert_eq!(m.terminal.create_patterns.len(), 1);
     assert_eq!(m.terminal.create_patterns[0].hops.len(), 1);
     assert_eq!(
-        m.terminal.create_patterns[0].hops[0]
-            .rel
-            .edge_type
-            .as_deref(),
-        Some("KNOWS")
+        m.terminal.create_patterns[0].hops[0].rel.edge_types,
+        vec!["KNOWS"]
     );
 }
 
@@ -370,7 +382,7 @@ fn var_length_with_var_and_type() {
     let m = unwrap_match(parse("MATCH (a)-[r:KNOWS*1..3]->(b) RETURN r").unwrap());
     let rel = &first_match(&m).patterns[0].hops[0].rel;
     assert_eq!(rel.var.as_deref(), Some("r"));
-    assert_eq!(rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(rel.edge_types, vec!["KNOWS"]);
     let vl = rel.var_length.unwrap();
     assert_eq!(vl.min, 1);
     assert_eq!(vl.max, 3);
@@ -390,10 +402,7 @@ fn create_path_with_relationship() {
         c.patterns[0].start.labels.first().map(String::as_str),
         Some("Person")
     );
-    assert_eq!(
-        c.patterns[0].hops[0].rel.edge_type.as_deref(),
-        Some("KNOWS")
-    );
+    assert_eq!(c.patterns[0].hops[0].rel.edge_types, vec!["KNOWS"]);
     assert_eq!(
         c.patterns[0].hops[0]
             .target
@@ -510,16 +519,16 @@ fn multi_hop_chain() {
     let m = unwrap_match(parse("MATCH (a)-[:KNOWS]->(b)-[:WORKS_AT]->(c) RETURN a, c").unwrap());
     assert_eq!(first_match(&m).patterns[0].hops.len(), 2);
     assert_eq!(
-        first_match(&m).patterns[0].hops[0].rel.edge_type.as_deref(),
-        Some("KNOWS")
+        first_match(&m).patterns[0].hops[0].rel.edge_types,
+        vec!["KNOWS"]
     );
     assert_eq!(
         first_match(&m).patterns[0].hops[0].target.var.as_deref(),
         Some("b")
     );
     assert_eq!(
-        first_match(&m).patterns[0].hops[1].rel.edge_type.as_deref(),
-        Some("WORKS_AT")
+        first_match(&m).patterns[0].hops[1].rel.edge_types,
+        vec!["WORKS_AT"]
     );
     assert_eq!(
         first_match(&m).patterns[0].hops[1].target.var.as_deref(),
@@ -1452,10 +1461,7 @@ fn multi_top_level_merge_parses_as_chained_clauses() {
         unreachable!()
     };
     assert_eq!(edge_merge.pattern.hops.len(), 1);
-    assert_eq!(
-        edge_merge.pattern.hops[0].rel.edge_type.as_deref(),
-        Some("KNOWS")
-    );
+    assert_eq!(edge_merge.pattern.hops[0].rel.edge_types, vec!["KNOWS"]);
     assert_eq!(m.terminal.return_items.len(), 3);
 }
 
@@ -1905,7 +1911,7 @@ fn pattern_predicate_parses_as_expr_pattern_exists() {
     };
     assert_eq!(pat.start.var.as_deref(), Some("a"));
     assert_eq!(pat.hops.len(), 1);
-    assert_eq!(pat.hops[0].rel.edge_type.as_deref(), Some("KNOWS"));
+    assert_eq!(pat.hops[0].rel.edge_types, vec!["KNOWS"]);
 }
 
 #[test]

@@ -510,12 +510,12 @@ fn expand_single_hop_predicate(
         }
     };
     for (edge_id, neighbor_id) in neighbors {
-        if let Some(t) = &hop.rel.edge_type {
+        if !hop.rel.edge_types.is_empty() {
             let edge = match ctx.reader.get_edge(edge_id)? {
                 Some(e) => e,
                 None => continue,
             };
-            if &edge.edge_type != t {
+            if !hop.rel.edge_types.iter().any(|t| t == &edge.edge_type) {
                 continue;
             }
         }
@@ -601,12 +601,12 @@ fn vl_pred_dfs(
         if used.contains(&edge_id) {
             continue;
         }
-        if let Some(t) = &hop.rel.edge_type {
+        if !hop.rel.edge_types.is_empty() {
             let edge = match ctx.reader.get_edge(edge_id)? {
                 Some(e) => e,
                 None => continue,
             };
-            if &edge.edge_type != t {
+            if !hop.rel.edge_types.iter().any(|t| t == &edge.edge_type) {
                 continue;
             }
         }
@@ -766,7 +766,7 @@ fn count_walk_hops(
                 }
             };
             for (edge_id, neighbor_id) in neighbors {
-                let edge_record = if hop.rel.edge_type.is_some() || hop.rel.var.is_some() {
+                let edge_record = if !hop.rel.edge_types.is_empty() || hop.rel.var.is_some() {
                     match ctx.reader.get_edge(edge_id)? {
                         Some(e) => Some(e),
                         None => continue,
@@ -774,9 +774,9 @@ fn count_walk_hops(
                 } else {
                     None
                 };
-                if let Some(t) = &hop.rel.edge_type {
+                if !hop.rel.edge_types.is_empty() {
                     if let Some(e) = &edge_record {
-                        if &e.edge_type != t {
+                        if !hop.rel.edge_types.iter().any(|t| t == &e.edge_type) {
                             continue;
                         }
                     }
@@ -931,7 +931,7 @@ fn walk_exists_hops(
             for (edge_id, neighbor_id) in neighbors {
                 // Fetch the edge when we need its type or when
                 // the WHERE clause will bind it by variable.
-                let edge_record = if hop.rel.edge_type.is_some() || hop.rel.var.is_some() {
+                let edge_record = if !hop.rel.edge_types.is_empty() || hop.rel.var.is_some() {
                     match ctx.reader.get_edge(edge_id)? {
                         Some(e) => Some(e),
                         None => continue,
@@ -939,9 +939,9 @@ fn walk_exists_hops(
                 } else {
                     None
                 };
-                if let Some(t) = &hop.rel.edge_type {
+                if !hop.rel.edge_types.is_empty() {
                     if let Some(e) = &edge_record {
-                        if &e.edge_type != t {
+                        if !hop.rel.edge_types.iter().any(|t| t == &e.edge_type) {
                             continue;
                         }
                     }

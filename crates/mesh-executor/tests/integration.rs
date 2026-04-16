@@ -346,6 +346,98 @@ fn edge_type_filter() {
 }
 
 #[test]
+fn multi_type_relationship_pattern_knows_or_likes() {
+    let (store, _d) = open_store();
+    let _g = build_social_graph(&store);
+
+    // [:KNOWS|LIKES] should match both KNOWS and LIKES edges.
+    // KNOWS: Ada->Alan, Alan->Grace
+    // LIKES: Alan->Ada
+    // So (a)-[:KNOWS|LIKES]->(b) should yield 3 rows.
+    let rows = run(
+        &store,
+        "MATCH (a)-[:KNOWS|LIKES]->(b) RETURN a.name AS src, b.name AS dst",
+    );
+    let mut pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "src"), str_prop(r, "dst")))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Ada".to_string(), "Alan".to_string()),
+            ("Alan".to_string(), "Ada".to_string()),
+            ("Alan".to_string(), "Grace".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn multi_type_relationship_three_types() {
+    let (store, _d) = open_store();
+    let _g = build_social_graph(&store);
+
+    // [:KNOWS|LIKES|WORKS_AT] should match all 4 edges.
+    let rows = run(
+        &store,
+        "MATCH (a)-[:KNOWS|LIKES|WORKS_AT]->(b) RETURN a.name AS src, b.name AS dst",
+    );
+    let mut pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "src"), str_prop(r, "dst")))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Ada".to_string(), "Alan".to_string()),
+            ("Ada".to_string(), "Analytics".to_string()),
+            ("Alan".to_string(), "Ada".to_string()),
+            ("Alan".to_string(), "Grace".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn multi_type_with_edge_variable_and_type_function() {
+    let (store, _d) = open_store();
+    let _g = build_social_graph(&store);
+
+    // Bind the edge to `r` and use type(r).
+    let rows = run(
+        &store,
+        "MATCH (a:Person)-[r:KNOWS|LIKES]->(b:Person) RETURN a.name AS src, type(r) AS rel, b.name AS dst",
+    );
+    let mut triples: Vec<(String, String, String)> = rows
+        .iter()
+        .map(|r| (str_prop(r, "src"), str_prop(r, "rel"), str_prop(r, "dst")))
+        .collect();
+    triples.sort();
+    assert_eq!(
+        triples,
+        vec![
+            ("Ada".to_string(), "KNOWS".to_string(), "Alan".to_string()),
+            ("Alan".to_string(), "KNOWS".to_string(), "Grace".to_string()),
+            ("Alan".to_string(), "LIKES".to_string(), "Ada".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn multi_type_with_colon_prefix_on_second_type() {
+    let (store, _d) = open_store();
+    let _g = build_social_graph(&store);
+
+    // Also accept [:KNOWS|:LIKES] with colon on the second type.
+    let rows = run(
+        &store,
+        "MATCH (a)-[:KNOWS|:LIKES]->(b) RETURN a.name AS src, b.name AS dst",
+    );
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
 fn multi_hop_chain_two_knows() {
     let (store, _d) = open_store();
     let _g = build_social_graph(&store);
@@ -5795,23 +5887,32 @@ fn date_plus_duration_with_seconds_errors() {
 
 #[test]
 fn datetime_ordering_works_in_where() {
-    let (store, _d) = open_store();
-    let rows = run(
-        &store,
-        "UNWIND [datetime() - duration({days: 1}), datetime() + duration({days: 1})] AS ts \
-         WHERE ts < datetime() \
-         RETURN ts",
-    );
-    assert_eq!(rows.len(), 1);
-    let ts = match rows[0].get("ts") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
-        other => panic!("expected DateTime, got {other:?}"),
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    assert!(ts < now);
+    // This test requires a larger stack in debug mode due to deeply
+    // recursive expression evaluation (datetime arithmetic inside a
+    // list literal inside UNWIND).
+    let child = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let (store, _d) = open_store();
+            let rows = run(
+                &store,
+                "UNWIND [datetime() - duration({days: 1}), datetime() + duration({days: 1})] AS ts \
+                 WHERE ts < datetime() \
+                 RETURN ts",
+            );
+            assert_eq!(rows.len(), 1);
+            let ts = match rows[0].get("ts") {
+                Some(Value::Property(Property::DateTime(ms))) => *ms,
+                other => panic!("expected DateTime, got {other:?}"),
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            assert!(ts < now);
+        })
+        .unwrap();
+    child.join().unwrap();
 }
 
 #[test]
