@@ -1988,13 +1988,27 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                                 var
                             )));
                         }
-                        if bound_vars.contains_key(var) && !is_bound_start {
-                            return Err(Error::Plan(format!(
-                                "variable '{}' is already bound by an earlier clause; \
-                                 only the pattern's start variable may be re-referenced \
-                                 across stages",
-                                var
-                            )));
+                        // Variables from earlier clauses can be
+                        // re-referenced if the type matches. Only
+                        // reject actual type conflicts.
+                        if let Some(&existing_type) = bound_vars.get(var) {
+                            let new_type = if start_var_name == Some(var.as_str()) {
+                                VarType::Node
+                            } else if pattern
+                                .hops
+                                .iter()
+                                .any(|h| h.rel.var.as_deref() == Some(var.as_str()))
+                            {
+                                VarType::Edge
+                            } else {
+                                VarType::Node
+                            };
+                            if existing_type != new_type {
+                                return Err(Error::Plan(format!(
+                                    "variable '{}' already defined with a different type",
+                                    var
+                                )));
+                            }
                         }
                         if !is_bound_start {
                             this_clause_vars.insert(var.clone());
@@ -2483,9 +2497,15 @@ fn apply_optional_match(
 ) -> Result<LogicalPlan> {
     for pattern in &clause.patterns {
         if pattern.hops.is_empty() {
-            return Err(Error::Plan(
-                "OPTIONAL MATCH requires at least one relationship hop".into(),
-            ));
+            // Bare-node OPTIONAL MATCH: scan for matching nodes.
+            // If none match, the caller produces a null-bound row.
+            let fresh = plan_pattern(pattern, 0, ctx)?;
+            collect_pattern_vars_typed(pattern, bound_vars)?;
+            plan = LogicalPlan::CartesianProduct {
+                left: Box::new(plan),
+                right: Box::new(fresh),
+            };
+            continue;
         }
         let start_var = pattern
             .start

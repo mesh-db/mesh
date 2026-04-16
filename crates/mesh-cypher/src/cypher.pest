@@ -1,4 +1,5 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 
 query = { SOI ~ (kw_explain | kw_profile)? ~ query_body ~ EOI }
 

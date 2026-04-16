@@ -4877,21 +4877,17 @@ fn cross_stage_rebind_property_reassertion_rejected() {
 }
 
 #[test]
-fn cross_stage_rebind_second_var_also_bound_rejected() {
-    // `b` is bound by the first MATCH, then the second MATCH
-    // references both `a` and `b`. Only the start variable
-    // is allowed to carry across; a pre-bound hop destination
-    // (path-existence check) needs a different operator and
-    // is deferred.
+fn cross_stage_rebind_both_vars_bound_plans() {
+    // Both `a` and `b` are bound from the first MATCH. The
+    // second MATCH (a)-[:KNOWS]->(b) is a correlated join —
+    // find edges between the two bound nodes.
     let stmt = mesh_cypher::parse(
         "MATCH (a:Person), (b:Person) WITH a, b MATCH (a)-[:KNOWS]->(b) RETURN a, b",
     )
     .unwrap();
-    let err = mesh_cypher::plan(&stmt).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("only the pattern's start variable"),
-        "expected 'only start var' error, got: {msg}"
+    mesh_cypher::plan(&stmt).expect(
+        "cross-stage rebind with both vars bound should plan",
+        "expected 'only start var' error, got: {msg}",
     );
 }
 
