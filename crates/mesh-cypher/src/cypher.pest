@@ -456,7 +456,7 @@ reserved = @{
      ^"distinct" | ^"order" | ^"by" | ^"ascending" | ^"asc" | ^"descending" | ^"desc" |
      ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind" |
      ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on" |
-     ^"with" | ^"optional" | ^"contains" | ^"remove")
+     ^"with" | ^"optional" | ^"remove")
     ~ !id_cont
 }
 
