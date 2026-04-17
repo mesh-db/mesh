@@ -2239,6 +2239,33 @@ fn build_subquery_body(pair: Pair<Rule>) -> Result<Statement> {
                 },
             }))
         }
+        Rule::bare_pattern_body => {
+            let mut patterns = Vec::new();
+            let mut where_clause = None;
+            for p in inner.into_inner() {
+                match p.as_rule() {
+                    Rule::pattern_list => patterns = build_pattern_list(p)?,
+                    Rule::where_clause => {
+                        let ep = p
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| Error::Parse("empty where".into()))?;
+                        where_clause = Some(build_expression(ep)?);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Statement::Match(crate::ast::MatchStmt {
+                clauses: vec![crate::ast::ReadingClause::Match(crate::ast::MatchClause {
+                    patterns,
+                    where_clause,
+                })],
+                terminal: crate::ast::TerminalTail {
+                    star: true,
+                    ..Default::default()
+                },
+            }))
+        }
         r => Err(Error::Parse(format!(
             "unexpected subquery_body child: {r:?}"
         ))),

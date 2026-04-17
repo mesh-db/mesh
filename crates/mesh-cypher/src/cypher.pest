@@ -243,7 +243,7 @@ nn_integer = @{ ASCII_DIGIT+ }
 node_pattern = { "(" ~ identifier? ~ label_spec* ~ properties? ~ ")" }
 label_spec = { ":" ~ identifier }
 properties = { "{" ~ (property_entry ~ ("," ~ property_entry)*)? ~ "}" }
-property_entry = { identifier ~ ":" ~ property_value }
+property_entry = { map_key ~ ":" ~ property_value }
 // Node-pattern property values are deliberately narrower than full
 // expressions: only literals or parameters are allowed. This statically
 // rejects things like `{name: m.y}` (free row references in pattern
@@ -360,8 +360,9 @@ exists_subquery = {
     kw_exists ~ "{" ~ subquery_body ~ "}"
 }
 
-subquery_body = { read_stmt | bare_match_body }
+subquery_body = { read_stmt | bare_match_body | bare_pattern_body }
 bare_match_body = { kw_match ~ pattern_list ~ where_clause? }
+bare_pattern_body = { pattern_list ~ where_clause? }
 
 // A `pattern` used as a boolean expression — `(a)-[:KNOWS]->(b)`
 // in a WHERE clause. Distinct from the top-level `pattern` rule
@@ -405,7 +406,9 @@ list_pred_name = @{ (^"any" | ^"all" | ^"none" | ^"single") ~ !id_cont }
 // identifiers; Neo4j also supports string-literal keys but the v1
 // restriction matches what driver code actually emits.
 map_literal = { "{" ~ (map_entry ~ ("," ~ map_entry)*)? ~ "}" }
-map_entry = { identifier ~ ":" ~ expression }
+map_entry = { map_key ~ ":" ~ expression }
+// Map keys accept reserved words (e.g. {null: 1, set: 2})
+map_key = @{ backtick_id | (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 // Compound-atomic: keeps `identifier`'s atomic semantics for the name
 // portion while disallowing whitespace between `$` and the name. Allows

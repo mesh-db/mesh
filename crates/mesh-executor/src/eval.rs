@@ -1800,9 +1800,10 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         "properties" => {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
-                Value::Null => Ok(Value::Null),
+                Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                 Value::Node(n) => Ok(Value::Property(Property::Map(n.properties))),
                 Value::Edge(e) => Ok(Value::Property(Property::Map(e.properties))),
+                Value::Property(Property::Map(m)) => Ok(Value::Property(Property::Map(m))),
                 _ => Err(Error::TypeMismatch),
             }
         }
