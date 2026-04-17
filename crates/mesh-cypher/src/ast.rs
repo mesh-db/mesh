@@ -291,6 +291,8 @@ pub enum RemoveItem {
 pub struct DeleteClause {
     pub detach: bool,
     pub vars: Vec<String>,
+    /// DELETE expressions (superset of vars — includes index access etc.)
+    pub exprs: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

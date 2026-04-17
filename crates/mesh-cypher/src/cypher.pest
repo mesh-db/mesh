@@ -201,7 +201,7 @@ remove_label_item = { identifier ~ label_spec+ }
 remove_prop_item = { property_access }
 
 delete_tail = { kw_detach? ~ kw_delete ~ delete_items }
-delete_items = { identifier ~ ("," ~ identifier)* }
+delete_items = { expression ~ ("," ~ expression)* }
 
 // A pattern is a start node plus zero or more relationship+node
 // hops, optionally prefixed with `<var> =` to bind the full

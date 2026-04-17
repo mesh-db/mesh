@@ -676,25 +676,7 @@ fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail
                 }
             }
             Rule::delete_tail => {
-                let mut detach = false;
-                let mut vars = Vec::new();
-                for inner in p.into_inner() {
-                    match inner.as_rule() {
-                        Rule::kw_detach => detach = true,
-                        Rule::delete_items => {
-                            for id in inner.into_inner() {
-                                vars.push(parse_ident(id.as_str()));
-                            }
-                        }
-                        r => {
-                            return Err(Error::Parse(format!(
-                                "unexpected rule in delete tail: {:?}",
-                                r
-                            )))
-                        }
-                    }
-                }
-                terminal.delete = Some(DeleteClause { detach, vars });
+                terminal.delete = Some(build_delete_clause(p)?);
             }
             Rule::remove_tail => {
                 let items_pair = p
@@ -889,12 +871,18 @@ fn build_set_items(pair: Pair<Rule>) -> Result<Vec<crate::ast::SetItem>> {
 fn build_delete_clause(pair: Pair<Rule>) -> Result<DeleteClause> {
     let mut detach = false;
     let mut vars = Vec::new();
+    let mut exprs = Vec::new();
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::kw_detach => detach = true,
             Rule::delete_items => {
-                for id in inner.into_inner() {
-                    vars.push(parse_ident(id.as_str()));
+                for item in inner.into_inner() {
+                    let expr = build_expression(item)?;
+                    // Extract variable name for backwards compatibility
+                    if let Expr::Identifier(ref name) = expr {
+                        vars.push(name.clone());
+                    }
+                    exprs.push(expr);
                 }
             }
             r => {
@@ -905,7 +893,7 @@ fn build_delete_clause(pair: Pair<Rule>) -> Result<DeleteClause> {
             }
         }
     }
-    Ok(DeleteClause { detach, vars })
+    Ok(DeleteClause { detach, vars, exprs })
 }
 
 /// Parse a `remove_tail` pair into [`RemoveItem`] entries.
@@ -2263,14 +2251,29 @@ fn parse_integer(s: &str) -> Result<i64> {
     } else {
         (false, s)
     };
-    let val = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
-        i64::from_str_radix(hex, 16).map_err(|_| Error::InvalidNumber(s.to_string()))?
+    // Parse as u64 first to handle i64::MIN correctly (-2^63)
+    let uval = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).map_err(|_| Error::InvalidNumber(s.to_string()))?
     } else if let Some(oct) = digits.strip_prefix("0o").or_else(|| digits.strip_prefix("0O")) {
-        i64::from_str_radix(oct, 8).map_err(|_| Error::InvalidNumber(s.to_string()))?
+        u64::from_str_radix(oct, 8).map_err(|_| Error::InvalidNumber(s.to_string()))?
     } else {
-        digits.parse::<i64>().map_err(|_| Error::InvalidNumber(s.to_string()))?
+        digits
+            .parse::<u64>()
+            .map_err(|_| Error::InvalidNumber(s.to_string()))?
     };
-    Ok(if negative { -val } else { val })
+    if negative {
+        // -(2^63) = i64::MIN, handle without overflow
+        if uval > (i64::MAX as u64) + 1 {
+            return Err(Error::InvalidNumber(s.to_string()));
+        }
+        Ok(uval.wrapping_neg() as i64)
+    } else {
+        if uval > i64::MAX as u64 {
+            return Err(Error::InvalidNumber(s.to_string()));
+        }
+        Ok(uval as i64)
+    }
 }
 
 fn build_compare_op(pair: Pair<Rule>) -> Result<CompareOp> {
