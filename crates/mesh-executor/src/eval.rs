@@ -286,6 +286,12 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::Compare { op, left, right } => {
             let vl = eval_expr(left, ctx)?;
             let vr = eval_expr(right, ctx)?;
+            // Null propagation: any comparison with null returns null
+            if matches!(vl, Value::Null | Value::Property(Property::Null))
+                || matches!(vr, Value::Null | Value::Property(Property::Null))
+            {
+                return Ok(Value::Null);
+            }
             match compare(*op, &vl, &vr) {
                 Ok(b) => Ok(Value::Property(Property::Bool(b))),
                 Err(Error::TypeMismatch) | Err(Error::UnsupportedComparison) => Ok(Value::Null),
