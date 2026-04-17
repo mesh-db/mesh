@@ -2670,9 +2670,28 @@ fn value_to_string(v: Value) -> Value {
 
 pub(crate) fn compare_values(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Greater,
-        (_, Value::Null) => Ordering::Less,
+        (Value::Null, Value::Null)
+        | (Value::Property(Property::Null), Value::Property(Property::Null)) => Ordering::Equal,
+        (Value::Null | Value::Property(Property::Null), _) => Ordering::Greater,
+        (_, Value::Null | Value::Property(Property::Null)) => Ordering::Less,
+        (Value::List(la), Value::List(lb)) => {
+            for (x, y) in la.iter().zip(lb.iter()) {
+                let ord = compare_values(x, y);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            la.len().cmp(&lb.len())
+        }
+        (Value::Property(Property::List(la)), Value::Property(Property::List(lb))) => {
+            for (x, y) in la.iter().zip(lb.iter()) {
+                let ord = compare_props(x, y);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            la.len().cmp(&lb.len())
+        }
         (Value::Property(ap), Value::Property(bp)) => compare_props(ap, bp),
         _ => Ordering::Equal,
     }
