@@ -258,7 +258,8 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 }
                 _ => return Err(Error::TypeMismatch),
             };
-            let mut count = 0usize;
+            let mut true_count = 0usize;
+            let mut has_null = false;
             for item in &items {
                 let mut scratch = ctx.row.clone();
                 scratch.insert(var.clone(), item.clone());
@@ -268,20 +269,63 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     Err(Error::TypeMismatch) | Err(Error::NotBoolean) => Value::Null,
                     Err(e) => return Err(e),
                 };
-                if to_bool(&v).unwrap_or(false) {
-                    count += 1;
-                    if *kind == mesh_cypher::ListPredicateKind::Any {
-                        return Ok(Value::Property(Property::Bool(true)));
+                match to_bool_3v(&v).unwrap_or(None) {
+                    Some(true) => {
+                        true_count += 1;
+                        if *kind == mesh_cypher::ListPredicateKind::Any {
+                            return Ok(Value::Property(Property::Bool(true)));
+                        }
+                    }
+                    Some(false) => {
+                        if *kind == mesh_cypher::ListPredicateKind::All {
+                            return Ok(Value::Property(Property::Bool(false)));
+                        }
+                    }
+                    None => has_null = true,
+                }
+            }
+            // Three-valued result: if null was encountered and no
+            // definitive answer was reached, return null.
+            match kind {
+                mesh_cypher::ListPredicateKind::Any => {
+                    if true_count > 0 {
+                        Ok(Value::Property(Property::Bool(true)))
+                    } else if has_null {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Property(Property::Bool(false)))
+                    }
+                }
+                mesh_cypher::ListPredicateKind::All => {
+                    if true_count == items.len() {
+                        Ok(Value::Property(Property::Bool(true)))
+                    } else if has_null {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Property(Property::Bool(false)))
+                    }
+                }
+                mesh_cypher::ListPredicateKind::None => {
+                    if true_count > 0 {
+                        Ok(Value::Property(Property::Bool(false)))
+                    } else if has_null {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Property(Property::Bool(true)))
+                    }
+                }
+                mesh_cypher::ListPredicateKind::Single => {
+                    if true_count == 1 && !has_null {
+                        Ok(Value::Property(Property::Bool(true)))
+                    } else if true_count > 1 {
+                        Ok(Value::Property(Property::Bool(false)))
+                    } else if has_null {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Property(Property::Bool(true_count == 1)))
                     }
                 }
             }
-            let result = match kind {
-                mesh_cypher::ListPredicateKind::Any => count > 0,
-                mesh_cypher::ListPredicateKind::All => count == items.len(),
-                mesh_cypher::ListPredicateKind::None => count == 0,
-                mesh_cypher::ListPredicateKind::Single => count == 1,
-            };
-            Ok(Value::Property(Property::Bool(result)))
         }
         Expr::Compare { op, left, right } => {
             let vl = eval_expr(left, ctx)?;
