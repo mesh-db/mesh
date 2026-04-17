@@ -2803,26 +2803,31 @@ fn compare_props(a: &Property, b: &Property) -> Ordering {
 }
 
 /// Type precedence for cross-type ordering (higher = sorts later in ASC).
+/// Neo4j order: Map < Node < Relationship < List < Path < String < Boolean < Number < Null
 fn type_order_prop(p: &Property) -> u8 {
     match p {
-        Property::Null => 0,
-        Property::Int64(_) | Property::Float64(_) => 1,
-        Property::Bool(_) => 2,
-        Property::String(_) => 3,
+        Property::Map(_) => 1,
         Property::List(_) => 4,
-        Property::Map(_) => 5,
-        Property::Date(_) | Property::DateTime(_) | Property::Duration(_) => 6,
+        Property::String(_) => 6,
+        Property::Bool(_) => 7,
+        Property::Int64(_) | Property::Float64(_) => 8,
+        Property::Date(_) | Property::DateTime(_) | Property::Duration(_) => 9,
+        Property::Null => 10,
     }
 }
 
 fn type_order_value(v: &Value) -> u8 {
     match v {
+        Value::Property(Property::Map(_)) => 1,
+        Value::Node(_) => 2,
+        Value::Edge(_) => 3,
+        Value::List(_) | Value::Property(Property::List(_)) => 4,
+        Value::Path { .. } => 5,
+        Value::Property(Property::String(_)) => 6,
+        Value::Property(Property::Bool(_)) => 7,
+        Value::Property(Property::Int64(_) | Property::Float64(_)) => 8,
+        Value::Property(Property::Date(_) | Property::DateTime(_) | Property::Duration(_)) => 9,
         Value::Null | Value::Property(Property::Null) => 10,
-        Value::Property(p) => type_order_prop(p),
-        Value::Node(_) => 7,
-        Value::Edge(_) => 8,
-        Value::Path { .. } => 6,
-        Value::List(_) => 4,
     }
 }
 
