@@ -349,10 +349,26 @@ fn format_property(p: &Property) -> String {
     match p {
         Property::Int64(n) => n.to_string(),
         Property::Float64(f) => {
-            if *f == f.floor() && f.is_finite() {
+            // Negative zero displays as positive zero
+            let f = if *f == 0.0 { 0.0 } else { *f };
+            if f == f.floor() && f.is_finite() && f.abs() < 1e15 {
                 format!("{f:.1}")
+            } else if f.is_nan() {
+                "NaN".to_string()
+            } else if !f.is_finite() {
+                if f > 0.0 {
+                    "Infinity".to_string()
+                } else {
+                    "-Infinity".to_string()
+                }
             } else {
-                f.to_string()
+                let s = format!("{f}");
+                // Use scientific notation only for very large values
+                if f.abs() >= 1e15 && !s.contains('e') && !s.contains('E') {
+                    format!("{f:e}")
+                } else {
+                    s
+                }
             }
         }
         Property::String(s) => format!("'{s}'"),
