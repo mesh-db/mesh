@@ -10,8 +10,8 @@ query = { SOI ~ (kw_explain | kw_profile)? ~ query_body ~ EOI }
 // unionable row streams and are rejected at parse time.
 query_body = {
     create_index_stmt | drop_index_stmt | show_indexes_stmt |
-    create_stmt |
-    union_query
+    union_query |
+    create_stmt
 }
 
 // A read query, possibly composed of multiple branches joined by

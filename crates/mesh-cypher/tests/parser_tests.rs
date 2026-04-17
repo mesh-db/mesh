@@ -10,6 +10,25 @@ fn unwrap_match(s: Statement) -> MatchStmt {
 fn unwrap_create(s: Statement) -> CreateStmt {
     match s {
         Statement::Create(c) => c,
+        // CREATE statements may now parse through match_stmt path
+        Statement::Match(m) => {
+            let mut patterns = Vec::new();
+            for c in &m.clauses {
+                if let ReadingClause::Create(ps) = c {
+                    patterns.extend(ps.clone());
+                }
+            }
+            patterns.extend(m.terminal.create_patterns.clone());
+            CreateStmt {
+                patterns,
+                return_items: m.terminal.return_items.clone(),
+                star: m.terminal.star,
+                distinct: m.terminal.distinct,
+                order_by: m.terminal.order_by.clone(),
+                skip: m.terminal.skip.clone(),
+                limit: m.terminal.limit.clone(),
+            }
+        }
         _ => panic!("expected create statement"),
     }
 }
