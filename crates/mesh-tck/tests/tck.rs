@@ -196,6 +196,32 @@ fn when_executing_control_query(world: &mut MeshWorld, step: &cucumber::gherkin:
 
 // --- Then steps ---
 
+/// Normalize property formatting for comparison: ensure consistent
+/// whitespace around colons in `{key:val}` vs `{key: val}`.
+fn normalize_tck(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        out.push(chars[i]);
+        if chars[i] == ':' && i > 0 && i + 1 < chars.len() {
+            let before = chars[i - 1];
+            let after = chars[i + 1];
+            if (before.is_alphanumeric() || before == '_' || before == '`')
+                && after != ' '
+                && after != '\''
+                && after != '{'
+                && after != '['
+                && after != '('
+            {
+                out.push(' ');
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 #[then("the result should be, in any order:")]
 fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
     if let Some(err) = &world.error {
@@ -223,13 +249,16 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
         .map(|row| {
             headers
                 .iter()
-                .map(|h| format_value(row.get(*h).unwrap_or(&Value::Null)))
+                .map(|h| normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null))))
                 .collect()
         })
         .collect();
     actual_strs.sort();
 
-    let mut expected_sorted = expected_rows.clone();
+    let mut expected_sorted: Vec<Vec<String>> = expected_rows
+        .iter()
+        .map(|row| row.iter().map(|s| normalize_tck(s)).collect())
+        .collect();
     expected_sorted.sort();
 
     assert_eq!(
@@ -256,14 +285,19 @@ fn then_result_in_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
         .map(|row| {
             headers
                 .iter()
-                .map(|h| format_value(row.get(*h).unwrap_or(&Value::Null)))
+                .map(|h| normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null))))
                 .collect()
         })
         .collect();
 
+    let expected_normalized: Vec<Vec<String>> = expected_rows
+        .iter()
+        .map(|row| row.iter().map(|s| normalize_tck(s)).collect())
+        .collect();
+
     assert_eq!(
-        actual_strs, expected_rows,
-        "Result mismatch (ordered).\nActual:   {actual_strs:?}\nExpected: {expected_rows:?}"
+        actual_strs, expected_normalized,
+        "Result mismatch (ordered).\nActual:   {actual_strs:?}\nExpected: {expected_normalized:?}"
     );
 }
 
