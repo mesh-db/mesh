@@ -274,7 +274,8 @@ label_predicate = { label_spec+ }
 // parses as `(a.age + 1) > 18` instead of trying to treat the
 // comparison as a primary.
 add_expr = { mul_expr ~ ((op_add | op_sub) ~ mul_expr)* }
-mul_expr = { unary_expr ~ ((op_mul | op_div | op_mod) ~ unary_expr)* }
+mul_expr = { pow_expr ~ ((op_mul | op_div | op_mod) ~ pow_expr)* }
+pow_expr = { unary_expr ~ (op_pow ~ unary_expr)* }
 unary_expr = { (op_neg ~ unary_expr) | primary }
 
 op_add = { "+" }
@@ -282,6 +283,7 @@ op_sub = { "-" }
 op_mul = { "*" }
 op_div = { "/" }
 op_mod = { "%" }
+op_pow = { "^" }
 op_neg = { "-" }
 
 // Postfix `IS NULL` / `IS NOT NULL`. Ordered so `IS NOT NULL`
@@ -434,7 +436,8 @@ fn_arg_list = { kw_distinct? ~ expression ~ ("," ~ expression)* }
 property_access = { identifier ~ "." ~ identifier }
 
 literal = { float | integer | string | boolean_lit | null_lit }
-float = @{ "-"? ~ (ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ | "." ~ ASCII_DIGIT+) ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? }
+float = @{ "-"? ~ (ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ | "." ~ ASCII_DIGIT+) ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)?
+         | "-"? ~ ASCII_DIGIT+ ~ ("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+ }
 integer = @{ "-"? ~ (hex_integer | octal_integer | ASCII_DIGIT+) }
 hex_integer = _{ ("0x" | "0X") ~ ASCII_HEX_DIGIT+ }
 octal_integer = _{ ("0o" | "0O") ~ ('0'..'7')+ }

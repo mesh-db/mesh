@@ -1119,10 +1119,6 @@ pub(crate) fn eval_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<
                 if b == 0 {
                     return Err(Error::DivideByZero);
                 }
-                // Cypher and Neo4j use truncated integer
-                // division for int/int; `/` on f64 is floating
-                // and diverges. `wrapping_div` guards against
-                // `i64::MIN / -1` panicking.
                 Num::Int(a.wrapping_div(b))
             }
             BinaryOp::Mod => {
@@ -1131,6 +1127,8 @@ pub(crate) fn eval_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<
                 }
                 Num::Int(a.wrapping_rem(b))
             }
+            // Exponentiation always produces a float
+            BinaryOp::Pow => Num::Float((a as f64).powf(b as f64)),
         },
         (a, b) => {
             let af = a.to_f64();
@@ -1141,6 +1139,7 @@ pub(crate) fn eval_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<
                 BinaryOp::Mul => af * bf,
                 BinaryOp::Div => af / bf,
                 BinaryOp::Mod => af % bf,
+                BinaryOp::Pow => af.powf(bf),
             };
             Num::Float(r)
         }

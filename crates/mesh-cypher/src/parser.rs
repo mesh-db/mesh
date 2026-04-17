@@ -1698,6 +1698,33 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             }
             Ok(left)
         }
+        Rule::pow_expr => {
+            let mut inner = pair.into_inner();
+            let mut left = build_expression(
+                inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty pow_expr".into()))?,
+            )?;
+            while let Some(op_pair) = inner.next() {
+                if op_pair.as_rule() != Rule::op_pow {
+                    return Err(Error::Parse(format!(
+                        "unexpected rule in pow_expr: {:?}",
+                        op_pair.as_rule()
+                    )));
+                }
+                let right = build_expression(
+                    inner
+                        .next()
+                        .ok_or_else(|| Error::Parse("pow_expr missing rhs".into()))?,
+                )?;
+                left = Expr::BinaryOp {
+                    op: BinaryOp::Pow,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            }
+            Ok(left)
+        }
         Rule::unary_expr => {
             let mut inner = pair.into_inner();
             let first = inner
