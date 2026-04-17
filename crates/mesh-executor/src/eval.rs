@@ -116,6 +116,29 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             {
                 return Ok(Value::Null);
             }
+            // String index on node/edge/map = dynamic property access
+            if let Value::Property(Property::String(key)) = &idx_val {
+                return match base_val {
+                    Value::Node(n) => Ok(n
+                        .properties
+                        .get(key)
+                        .cloned()
+                        .map(Value::Property)
+                        .unwrap_or(Value::Null)),
+                    Value::Edge(e) => Ok(e
+                        .properties
+                        .get(key)
+                        .cloned()
+                        .map(Value::Property)
+                        .unwrap_or(Value::Null)),
+                    Value::Property(Property::Map(m)) => Ok(m
+                        .get(key)
+                        .cloned()
+                        .map(Value::Property)
+                        .unwrap_or(Value::Null)),
+                    _ => Ok(Value::Null),
+                };
+            }
             let items = match base_val {
                 Value::List(items) => items,
                 Value::Property(Property::List(props)) => {
