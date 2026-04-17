@@ -2208,11 +2208,6 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             ));
                         }
                         let edge_type = hop.rel.edge_types[0].clone();
-                        if !matches!(hop.rel.direction, Direction::Outgoing) {
-                            return Err(Error::Plan(
-                                "MERGE currently supports only directed outgoing edges".into(),
-                            ));
-                        }
                         let dst_var =
                             hop.target.var.clone().unwrap_or_else(|| {
                                 format!("__merge_t{}_{}", stage_pattern_offset, hi)
@@ -2221,14 +2216,20 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             hop.rel.var.clone().unwrap_or_else(|| {
                                 format!("__merge_e{}_{}", stage_pattern_offset, hi)
                             });
+                        // For incoming edges, swap src and dst
+                        let (merge_src, merge_dst) = if matches!(hop.rel.direction, Direction::Incoming) {
+                            (dst_var.clone(), current_src.clone())
+                        } else {
+                            (current_src.clone(), dst_var.clone())
+                        };
                         let current = plan.take().ok_or_else(|| {
                             Error::Plan("MERGE on an edge pattern requires bound endpoints".into())
                         })?;
                         plan = Some(LogicalPlan::MergeEdge {
                             input: Box::new(current),
                             edge_var: edge_var.clone(),
-                            src_var: current_src.clone(),
-                            dst_var: dst_var.clone(),
+                            src_var: merge_src,
+                            dst_var: merge_dst,
                             edge_type,
                             on_create: on_create.clone(),
                             on_match: on_match.clone(),
@@ -2629,11 +2630,8 @@ fn apply_optional_match(
         let start_var = pattern
             .start
             .var
-            .as_ref()
-            .ok_or_else(|| {
-                Error::Plan("OPTIONAL MATCH start node must name an already-bound variable".into())
-            })?
-            .clone();
+            .clone()
+            .unwrap_or_else(|| format!("__opt_start_{}", bound_vars.len()));
         if !bound_vars.contains_key(&start_var) {
             // Standalone OPTIONAL MATCH — the start var is not yet
             // bound. Plan it like a regular MATCH: fresh scan + hops.

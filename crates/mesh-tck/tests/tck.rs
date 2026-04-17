@@ -439,7 +439,68 @@ fn parse_tck_value(s: &str) -> Value {
     if s.starts_with('\'') && s.ends_with('\'') {
         return Value::Property(Property::String(s[1..s.len() - 1].to_string()));
     }
+    // Parse list parameters like [1, 2, null]
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        if inner.is_empty() {
+            return Value::List(Vec::new());
+        }
+        let items: Vec<Value> = split_list_elements(inner)
+            .iter()
+            .map(|item| parse_tck_value(item))
+            .collect();
+        return Value::List(items);
+    }
+    // Parse map parameters like {key: value}
+    if s.starts_with('{') && s.ends_with('}') {
+        let inner = &s[1..s.len() - 1];
+        if inner.is_empty() {
+            return Value::Property(Property::Map(std::collections::HashMap::new()));
+        }
+        let mut map = std::collections::HashMap::new();
+        for entry in split_list_elements(inner) {
+            let entry = entry.trim();
+            if let Some(colon_pos) = entry.find(':') {
+                let key = entry[..colon_pos].trim().to_string();
+                let val = parse_tck_value(&entry[colon_pos + 1..]);
+                if let Value::Property(p) = val {
+                    map.insert(key, p);
+                } else if matches!(val, Value::Null) {
+                    map.insert(key, Property::Null);
+                }
+            }
+        }
+        return Value::Property(Property::Map(map));
+    }
     Value::Property(Property::String(s.to_string()))
+}
+
+/// Split comma-separated elements, respecting nested brackets.
+fn split_list_elements(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '[' | '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ']' | '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                result.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        result.push(current.trim().to_string());
+    }
+    result
 }
 
 // --- Main ---

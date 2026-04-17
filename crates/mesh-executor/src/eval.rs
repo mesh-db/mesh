@@ -153,34 +153,39 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 _ => return Err(Error::TypeMismatch),
             };
             let len = items.len() as i64;
-            let resolve = |expr: &Expr| -> Result<i64> {
+            let resolve = |expr: &Expr| -> Result<Option<i64>> {
                 match eval_expr(expr, ctx)? {
-                    Value::Property(Property::Int64(i)) => Ok(i),
+                    Value::Property(Property::Int64(i)) => Ok(Some(i)),
+                    Value::Null | Value::Property(Property::Null) => Ok(None),
                     _ => Err(Error::TypeMismatch),
                 }
             };
             let s = match start {
-                Some(e) => {
-                    let raw = resolve(e)?;
-                    let abs = if raw < 0 {
-                        (len + raw).max(0)
-                    } else {
-                        raw.min(len)
-                    };
-                    abs as usize
-                }
+                Some(e) => match resolve(e)? {
+                    Some(raw) => {
+                        let abs = if raw < 0 {
+                            (len + raw).max(0)
+                        } else {
+                            raw.min(len)
+                        };
+                        abs as usize
+                    }
+                    None => return Ok(Value::Null),
+                },
                 None => 0,
             };
             let e = match end {
-                Some(e) => {
-                    let raw = resolve(e)?;
-                    let abs = if raw < 0 {
-                        (len + raw).max(0)
-                    } else {
-                        raw.min(len)
-                    };
-                    abs as usize
-                }
+                Some(e) => match resolve(e)? {
+                    Some(raw) => {
+                        let abs = if raw < 0 {
+                            (len + raw).max(0)
+                        } else {
+                            raw.min(len)
+                        };
+                        abs as usize
+                    }
+                    None => return Ok(Value::Null),
+                },
                 None => len as usize,
             };
             if s >= e {
