@@ -7,8 +7,9 @@ use crate::{
 };
 use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use mesh_cypher::{
-    AggregateArg, AggregateFn, AggregateSpec, CreateEdgeSpec, CreateNodeSpec, Direction, Expr,
-    LogicalPlan, RemoveSpec, ReturnItem, SetAssignment, SortItem,
+    AggregateArg, AggregateFn, AggregateSpec, BinaryOp, CallArgs, CompareOp, CreateEdgeSpec,
+    CreateNodeSpec, Direction, Expr, Literal, LogicalPlan, RemoveSpec, ReturnItem, SetAssignment,
+    SortItem, UnaryOp,
 };
 use mesh_storage::RocksDbStorageEngine;
 use std::cmp::Ordering;
@@ -2488,14 +2489,102 @@ impl Operator for ProjectOp {
 }
 
 fn default_name(expr: &Expr, idx: usize) -> String {
-    match expr {
+    render_expr_name(expr).unwrap_or_else(|| format!("col{}", idx))
+}
+
+fn render_expr_name(expr: &Expr) -> Option<String> {
+    Some(match expr {
         Expr::Identifier(s) => s.clone(),
-        Expr::Property { var, key } => format!("{}.{}", var, key),
+        Expr::Property { var, key } => format!("{var}.{key}"),
         Expr::PropertyAccess { base, key } => {
-            format!("{}.{}", default_name(base, idx), key)
+            format!("{}.{key}", render_expr_name(base)?)
         }
-        _ => format!("col{}", idx),
-    }
+        Expr::Parameter(name) => format!("${name}"),
+        Expr::Literal(Literal::String(s)) => format!("'{s}'"),
+        Expr::Literal(Literal::Integer(i)) => i.to_string(),
+        Expr::Literal(Literal::Float(f)) => f.to_string(),
+        Expr::Literal(Literal::Boolean(b)) => b.to_string(),
+        Expr::Literal(Literal::Null) => "NULL".into(),
+        Expr::Call { name, args } => {
+            let arg_str = match args {
+                CallArgs::Star => "*".into(),
+                CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) => {
+                    let prefix = if matches!(args, CallArgs::DistinctExprs(_)) {
+                        "DISTINCT "
+                    } else {
+                        ""
+                    };
+                    let inner: Vec<String> = es.iter().filter_map(render_expr_name).collect();
+                    if inner.len() != es.len() {
+                        return None;
+                    }
+                    format!("{prefix}{}", inner.join(", "))
+                }
+            };
+            format!("{name}({arg_str})")
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let op_str = match op {
+                BinaryOp::Add => " + ",
+                BinaryOp::Sub => " - ",
+                BinaryOp::Mul => " * ",
+                BinaryOp::Div => " / ",
+                BinaryOp::Mod => " % ",
+                BinaryOp::Pow => " ^ ",
+            };
+            format!("{}{op_str}{}", render_expr_name(left)?, render_expr_name(right)?)
+        }
+        Expr::UnaryOp { op, operand } => {
+            let op_str = match op {
+                UnaryOp::Neg => "-",
+            };
+            format!("{op_str}{}", render_expr_name(operand)?)
+        }
+        Expr::Not(inner) => format!("NOT {}", render_expr_name(inner)?),
+        Expr::IsNull { negated, inner } => {
+            if *negated {
+                format!("{} IS NOT NULL", render_expr_name(inner)?)
+            } else {
+                format!("{} IS NULL", render_expr_name(inner)?)
+            }
+        }
+        Expr::Compare { op, left, right } => {
+            let op_str = match op {
+                CompareOp::Eq => " = ",
+                CompareOp::Ne => " <> ",
+                CompareOp::Lt => " < ",
+                CompareOp::Le => " <= ",
+                CompareOp::Gt => " > ",
+                CompareOp::Ge => " >= ",
+                CompareOp::StartsWith => " STARTS WITH ",
+                CompareOp::EndsWith => " ENDS WITH ",
+                CompareOp::Contains => " CONTAINS ",
+                CompareOp::RegexMatch => " =~ ",
+            };
+            format!("{}{op_str}{}", render_expr_name(left)?, render_expr_name(right)?)
+        }
+        Expr::List(items) => {
+            let inner: Vec<String> = items.iter().filter_map(render_expr_name).collect();
+            if inner.len() != items.len() {
+                return None;
+            }
+            format!("[{}]", inner.join(", "))
+        }
+        Expr::Map(entries) => {
+            let inner: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| render_expr_name(v).map(|vn| format!("{k}: {vn}")))
+                .collect::<Option<Vec<_>>>()?;
+            format!("{{{}}}", inner.join(", "))
+        }
+        Expr::IndexAccess { base, index } => {
+            format!("{}[{}]", render_expr_name(base)?, render_expr_name(index)?)
+        }
+        Expr::InList { element, list } => {
+            format!("{} IN {}", render_expr_name(element)?, render_expr_name(list)?)
+        }
+        _ => return None,
+    })
 }
 
 struct DistinctOp {

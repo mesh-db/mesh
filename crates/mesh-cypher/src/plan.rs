@@ -1,6 +1,7 @@
 use crate::ast::{
-    CallArgs, CreateStmt, Direction, Expr, IndexDdl, Literal, MatchStmt, NodePattern, Pattern,
-    ReturnItem, ReturnStmt, ShortestKind, SortItem, Statement, UnionStmt, UnwindStmt,
+    BinaryOp, CallArgs, CompareOp, CreateStmt, Direction, Expr, IndexDdl, Literal, MatchStmt,
+    NodePattern, Pattern, ReturnItem, ReturnStmt, ShortestKind, SortItem, Statement, UnaryOp,
+    UnionStmt, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -1131,7 +1132,103 @@ fn render_expr_key(expr: &Expr) -> String {
         Expr::Literal(Literal::Float(f)) => f.to_string(),
         Expr::Literal(Literal::Boolean(b)) => b.to_string(),
         Expr::Literal(Literal::Null) => "NULL".into(),
-        Expr::Call { name, .. } => format!("{name}(...)"),
+        Expr::Call { name, args } => {
+            let arg_str = match args {
+                CallArgs::Star => "*".into(),
+                CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) => {
+                    let prefix = if matches!(args, CallArgs::DistinctExprs(_)) {
+                        "DISTINCT "
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{}{}",
+                        prefix,
+                        es.iter().map(render_expr_key).collect::<Vec<_>>().join(", ")
+                    )
+                }
+            };
+            format!("{name}({arg_str})")
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let op_str = match op {
+                BinaryOp::Add => " + ",
+                BinaryOp::Sub => " - ",
+                BinaryOp::Mul => " * ",
+                BinaryOp::Div => " / ",
+                BinaryOp::Mod => " % ",
+                BinaryOp::Pow => " ^ ",
+            };
+            format!("{}{op_str}{}", render_expr_key(left), render_expr_key(right))
+        }
+        Expr::UnaryOp { op, operand } => {
+            let op_str = match op {
+                UnaryOp::Neg => "-",
+            };
+            format!("{op_str}{}", render_expr_key(operand))
+        }
+        Expr::Not(inner) => format!("NOT {}", render_expr_key(inner)),
+        Expr::IsNull { negated, inner } => {
+            if *negated {
+                format!("{} IS NOT NULL", render_expr_key(inner))
+            } else {
+                format!("{} IS NULL", render_expr_key(inner))
+            }
+        }
+        Expr::Compare { op, left, right } => {
+            let op_str = match op {
+                CompareOp::Eq => " = ",
+                CompareOp::Ne => " <> ",
+                CompareOp::Lt => " < ",
+                CompareOp::Le => " <= ",
+                CompareOp::Gt => " > ",
+                CompareOp::Ge => " >= ",
+                CompareOp::StartsWith => " STARTS WITH ",
+                CompareOp::EndsWith => " ENDS WITH ",
+                CompareOp::Contains => " CONTAINS ",
+                CompareOp::RegexMatch => " =~ ",
+            };
+            format!("{}{op_str}{}", render_expr_key(left), render_expr_key(right))
+        }
+        Expr::List(items) => {
+            let inner: Vec<String> = items.iter().map(render_expr_key).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        Expr::Map(entries) => {
+            let inner: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", render_expr_key(v)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Expr::IndexAccess { base, index } => {
+            format!("{}[{}]", render_expr_key(base), render_expr_key(index))
+        }
+        Expr::InList { element, list } => {
+            format!("{} IN {}", render_expr_key(element), render_expr_key(list))
+        }
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            let mut s = String::from("CASE");
+            if let Some(sc) = scrutinee {
+                s.push_str(&format!(" {}", render_expr_key(sc)));
+            }
+            for (when, then) in branches {
+                s.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    render_expr_key(when),
+                    render_expr_key(then)
+                ));
+            }
+            if let Some(el) = else_expr {
+                s.push_str(&format!(" ELSE {}", render_expr_key(el)));
+            }
+            s.push_str(" END");
+            s
+        }
         _ => format!("{expr:?}"),
     }
 }
