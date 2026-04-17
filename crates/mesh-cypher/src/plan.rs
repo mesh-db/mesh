@@ -2802,6 +2802,17 @@ fn classify_return_items(
                     AggregateArg::Star
                 }
                 CallArgs::Exprs(es) if es.len() == 1 => AggregateArg::Expr(es[0].clone()),
+                // percentileDisc/percentileCont take 2 args (expr, percentile)
+                // We use only the first arg for aggregation; the second is a constant
+                CallArgs::Exprs(es)
+                    if es.len() == 2
+                        && matches!(
+                            func,
+                            AggregateFn::PercentileDisc | AggregateFn::PercentileCont
+                        ) =>
+                {
+                    AggregateArg::Expr(es[0].clone())
+                }
                 CallArgs::Exprs(_) => {
                     return Err(Error::Plan(format!("{} takes exactly one argument", name)))
                 }

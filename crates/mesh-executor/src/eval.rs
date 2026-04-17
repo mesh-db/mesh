@@ -513,7 +513,11 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::BinaryOp { op, left, right } => {
             let l = eval_expr(left, ctx)?;
             let r = eval_expr(right, ctx)?;
-            eval_binary_op(*op, l, r)
+            match eval_binary_op(*op, l, r) {
+                Ok(v) => Ok(v),
+                Err(Error::TypeMismatch) => Ok(Value::Null),
+                Err(e) => Err(e),
+            }
         }
         Expr::UnaryOp { op, operand } => {
             let v = eval_expr(operand, ctx)?;
