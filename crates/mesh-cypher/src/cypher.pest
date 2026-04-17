@@ -434,7 +434,7 @@ fn_arg_list = { kw_distinct? ~ expression ~ ("," ~ expression)* }
 property_access = { identifier ~ "." ~ identifier }
 
 literal = { float | integer | string | boolean_lit | null_lit }
-float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+float = @{ "-"? ~ (ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ | "." ~ ASCII_DIGIT+) ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? }
 integer = @{ "-"? ~ (hex_integer | octal_integer | ASCII_DIGIT+) }
 hex_integer = _{ ("0x" | "0X") ~ ASCII_HEX_DIGIT+ }
 octal_integer = _{ ("0o" | "0O") ~ ('0'..'7')+ }
