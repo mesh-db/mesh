@@ -453,7 +453,7 @@ reserved = @{
     (^"create" | ^"merge" | ^"match" | ^"where" | ^"return" | ^"skip" | ^"limit" |
      ^"as" | ^"or" | ^"and" | ^"not" | ^"true" | ^"false" | ^"null" |
      ^"set" | ^"delete" | ^"detach" |
-     ^"distinct" | ^"order" | ^"by" | ^"asc" | ^"desc" |
+     ^"distinct" | ^"order" | ^"by" | ^"ascending" | ^"asc" | ^"descending" | ^"desc" |
      ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind" |
      ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on" |
      ^"with" | ^"optional" | ^"contains" | ^"remove")
@@ -477,8 +477,8 @@ kw_delete = _{ ^"delete" }
 kw_detach = @{ ^"detach" ~ !id_cont }
 kw_order = _{ ^"order" }
 kw_by = _{ ^"by" }
-kw_asc = @{ ^"asc" ~ !id_cont }
-kw_desc = @{ ^"desc" ~ !id_cont }
+kw_asc = @{ (^"ascending" | ^"asc") ~ !id_cont }
+kw_desc = @{ (^"descending" | ^"desc") ~ !id_cont }
 kw_distinct = @{ ^"distinct" ~ !id_cont }
 kw_case = @{ ^"case" ~ !id_cont }
 kw_when = @{ ^"when" ~ !id_cont }
