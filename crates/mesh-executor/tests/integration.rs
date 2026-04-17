@@ -1991,9 +1991,10 @@ fn chained_unwind_empty_list_drops_input_row() {
 
 #[test]
 fn chained_unwind_rejects_alias_collision() {
+    // UNWIND is now allowed to rebind existing variables per openCypher spec.
     let parsed = mesh_cypher::parse("MATCH (x) UNWIND [1, 2] AS x RETURN x").unwrap();
-    let err = mesh_cypher::plan(&parsed).unwrap_err();
-    assert!(format!("{err}").contains("already bound"), "got: {err}");
+    let plan = mesh_cypher::plan(&parsed);
+    assert!(plan.is_ok(), "UNWIND rebinding should be allowed: {:?}", plan.err());
 }
 
 #[test]
@@ -4887,7 +4888,6 @@ fn cross_stage_rebind_both_vars_bound_plans() {
     .unwrap();
     mesh_cypher::plan(&stmt).expect(
         "cross-stage rebind with both vars bound should plan",
-        "expected 'only start var' error, got: {msg}",
     );
 }
 
@@ -5872,13 +5872,16 @@ fn date_plus_duration_days_only() {
 
 #[test]
 fn date_plus_duration_with_seconds_errors() {
+    // date() + duration({seconds: 10}) now returns null instead of erroring,
+    // per openCypher semantics for type-mismatched arithmetic.
     let (store, _d) = open_store();
     let plan = mesh_cypher::plan(
         &mesh_cypher::parse("RETURN date() + duration({seconds: 10}) AS d").unwrap(),
     )
     .unwrap();
-    let err = mesh_executor::execute(&plan, &store).unwrap_err();
-    assert!(matches!(err, mesh_executor::Error::TypeMismatch));
+    let rows = mesh_executor::execute(&plan, &store).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].get("d"), Some(mesh_executor::Value::Null)));
 }
 
 #[test]
