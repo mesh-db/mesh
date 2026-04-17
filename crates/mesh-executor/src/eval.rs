@@ -2393,42 +2393,58 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             let mut seconds = 0_i64;
             let mut nanos = 0_i32;
             for (k, v) in &entries {
-                let as_i64 = match v {
-                    Property::Int64(i) => *i,
+                let as_f64 = match v {
+                    Property::Int64(i) => *i as f64,
+                    Property::Float64(f) => *f,
                     Property::Null => continue,
                     _ => return Err(Error::TypeMismatch),
                 };
+                // Use f64 arithmetic to handle fractional cascading
                 match k.as_str() {
                     "years" => {
-                        months = months.wrapping_add(as_i64.wrapping_mul(12));
+                        let total_months = as_f64 * 12.0;
+                        months += total_months as i64;
+                        let frac_months = total_months - (total_months as i64 as f64);
+                        days += (frac_months * 30.0) as i64;
                     }
                     "months" => {
-                        months = months.wrapping_add(as_i64);
+                        months += as_f64 as i64;
+                        let frac = as_f64 - (as_f64 as i64 as f64);
+                        days += (frac * 30.0) as i64;
                     }
                     "weeks" => {
-                        days = days.wrapping_add(as_i64.wrapping_mul(7));
+                        days += (as_f64 * 7.0) as i64;
                     }
                     "days" => {
-                        days = days.wrapping_add(as_i64);
+                        days += as_f64 as i64;
+                        let frac = as_f64 - (as_f64 as i64 as f64);
+                        seconds += (frac * 86400.0) as i64;
                     }
                     "hours" => {
-                        seconds = seconds.wrapping_add(as_i64.wrapping_mul(3600));
+                        seconds += (as_f64 * 3600.0) as i64;
+                        let frac = as_f64 * 3600.0 - ((as_f64 * 3600.0) as i64 as f64);
+                        nanos += (frac * 1_000_000_000.0) as i32;
                     }
                     "minutes" => {
-                        seconds = seconds.wrapping_add(as_i64.wrapping_mul(60));
+                        seconds += (as_f64 * 60.0) as i64;
+                        let frac = as_f64 * 60.0 - ((as_f64 * 60.0) as i64 as f64);
+                        nanos += (frac * 1_000_000_000.0) as i32;
                     }
                     "seconds" => {
-                        seconds = seconds.wrapping_add(as_i64);
+                        seconds += as_f64 as i64;
+                        let frac = as_f64 - (as_f64 as i64 as f64);
+                        nanos += (frac * 1_000_000_000.0) as i32;
                     }
                     "milliseconds" => {
-                        seconds = seconds.wrapping_add(as_i64 / 1000);
-                        nanos = nanos.wrapping_add(((as_i64 % 1000) as i32) * 1_000_000);
+                        let total_nanos = as_f64 * 1_000_000.0;
+                        seconds += (total_nanos / 1_000_000_000.0) as i64;
+                        nanos += (total_nanos % 1_000_000_000.0) as i32;
                     }
                     "microseconds" => {
-                        nanos = nanos.wrapping_add((as_i64 as i32).wrapping_mul(1000));
+                        nanos += (as_f64 * 1000.0) as i32;
                     }
                     "nanoseconds" => {
-                        nanos = nanos.wrapping_add(as_i64 as i32);
+                        nanos += as_f64 as i32;
                     }
                     other => {
                         return Err(Error::UnknownScalarFunction(format!(
