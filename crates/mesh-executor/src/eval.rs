@@ -1776,10 +1776,16 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 Value::Property(Property::Float64(f)) => {
                     Ok(Value::Property(Property::Int64(f as i64)))
                 }
-                Value::Property(Property::String(s)) => match s.trim().parse::<i64>() {
-                    Ok(n) => Ok(Value::Property(Property::Int64(n))),
-                    Err(_) => Ok(Value::Null),
-                },
+                Value::Property(Property::String(s)) => {
+                    let trimmed = s.trim();
+                    if let Ok(n) = trimmed.parse::<i64>() {
+                        Ok(Value::Property(Property::Int64(n)))
+                    } else if let Ok(f) = trimmed.parse::<f64>() {
+                        Ok(Value::Property(Property::Int64(f as i64)))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
                 Value::Property(Property::Bool(b)) => {
                     Ok(Value::Property(Property::Int64(if b { 1 } else { 0 })))
                 }

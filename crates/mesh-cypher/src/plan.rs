@@ -2841,8 +2841,6 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
         };
     }
 
-    // Post-projection WHERE — references the WITH's aliases,
-    // not the pattern's bindings.
     if let Some(predicate) = &w.where_clause {
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
