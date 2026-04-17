@@ -371,7 +371,14 @@ fn format_property(p: &Property) -> String {
                 }
             }
         }
-        Property::String(s) => format!("'{s}'"),
+        Property::String(s) => {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("'{escaped}'")
+        }
         Property::Bool(b) => b.to_string(),
         Property::Null => "null".to_string(),
         Property::List(items) => {
