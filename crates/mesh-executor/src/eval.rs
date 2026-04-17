@@ -2772,7 +2772,8 @@ pub(crate) fn compare_values(a: &Value, b: &Value) -> Ordering {
             la.len().cmp(&lb.len())
         }
         (Value::Property(ap), Value::Property(bp)) => compare_props(ap, bp),
-        _ => Ordering::Equal,
+        // Cross-type value ordering
+        _ => type_order_value(a).cmp(&type_order_value(b)),
     }
 }
 
@@ -2795,7 +2796,33 @@ fn compare_props(a: &Property, b: &Property) -> Ordering {
         // order over durations should project a specific field.
         (Property::DateTime(a), Property::DateTime(b)) => a.cmp(b),
         (Property::Date(a), Property::Date(b)) => a.cmp(b),
-        _ => Ordering::Equal,
+        // Cross-type ordering: use type precedence
+        // Neo4j order: Map > List > String > Boolean > Number
+        _ => type_order_prop(a).cmp(&type_order_prop(b)),
+    }
+}
+
+/// Type precedence for cross-type ordering (higher = sorts later in ASC).
+fn type_order_prop(p: &Property) -> u8 {
+    match p {
+        Property::Null => 0,
+        Property::Int64(_) | Property::Float64(_) => 1,
+        Property::Bool(_) => 2,
+        Property::String(_) => 3,
+        Property::List(_) => 4,
+        Property::Map(_) => 5,
+        Property::Date(_) | Property::DateTime(_) | Property::Duration(_) => 6,
+    }
+}
+
+fn type_order_value(v: &Value) -> u8 {
+    match v {
+        Value::Null | Value::Property(Property::Null) => 10,
+        Value::Property(p) => type_order_prop(p),
+        Value::Node(_) => 7,
+        Value::Edge(_) => 8,
+        Value::Path { .. } => 6,
+        Value::List(_) => 4,
     }
 }
 
