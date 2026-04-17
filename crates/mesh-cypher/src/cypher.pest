@@ -93,7 +93,7 @@ unwind_stmt = {
 // terminal tail is optional: a bare `MERGE (n)` has no
 // RETURN but is still valid (it's effectful).
 match_stmt = {
-    reading_clause+ ~ terminal_tail?
+    (reading_clause | mutation_clause)+ ~ terminal_tail?
 }
 
 // One reading stage. The parser enforces that the first
@@ -426,7 +426,7 @@ list_comp = {
 list_comp_where = { kw_where ~ expression }
 list_comp_proj = { "|" ~ expression }
 
-function_call = { identifier ~ "(" ~ fn_args? ~ ")" }
+function_call = { identifier ~ ("." ~ identifier)? ~ "(" ~ fn_args? ~ ")" }
 fn_args = { count_star | fn_arg_list }
 count_star = { "*" }
 fn_arg_list = { kw_distinct? ~ expression ~ ("," ~ expression)* }
@@ -435,7 +435,9 @@ property_access = { identifier ~ "." ~ identifier }
 
 literal = { float | integer | string | boolean_lit | null_lit }
 float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
-integer = @{ "-"? ~ ASCII_DIGIT+ }
+integer = @{ "-"? ~ (hex_integer | octal_integer | ASCII_DIGIT+) }
+hex_integer = _{ ("0x" | "0X") ~ ASCII_HEX_DIGIT+ }
+octal_integer = _{ ("0o" | "0O") ~ ('0'..'7')+ }
 string = ${ "\"" ~ string_dq ~ "\"" | "'" ~ string_sq ~ "'" }
 string_dq = @{ ("\\" ~ ANY | (!"\"" ~ !"\\" ~ ANY))* }
 string_sq = @{ ("\\" ~ ANY | (!"'" ~ !"\\" ~ ANY))* }

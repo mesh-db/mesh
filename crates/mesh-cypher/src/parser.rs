@@ -519,6 +519,40 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                     }
                 }
             }
+            Rule::mutation_clause => {
+                let mc = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty mutation_clause".into()))?;
+                match mc.as_rule() {
+                    Rule::create_tail => {
+                        let patterns = build_pattern_list_from_create(mc)?;
+                        clauses.push(ReadingClause::Create(patterns));
+                    }
+                    Rule::set_tail => {
+                        let items = build_set_items(mc)?;
+                        clauses.push(ReadingClause::Set(items));
+                    }
+                    Rule::delete_tail => {
+                        let del = build_delete_clause(mc)?;
+                        clauses.push(ReadingClause::Delete(del));
+                    }
+                    Rule::remove_tail => {
+                        let items = build_remove_items(mc)?;
+                        clauses.push(ReadingClause::Remove(items));
+                    }
+                    Rule::foreach_tail => {
+                        let fc = build_foreach_clause(mc)?;
+                        clauses.push(ReadingClause::Foreach(fc));
+                    }
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rule inside mutation_clause: {:?}",
+                            r
+                        )))
+                    }
+                }
+            }
             Rule::terminal_tail => {
                 build_terminal_tail(p, &mut terminal)?;
             }
@@ -548,7 +582,13 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         | ReadingClause::With(_)
         | ReadingClause::Call(_)
         | ReadingClause::LoadCsv(_)
+        | ReadingClause::Create(_)
         | ReadingClause::OptionalMatch(_) => {}
+        _ => {
+            return Err(Error::Parse(
+                "query must start with MATCH, CREATE, MERGE, or UNWIND".into(),
+            ));
+        }
     }
 
     Ok(MatchStmt { clauses, terminal })
@@ -816,6 +856,146 @@ fn build_terminal_tail(pair: Pair<Rule>, terminal: &mut crate::ast::TerminalTail
         }
     }
     Ok(())
+}
+
+/// Extract patterns from a `create_tail` pair.
+fn build_pattern_list_from_create(pair: Pair<Rule>) -> Result<Vec<Pattern>> {
+    let list = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("create tail missing pattern list".into()))?;
+    build_pattern_list(list)
+}
+
+/// Parse the set_items from a `set_tail` pair.
+fn build_set_items(pair: Pair<Rule>) -> Result<Vec<crate::ast::SetItem>> {
+    let set_items_pair = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty set".into()))?;
+    let mut items = Vec::new();
+    for set_item_pair in set_items_pair.into_inner() {
+        debug_assert_eq!(set_item_pair.as_rule(), Rule::set_item);
+        let inner = set_item_pair
+            .into_inner()
+            .next()
+            .ok_or_else(|| Error::Parse("empty set item".into()))?;
+        items.push(build_set_item(inner)?);
+    }
+    Ok(items)
+}
+
+/// Parse a `delete_tail` pair into a [`DeleteClause`].
+fn build_delete_clause(pair: Pair<Rule>) -> Result<DeleteClause> {
+    let mut detach = false;
+    let mut vars = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::kw_detach => detach = true,
+            Rule::delete_items => {
+                for id in inner.into_inner() {
+                    vars.push(parse_ident(id.as_str()));
+                }
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in delete tail: {:?}",
+                    r
+                )))
+            }
+        }
+    }
+    Ok(DeleteClause { detach, vars })
+}
+
+/// Parse a `remove_tail` pair into [`RemoveItem`] entries.
+fn build_remove_items(pair: Pair<Rule>) -> Result<Vec<crate::ast::RemoveItem>> {
+    let items_pair = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty remove".into()))?;
+    let mut items = Vec::new();
+    for item_pair in items_pair.into_inner() {
+        debug_assert_eq!(item_pair.as_rule(), Rule::remove_item);
+        let inner = item_pair
+            .into_inner()
+            .next()
+            .ok_or_else(|| Error::Parse("empty remove item".into()))?;
+        match inner.as_rule() {
+            Rule::remove_prop_item => {
+                let mut parts = inner.into_inner();
+                let pa = parts.next().unwrap();
+                let mut pa_inner = pa.into_inner();
+                let var = pa_inner.next().unwrap().as_str().to_string();
+                let key = pa_inner.next().unwrap().as_str().to_string();
+                items.push(crate::ast::RemoveItem::Property { var, key });
+            }
+            Rule::remove_label_item => {
+                let mut var = String::new();
+                let mut labels = Vec::new();
+                for child in inner.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => var = parse_ident(child.as_str()),
+                        Rule::label_spec => {
+                            let label = child.into_inner().next().unwrap().as_str().to_string();
+                            labels.push(label);
+                        }
+                        _ => {}
+                    }
+                }
+                items.push(crate::ast::RemoveItem::Labels { var, labels });
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in remove item: {:?}",
+                    r
+                )));
+            }
+        }
+    }
+    Ok(items)
+}
+
+/// Parse a `foreach_tail` pair into a [`ForeachClause`].
+fn build_foreach_clause(pair: Pair<Rule>) -> Result<crate::ast::ForeachClause> {
+    let mut var = String::new();
+    let mut list_expr = None;
+    let mut set_items = Vec::new();
+    let mut remove_items = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier if var.is_empty() => {
+                var = parse_ident(inner.as_str());
+            }
+            Rule::expression if list_expr.is_none() => {
+                list_expr = Some(build_expression(inner)?);
+            }
+            Rule::kw_in | Rule::kw_foreach => {}
+            Rule::foreach_body => {
+                let body_inner = inner
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty foreach body".into()))?;
+                match body_inner.as_rule() {
+                    Rule::set_tail => {
+                        set_items.extend(build_set_items(body_inner)?);
+                    }
+                    Rule::remove_tail => {
+                        remove_items.extend(build_remove_items(body_inner)?);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(crate::ast::ForeachClause {
+        var,
+        list_expr: list_expr
+            .ok_or_else(|| Error::Parse("FOREACH missing list expression".into()))?,
+        set_items,
+        remove_items,
+    })
 }
 
 /// Parse one `OPTIONAL MATCH <patterns> [WHERE ...]` clause into
@@ -1642,12 +1822,20 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
         Rule::literal => Ok(Expr::Literal(build_literal(pair)?)),
         Rule::function_call => {
             let mut inner = pair.into_inner();
-            let name = inner
+            // Collect identifiers to build function name (may include namespace dot)
+            let first = inner
                 .next()
-                .ok_or_else(|| Error::Parse("function call missing name".into()))?
-                .as_str()
-                .to_string();
-            let args = match inner.next() {
+                .ok_or_else(|| Error::Parse("function call missing name".into()))?;
+            let mut name = parse_ident(first.as_str());
+            // Check if next token is another identifier (namespace form: ns.func)
+            let mut next = inner.next();
+            if let Some(ref p) = next {
+                if p.as_rule() == Rule::identifier {
+                    name = format!("{}.{}", name, parse_ident(p.as_str()));
+                    next = inner.next();
+                }
+            }
+            let args = match next {
                 None => CallArgs::Exprs(Vec::new()),
                 Some(fn_args_pair) => {
                     let inside = fn_args_pair
@@ -2070,7 +2258,19 @@ fn unescape_string(s: &str) -> String {
 }
 
 fn parse_integer(s: &str) -> Result<i64> {
-    s.parse().map_err(|_| Error::InvalidNumber(s.to_string()))
+    let (negative, digits) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, s)
+    };
+    let val = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).map_err(|_| Error::InvalidNumber(s.to_string()))?
+    } else if let Some(oct) = digits.strip_prefix("0o").or_else(|| digits.strip_prefix("0O")) {
+        i64::from_str_radix(oct, 8).map_err(|_| Error::InvalidNumber(s.to_string()))?
+    } else {
+        digits.parse::<i64>().map_err(|_| Error::InvalidNumber(s.to_string()))?
+    };
+    Ok(if negative { -val } else { val })
 }
 
 fn build_compare_op(pair: Pair<Rule>) -> Result<CompareOp> {

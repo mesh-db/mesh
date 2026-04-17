@@ -3,6 +3,7 @@ use crate::{
     reader::GraphReader,
     value::{ParamMap, Row, Value},
 };
+use chrono::{Datelike, Timelike};
 use mesh_core::{NodeId, Property};
 use mesh_cypher::{
     BinaryOp, CallArgs, CompareOp, Direction, Expr, Literal, NodePattern, Pattern, UnaryOp,
@@ -80,7 +81,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     .cloned()
                     .map(Value::Property)
                     .unwrap_or(Value::Null)),
-                _ => Err(Error::NotNodeOrEdge),
+                _ => Ok(Value::Null),
             }
         }
         Expr::PropertyAccess { base, key } => {
@@ -104,7 +105,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     .cloned()
                     .map(Value::Property)
                     .unwrap_or(Value::Null)),
-                _ => Err(Error::NotNodeOrEdge),
+                _ => Ok(Value::Null),
             }
         }
         Expr::IndexAccess { base, index } => {
@@ -189,28 +190,51 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         }
         Expr::Not(inner) => {
             let v = eval_expr(inner, ctx)?;
-            Ok(Value::Property(Property::Bool(!to_bool(&v)?)))
+            match to_bool_3v(&v)? {
+                Some(b) => Ok(Value::Property(Property::Bool(!b))),
+                None => Ok(Value::Null),
+            }
         }
         Expr::And(a, b) => {
-            let va = to_bool(&eval_expr(a, ctx)?)?;
-            if !va {
+            // Three-valued AND: false AND anything = false,
+            // true AND x = x, null AND false = false, null AND x = null
+            let va = to_bool_3v(&eval_expr(a, ctx)?)?;
+            if va == Some(false) {
                 return Ok(Value::Property(Property::Bool(false)));
             }
-            let vb = to_bool(&eval_expr(b, ctx)?)?;
-            Ok(Value::Property(Property::Bool(vb)))
+            let vb = to_bool_3v(&eval_expr(b, ctx)?)?;
+            if vb == Some(false) {
+                return Ok(Value::Property(Property::Bool(false)));
+            }
+            match (va, vb) {
+                (Some(true), Some(true)) => Ok(Value::Property(Property::Bool(true))),
+                _ => Ok(Value::Null),
+            }
         }
         Expr::Or(a, b) => {
-            let va = to_bool(&eval_expr(a, ctx)?)?;
-            if va {
+            // Three-valued OR: true OR anything = true,
+            // false OR x = x, null OR true = true, null OR x = null
+            let va = to_bool_3v(&eval_expr(a, ctx)?)?;
+            if va == Some(true) {
                 return Ok(Value::Property(Property::Bool(true)));
             }
-            let vb = to_bool(&eval_expr(b, ctx)?)?;
-            Ok(Value::Property(Property::Bool(vb)))
+            let vb = to_bool_3v(&eval_expr(b, ctx)?)?;
+            if vb == Some(true) {
+                return Ok(Value::Property(Property::Bool(true)));
+            }
+            match (va, vb) {
+                (Some(false), Some(false)) => Ok(Value::Property(Property::Bool(false))),
+                _ => Ok(Value::Null),
+            }
         }
         Expr::Xor(a, b) => {
-            let va = to_bool(&eval_expr(a, ctx)?)?;
-            let vb = to_bool(&eval_expr(b, ctx)?)?;
-            Ok(Value::Property(Property::Bool(va ^ vb)))
+            // Three-valued XOR: null XOR anything = null
+            let va = to_bool_3v(&eval_expr(a, ctx)?)?;
+            let vb = to_bool_3v(&eval_expr(b, ctx)?)?;
+            match (va, vb) {
+                (Some(x), Some(y)) => Ok(Value::Property(Property::Bool(x ^ y))),
+                _ => Ok(Value::Null),
+            }
         }
         Expr::ListPredicate {
             kind,
@@ -234,7 +258,11 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 let mut scratch = ctx.row.clone();
                 scratch.insert(var.clone(), item.clone());
                 let sub_ctx = ctx.with_row(&scratch);
-                let v = eval_expr(predicate, &sub_ctx)?;
+                let v = match eval_expr(predicate, &sub_ctx) {
+                    Ok(v) => v,
+                    Err(Error::TypeMismatch) | Err(Error::NotBoolean) => Value::Null,
+                    Err(e) => return Err(e),
+                };
                 if to_bool(&v).unwrap_or(false) {
                     count += 1;
                     if *kind == mesh_cypher::ListPredicateKind::Any {
@@ -281,22 +309,42 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         }
         Expr::InList { element, list } => {
             let elem = eval_expr(element, ctx)?;
-            if matches!(elem, Value::Null | Value::Property(Property::Null)) {
-                return Ok(Value::Property(Property::Bool(false)));
-            }
             let list_val = eval_expr(list, ctx)?;
+            // null IN anything = null; x IN null = null
+            if matches!(list_val, Value::Null | Value::Property(Property::Null)) {
+                return Ok(Value::Null);
+            }
             let items = match list_val {
                 Value::List(items) => items,
                 Value::Property(Property::List(props)) => {
                     props.into_iter().map(Value::Property).collect()
                 }
-                Value::Null | Value::Property(Property::Null) => {
-                    return Ok(Value::Property(Property::Bool(false)));
-                }
                 _ => return Err(Error::TypeMismatch),
             };
-            let found = items.iter().any(|item| values_equal(&elem, item));
-            Ok(Value::Property(Property::Bool(found)))
+            if matches!(elem, Value::Null | Value::Property(Property::Null)) {
+                // null IN [anything] = null (unless list is empty → false)
+                return if items.is_empty() {
+                    Ok(Value::Property(Property::Bool(false)))
+                } else {
+                    Ok(Value::Null)
+                };
+            }
+            // Three-valued IN: if element matches any item → true;
+            // if any item is null and no match found → null; otherwise false
+            let mut has_null = false;
+            for item in &items {
+                if values_equal(&elem, item) {
+                    return Ok(Value::Property(Property::Bool(true)));
+                }
+                if matches!(item, Value::Null | Value::Property(Property::Null)) {
+                    has_null = true;
+                }
+            }
+            if has_null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Property(Property::Bool(false)))
+            }
         }
         Expr::Call { name, args } => call_scalar(name, args, ctx),
         Expr::List(items) => {
@@ -1017,6 +1065,19 @@ pub(crate) fn eval_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<
                 out.extend(b.iter().cloned());
                 return Ok(Value::List(out));
             }
+            // list + element: append to list
+            (Value::List(a), rhs) => {
+                let mut out = a.clone();
+                out.push(rhs.clone());
+                return Ok(Value::List(out));
+            }
+            // element + list: prepend to list
+            (lhs, Value::List(b)) => {
+                let mut out = Vec::with_capacity(b.len() + 1);
+                out.push(lhs.clone());
+                out.extend(b.iter().cloned());
+                return Ok(Value::List(out));
+            }
             _ => {}
         }
     }
@@ -1162,11 +1223,30 @@ fn now_epoch_millis() -> i64 {
 fn parse_datetime(s: &str) -> Result<i64> {
     use chrono::{DateTime, FixedOffset, NaiveDateTime};
     let trimmed = s.trim();
+    // Strip bracketed timezone names like [Europe/Stockholm]
+    let trimmed = if let Some(idx) = trimmed.find('[') {
+        trimmed[..idx].trim()
+    } else {
+        trimmed
+    };
     // Try RFC 3339 first (fastest path for the canonical form
     // drivers emit). Chrono's `DateTime::parse_from_rfc3339`
     // accepts both `Z` and explicit offsets.
     if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(trimmed) {
         return Ok(dt.timestamp_millis());
+    }
+    // Try ISO 8601 formats with timezone offsets (with and without colons)
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.f%:z",
+        "%Y-%m-%dT%H:%M:%S%:z",
+        "%Y-%m-%dT%H:%M:%S%.f%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M%z",
+        "%Y-%m-%dT%H:%M%:z",
+    ] {
+        if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(trimmed, fmt) {
+            return Ok(dt.timestamp_millis());
+        }
     }
     // Fall back to a few naive forms. Each is interpreted as
     // UTC. Formats are tried in descending specificity so a
@@ -1175,6 +1255,7 @@ fn parse_datetime(s: &str) -> Result<i64> {
     for fmt in [
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S",
     ] {
@@ -2355,7 +2436,168 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             })))
         }
 
+        // Namespace-qualified temporal functions (duration.between, etc.)
+        "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
+            if arg_exprs.len() != 2 {
+                return Err(Error::UnknownScalarFunction(format!(
+                    "{name}() expects 2 arguments, got {}",
+                    arg_exprs.len()
+                )));
+            }
+            let a = eval_expr(&arg_exprs[0], ctx)?;
+            let b = eval_expr(&arg_exprs[1], ctx)?;
+            if matches!(a, Value::Null | Value::Property(Property::Null))
+                || matches!(b, Value::Null | Value::Property(Property::Null))
+            {
+                return Ok(Value::Null);
+            }
+            // Extract epoch millis from both temporal values
+            let a_millis = temporal_to_millis(&a)?;
+            let b_millis = temporal_to_millis(&b)?;
+            let diff_millis = b_millis - a_millis;
+            let diff_secs = diff_millis / 1000;
+            let remaining_nanos = ((diff_millis % 1000) * 1_000_000) as i32;
+            Ok(Value::Property(Property::Duration(mesh_core::Duration {
+                months: 0,
+                days: 0,
+                seconds: diff_secs,
+                nanos: remaining_nanos,
+            })))
+        }
+
+        // Temporal truncation functions
+        "datetime.truncate" | "localdatetime.truncate" | "date.truncate"
+        | "time.truncate" | "localtime.truncate" => {
+            if arg_exprs.is_empty() || arg_exprs.len() > 3 {
+                return Err(Error::UnknownScalarFunction(format!(
+                    "{name}() expects 1-3 arguments, got {}",
+                    arg_exprs.len()
+                )));
+            }
+            let unit = eval_expr(&arg_exprs[0], ctx)?;
+            let temporal = if arg_exprs.len() > 1 {
+                eval_expr(&arg_exprs[1], ctx)?
+            } else {
+                // Default to current time
+                Value::Property(Property::DateTime(now_epoch_millis()))
+            };
+            if matches!(temporal, Value::Null | Value::Property(Property::Null)) {
+                return Ok(Value::Null);
+            }
+            let unit_str = match &unit {
+                Value::Property(Property::String(s)) => s.to_ascii_lowercase(),
+                _ => return Err(Error::TypeMismatch),
+            };
+            truncate_temporal(name, &unit_str, &temporal)
+        }
+
         _ => Err(Error::UnknownScalarFunction(name.to_string())),
+    }
+}
+
+/// Extract epoch milliseconds from a temporal value.
+fn temporal_to_millis(v: &Value) -> Result<i64> {
+    match v {
+        Value::Property(Property::DateTime(ms)) => Ok(*ms),
+        Value::Property(Property::Date(days)) => Ok(*days as i64 * 86_400_000),
+        _ => Err(Error::TypeMismatch),
+    }
+}
+
+/// Truncate a temporal value to the specified unit.
+fn truncate_temporal(name: &str, unit: &str, temporal: &Value) -> Result<Value> {
+    match temporal {
+        Value::Property(Property::DateTime(_)) | Value::Property(Property::Date(_)) => {
+            let millis = match temporal {
+                Value::Property(Property::DateTime(ms)) => *ms,
+                Value::Property(Property::Date(days)) => *days as i64 * 86_400_000,
+                _ => unreachable!(),
+            };
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let secs = millis / 1000;
+            let nanos = ((millis % 1000) * 1_000_000) as u32;
+            let dt = chrono::DateTime::from_timestamp(secs, nanos)
+                .map(|d| d.naive_utc())
+                .unwrap_or_else(|| epoch.and_hms_opt(0, 0, 0).unwrap());
+            let truncated = match unit.as_ref() {
+                "millennium" => {
+                    let y = ((dt.year() - 1) / 1000) * 1000 + 1;
+                    chrono::NaiveDate::from_ymd_opt(y, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                }
+                "century" => {
+                    let y = ((dt.year() - 1) / 100) * 100 + 1;
+                    chrono::NaiveDate::from_ymd_opt(y, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                }
+                "decade" => {
+                    let y = (dt.year() / 10) * 10;
+                    chrono::NaiveDate::from_ymd_opt(y, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                }
+                "year" => chrono::NaiveDate::from_ymd_opt(dt.year(), 1, 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                "weekyear" | "week" => {
+                    let weekday = dt.weekday().num_days_from_monday();
+                    let d = dt.date() - chrono::Duration::days(weekday as i64);
+                    d.and_hms_opt(0, 0, 0).unwrap()
+                }
+                "quarter" => {
+                    let q = (dt.month() - 1) / 3;
+                    chrono::NaiveDate::from_ymd_opt(dt.year(), q * 3 + 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                }
+                "month" => chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                "day" => dt.date().and_hms_opt(0, 0, 0).unwrap(),
+                "hour" => {
+                    dt.date()
+                        .and_hms_opt(dt.hour(), 0, 0)
+                        .unwrap()
+                }
+                "minute" => {
+                    dt.date()
+                        .and_hms_opt(dt.hour(), dt.minute(), 0)
+                        .unwrap()
+                }
+                "second" => {
+                    dt.date()
+                        .and_hms_opt(dt.hour(), dt.minute(), dt.second())
+                        .unwrap()
+                }
+                "millisecond" | "microsecond" => dt,
+                _ => {
+                    return Err(Error::UnknownScalarFunction(format!(
+                        "unsupported truncation unit: {unit}"
+                    )));
+                }
+            };
+            let diff = truncated
+                .signed_duration_since(epoch.and_hms_opt(0, 0, 0).unwrap());
+            let result_millis = diff.num_milliseconds();
+            if name.starts_with("date.") || name.starts_with("date.") {
+                let days = (result_millis / 86_400_000) as i32;
+                Ok(Value::Property(Property::Date(days)))
+            } else {
+                Ok(Value::Property(Property::DateTime(result_millis)))
+            }
+        }
+        _ => {
+            // For unsupported temporal types, pass through
+            Ok(temporal.clone())
+        }
     }
 }
 
@@ -2532,7 +2774,17 @@ fn literal_to_value(lit: &Literal) -> Value {
 pub(crate) fn to_bool(v: &Value) -> Result<bool> {
     match v {
         Value::Property(Property::Bool(b)) => Ok(*b),
-        Value::Null => Ok(false),
+        Value::Null | Value::Property(Property::Null) => Ok(false),
+        _ => Err(Error::NotBoolean),
+    }
+}
+
+/// Three-valued to_bool: returns None for NULL (unknown), Some(b) for booleans.
+/// Used by logical operators (AND/OR/NOT/XOR) to implement proper NULL propagation.
+fn to_bool_3v(v: &Value) -> Result<Option<bool>> {
+    match v {
+        Value::Property(Property::Bool(b)) => Ok(Some(*b)),
+        Value::Null | Value::Property(Property::Null) => Ok(None),
         _ => Err(Error::NotBoolean),
     }
 }
@@ -2542,7 +2794,9 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
 }
 
 fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
-    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+    if matches!(l, Value::Null | Value::Property(Property::Null))
+        || matches!(r, Value::Null | Value::Property(Property::Null))
+    {
         return Ok(false);
     }
     // String-predicate operators dispatch separately from
@@ -2579,6 +2833,50 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
         }
         _ => {}
     }
+    // List comparison: element-by-element, shorter list is "less"
+    if let (Value::List(la), Value::List(lb)) = (l, r) {
+        for (a, b) in la.iter().zip(lb.iter()) {
+            match compare(CompareOp::Eq, a, b) {
+                Ok(true) => continue,
+                Ok(false) => {
+                    // Elements differ — compare for ordering
+                    let lt = compare(CompareOp::Lt, a, b).unwrap_or(false);
+                    let ord = if lt {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    };
+                    return Ok(match op {
+                        CompareOp::Eq => false,
+                        CompareOp::Ne => true,
+                        CompareOp::Lt => ord == Ordering::Less,
+                        CompareOp::Le => ord != Ordering::Greater,
+                        CompareOp::Gt => ord == Ordering::Greater,
+                        CompareOp::Ge => ord != Ordering::Less,
+                        _ => false,
+                    });
+                }
+                Err(_) => return Err(Error::TypeMismatch),
+            }
+        }
+        // All common elements are equal; compare lengths
+        let ord = la.len().cmp(&lb.len());
+        return Ok(match op {
+            CompareOp::Eq => ord == Ordering::Equal,
+            CompareOp::Ne => ord != Ordering::Equal,
+            CompareOp::Lt => ord == Ordering::Less,
+            CompareOp::Le => ord != Ordering::Greater,
+            CompareOp::Gt => ord == Ordering::Greater,
+            CompareOp::Ge => ord != Ordering::Less,
+            _ => false,
+        });
+    }
+    // Property::List comparison
+    if let (Value::Property(Property::List(la)), Value::Property(Property::List(lb))) = (l, r) {
+        let la_vals: Vec<Value> = la.iter().cloned().map(Value::Property).collect();
+        let lb_vals: Vec<Value> = lb.iter().cloned().map(Value::Property).collect();
+        return compare(op, &Value::List(la_vals), &Value::List(lb_vals));
+    }
     let (lp, rp) = match (l, r) {
         (Value::Property(lp), Value::Property(rp)) => (lp, rp),
         _ => return Err(Error::TypeMismatch),
@@ -2595,13 +2893,7 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
         (Property::Float64(a), Property::Int64(b)) => {
             a.partial_cmp(&(*b as f64)).ok_or(Error::TypeMismatch)?
         }
-        (Property::Bool(a), Property::Bool(b)) => {
-            return match op {
-                CompareOp::Eq => Ok(a == b),
-                CompareOp::Ne => Ok(a != b),
-                _ => Err(Error::UnsupportedComparison),
-            };
-        }
+        (Property::Bool(a), Property::Bool(b)) => a.cmp(b),
         // Temporal comparisons — DateTime and Date carry total
         // orderings by their epoch-offset components. Duration
         // only supports equality because component ordering

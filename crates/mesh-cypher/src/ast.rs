@@ -130,6 +130,17 @@ pub enum ReadingClause {
     /// input row. Correlated subqueries import outer bindings via
     /// `WITH var1, var2` as the first clause inside the body.
     Call(Box<Statement>),
+    /// Mid-query `CREATE pattern_list` — creates nodes/edges
+    /// inline, allowing subsequent reading clauses to see them.
+    Create(Vec<Pattern>),
+    /// Mid-query `SET ...` — updates properties/labels inline.
+    Set(Vec<SetItem>),
+    /// Mid-query `DELETE ...` / `DETACH DELETE ...`
+    Delete(DeleteClause),
+    /// Mid-query `REMOVE ...`
+    Remove(Vec<RemoveItem>),
+    /// Mid-query `FOREACH (...)` — applies mutations to each element.
+    Foreach(ForeachClause),
 }
 
 /// A mid-query `UNWIND expression AS alias`. Evaluates the

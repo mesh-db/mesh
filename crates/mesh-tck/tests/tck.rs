@@ -93,8 +93,26 @@ fn given_any_graph(world: &mut MeshWorld) {
 #[given("having executed:")]
 fn given_having_executed(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
     let text = step.docstring.as_ref().expect("docstring").trim();
-    // The TCK uses both semicolons and newlines to separate
-    // statements. Split on newline-then-keyword boundaries.
+    // First, try executing as a single statement
+    let single_line = text
+        .lines()
+        .map(|l| {
+            if let Some(idx) = l.find("//") {
+                l[..idx].trim()
+            } else {
+                l.trim()
+            }
+        })
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    world.error = None;
+    world.run_cypher(&single_line);
+    if world.error.is_none() {
+        return;
+    }
+    // If single-statement fails, try splitting on keyword boundaries
+    world.error = None;
     let stmts = split_statements(text);
     for stmt in &stmts {
         let stmt = stmt.trim();
@@ -431,9 +449,17 @@ fn main() {
         "../../tck/opencypher/tck/features/clauses/match/Match1.feature".to_string()
     });
 
-    futures::executor::block_on(
-        MeshWorld::cucumber()
-            .max_concurrent_scenarios(1)
-            .run(features),
-    );
+    // Use a thread with a larger stack to handle deeply nested expressions
+    // (e.g. 20-deep nested list literals) without stack overflow.
+    let builder = std::thread::Builder::new().stack_size(64 * 1024 * 1024);
+    let handle = builder
+        .spawn(move || {
+            futures::executor::block_on(
+                MeshWorld::cucumber()
+                    .max_concurrent_scenarios(1)
+                    .run(features),
+            );
+        })
+        .expect("failed to spawn test thread");
+    handle.join().expect("test thread panicked");
 }

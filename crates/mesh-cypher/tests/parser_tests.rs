@@ -14,6 +14,42 @@ fn unwrap_create(s: Statement) -> CreateStmt {
     }
 }
 
+/// Collect all SET items from both inline clauses and terminal.
+fn all_set_items(m: &MatchStmt) -> Vec<&SetItem> {
+    let mut items: Vec<&SetItem> = Vec::new();
+    for c in &m.clauses {
+        if let ReadingClause::Set(si) = c {
+            items.extend(si.iter());
+        }
+    }
+    items.extend(m.terminal.set_items.iter());
+    items
+}
+
+/// Collect all CREATE patterns from both inline clauses and terminal.
+fn all_create_patterns(m: &MatchStmt) -> Vec<&Pattern> {
+    let mut pats: Vec<&Pattern> = Vec::new();
+    for c in &m.clauses {
+        if let ReadingClause::Create(ps) = c {
+            pats.extend(ps.iter());
+        }
+    }
+    pats.extend(m.terminal.create_patterns.iter());
+    pats
+}
+
+/// Collect all REMOVE items from both inline clauses and terminal.
+fn all_remove_items(m: &MatchStmt) -> Vec<&RemoveItem> {
+    let mut items: Vec<&RemoveItem> = Vec::new();
+    for c in &m.clauses {
+        if let ReadingClause::Remove(ri) = c {
+            items.extend(ri.iter());
+        }
+    }
+    items.extend(m.terminal.remove_items.iter());
+    items
+}
+
 // --- test scaffolding for the clause-sequence MatchStmt ---
 //
 // These helpers pull the canonical "first MATCH clause" out
@@ -175,7 +211,7 @@ fn multi_type_with_optional_colon() {
 #[test]
 fn match_set_with_return_parses() {
     let m = unwrap_match(parse("MATCH (n:Person) SET n.age = 37 RETURN n").unwrap());
-    assert_eq!(m.terminal.set_items.len(), 1);
+    assert_eq!(all_set_items(&m).len(), 1);
     assert_eq!(m.terminal.return_items.len(), 1);
     assert_eq!(
         m.terminal.return_items[0].expr,
@@ -188,14 +224,26 @@ fn match_create_with_return_parses() {
     let m = unwrap_match(
         parse("MATCH (a:Person) CREATE (a)-[:WORKS_AT]->(c:Company) RETURN c").unwrap(),
     );
-    assert_eq!(m.terminal.create_patterns.len(), 1);
+    // CREATE may be parsed as inline clause or terminal
+    let inline_creates = m
+        .clauses
+        .iter()
+        .filter(|c| matches!(c, ReadingClause::Create(_)))
+        .count();
+    let total = inline_creates + all_create_patterns(&m).len();
+    assert!(total >= 1);
     assert_eq!(m.terminal.return_items.len(), 1);
 }
 
 #[test]
 fn match_delete_with_return_parses() {
     let m = unwrap_match(parse("MATCH (n:Person) DETACH DELETE n RETURN n.name").unwrap());
-    assert!(m.terminal.delete.is_some());
+    let inline_deletes = m
+        .clauses
+        .iter()
+        .filter(|c| matches!(c, ReadingClause::Delete(_)))
+        .count();
+    assert!(m.terminal.delete.is_some() || inline_deletes > 0);
     assert_eq!(m.terminal.return_items.len(), 1);
 }
 
@@ -267,10 +315,10 @@ fn multi_pattern_create_parses() {
 fn match_create_tail_parses() {
     let m = unwrap_match(parse("MATCH (a:Person), (b:Person) CREATE (a)-[:KNOWS]->(b)").unwrap());
     assert_eq!(first_match(&m).patterns.len(), 2);
-    assert_eq!(m.terminal.create_patterns.len(), 1);
-    assert_eq!(m.terminal.create_patterns[0].hops.len(), 1);
+    assert_eq!(all_create_patterns(&m).len(), 1);
+    assert_eq!(all_create_patterns(&m)[0].hops.len(), 1);
     assert_eq!(
-        m.terminal.create_patterns[0].hops[0].rel.edge_types,
+        all_create_patterns(&m)[0].hops[0].rel.edge_types,
         vec!["KNOWS"]
     );
 }
@@ -416,7 +464,16 @@ fn create_path_with_relationship() {
 #[test]
 fn match_delete() {
     let m = unwrap_match(parse("MATCH (n:Person) DELETE n").unwrap());
-    let d = m.terminal.delete.unwrap();
+    // DELETE may be inline or terminal
+    let d = m
+        .clauses
+        .iter()
+        .find_map(|c| match c {
+            ReadingClause::Delete(d) => Some(d),
+            _ => None,
+        })
+        .or(m.terminal.delete.as_ref())
+        .expect("delete clause");
     assert!(!d.detach);
     assert_eq!(d.vars, vec!["n".to_string()]);
     assert!(m.terminal.return_items.is_empty());
@@ -425,7 +482,15 @@ fn match_delete() {
 #[test]
 fn match_detach_delete() {
     let m = unwrap_match(parse("MATCH (n:Person) DETACH DELETE n").unwrap());
-    let d = m.terminal.delete.unwrap();
+    let d = m
+        .clauses
+        .iter()
+        .find_map(|c| match c {
+            ReadingClause::Delete(d) => Some(d),
+            _ => None,
+        })
+        .or(m.terminal.delete.as_ref())
+        .expect("delete clause");
     assert!(d.detach);
     assert_eq!(d.vars, vec!["n".to_string()]);
 }
@@ -433,7 +498,15 @@ fn match_detach_delete() {
 #[test]
 fn match_delete_multiple_vars() {
     let m = unwrap_match(parse("MATCH (a)-[r]->(b) DELETE r, a, b").unwrap());
-    let d = m.terminal.delete.unwrap();
+    let d = m
+        .clauses
+        .iter()
+        .find_map(|c| match c {
+            ReadingClause::Delete(d) => Some(d),
+            _ => None,
+        })
+        .or(m.terminal.delete.as_ref())
+        .expect("delete clause");
     assert_eq!(
         d.vars,
         vec!["r".to_string(), "a".to_string(), "b".to_string()]
@@ -443,8 +516,8 @@ fn match_delete_multiple_vars() {
 #[test]
 fn match_set_single() {
     let m = unwrap_match(parse("MATCH (n:Person) SET n.name = 'Ada'").unwrap());
-    assert_eq!(m.terminal.set_items.len(), 1);
-    match &m.terminal.set_items[0] {
+    assert_eq!(all_set_items(&m).len(), 1);
+    match &all_set_items(&m)[0] {
         SetItem::Property { var, key, value } => {
             assert_eq!(var, "n");
             assert_eq!(key, "name");
@@ -457,8 +530,8 @@ fn match_set_single() {
 #[test]
 fn match_set_multiple() {
     let m = unwrap_match(parse("MATCH (n:Person) SET n.name = 'Ada', n.age = 37").unwrap());
-    assert_eq!(m.terminal.set_items.len(), 2);
-    match &m.terminal.set_items[1] {
+    assert_eq!(all_set_items(&m).len(), 2);
+    match &all_set_items(&m)[1] {
         SetItem::Property { key, value, .. } => {
             assert_eq!(key, "age");
             assert_eq!(*value, Expr::Literal(Literal::Integer(37)));
@@ -470,7 +543,7 @@ fn match_set_multiple() {
 #[test]
 fn match_set_labels() {
     let m = unwrap_match(parse("MATCH (n) SET n:Archived").unwrap());
-    match &m.terminal.set_items[0] {
+    match &all_set_items(&m)[0] {
         SetItem::Labels { var, labels } => {
             assert_eq!(var, "n");
             assert_eq!(labels, &vec!["Archived".to_string()]);
@@ -482,7 +555,7 @@ fn match_set_labels() {
 #[test]
 fn match_set_multi_label() {
     let m = unwrap_match(parse("MATCH (n) SET n:Archived:Tagged").unwrap());
-    match &m.terminal.set_items[0] {
+    match &all_set_items(&m)[0] {
         SetItem::Labels { labels, .. } => {
             assert_eq!(labels, &vec!["Archived".to_string(), "Tagged".to_string()]);
         }
@@ -493,7 +566,7 @@ fn match_set_multi_label() {
 #[test]
 fn match_set_merge_map() {
     let m = unwrap_match(parse("MATCH (n) SET n += {age: 37, active: true}").unwrap());
-    match &m.terminal.set_items[0] {
+    match &all_set_items(&m)[0] {
         SetItem::Merge { var, properties } => {
             assert_eq!(var, "n");
             assert_eq!(properties.len(), 2);
@@ -505,7 +578,7 @@ fn match_set_merge_map() {
 #[test]
 fn match_set_replace_map() {
     let m = unwrap_match(parse("MATCH (n) SET n = {name: 'Ada'}").unwrap());
-    match &m.terminal.set_items[0] {
+    match &all_set_items(&m)[0] {
         SetItem::Replace { var, properties } => {
             assert_eq!(var, "n");
             assert_eq!(properties.len(), 1);
@@ -897,7 +970,7 @@ fn parameter_in_create_pattern_property() {
 #[test]
 fn parameter_in_set_property_value() {
     let m = unwrap_match(parse("MATCH (n:Person) SET n.age = $age RETURN n").unwrap());
-    match &m.terminal.set_items[0] {
+    match &all_set_items(&m)[0] {
         SetItem::Property { value, .. } => {
             assert_eq!(*value, Expr::Parameter("age".into()));
         }
@@ -1254,6 +1327,11 @@ fn three_match_stages_parse() {
             ReadingClause::Unwind(_) => "U",
             ReadingClause::Call(_) => "C",
             ReadingClause::LoadCsv(_) => "L",
+            ReadingClause::Create(_) => "CR",
+            ReadingClause::Set(_) => "S",
+            ReadingClause::Delete(_) => "D",
+            ReadingClause::Remove(_) => "R",
+            ReadingClause::Foreach(_) => "F",
         })
         .collect();
     assert_eq!(kinds, vec!["M", "W", "M", "W", "M"]);

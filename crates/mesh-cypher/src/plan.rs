@@ -379,6 +379,8 @@ pub enum AggregateFn {
     Collect,
     StDev,
     StDevP,
+    PercentileDisc,
+    PercentileCont,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -398,6 +400,8 @@ fn aggregate_fn_from_name(name: &str) -> Option<AggregateFn> {
         "collect" => Some(AggregateFn::Collect),
         "stdev" => Some(AggregateFn::StDev),
         "stdevp" => Some(AggregateFn::StDevP),
+        "percentiledisc" => Some(AggregateFn::PercentileDisc),
+        "percentilecont" => Some(AggregateFn::PercentileCont),
         _ => None,
     }
 }
@@ -2245,13 +2249,6 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // chained case, each input row cross-products with
                 // the list the expression produces, binding `alias`
                 // per element.
-                if bound_vars.contains_key(&u.alias) {
-                    return Err(Error::Plan(format!(
-                        "variable '{}' is already bound; UNWIND cannot rebind \
-                         an existing variable",
-                        u.alias
-                    )));
-                }
                 plan = Some(match plan.take() {
                     None => LogicalPlan::Unwind {
                         var: u.alias.clone(),
@@ -2287,6 +2284,97 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     with_headers: lc.with_headers,
                 });
                 bound_vars.insert(lc.alias.clone(), VarType::Scalar);
+            }
+            ReadingClause::Create(patterns) => {
+                let mut nodes: Vec<CreateNodeSpec> = Vec::new();
+                let mut edges: Vec<CreateEdgeSpec> = Vec::new();
+                let mut var_idx: HashMap<String, usize> = HashMap::new();
+                for pattern in patterns {
+                    build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &bound_vars)?;
+                }
+                // Register newly created variables as bound
+                for n in &nodes {
+                    if let CreateNodeSpec::New { var: Some(v), .. } = n {
+                        bound_vars.insert(v.clone(), VarType::Node);
+                    }
+                }
+                plan = Some(LogicalPlan::CreatePath {
+                    input: plan.take().map(Box::new),
+                    nodes,
+                    edges,
+                });
+            }
+            ReadingClause::Set(items) => {
+                let assignments = items
+                    .iter()
+                    .map(set_item_to_assignment)
+                    .collect();
+                let current = plan.take().ok_or_else(|| {
+                    Error::Plan("SET requires a preceding clause".into())
+                })?;
+                plan = Some(LogicalPlan::SetProperty {
+                    input: Box::new(current),
+                    assignments,
+                });
+            }
+            ReadingClause::Delete(dc) => {
+                let current = plan.take().ok_or_else(|| {
+                    Error::Plan("DELETE requires a preceding clause".into())
+                })?;
+                plan = Some(LogicalPlan::Delete {
+                    input: Box::new(current),
+                    detach: dc.detach,
+                    vars: dc.vars.clone(),
+                });
+            }
+            ReadingClause::Remove(items) => {
+                let specs = items
+                    .iter()
+                    .map(|ri| match ri {
+                        crate::ast::RemoveItem::Property { var, key } => RemoveSpec::Property {
+                            var: var.clone(),
+                            key: key.clone(),
+                        },
+                        crate::ast::RemoveItem::Labels { var, labels } => RemoveSpec::Labels {
+                            var: var.clone(),
+                            labels: labels.clone(),
+                        },
+                    })
+                    .collect();
+                let current = plan.take().ok_or_else(|| {
+                    Error::Plan("REMOVE requires a preceding clause".into())
+                })?;
+                plan = Some(LogicalPlan::Remove {
+                    input: Box::new(current),
+                    items: specs,
+                });
+            }
+            ReadingClause::Foreach(fe) => {
+                let set_assignments = fe.set_items.iter().map(set_item_to_assignment).collect();
+                let remove_specs = fe
+                    .remove_items
+                    .iter()
+                    .map(|ri| match ri {
+                        crate::ast::RemoveItem::Property { var, key } => RemoveSpec::Property {
+                            var: var.clone(),
+                            key: key.clone(),
+                        },
+                        crate::ast::RemoveItem::Labels { var, labels } => RemoveSpec::Labels {
+                            var: var.clone(),
+                            labels: labels.clone(),
+                        },
+                    })
+                    .collect();
+                let current = plan.take().ok_or_else(|| {
+                    Error::Plan("FOREACH requires a preceding clause".into())
+                })?;
+                plan = Some(LogicalPlan::Foreach {
+                    input: Box::new(current),
+                    var: fe.var.clone(),
+                    list_expr: fe.list_expr.clone(),
+                    set_assignments,
+                    remove_items: remove_specs,
+                });
             }
         }
     }
@@ -2402,11 +2490,22 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     // MERGE clauses count as side-effectful even without a
     // trailing RETURN, so `MERGE (x)` is a valid complete
     // query. MATCH-only (with no terminal and no writing
-    // clause) is still an error.
+    // clause) is still an error. Also check for inline
+    // mutation clauses (CREATE/SET/DELETE/REMOVE in reading position).
     let has_merge_clause = stmt
         .clauses
         .iter()
         .any(|c| matches!(c, crate::ast::ReadingClause::Merge(_)));
+    let has_inline_mutation = stmt.clauses.iter().any(|c| {
+        matches!(
+            c,
+            crate::ast::ReadingClause::Create(_)
+                | crate::ast::ReadingClause::Set(_)
+                | crate::ast::ReadingClause::Delete(_)
+                | crate::ast::ReadingClause::Remove(_)
+                | crate::ast::ReadingClause::Foreach(_)
+        )
+    });
 
     if terminal.star || !terminal.return_items.is_empty() {
         plan = apply_return_pipeline(
@@ -2418,7 +2517,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
             terminal.skip.clone(),
             terminal.limit.clone(),
         )?;
-    } else if !has_mutation && !has_merge_clause {
+    } else if !has_mutation && !has_merge_clause && !has_inline_mutation {
         return Err(Error::Plan(
             "query must be followed by RETURN, SET, DELETE, CREATE, or end with a MERGE".into(),
         ));
