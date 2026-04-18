@@ -1761,7 +1761,7 @@ fn consume_segment(s: &str) -> Option<((i64, Option<i32>), char, &str)> {
 /// Unsupported temporal combinations return `None` which flows
 /// through to `to_number` and errors as `TypeMismatch`.
 fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<Result<Value>> {
-    use Property::{Date, DateTime, Duration as Dur};
+    use Property::{Date, DateTime, Duration as Dur, LocalDateTime, Time};
     let l = match left {
         Value::Property(p) => p,
         _ => return None,
@@ -1771,13 +1771,15 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
         _ => return None,
     };
     match (op, l, r) {
-        (BinaryOp::Add, DateTime(ms), Dur(d)) | (BinaryOp::Add, Dur(d), DateTime(ms)) => Some(Ok(
-            Value::Property(DateTime(datetime_add_duration(*ms, *d))),
+        // DateTime + Duration
+        (BinaryOp::Add, DateTime(ns), Dur(d)) | (BinaryOp::Add, Dur(d), DateTime(ns)) => Some(Ok(
+            Value::Property(DateTime(datetime_add_duration(*ns, *d))),
         )),
-        (BinaryOp::Sub, DateTime(ms), Dur(d)) => Some(Ok(Value::Property(DateTime(
-            datetime_add_duration(*ms, negate_duration(*d)),
+        (BinaryOp::Sub, DateTime(ns), Dur(d)) => Some(Ok(Value::Property(DateTime(
+            datetime_add_duration(*ns, negate_duration(*d)),
         )))),
-        (BinaryOp::Sub, DateTime(a), DateTime(b)) => {
+        (BinaryOp::Sub, DateTime(a), DateTime(b))
+        | (BinaryOp::Sub, LocalDateTime(a), LocalDateTime(b)) => {
             let diff_ns = a.wrapping_sub(*b);
             Some(Ok(Value::Property(Dur(mesh_core::Duration {
                 months: 0,
@@ -1786,6 +1788,15 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
                 nanos: diff_ns.rem_euclid(1_000_000_000) as i32,
             }))))
         }
+        // LocalDateTime + Duration
+        (BinaryOp::Add, LocalDateTime(ns), Dur(d))
+        | (BinaryOp::Add, Dur(d), LocalDateTime(ns)) => Some(Ok(Value::Property(
+            LocalDateTime(datetime_add_duration(*ns, *d)),
+        ))),
+        (BinaryOp::Sub, LocalDateTime(ns), Dur(d)) => Some(Ok(Value::Property(LocalDateTime(
+            datetime_add_duration(*ns, negate_duration(*d)),
+        )))),
+        // Date + Duration
         (BinaryOp::Add, Date(days), Dur(d)) | (BinaryOp::Add, Dur(d), Date(days)) => {
             Some(date_add_duration(*days, *d))
         }
@@ -1796,12 +1807,83 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
             seconds: 0,
             nanos: 0,
         })))),
+        // Time + Duration — mod 24h, sub-day components only.
+        (
+            BinaryOp::Add,
+            Time {
+                nanos,
+                tz_offset_secs,
+            },
+            Dur(d),
+        )
+        | (
+            BinaryOp::Add,
+            Dur(d),
+            Time {
+                nanos,
+                tz_offset_secs,
+            },
+        ) => Some(Ok(Value::Property(time_add_duration(
+            *nanos,
+            *tz_offset_secs,
+            *d,
+        )))),
+        (
+            BinaryOp::Sub,
+            Time {
+                nanos,
+                tz_offset_secs,
+            },
+            Dur(d),
+        ) => Some(Ok(Value::Property(time_add_duration(
+            *nanos,
+            *tz_offset_secs,
+            negate_duration(*d),
+        )))),
+        (
+            BinaryOp::Sub,
+            Time {
+                nanos: a,
+                tz_offset_secs: _,
+            },
+            Time {
+                nanos: b,
+                tz_offset_secs: _,
+            },
+        ) => {
+            let diff = a.wrapping_sub(*b);
+            let diff_i128 = diff as i128;
+            Some(Ok(Value::Property(Dur(mesh_core::Duration {
+                months: 0,
+                days: 0,
+                seconds: diff_i128.div_euclid(1_000_000_000) as i64,
+                nanos: diff_i128.rem_euclid(1_000_000_000) as i32,
+            }))))
+        }
+        // Duration arithmetic
         (BinaryOp::Add, Dur(a), Dur(b)) => Some(Ok(Value::Property(Dur(add_durations(*a, *b))))),
         (BinaryOp::Sub, Dur(a), Dur(b)) => Some(Ok(Value::Property(Dur(add_durations(
             *a,
             negate_duration(*b),
         ))))),
         _ => None,
+    }
+}
+
+/// Add a Duration to a Time value, wrapping mod 24h. Sub-day
+/// components only — month/day components are silently dropped
+/// because Time has no calendar.
+fn time_add_duration(
+    nanos: i64,
+    tz_offset_secs: Option<i32>,
+    d: mesh_core::Duration,
+) -> Property {
+    let nanos_per_day: i64 = 86_400_000_000_000;
+    let tod = (d.seconds as i128) * 1_000_000_000 + (d.nanos as i128);
+    let new_nanos = ((nanos as i128 + tod).rem_euclid(nanos_per_day as i128)) as i64;
+    Property::Time {
+        nanos: new_nanos,
+        tz_offset_secs,
     }
 }
 
