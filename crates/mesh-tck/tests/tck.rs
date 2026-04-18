@@ -446,8 +446,8 @@ fn format_iso_duration(d: &mesh_core::Duration) -> String {
     if has_time {
         result.push('T');
         let negative = total_ns_signed < 0;
-        let abs_ns = total_ns_signed.unsigned_abs() as i64;
-        let abs_secs = abs_ns / 1_000_000_000;
+        let abs_ns: i128 = total_ns_signed.unsigned_abs() as i128;
+        let abs_secs: i128 = abs_ns / 1_000_000_000;
         let abs_nanos = (abs_ns % 1_000_000_000) as i32;
         let sign = if negative { "-" } else { "" };
         let hours = abs_secs / 3600;

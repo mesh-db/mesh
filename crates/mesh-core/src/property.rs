@@ -39,11 +39,11 @@ pub enum Property {
     /// Local (naive) datetime as epoch nanoseconds.
     /// Formatters omit any timezone suffix.
     LocalDateTime(i128),
-    /// Days since the UNIX epoch (1970-01-01, UTC). `i32` gives
-    /// ±5.9 million years of range — far more than any realistic
-    /// calendar application. Maps to Bolt `Date` (struct tag
-    /// `0x44`).
-    Date(i32),
+    /// Days since the UNIX epoch (1970-01-01, UTC). `i64` gives
+    /// roughly ±25 billion years — wide enough to round-trip the
+    /// ±999999999 year range the TCK exercises at its extremes.
+    /// Maps to Bolt `Date` (struct tag `0x44`), which is also i64.
+    Date(i64),
     /// A Cypher duration value — see [`Duration`].
     Duration(Duration),
     /// Time of day as nanoseconds since midnight, with an optional

@@ -1487,16 +1487,26 @@ fn parse_datetime_with_tz(s: &str) -> Result<(i128, Option<i32>, Option<String>)
         }
     }
     if let Some((date_part, time_part)) = trimmed.split_once('T') {
-        if let Some(date) = parse_iso_date(date_part) {
+        let days_opt = parse_iso_date(date_part)
+            .map(|d| {
+                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                d.signed_duration_since(epoch).num_days()
+            })
+            .or_else(|| parse_iso_date_big(date_part));
+        if let Some(days) = days_opt {
             let (tod_nanos, tz) = parse_time_string_with_tz(time_part)?;
-            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let days = date.signed_duration_since(epoch).num_days() as i128;
-            let local_nanos = days * 86_400_000_000_000 + tod_nanos as i128;
+            let local_nanos = (days as i128) * 86_400_000_000_000 + tod_nanos as i128;
             let nanos = match tz {
                 Some(off) => local_nanos - (off as i128) * 1_000_000_000,
                 None => local_nanos,
             };
             return Ok(finalise(nanos, tz));
+        }
+    } else {
+        // Pure date form without a time component also comes through
+        // `datetime()` / `localdatetime()` in TCK scenarios.
+        if let Some(days) = parse_iso_date_big(trimmed) {
+            return Ok(finalise((days as i128) * 86_400_000_000_000, None));
         }
     }
     Err(Error::UnknownScalarFunction(format!(
@@ -1514,18 +1524,23 @@ fn datetime_to_nanos<Tz: chrono::TimeZone>(dt: &chrono::DateTime<Tz>) -> i128 {
 
 /// Parse an ISO 8601 calendar date (`YYYY-MM-DD`) into days
 /// since the UNIX epoch. Any other form is rejected.
-fn parse_date(s: &str) -> Result<i32> {
+fn parse_date(s: &str) -> Result<i64> {
+    // Try the chrono-backed path first for the common ±292 K year
+    // range; fall back to an out-of-range parser that only needs
+    // the Gregorian rules (so we can round-trip the TCK's extreme
+    // year values like ±999999999).
     use chrono::NaiveDate;
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid calendar date");
-    let parsed = parse_iso_date(s.trim()).ok_or_else(|| {
-        Error::UnknownScalarFunction(format!("date() could not parse {s:?} as ISO 8601 date"))
-    })?;
-    let days = parsed.signed_duration_since(epoch).num_days();
-    i32::try_from(days).map_err(|_| {
-        Error::UnknownScalarFunction(format!(
-            "date() {s:?} is outside the representable i32 day range"
-        ))
-    })
+    let trimmed = s.trim();
+    if let Some(parsed) = parse_iso_date(trimmed) {
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        return Ok(parsed.signed_duration_since(epoch).num_days());
+    }
+    if let Some(days) = parse_iso_date_big(trimmed) {
+        return Ok(days);
+    }
+    Err(Error::UnknownScalarFunction(format!(
+        "date() could not parse {s:?} as ISO 8601 date"
+    )))
 }
 
 /// Parse an ISO 8601 date in any supported form:
@@ -1598,6 +1613,92 @@ fn parse_iso_date(s: &str) -> Option<chrono::NaiveDate> {
         }
         _ => None,
     }
+}
+
+/// Parse an ISO 8601 date with an *extended* year — `±NNNNNNNNN-MM-DD`
+/// — into days since the 1970-01-01 epoch, without going through
+/// `chrono::NaiveDate` (which tops out around ±262 K years). Only
+/// handles the extended-year calendar form; other ISO 8601 shapes
+/// funnel through `parse_iso_date` first.
+fn parse_iso_date_big(s: &str) -> Option<i64> {
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'+' => (1_i64, &s[1..]),
+        b'-' => (-1_i64, &s[1..]),
+        _ => return None,
+    };
+    // Extended-year calendar form: `YYYY...-MM-DD` (any number of
+    // year digits >= 4).
+    let mut parts = rest.split('-');
+    let year_str = parts.next()?;
+    let month_str = parts.next()?;
+    let day_str = parts.next()?;
+    if parts.next().is_some()
+        || year_str.is_empty()
+        || !year_str.chars().all(|c| c.is_ascii_digit())
+        || month_str.len() != 2
+        || day_str.len() != 2
+    {
+        return None;
+    }
+    let year: i64 = year_str.parse().ok()?;
+    let year = sign * year;
+    let month: u32 = month_str.parse().ok()?;
+    let day: u32 = day_str.parse().ok()?;
+    if !(1..=12).contains(&month) || day == 0 || day > 31 {
+        return None;
+    }
+    big_ymd_to_days(year, month, day)
+}
+
+/// Convert a (year, month, day) into days since 1970-01-01 using
+/// proleptic Gregorian rules. Works for the full i64 year range.
+fn big_ymd_to_days(year: i64, month: u32, day: u32) -> Option<i64> {
+    // Algorithm: shift the calendar to start on March 1st (so Feb
+    // is the last month of the previous year and we don't have to
+    // special-case its variable length), count eras of 400 years,
+    // then offset back to Jan 1 1970.
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let m = month as i64;
+    let d = day as i64;
+    // Sanity check day in month (leap-year aware).
+    let days_in = {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            _ => 28,
+        }
+    };
+    if d < 1 || d > days_in as i64 {
+        return None;
+    }
+    let y = if m <= 2 { year - 1 } else { year };
+    let shifted_m = if m <= 2 { m + 9 } else { m - 3 } as i64;
+    // `days_from_civil` — Howard Hinnant's algorithm.
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * shifted_m + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// Convert days since 1970-01-01 back into (year, month, day). Uses
+/// Hinnant's civil_from_days. Handles the full i64 range.
+fn big_days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d)
 }
 
 /// Parse a time string like "12:31:14.645876123" into nanoseconds since midnight.
@@ -2378,14 +2479,14 @@ fn datetime_add_duration(epoch_nanos: i128, d: mesh_core::Duration) -> i128 {
 /// non-zero `seconds` or `nanos` field, we return a type error
 /// so drivers can't silently drop a time-of-day component they
 /// meant to apply.
-fn date_add_duration(days: i32, d: mesh_core::Duration) -> Result<Value> {
+fn date_add_duration(days: i64, d: mesh_core::Duration) -> Result<Value> {
     // Sub-day components normally don't affect a Date, but Neo4j
     // cascades whole 24h chunks of the Duration's seconds into
     // the `days` slot when applying to a Date (so a duration built
     // up from fractional years/months lands on the right calendar
     // day even if the canonical storage kept some spill in seconds).
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-    let base = epoch + chrono::Duration::days(days as i64);
+    let base = epoch + chrono::Duration::days(days);
     // Truncate toward zero so a negative partial day (`-56950s`)
     // doesn't borrow a whole day, but a full positive day (`+86400s`
     // or more) still cascades. Matches Neo4j's date+duration rules.
@@ -2394,8 +2495,7 @@ fn date_add_duration(days: i32, d: mesh_core::Duration) -> Result<Value> {
     let final_date = new_date
         + chrono::Duration::days(d.days.wrapping_add(seconds_day_carry));
     let new_days = final_date.signed_duration_since(epoch).num_days();
-    let clamped = i32::try_from(new_days).map_err(|_| Error::TypeMismatch)?;
-    Ok(Value::Property(Property::Date(clamped)))
+    Ok(Value::Property(Property::Date(new_days)))
 }
 
 /// Add a number of months to a date using calendar arithmetic.
@@ -3287,11 +3387,8 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         }},
         "date" => match arg_exprs.len() {
             0 => {
-                let days = now_epoch_nanos().div_euclid(86_400_000_000_000);
-                let clamped = i32::try_from(days).map_err(|_| {
-                    Error::UnknownScalarFunction(format!("date() overflowed i32 days: {days}"))
-                })?;
-                Ok(Value::Property(Property::Date(clamped)))
+                let days = now_epoch_nanos().div_euclid(86_400_000_000_000) as i64;
+                Ok(Value::Property(Property::Date(days)))
             }
             1 => {
                 let v = eval_expr(&arg_exprs[0], ctx)?;
@@ -3309,25 +3406,25 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         let has_base = base_date.is_some();
                         let target = build_date_from_map(&m, base_or_epoch, has_base);
                         let days = target.signed_duration_since(epoch).num_days();
-                        Ok(Value::Property(Property::Date(days as i32)))
+                        Ok(Value::Property(Property::Date(days)))
                     }
                     // date(datetime_value) — extract local calendar
                     // date from a zoned DateTime. Shift by the offset
                     // so DST boundaries round to the *local* day.
                     Value::Property(Property::DateTime {
                         nanos,
-                        tz_offset_secs,        tz_name: _,
-
+                        tz_offset_secs,
+                        tz_name: _,
                     }) => {
                         let local = match tz_offset_secs {
                             Some(off) => nanos + (off as i128) * 1_000_000_000,
                             None => nanos,
                         };
-                        let days = local.div_euclid(86_400_000_000_000) as i32;
+                        let days = local.div_euclid(86_400_000_000_000) as i64;
                         Ok(Value::Property(Property::Date(days)))
                     }
                     Value::Property(Property::LocalDateTime(ns)) => {
-                        let days = ns.div_euclid(86_400_000_000_000) as i32;
+                        let days = ns.div_euclid(86_400_000_000_000) as i64;
                         Ok(Value::Property(Property::Date(days)))
                     }
                     // date(date_value) — identity, but keeps the
@@ -3739,20 +3836,13 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             };
             match (&a_tz_name, &b_tz_name) {
                 (Some(name), None) if b_tz.is_none() => {
-                    // Re-interpret b's naive wall-clock in a's zone.
-                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    let b_local_ns = (b_date.signed_duration_since(epoch).num_days() as i128)
-                        * 86_400_000_000_000
-                        + b_tod;
+                    let b_local_ns = (b_date as i128) * 86_400_000_000_000 + b_tod;
                     if let Some((off, _)) = parse_tz_name_local(name, b_local_ns) {
                         b_tz = Some(off);
                     }
                 }
                 (None, Some(name)) if a_tz.is_none() => {
-                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    let a_local_ns = (a_date.signed_duration_since(epoch).num_days() as i128)
-                        * 86_400_000_000_000
-                        + a_tod;
+                    let a_local_ns = (a_date as i128) * 86_400_000_000_000 + a_tod;
                     if let Some((off, _)) = parse_tz_name_local(name, a_local_ns) {
                         a_tz = Some(off);
                     }
@@ -3760,17 +3850,15 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 _ => {}
             }
             if a_tz.is_some() && b_tz.is_some() {
-                let shift_to_utc = |date: &mut chrono::NaiveDate,
-                                    tod: &mut i128,
-                                    off: i32| {
+                let shift_to_utc = |days: &mut i64, tod: &mut i128, off: i32| {
                     *tod -= (off as i128) * 1_000_000_000;
                     while *tod < 0 {
                         *tod += 86_400_000_000_000;
-                        *date -= chrono::Duration::days(1);
+                        *days -= 1;
                     }
                     while *tod >= 86_400_000_000_000 {
                         *tod -= 86_400_000_000_000;
-                        *date += chrono::Duration::days(1);
+                        *days += 1;
                     }
                 };
                 shift_to_utc(&mut a_date, &mut a_tod, a_tz.unwrap());
@@ -3805,7 +3893,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     let days = if time_only {
                         0
                     } else {
-                        let mut d = b_date.signed_duration_since(a_date).num_days();
+                        let mut d = b_date - a_date;
                         if d > 0 && b_tod < a_tod {
                             d -= 1;
                         } else if d < 0 && b_tod > a_tod {
@@ -3821,11 +3909,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                 }
                 "duration.inseconds" => {
-                    let days = if time_only {
-                        0
-                    } else {
-                        b_date.signed_duration_since(a_date).num_days()
-                    };
+                    let days = if time_only { 0 } else { b_date - a_date };
                     let total_nanos = (days as i128) * 86_400_000_000_000 + b_tod - a_tod;
                     let seconds = (total_nanos / 1_000_000_000) as i64;
                     let nanos = (total_nanos % 1_000_000_000) as i32;
@@ -3923,9 +4007,8 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             if let Some(null) = null_arg(arg_exprs, ctx)? {
                 return Ok(null);
             }
-            let days = now_epoch_nanos().div_euclid(86_400_000_000_000);
-            let clamped = i32::try_from(days).unwrap_or(0);
-            Ok(Value::Property(Property::Date(clamped)))
+            let days = now_epoch_nanos().div_euclid(86_400_000_000_000) as i64;
+            Ok(Value::Property(Property::Date(days)))
         }
         "time.transaction" | "time.statement" | "time.realtime" => {
             if let Some(null) = null_arg(arg_exprs, ctx)? {
@@ -4478,19 +4561,15 @@ enum TemporalKind {
 /// offset (DateTime always, Time only when a zone was supplied).
 fn temporal_to_date_tod(
     v: &Value,
-) -> Result<(chrono::NaiveDate, i128, Option<i32>, TemporalKind)> {
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+) -> Result<(i64, i128, Option<i32>, TemporalKind)> {
     match v {
-        Value::Property(Property::Date(days)) => Ok((
-            epoch + chrono::Duration::days(*days as i64),
-            0,
-            None,
-            TemporalKind::HasDate,
-        )),
+        Value::Property(Property::Date(days)) => {
+            Ok((*days, 0, None, TemporalKind::HasDate))
+        }
         Value::Property(Property::DateTime {
             nanos: ns,
-            tz_offset_secs,        tz_name: _,
-
+            tz_offset_secs,
+            tz_name: _,
         }) => {
             let local = match tz_offset_secs {
                 Some(off) => *ns + (*off as i128) * 1_000_000_000,
@@ -4500,7 +4579,7 @@ fn temporal_to_date_tod(
             let tod = local.rem_euclid(86_400_000_000_000);
             let days_i64 = i64::try_from(days).map_err(|_| Error::TypeMismatch)?;
             Ok((
-                epoch + chrono::Duration::days(days_i64),
+                days_i64,
                 tod,
                 *tz_offset_secs,
                 TemporalKind::HasDate,
@@ -4510,15 +4589,10 @@ fn temporal_to_date_tod(
             let days = ns.div_euclid(86_400_000_000_000);
             let tod = ns.rem_euclid(86_400_000_000_000);
             let days_i64 = i64::try_from(days).map_err(|_| Error::TypeMismatch)?;
-            Ok((
-                epoch + chrono::Duration::days(days_i64),
-                tod,
-                None,
-                TemporalKind::HasDate,
-            ))
+            Ok((days_i64, tod, None, TemporalKind::HasDate))
         }
         Value::Property(Property::Time { nanos, tz_offset_secs }) => Ok((
-            epoch,
+            0,
             *nanos as i128,
             *tz_offset_secs,
             TemporalKind::TimeOnly,
@@ -4527,35 +4601,38 @@ fn temporal_to_date_tod(
     }
 }
 
-/// Calculate the month difference between two dates.
-fn month_diff(a: chrono::NaiveDate, b: chrono::NaiveDate) -> i64 {
-    let a_months = a.year() as i64 * 12 + (a.month() as i64 - 1);
-    let b_months = b.year() as i64 * 12 + (b.month() as i64 - 1);
+/// Calculate the month difference between two dates (each expressed
+/// as days since the 1970 epoch). Rounds toward zero: if we haven't
+/// reached the target day-of-month, back off by one.
+fn month_diff(a_days: i64, b_days: i64) -> i64 {
+    let (ay, am, ad) = big_days_to_ymd(a_days);
+    let (by, bm, bd) = big_days_to_ymd(b_days);
+    let a_months = ay * 12 + (am as i64 - 1);
+    let b_months = by * 12 + (bm as i64 - 1);
     let mut diff = b_months - a_months;
-    // Adjust for day-of-month not reached
-    if diff > 0 && b.day() < a.day() {
+    if diff > 0 && bd < ad {
         diff -= 1;
-    } else if diff < 0 && b.day() > a.day() {
+    } else if diff < 0 && bd > ad {
         diff += 1;
     }
     diff
 }
 
-/// Like `month_diff`, but rounds *toward zero*. If the two endpoints
-/// land on the same day-of-month at different times, the one with
-/// the earlier tod has "not yet reached" the other month, so we
-/// shave off one whole month. Used by `duration.inMonths`.
+/// Like `month_diff`, but also considers time-of-day when the two
+/// endpoints fall on the same day-of-month.
 fn month_diff_tod(
-    a_date: chrono::NaiveDate,
+    a_days: i64,
     a_tod: i128,
-    b_date: chrono::NaiveDate,
+    b_days: i64,
     b_tod: i128,
 ) -> i64 {
-    let mut diff = month_diff(a_date, b_date);
+    let mut diff = month_diff(a_days, b_days);
     if diff == 0 {
         return 0;
     }
-    if a_date.day() == b_date.day() {
+    let (_ay, _am, ad) = big_days_to_ymd(a_days);
+    let (_by, _bm, bd) = big_days_to_ymd(b_days);
+    if ad == bd {
         if diff > 0 && b_tod < a_tod {
             diff -= 1;
         } else if diff < 0 && b_tod > a_tod {
@@ -4569,20 +4646,18 @@ fn month_diff_tod(
 /// (date + time-of-day nanoseconds). Matches Neo4j's duration.between
 /// semantics.
 fn duration_between_calendar(
-    a_date: chrono::NaiveDate,
+    a_days: i64,
     a_tod: i128,
-    b_date: chrono::NaiveDate,
+    b_days: i64,
     b_tod: i128,
 ) -> mesh_core::Duration {
-    // Compute years/months/days first, then time difference
-    let mut months = month_diff(a_date, b_date);
-    // Compute the reference date after applying months
-    let after_months = add_months_to_date(a_date, months);
-    let mut days = b_date.signed_duration_since(after_months).num_days();
+    // Compute years/months/days first using pure integer arithmetic
+    // (so ±10^9-year ranges don't overflow chrono's TimeDelta).
+    let mut months = month_diff(a_days, b_days);
+    let after_months_days = add_months_to_days(a_days, months);
+    let mut days = b_days - after_months_days;
 
-    // Now compute time difference
     let mut tod_diff = b_tod - a_tod;
-    // If tod_diff is negative and days > 0, borrow a day
     if tod_diff < 0 && days > 0 {
         days -= 1;
         tod_diff += 86_400_000_000_000;
@@ -4590,27 +4665,24 @@ fn duration_between_calendar(
         days += 1;
         tod_diff -= 86_400_000_000_000;
     }
-
-    // If months and days have opposite signs, adjust
     if months > 0 && days < 0 {
         months -= 1;
-        let after_months = add_months_to_date(a_date, months);
-        days = b_date.signed_duration_since(after_months).num_days();
+        let after_months_days = add_months_to_days(a_days, months);
+        days = b_days - after_months_days;
         if tod_diff < 0 && days > 0 {
             days -= 1;
             tod_diff += 86_400_000_000_000;
         }
     } else if months < 0 && days > 0 {
         months += 1;
-        let after_months = add_months_to_date(a_date, months);
-        days = b_date.signed_duration_since(after_months).num_days();
+        let after_months_days = add_months_to_days(a_days, months);
+        days = b_days - after_months_days;
         if tod_diff > 0 && days < 0 {
             days += 1;
             tod_diff -= 86_400_000_000_000;
         }
     }
 
-    // Normalize so nanos are always non-negative
     let seconds = tod_diff.div_euclid(1_000_000_000) as i64;
     let nanos = tod_diff.rem_euclid(1_000_000_000) as i32;
 
@@ -4619,6 +4691,29 @@ fn duration_between_calendar(
         days,
         seconds,
         nanos,
+    }
+}
+
+/// Add `months` to the given epoch-day. Preserves day-of-month where
+/// possible and clamps to the end of the target month otherwise
+/// (Jan 31 + 1 month → Feb 28/29). Works for the full i64 range.
+fn add_months_to_days(days: i64, months: i64) -> i64 {
+    let (y, m, d) = big_days_to_ymd(days);
+    let total_months = y * 12 + (m as i64 - 1) + months;
+    let new_year = total_months.div_euclid(12);
+    let new_month = (total_months.rem_euclid(12) + 1) as u32;
+    let max_day = days_in_month_big(new_year, new_month);
+    let new_day = d.min(max_day);
+    big_ymd_to_days(new_year, new_month, new_day).unwrap_or(days)
+}
+
+fn days_in_month_big(year: i64, month: u32) -> u32 {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        _ => 28,
     }
 }
 
@@ -4962,7 +5057,7 @@ fn truncate_temporal(
             let result_nanos: i128 = (diff.num_seconds() as i128) * 1_000_000_000
                 + (diff.subsec_nanos() as i128);
             if name.starts_with("date.") {
-                let days = diff.num_days() as i32;
+                let days = diff.num_days();
                 Ok(Value::Property(Property::Date(days)))
             } else if name.starts_with("localdatetime.") {
                 Ok(Value::Property(Property::LocalDateTime(result_nanos)))
@@ -5195,8 +5290,8 @@ fn duration_to_iso_string(d: &mesh_core::Duration) -> String {
     if has_time {
         result.push('T');
         let negative = total_ns_signed < 0;
-        let abs_ns = total_ns_signed.unsigned_abs() as i64;
-        let abs_secs = abs_ns / 1_000_000_000;
+        let abs_ns: i128 = total_ns_signed.unsigned_abs() as i128;
+        let abs_secs: i128 = abs_ns / 1_000_000_000;
         let abs_nanos = (abs_ns % 1_000_000_000) as i32;
         let sign = if negative { "-" } else { "" };
         let hours = abs_secs / 3600;

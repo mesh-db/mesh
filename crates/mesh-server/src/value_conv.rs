@@ -473,12 +473,7 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
                 });
             }
             let days = temporal_int(fields, 0, tag, "Date days")?;
-            let days_i32 =
-                i32::try_from(days).map_err(|_| ParamConversionError::MalformedTemporal {
-                    tag,
-                    reason: "date days out of i32 range",
-                })?;
-            Ok(Property::Date(days_i32))
+            Ok(Property::Date(days))
         }
         TAG_DURATION => {
             if fields.len() != 4 {
