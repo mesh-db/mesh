@@ -2697,13 +2697,29 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 match v {
                     Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                     Value::Property(Property::Map(m)) => {
-                        // Extract base time-of-day if a temporal source is provided
-                        let base_tod: i64 = if let Some(Property::Time { nanos, .. }) = m.get("time") {
-                            *nanos
-                        } else if let Some(Property::DateTime(ns)) | Some(Property::LocalDateTime(ns)) = m.get("datetime").or(m.get("localdatetime")) {
-                            ns.rem_euclid(86_400_000_000_000) as i64
-                        } else {
-                            0
+                        // Extract base time-of-day from ANY temporal value under
+                        // any of the temporal-source keys (time, datetime,
+                        // localdatetime). TCK tests pass e.g. a LocalDateTime
+                        // value under the "time" key to mean "use this value's
+                        // time-of-day", so we can't assume the key name matches
+                        // the value type.
+                        let base_tod: i64 = {
+                            let mut tod = 0i64;
+                            for key in ["time", "datetime", "localdatetime"] {
+                                match m.get(key) {
+                                    Some(Property::Time { nanos, .. }) => {
+                                        tod = *nanos;
+                                        break;
+                                    }
+                                    Some(Property::DateTime(ns))
+                                    | Some(Property::LocalDateTime(ns)) => {
+                                        tod = ns.rem_euclid(86_400_000_000_000) as i64;
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            tod
                         };
                         let base_h = base_tod / 3_600_000_000_000;
                         let base_min = (base_tod % 3_600_000_000_000) / 60_000_000_000;
@@ -3014,26 +3030,39 @@ fn extract_base_date_tod(
     m: &std::collections::HashMap<String, Property>,
     epoch: &chrono::NaiveDate,
 ) -> (Option<chrono::NaiveDate>, i128) {
-    for key in ["date", "datetime", "localdatetime"] {
+    // Check any of the temporal-source keys; accept any temporal value
+    // type under any key (TCK tests sometimes put a LocalDateTime
+    // under "time" or a Time under "datetime").
+    let mut base_date: Option<chrono::NaiveDate> = None;
+    let mut base_tod: i128 = 0;
+    for key in ["date", "datetime", "localdatetime", "time"] {
         match m.get(key) {
             Some(Property::Date(d)) => {
-                return (Some(*epoch + chrono::Duration::days(*d as i64)), 0);
+                if base_date.is_none() {
+                    base_date = Some(*epoch + chrono::Duration::days(*d as i64));
+                }
             }
             Some(Property::DateTime(ns)) | Some(Property::LocalDateTime(ns)) => {
                 let days = ns.div_euclid(86_400_000_000_000);
                 let tod = ns.rem_euclid(86_400_000_000_000);
                 if let Ok(d) = i64::try_from(days) {
-                    return (Some(*epoch + chrono::Duration::days(d)), tod);
+                    if base_date.is_none() {
+                        base_date = Some(*epoch + chrono::Duration::days(d));
+                    }
+                    if base_tod == 0 {
+                        base_tod = tod;
+                    }
+                }
+            }
+            Some(Property::Time { nanos, .. }) => {
+                if base_tod == 0 {
+                    base_tod = *nanos as i128;
                 }
             }
             _ => {}
         }
     }
-    // `time` field: no date, just time-of-day
-    if let Some(Property::Time { nanos, .. }) = m.get("time") {
-        return (None, *nanos as i128);
-    }
-    (None, 0)
+    (base_date, base_tod)
 }
 
 /// Build a date from a map of components, supporting multiple ways:
