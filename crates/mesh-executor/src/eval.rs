@@ -81,6 +81,61 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     .cloned()
                     .map(Value::Property)
                     .unwrap_or(Value::Null)),
+                // Temporal property access for Expr::Property
+                Value::Property(Property::Date(days)) => {
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let d = epoch + chrono::Duration::days(*days as i64);
+                    temporal_date_prop(&d, key)
+                }
+                Value::Property(Property::DateTime(ms)) => {
+                    let secs = ms / 1000;
+                    let nsec = ((ms % 1000) * 1_000_000) as u32;
+                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
+                        let naive = dt.naive_utc();
+                        let date = naive.date();
+                        match key.as_str() {
+                            "year" | "month" | "day" | "week" | "weekYear" | "dayOfWeek"
+                            | "weekDay" | "dayOfYear" | "quarter" | "ordinalDay"
+                            | "dayOfQuarter" => temporal_date_prop(&date, key),
+                            "hour" => Ok(Value::Property(Property::Int64(naive.hour() as i64))),
+                            "minute" => Ok(Value::Property(Property::Int64(naive.minute() as i64))),
+                            "second" => Ok(Value::Property(Property::Int64(naive.second() as i64))),
+                            "millisecond" => Ok(Value::Property(Property::Int64(
+                                (nsec / 1_000_000) as i64,
+                            ))),
+                            "microsecond" => Ok(Value::Property(Property::Int64(
+                                (nsec / 1_000) as i64,
+                            ))),
+                            "nanosecond" => Ok(Value::Property(Property::Int64(nsec as i64))),
+                            "epochMillis" => Ok(Value::Property(Property::Int64(*ms))),
+                            "epochSeconds" => Ok(Value::Property(Property::Int64(secs))),
+                            _ => Ok(Value::Null),
+                        }
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                Value::Property(Property::Duration(ref dur)) => match key.as_str() {
+                    "months" => Ok(Value::Property(Property::Int64(dur.months))),
+                    "days" => Ok(Value::Property(Property::Int64(dur.days))),
+                    "seconds" => Ok(Value::Property(Property::Int64(dur.seconds))),
+                    "nanosecondsOfSecond" | "nanoseconds" => {
+                        Ok(Value::Property(Property::Int64(dur.nanos as i64)))
+                    }
+                    "minutesOfHour" => {
+                        Ok(Value::Property(Property::Int64((dur.seconds % 3600) / 60)))
+                    }
+                    "secondsOfMinute" => {
+                        Ok(Value::Property(Property::Int64(dur.seconds % 60)))
+                    }
+                    "millisecondsOfSecond" => {
+                        Ok(Value::Property(Property::Int64((dur.nanos / 1_000_000) as i64)))
+                    }
+                    "microsecondsOfSecond" => {
+                        Ok(Value::Property(Property::Int64((dur.nanos / 1_000) as i64)))
+                    }
+                    _ => Ok(Value::Null),
+                },
                 _ => Ok(Value::Null),
             }
         }
@@ -118,8 +173,9 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                         let naive = dt.naive_utc();
                         let date = naive.date();
                         match key.as_str() {
-                            "year" | "month" | "day" | "week" | "dayOfWeek" | "dayOfYear"
-                            | "quarter" | "ordinalDay" => temporal_date_prop(&date, key),
+                            "year" | "month" | "day" | "week" | "weekYear" | "dayOfWeek"
+                            | "weekDay" | "dayOfYear" | "quarter" | "ordinalDay"
+                            | "dayOfQuarter" => temporal_date_prop(&date, key),
                             "hour" => Ok(Value::Property(Property::Int64(naive.hour() as i64))),
                             "minute" => Ok(Value::Property(Property::Int64(naive.minute() as i64))),
                             "second" => Ok(Value::Property(Property::Int64(naive.second() as i64))),
@@ -2736,9 +2792,15 @@ fn temporal_date_prop(d: &chrono::NaiveDate, key: &str) -> Result<Value> {
         "month" => d.month() as i64,
         "day" => d.day() as i64,
         "week" => d.iso_week().week() as i64,
-        "dayOfWeek" => d.weekday().num_days_from_monday() as i64 + 1,
+        "weekYear" => d.iso_week().year() as i64,
+        "dayOfWeek" | "weekDay" => d.weekday().num_days_from_monday() as i64 + 1,
         "dayOfYear" | "ordinalDay" => d.ordinal() as i64,
         "quarter" => ((d.month() - 1) / 3 + 1) as i64,
+        "dayOfQuarter" => {
+            let q_start_month = ((d.month() - 1) / 3) * 3 + 1;
+            let q_start = chrono::NaiveDate::from_ymd_opt(d.year(), q_start_month, 1).unwrap();
+            (d.signed_duration_since(q_start).num_days() + 1) as i64
+        }
         _ => return Ok(Value::Null),
     })))
 }
