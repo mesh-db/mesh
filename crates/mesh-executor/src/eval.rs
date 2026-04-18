@@ -3926,6 +3926,104 @@ fn temporal_to_nanos(v: &Value) -> Result<i128> {
     }
 }
 
+/// Truncate a time-of-day from a source temporal. Used by both
+/// `time.truncate(...)` and `localtime.truncate(...)`. The source
+/// can be any temporal type carrying a time component (Time,
+/// LocalDateTime, DateTime); Date inputs are treated as 00:00.
+fn truncate_time_value(
+    name: &str,
+    unit: &str,
+    temporal: &Value,
+    overrides: Option<&std::collections::HashMap<String, Property>>,
+) -> Result<Value> {
+    let is_zoned = name.starts_with("time.");
+    let (tod_nanos, source_tz) = match temporal {
+        Value::Property(Property::Time {
+            nanos,
+            tz_offset_secs,
+        }) => (*nanos as i128, *tz_offset_secs),
+        Value::Property(Property::LocalDateTime(ns)) => (
+            ns.rem_euclid(86_400_000_000_000),
+            None::<i32>,
+        ),
+        Value::Property(Property::DateTime {
+            nanos,
+            tz_offset_secs,
+        }) => {
+            let local = match tz_offset_secs {
+                Some(off) => *nanos + (*off as i128) * 1_000_000_000,
+                None => *nanos,
+            };
+            (local.rem_euclid(86_400_000_000_000), *tz_offset_secs)
+        }
+        Value::Property(Property::Date(_)) => (0_i128, None),
+        _ => return Err(Error::TypeMismatch),
+    };
+    // Truncate to the requested unit.
+    let truncated: i128 = match unit {
+        "day" => 0,
+        "hour" => tod_nanos - tod_nanos.rem_euclid(3_600_000_000_000),
+        "minute" => tod_nanos - tod_nanos.rem_euclid(60_000_000_000),
+        "second" => tod_nanos - tod_nanos.rem_euclid(1_000_000_000),
+        "millisecond" => tod_nanos - tod_nanos.rem_euclid(1_000_000),
+        "microsecond" => tod_nanos - tod_nanos.rem_euclid(1_000),
+        _ => {
+            return Err(Error::UnknownScalarFunction(format!(
+                "unsupported truncation unit for time: {unit}"
+            )));
+        }
+    };
+    // Override fields: hour/minute/second/millisecond/microsecond/nanosecond.
+    let mut final_nanos = truncated;
+    if let Some(ov) = overrides {
+        for (k, v) in ov.iter() {
+            let n = match v {
+                Property::Int64(n) => *n,
+                _ => continue,
+            };
+            match k.as_str() {
+                "hour" => {
+                    // Replace the hour-of-day.
+                    let sub = final_nanos.rem_euclid(3_600_000_000_000);
+                    final_nanos = (n as i128) * 3_600_000_000_000 + sub;
+                }
+                "minute" => {
+                    let hours = final_nanos / 3_600_000_000_000;
+                    let sub_minute = final_nanos.rem_euclid(60_000_000_000);
+                    final_nanos =
+                        hours * 3_600_000_000_000 + (n as i128) * 60_000_000_000 + sub_minute;
+                }
+                "second" => {
+                    let minute_aligned = final_nanos - final_nanos.rem_euclid(60_000_000_000);
+                    let sub_second = final_nanos.rem_euclid(1_000_000_000);
+                    final_nanos = minute_aligned + (n as i128) * 1_000_000_000 + sub_second;
+                }
+                "millisecond" => {
+                    let second_aligned = final_nanos - final_nanos.rem_euclid(1_000_000_000);
+                    final_nanos = second_aligned + (n as i128) * 1_000_000;
+                }
+                "microsecond" => {
+                    let second_aligned = final_nanos - final_nanos.rem_euclid(1_000_000_000);
+                    final_nanos = second_aligned + (n as i128) * 1_000;
+                }
+                "nanosecond" => {
+                    let second_aligned = final_nanos - final_nanos.rem_euclid(1_000_000_000);
+                    final_nanos = second_aligned + (n as i128);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(Value::Property(Property::Time {
+        nanos: final_nanos as i64,
+        tz_offset_secs: if is_zoned {
+            Some(source_tz.unwrap_or(0))
+        } else {
+            None
+        },
+    }))
+}
+
 /// Truncate a temporal value to the specified unit.
 fn truncate_temporal(
     name: &str,
@@ -3933,19 +4031,31 @@ fn truncate_temporal(
     temporal: &Value,
     overrides: Option<&std::collections::HashMap<String, Property>>,
 ) -> Result<Value> {
+    // time.truncate / localtime.truncate produce a Time value. Pull
+    // the local time-of-day out of whatever source temporal we were
+    // given, truncate that, apply overrides, and wrap.
+    if name.starts_with("time.") || name.starts_with("localtime.") {
+        return truncate_time_value(name, unit, temporal, overrides);
+    }
     match temporal {
         Value::Property(Property::DateTime { .. })
         | Value::Property(Property::LocalDateTime(_))
         | Value::Property(Property::Date(_)) => {
-            let epoch_ns: i128 = match temporal {
-                Value::Property(Property::DateTime { nanos: ns, .. })
-                | Value::Property(Property::LocalDateTime(ns)) => *ns,
-                Value::Property(Property::Date(days)) => *days as i128 * 86_400_000_000_000,
-                _ => unreachable!(),
-            };
+            // For datetime() we truncate the *local* wall-clock, not
+            // the UTC instant — Neo4j rounds within the zone where
+            // the value was authored. Shift back to UTC at the end.
             let source_tz: Option<i32> = match temporal {
                 Value::Property(Property::DateTime { tz_offset_secs, .. }) => *tz_offset_secs,
                 _ => None,
+            };
+            let epoch_ns: i128 = match temporal {
+                Value::Property(Property::DateTime { nanos: ns, .. }) => match source_tz {
+                    Some(off) => *ns + (off as i128) * 1_000_000_000,
+                    None => *ns,
+                },
+                Value::Property(Property::LocalDateTime(ns)) => *ns,
+                Value::Property(Property::Date(days)) => *days as i128 * 86_400_000_000_000,
+                _ => unreachable!(),
             };
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
             let (secs, nanos) = nanos_to_secs_nanos(epoch_ns);
@@ -3980,7 +4090,21 @@ fn truncate_temporal(
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap(),
-                "weekyear" | "week" => {
+                "weekyear" => {
+                    // Jump to Mon, week 1 of the ISO week-year that
+                    // owns `dt`. This differs from `week`: at year
+                    // boundaries the iso week year can disagree with
+                    // the calendar year (Jan 1 1984 is in weekYear
+                    // 1983 since it falls on a Sunday).
+                    use chrono::Datelike;
+                    let iso = dt.iso_week();
+                    let wy = iso.year();
+                    chrono::NaiveDate::from_isoywd_opt(wy, 1, chrono::Weekday::Mon)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                }
+                "week" => {
                     let weekday = dt.weekday().num_days_from_monday();
                     let d = dt.date() - chrono::Duration::days(weekday as i64);
                     d.and_hms_opt(0, 0, 0).unwrap()
@@ -4075,8 +4199,14 @@ fn truncate_temporal(
             } else if name.starts_with("localdatetime.") {
                 Ok(Value::Property(Property::LocalDateTime(result_nanos)))
             } else {
+                // `result_nanos` is local wall-clock; shift back to
+                // UTC so the stored DateTime nanos are always UTC.
+                let utc_nanos = match source_tz {
+                    Some(off) => result_nanos - (off as i128) * 1_000_000_000,
+                    None => result_nanos,
+                };
                 Ok(Value::Property(Property::DateTime {
-                    nanos: result_nanos,
+                    nanos: utc_nanos,
                     tz_offset_secs: source_tz,
                 }))
             }
