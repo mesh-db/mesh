@@ -1350,12 +1350,33 @@ fn map_int(m: &std::collections::HashMap<String, Property>, key: &str) -> Option
     }
 }
 
+std::thread_local! {
+    // Cache of `now_epoch_nanos()` for the current statement. Cleared
+    // by `reset_statement_time()` at the top of every query execution
+    // so calls within a single statement see the same "now" — this
+    // matches Neo4j, which evaluates `datetime()` etc. once per
+    // statement so `duration.between(datetime(), datetime())` is
+    // exactly `PT0S`.
+    static STATEMENT_NANOS: std::cell::Cell<Option<i128>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn reset_statement_time() {
+    STATEMENT_NANOS.with(|c| c.set(None));
+}
+
 fn now_epoch_nanos() -> i128 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    duration.as_nanos() as i128
+    STATEMENT_NANOS.with(|cell| match cell.get() {
+        Some(ns) => ns,
+        None => {
+            let duration = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let ns = duration.as_nanos() as i128;
+            cell.set(Some(ns));
+            ns
+        }
+    })
 }
 
 /// Convenience: epoch nanos → (secs, subsec_nanos)
@@ -3689,8 +3710,21 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             // tod back to UTC so tz differences contribute to the
             // duration. Mixed zoned/local uses the local wall-clock
             // on both sides — this is what Neo4j does.
-            let (mut a_date, mut a_tod, mut a_tz, a_kind) = temporal_to_date_tod(&a)?;
-            let (mut b_date, mut b_tod, mut b_tz, b_kind) = temporal_to_date_tod(&b)?;
+            let (mut a_date, mut a_tod, mut a_tz, mut a_kind) = temporal_to_date_tod(&a)?;
+            let (mut b_date, mut b_tod, mut b_tz, mut b_kind) = temporal_to_date_tod(&b)?;
+            // A TimeOnly value has no calendar date; when paired with
+            // a zoned datetime, Neo4j anchors the time on that
+            // datetime's local date (so `localtime(0:00)` to
+            // `datetime(Oct 29 4:00 EU/STK)` on DST fall-back day
+            // gives PT5H, not PT4H). Promote the time-only side so
+            // the rest of the logic can treat both uniformly.
+            if a_kind == TemporalKind::TimeOnly && b_kind == TemporalKind::HasDate {
+                a_date = b_date;
+                a_kind = TemporalKind::HasDate;
+            } else if b_kind == TemporalKind::TimeOnly && a_kind == TemporalKind::HasDate {
+                b_date = a_date;
+                b_kind = TemporalKind::HasDate;
+            }
             // If exactly one side carries a zone + named tz, borrow
             // that zone to interpret the other side's wall-clock —
             // matches Neo4j's DST-day behaviour (Oct 29 2017 in

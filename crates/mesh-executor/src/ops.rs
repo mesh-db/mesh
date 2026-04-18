@@ -123,6 +123,11 @@ pub fn execute_with_reader(
     writer: &dyn GraphWriter,
     params: &ParamMap,
 ) -> Result<Vec<Row>> {
+    // `datetime()`, `localtime()`, and friends cache "now" in a
+    // thread-local so multiple calls inside the same statement see
+    // the same instant. Clear it at the start of every execution so
+    // the next query gets a fresh reading.
+    crate::eval::reset_statement_time();
     // Schema DDL never enters the operator pipeline — it's a
     // side-effect on the backing store, not a row-producing query.
     // Short-circuit here so `build_op` stays a pure plan-to-operator
