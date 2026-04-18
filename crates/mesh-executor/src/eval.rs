@@ -1784,6 +1784,65 @@ fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
         return Err(bad());
     }
 
+    // ISO 8601 also allows an alternative "calendar date" duration
+    // form: `P[YYYY-MM-DD]T[HH:MM:SS.fff]`. Detect it by the shape
+    // `digits-digits-digits` — unit-based durations like
+    // `P12Y5M-14D` also contain `-`, so we need the stronger check.
+    let is_calendar_form = {
+        let segs: Vec<&str> = date_part.split('-').collect();
+        segs.len() == 3 && segs.iter().all(|s| !s.is_empty()
+            && s.chars().all(|c| c.is_ascii_digit()))
+    };
+    if is_calendar_form {
+        let mut d_iter = date_part.split('-');
+        let y = d_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
+        let mo = d_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
+        let d = d_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
+        if d_iter.next().is_some() {
+            return Err(bad());
+        }
+        let mut months = y * 12 + mo;
+        let mut days = d;
+        let mut seconds = 0_i64;
+        let mut nanos = 0_i32;
+        if let Some(time) = time_part {
+            let mut t_iter = time.split(':');
+            let hh = t_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
+            let mm = t_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
+            let ss_raw = t_iter.next().ok_or_else(bad)?;
+            if t_iter.next().is_some() {
+                return Err(bad());
+            }
+            let (ss_whole, ss_frac) = match ss_raw.split_once('.') {
+                Some((w, f)) => {
+                    let whole: i64 = w.parse().map_err(|_| bad())?;
+                    let mut padded = String::from(f);
+                    while padded.len() < 9 {
+                        padded.push('0');
+                    }
+                    padded.truncate(9);
+                    let frac: i32 = padded.parse().map_err(|_| bad())?;
+                    (whole, frac)
+                }
+                None => (ss_raw.parse::<i64>().map_err(|_| bad())?, 0),
+            };
+            seconds = hh * 3600 + mm * 60 + ss_whole;
+            nanos = ss_frac;
+        }
+        if negative {
+            months = months.wrapping_neg();
+            days = days.wrapping_neg();
+            seconds = seconds.wrapping_neg();
+            nanos = nanos.wrapping_neg();
+        }
+        return Ok(mesh_core::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        });
+    }
+
     let mut months = 0_i64;
     let mut days = 0_i64;
     let mut seconds = 0_i64;
@@ -3630,8 +3689,42 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             // tod back to UTC so tz differences contribute to the
             // duration. Mixed zoned/local uses the local wall-clock
             // on both sides — this is what Neo4j does.
-            let (mut a_date, mut a_tod, a_tz, a_kind) = temporal_to_date_tod(&a)?;
-            let (mut b_date, mut b_tod, b_tz, b_kind) = temporal_to_date_tod(&b)?;
+            let (mut a_date, mut a_tod, mut a_tz, a_kind) = temporal_to_date_tod(&a)?;
+            let (mut b_date, mut b_tod, mut b_tz, b_kind) = temporal_to_date_tod(&b)?;
+            // If exactly one side carries a zone + named tz, borrow
+            // that zone to interpret the other side's wall-clock —
+            // matches Neo4j's DST-day behaviour (Oct 29 2017 in
+            // Stockholm is 25h long from a zoned vs. naive midnight).
+            let a_tz_name = match &a {
+                Value::Property(Property::DateTime { tz_name, .. }) => tz_name.clone(),
+                _ => None,
+            };
+            let b_tz_name = match &b {
+                Value::Property(Property::DateTime { tz_name, .. }) => tz_name.clone(),
+                _ => None,
+            };
+            match (&a_tz_name, &b_tz_name) {
+                (Some(name), None) if b_tz.is_none() => {
+                    // Re-interpret b's naive wall-clock in a's zone.
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let b_local_ns = (b_date.signed_duration_since(epoch).num_days() as i128)
+                        * 86_400_000_000_000
+                        + b_tod;
+                    if let Some((off, _)) = parse_tz_name_local(name, b_local_ns) {
+                        b_tz = Some(off);
+                    }
+                }
+                (None, Some(name)) if a_tz.is_none() => {
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let a_local_ns = (a_date.signed_duration_since(epoch).num_days() as i128)
+                        * 86_400_000_000_000
+                        + a_tod;
+                    if let Some((off, _)) = parse_tz_name_local(name, a_local_ns) {
+                        a_tz = Some(off);
+                    }
+                }
+                _ => {}
+            }
             if a_tz.is_some() && b_tz.is_some() {
                 let shift_to_utc = |date: &mut chrono::NaiveDate,
                                     tod: &mut i128,
@@ -3739,6 +3832,49 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             }
             Ok(Value::Property(Property::DateTime {
                 nanos: now_epoch_nanos(),
+                tz_offset_secs: Some(0),
+                tz_name: None,
+            }))
+        }
+        // `datetime.fromepoch(seconds, nanos)` — pair of integers.
+        // `datetime.fromepochmillis(ms)` — single integer.
+        "datetime.fromepoch" => {
+            if arg_exprs.len() != 2 {
+                return Err(Error::UnknownScalarFunction(
+                    "datetime.fromepoch() expects (seconds, nanoseconds)".into(),
+                ));
+            }
+            let s = eval_expr(&arg_exprs[0], ctx)?;
+            let n = eval_expr(&arg_exprs[1], ctx)?;
+            let to_i64 = |v: Value| -> Option<i64> {
+                match v {
+                    Value::Property(Property::Int64(i)) => Some(i),
+                    _ => None,
+                }
+            };
+            let (Some(seconds), Some(sub)) = (to_i64(s), to_i64(n)) else {
+                return Err(Error::TypeMismatch);
+            };
+            let nanos = (seconds as i128) * 1_000_000_000 + sub as i128;
+            Ok(Value::Property(Property::DateTime {
+                nanos,
+                tz_offset_secs: Some(0),
+                tz_name: None,
+            }))
+        }
+        "datetime.fromepochmillis" => {
+            if arg_exprs.len() != 1 {
+                return Err(Error::UnknownScalarFunction(
+                    "datetime.fromepochmillis() expects a single integer".into(),
+                ));
+            }
+            let v = eval_expr(&arg_exprs[0], ctx)?;
+            let ms: i64 = match v {
+                Value::Property(Property::Int64(i)) => i,
+                _ => return Err(Error::TypeMismatch),
+            };
+            Ok(Value::Property(Property::DateTime {
+                nanos: (ms as i128) * 1_000_000,
                 tz_offset_secs: Some(0),
                 tz_name: None,
             }))
