@@ -1370,12 +1370,13 @@ impl Operator for CallSubqueryOp {
 
 fn value_to_property(v: Value) -> Result<Property> {
     match v {
+        Value::Property(Property::Map(_)) => Err(Error::InvalidSetValue),
         Value::Property(p) => Ok(p),
         Value::Null => Ok(Property::Null),
         Value::List(items) => {
             let props: Vec<Property> = items
                 .into_iter()
-                .map(|item| value_to_property(item))
+                .map(value_to_property)
                 .collect::<Result<_>>()?;
             Ok(Property::List(props))
         }
