@@ -2894,11 +2894,16 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 return Ok(Value::Null);
             }
             // Extract date and time-of-day from both temporal values
-            let (a_date, a_tod) = temporal_to_date_tod(&a)?;
-            let (b_date, b_tod) = temporal_to_date_tod(&b)?;
+            let (a_date, a_tod, a_kind) = temporal_to_date_tod(&a)?;
+            let (b_date, b_tod, b_kind) = temporal_to_date_tod(&b)?;
+            // When either side has no date (Time/LocalTime), collapse
+            // to a time-only difference. Neo4j drops the calendar
+            // component of the other side in this case.
+            let time_only = a_kind == TemporalKind::TimeOnly
+                || b_kind == TemporalKind::TimeOnly;
             let duration = match name {
                 "duration.inmonths" => {
-                    let months = month_diff(a_date, b_date);
+                    let months = if time_only { 0 } else { month_diff(a_date, b_date) };
                     mesh_core::Duration {
                         months,
                         days: 0,
@@ -2907,7 +2912,11 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                 }
                 "duration.indays" => {
-                    let days = b_date.signed_duration_since(a_date).num_days();
+                    let days = if time_only {
+                        0
+                    } else {
+                        b_date.signed_duration_since(a_date).num_days()
+                    };
                     mesh_core::Duration {
                         months: 0,
                         days,
@@ -2916,7 +2925,11 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                 }
                 "duration.inseconds" => {
-                    let days = b_date.signed_duration_since(a_date).num_days();
+                    let days = if time_only {
+                        0
+                    } else {
+                        b_date.signed_duration_since(a_date).num_days()
+                    };
                     let total_nanos = (days as i128) * 86_400_000_000_000 + b_tod - a_tod;
                     let seconds = (total_nanos / 1_000_000_000) as i64;
                     let nanos = (total_nanos % 1_000_000_000) as i32;
@@ -2928,8 +2941,21 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                 }
                 _ => {
-                    // duration.between: compute calendar-aware components
-                    duration_between_calendar(a_date, a_tod, b_date, b_tod)
+                    // duration.between: calendar-aware when both have
+                    // dates; pure time-diff otherwise.
+                    if time_only {
+                        let diff_ns = b_tod - a_tod;
+                        let seconds = diff_ns.div_euclid(1_000_000_000) as i64;
+                        let nanos = diff_ns.rem_euclid(1_000_000_000) as i32;
+                        mesh_core::Duration {
+                            months: 0,
+                            days: 0,
+                            seconds,
+                            nanos,
+                        }
+                    } else {
+                        duration_between_calendar(a_date, a_tod, b_date, b_tod)
+                    }
                 }
             };
             Ok(Value::Property(Property::Duration(duration)))
@@ -3163,22 +3189,39 @@ fn temporal_date_prop(d: &chrono::NaiveDate, key: &str) -> Result<Value> {
     })))
 }
 
-/// Extract (date, time-of-day nanoseconds) from any temporal value.
-fn temporal_to_date_tod(v: &Value) -> Result<(chrono::NaiveDate, i128)> {
+/// Classification of a temporal value for duration.between:
+/// - HasDate: value carries a calendar date (Date, DateTime, LocalDateTime)
+/// - TimeOnly: value has only a time-of-day (Time, LocalTime)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TemporalKind {
+    HasDate,
+    TimeOnly,
+}
+
+/// Extract (date, time-of-day nanoseconds, kind) from any temporal value.
+fn temporal_to_date_tod(v: &Value) -> Result<(chrono::NaiveDate, i128, TemporalKind)> {
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     match v {
-        Value::Property(Property::Date(days)) => {
-            Ok((epoch + chrono::Duration::days(*days as i64), 0))
-        }
-        Value::Property(Property::DateTime(ns)) => {
+        Value::Property(Property::Date(days)) => Ok((
+            epoch + chrono::Duration::days(*days as i64),
+            0,
+            TemporalKind::HasDate,
+        )),
+        Value::Property(Property::DateTime(ns))
+        | Value::Property(Property::LocalDateTime(ns)) => {
             let days = ns.div_euclid(86_400_000_000_000);
             let tod = ns.rem_euclid(86_400_000_000_000);
             let days_i64 = i64::try_from(days).map_err(|_| Error::TypeMismatch)?;
-            Ok((epoch + chrono::Duration::days(days_i64), tod))
+            Ok((
+                epoch + chrono::Duration::days(days_i64),
+                tod,
+                TemporalKind::HasDate,
+            ))
         }
         Value::Property(Property::Time { nanos, .. }) => {
-            // Time value has no date, use epoch
-            Ok((epoch, *nanos as i128))
+            // Time value has no date, use epoch; caller should treat
+            // as time-only for duration.between semantics.
+            Ok((epoch, *nanos as i128, TemporalKind::TimeOnly))
         }
         _ => Err(Error::TypeMismatch),
     }
