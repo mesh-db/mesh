@@ -407,6 +407,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             src_var,
             dst_var,
             edge_type,
+            undirected,
             on_create,
             on_match,
         } => Box::new(MergeEdgeOp::new(
@@ -415,6 +416,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             src_var.clone(),
             dst_var.clone(),
             edge_type.clone(),
+            *undirected,
             on_create.clone(),
             on_match.clone(),
         )),
@@ -1702,6 +1704,7 @@ struct MergeEdgeOp {
     src_var: String,
     dst_var: String,
     edge_type: String,
+    undirected: bool,
     on_create: Vec<SetAssignment>,
     on_match: Vec<SetAssignment>,
 }
@@ -1713,6 +1716,7 @@ impl MergeEdgeOp {
         src_var: String,
         dst_var: String,
         edge_type: String,
+        undirected: bool,
         on_create: Vec<SetAssignment>,
         on_match: Vec<SetAssignment>,
     ) -> Self {
@@ -1722,6 +1726,7 @@ impl MergeEdgeOp {
             src_var,
             dst_var,
             edge_type,
+            undirected,
             on_create,
             on_match,
         }
@@ -1748,7 +1753,9 @@ impl Operator for MergeEdgeOp {
             };
 
             // Scan outgoing edges from src, looking for one
-            // that targets dst with the matching type.
+            // that targets dst with the matching type. When the
+            // MERGE pattern is undirected, also scan incoming
+            // edges — the first match in either direction wins.
             let mut matched_edge: Option<Edge> = None;
             for (edge_id, neighbor_id) in ctx.store.outgoing(src_node.id)? {
                 if neighbor_id != dst_node.id {
@@ -1758,6 +1765,19 @@ impl Operator for MergeEdgeOp {
                     if edge.edge_type == self.edge_type {
                         matched_edge = Some(edge);
                         break;
+                    }
+                }
+            }
+            if matched_edge.is_none() && self.undirected {
+                for (edge_id, neighbor_id) in ctx.store.incoming(src_node.id)? {
+                    if neighbor_id != dst_node.id {
+                        continue;
+                    }
+                    if let Some(edge) = ctx.store.get_edge(edge_id)? {
+                        if edge.edge_type == self.edge_type {
+                            matched_edge = Some(edge);
+                            break;
+                        }
                     }
                 }
             }

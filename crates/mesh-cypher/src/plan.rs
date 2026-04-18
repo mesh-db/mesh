@@ -219,6 +219,11 @@ pub enum LogicalPlan {
         src_var: String,
         dst_var: String,
         edge_type: String,
+        /// True when the pattern's arrow is undirected (`-[r]-`) —
+        /// an existing edge in either direction counts as a match
+        /// and the newly-created edge is emitted in the src→dst
+        /// direction (matching Neo4j's tie-breaking behavior).
+        undirected: bool,
         on_create: Vec<SetAssignment>,
         on_match: Vec<SetAssignment>,
     },
@@ -2380,6 +2385,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             src_var: merge_src,
                             dst_var: merge_dst,
                             edge_type,
+                            undirected: matches!(hop.rel.direction, Direction::Both),
                             on_create: on_create.clone(),
                             on_match: on_match.clone(),
                         });
