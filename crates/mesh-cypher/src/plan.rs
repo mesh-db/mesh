@@ -2801,6 +2801,39 @@ fn apply_optional_match(
 /// LIMIT. Downstream clauses (RETURN, another MATCH) then see
 /// only the names introduced by this WITH's items.
 fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Result<LogicalPlan> {
+    let has_aggregates = !w.star
+        && w.items.iter().any(|it| matches!(
+            &it.expr,
+            Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some()
+        ));
+
+    // openCypher: `WHERE` attached to `WITH` can reference BOTH the
+    // variables bound before the WITH and the aliases introduced by
+    // it. When the projection is non-aggregating, push the filter
+    // *before* the projection — substituting any alias reference
+    // with its defining expression — so the pre-WITH vars stay in
+    // scope. Aggregating WITH keeps the filter after so HAVING-style
+    // predicates on aggregate results work correctly.
+    let (pre_filter, post_filter) = match (&w.where_clause, has_aggregates, w.star) {
+        (Some(pred), false, false) => {
+            let alias_map: std::collections::HashMap<String, Expr> = w
+                .items
+                .iter()
+                .filter_map(|it| it.alias.as_ref().map(|a| (a.clone(), it.expr.clone())))
+                .collect();
+            (Some(substitute_aliases(pred.clone(), &alias_map)), None)
+        }
+        (Some(pred), _, _) => (None, Some(pred.clone())),
+        (None, _, _) => (None, None),
+    };
+
+    if let Some(predicate) = pre_filter {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate,
+        };
+    }
+
     if w.star {
         plan = LogicalPlan::Identity {
             input: Box::new(plan),
@@ -2834,10 +2867,10 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
         };
     }
 
-    if let Some(predicate) = &w.where_clause {
+    if let Some(predicate) = post_filter {
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
-            predicate: predicate.clone(),
+            predicate,
         };
     }
 
@@ -3059,5 +3092,132 @@ fn contains_aggregate(expr: &Expr) -> bool {
                     .unwrap_or(false)
         }
         _ => false,
+    }
+}
+
+/// Substitute alias references in `expr` using `map`. Used to push
+/// a WHERE filter attached to a WITH clause upstream of the
+/// projection — the predicate may reference both pre-WITH variables
+/// and WITH aliases, so alias occurrences are rewritten to the
+/// expression that defines them (leaving pre-WITH vars untouched).
+fn substitute_aliases(
+    expr: Expr,
+    map: &std::collections::HashMap<String, Expr>,
+) -> Expr {
+    match expr {
+        Expr::Identifier(ref name) => {
+            if let Some(repl) = map.get(name) {
+                repl.clone()
+            } else {
+                expr
+            }
+        }
+        Expr::Property { var, key } => {
+            if let Some(repl) = map.get(&var) {
+                Expr::PropertyAccess {
+                    base: Box::new(repl.clone()),
+                    key,
+                }
+            } else {
+                Expr::Property { var, key }
+            }
+        }
+        Expr::Not(inner) => Expr::Not(Box::new(substitute_aliases(*inner, map))),
+        Expr::And(a, b) => Expr::And(
+            Box::new(substitute_aliases(*a, map)),
+            Box::new(substitute_aliases(*b, map)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(substitute_aliases(*a, map)),
+            Box::new(substitute_aliases(*b, map)),
+        ),
+        Expr::Xor(a, b) => Expr::Xor(
+            Box::new(substitute_aliases(*a, map)),
+            Box::new(substitute_aliases(*b, map)),
+        ),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op,
+            left: Box::new(substitute_aliases(*left, map)),
+            right: Box::new(substitute_aliases(*right, map)),
+        },
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op,
+            left: Box::new(substitute_aliases(*left, map)),
+            right: Box::new(substitute_aliases(*right, map)),
+        },
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op,
+            operand: Box::new(substitute_aliases(*operand, map)),
+        },
+        Expr::IsNull { negated, inner } => Expr::IsNull {
+            negated,
+            inner: Box::new(substitute_aliases(*inner, map)),
+        },
+        Expr::PropertyAccess { base, key } => Expr::PropertyAccess {
+            base: Box::new(substitute_aliases(*base, map)),
+            key,
+        },
+        Expr::IndexAccess { base, index } => Expr::IndexAccess {
+            base: Box::new(substitute_aliases(*base, map)),
+            index: Box::new(substitute_aliases(*index, map)),
+        },
+        Expr::SliceAccess { base, start, end } => Expr::SliceAccess {
+            base: Box::new(substitute_aliases(*base, map)),
+            start: start.map(|e| Box::new(substitute_aliases(*e, map))),
+            end: end.map(|e| Box::new(substitute_aliases(*e, map))),
+        },
+        Expr::HasLabels { expr, labels } => Expr::HasLabels {
+            expr: Box::new(substitute_aliases(*expr, map)),
+            labels,
+        },
+        Expr::InList { element, list } => Expr::InList {
+            element: Box::new(substitute_aliases(*element, map)),
+            list: Box::new(substitute_aliases(*list, map)),
+        },
+        Expr::Call { name, args } => Expr::Call {
+            name,
+            args: match args {
+                CallArgs::Star => CallArgs::Star,
+                CallArgs::Exprs(es) => CallArgs::Exprs(
+                    es.into_iter().map(|e| substitute_aliases(e, map)).collect(),
+                ),
+                CallArgs::DistinctExprs(es) => CallArgs::DistinctExprs(
+                    es.into_iter().map(|e| substitute_aliases(e, map)).collect(),
+                ),
+            },
+        },
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => Expr::Case {
+            scrutinee: scrutinee.map(|s| Box::new(substitute_aliases(*s, map))),
+            branches: branches
+                .into_iter()
+                .map(|(c, r)| (substitute_aliases(c, map), substitute_aliases(r, map)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(substitute_aliases(*e, map))),
+        },
+        Expr::List(items) => Expr::List(
+            items.into_iter().map(|e| substitute_aliases(e, map)).collect(),
+        ),
+        Expr::Map(entries) => Expr::Map(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k, substitute_aliases(v, map)))
+                .collect(),
+        ),
+        Expr::ListComprehension {
+            var,
+            source,
+            predicate,
+            projection,
+        } => Expr::ListComprehension {
+            var,
+            source: Box::new(substitute_aliases(*source, map)),
+            predicate: predicate.map(|p| Box::new(substitute_aliases(*p, map))),
+            projection: projection.map(|p| Box::new(substitute_aliases(*p, map))),
+        },
+        other => other,
     }
 }
