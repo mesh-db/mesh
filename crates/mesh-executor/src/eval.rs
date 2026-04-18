@@ -2708,10 +2708,20 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         let hour = map_int(&m, "hour").unwrap_or_else(|| default_tod(base_hour));
                         let minute = map_int(&m, "minute").unwrap_or_else(|| default_tod(base_min));
                         let second = map_int(&m, "second").unwrap_or_else(|| default_tod(base_sec));
-                        let nanos = map_int(&m, "nanosecond")
-                            .or_else(|| map_int(&m, "millisecond").map(|ms| ms * 1_000_000))
-                            .or_else(|| map_int(&m, "microsecond").map(|us| us * 1_000))
-                            .unwrap_or_else(|| default_tod(base_ns));
+                        // ms/us/ns combine: each is the appropriate order of
+                        // magnitude's contribution to sub-second nanoseconds.
+                        // Absent fields fall back to base. Present fields
+                        // add up.
+                        let has_any_sub = m.contains_key("millisecond")
+                            || m.contains_key("microsecond")
+                            || m.contains_key("nanosecond");
+                        let nanos = if has_any_sub {
+                            map_int(&m, "millisecond").unwrap_or(0) * 1_000_000
+                                + map_int(&m, "microsecond").unwrap_or(0) * 1_000
+                                + map_int(&m, "nanosecond").unwrap_or(0)
+                        } else {
+                            default_tod(base_ns)
+                        };
                         let epoch_nanos: i128 = (days_since_epoch as i128) * 86_400_000_000_000
                             + (hour as i128) * 3_600_000_000_000
                             + (minute as i128) * 60_000_000_000
@@ -2815,10 +2825,20 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         let hour = map_int(&m, "hour").unwrap_or_else(|| default_tod(base_h));
                         let minute = map_int(&m, "minute").unwrap_or_else(|| default_tod(base_min));
                         let second = map_int(&m, "second").unwrap_or_else(|| default_tod(base_sec));
-                        let nanos = map_int(&m, "nanosecond")
-                            .or_else(|| map_int(&m, "millisecond").map(|ms| ms * 1_000_000))
-                            .or_else(|| map_int(&m, "microsecond").map(|us| us * 1_000))
-                            .unwrap_or_else(|| default_tod(base_ns));
+                        // ms/us/ns combine: each is the appropriate order of
+                        // magnitude's contribution to sub-second nanoseconds.
+                        // Absent fields fall back to base. Present fields
+                        // add up.
+                        let has_any_sub = m.contains_key("millisecond")
+                            || m.contains_key("microsecond")
+                            || m.contains_key("nanosecond");
+                        let nanos = if has_any_sub {
+                            map_int(&m, "millisecond").unwrap_or(0) * 1_000_000
+                                + map_int(&m, "microsecond").unwrap_or(0) * 1_000
+                                + map_int(&m, "nanosecond").unwrap_or(0)
+                        } else {
+                            default_tod(base_ns)
+                        };
                         let time_nanos =
                             hour * 3_600_000_000_000 + minute * 60_000_000_000
                             + second * 1_000_000_000 + nanos;
