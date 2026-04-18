@@ -5866,8 +5866,8 @@ fn date_plus_duration_days_only() {
 
 #[test]
 fn date_plus_duration_with_seconds_errors() {
-    // date() + duration({seconds: 10}) now returns null instead of erroring,
-    // per openCypher semantics for type-mismatched arithmetic.
+    // date() + duration({seconds: 10}) silently drops sub-day components
+    // and returns today's date, matching openCypher behavior.
     let (store, _d) = open_store();
     let plan = mesh_cypher::plan(
         &mesh_cypher::parse("RETURN date() + duration({seconds: 10}) AS d").unwrap(),
@@ -5875,7 +5875,10 @@ fn date_plus_duration_with_seconds_errors() {
     .unwrap();
     let rows = mesh_executor::execute(&plan, &store).unwrap();
     assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0].get("d"), Some(mesh_executor::Value::Null)));
+    assert!(matches!(
+        rows[0].get("d"),
+        Some(mesh_executor::Value::Property(mesh_core::Property::Date(_)))
+    ));
 }
 
 #[test]

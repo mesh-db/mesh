@@ -1761,12 +1761,23 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
 /// fields on `Duration` directly and apply their own math.
 fn datetime_add_duration(epoch_nanos: i128, d: mesh_core::Duration) -> i128 {
     let nanos_per_day: i128 = 86_400_000_000_000;
-    let nanos_per_month: i128 = 30 * nanos_per_day;
-    epoch_nanos
-        .saturating_add((d.months as i128).saturating_mul(nanos_per_month))
-        .saturating_add((d.days as i128).saturating_mul(nanos_per_day))
-        .saturating_add((d.seconds as i128).saturating_mul(1_000_000_000))
-        .saturating_add(d.nanos as i128)
+    // Split epoch_nanos into date + time-of-day for proper calendar month math
+    let total_days = epoch_nanos.div_euclid(nanos_per_day);
+    let time_of_day_ns = epoch_nanos.rem_euclid(nanos_per_day);
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let i64_days = i64::try_from(total_days).unwrap_or(0);
+    let base_date = epoch + chrono::Duration::days(i64_days);
+    // Apply months with calendar semantics
+    let after_months = add_months_to_date(base_date, d.months);
+    // Apply days, seconds, nanos
+    let final_date = after_months + chrono::Duration::days(d.days);
+    let new_days = final_date.signed_duration_since(epoch).num_days() as i128;
+    let new_time_of_day = time_of_day_ns
+        + (d.seconds as i128).saturating_mul(1_000_000_000)
+        + (d.nanos as i128);
+    new_days
+        .saturating_mul(nanos_per_day)
+        .saturating_add(new_time_of_day)
 }
 
 /// Add a [`Duration`] to a day-count `Date`. Only the `months`
@@ -1776,15 +1787,41 @@ fn datetime_add_duration(epoch_nanos: i128, d: mesh_core::Duration) -> i128 {
 /// so drivers can't silently drop a time-of-day component they
 /// meant to apply.
 fn date_add_duration(days: i32, d: mesh_core::Duration) -> Result<Value> {
-    if d.seconds != 0 || d.nanos != 0 {
-        return Err(Error::TypeMismatch);
-    }
-    let month_days: i64 = 30;
-    let new_days = (days as i64)
-        .wrapping_add(d.months.wrapping_mul(month_days))
-        .wrapping_add(d.days);
+    // Ignore sub-day components (seconds, nanos) since Date has
+    // no time-of-day component.
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let base = epoch + chrono::Duration::days(days as i64);
+    // Apply months using calendar arithmetic
+    let new_date = add_months_to_date(base, d.months);
+    let final_date = new_date + chrono::Duration::days(d.days);
+    let new_days = final_date.signed_duration_since(epoch).num_days();
     let clamped = i32::try_from(new_days).map_err(|_| Error::TypeMismatch)?;
     Ok(Value::Property(Property::Date(clamped)))
+}
+
+/// Add a number of months to a date using calendar arithmetic.
+/// Handles month overflow (e.g., Jan 31 + 1 month = Feb 28/29).
+fn add_months_to_date(date: chrono::NaiveDate, months: i64) -> chrono::NaiveDate {
+    let year = date.year() as i64;
+    let month = date.month() as i64;
+    let total_months = (year * 12 + (month - 1)) + months;
+    let new_year = total_months.div_euclid(12) as i32;
+    let new_month = (total_months.rem_euclid(12) + 1) as u32;
+    // Day clamping: Jan 31 + 1 month = Feb 28/29
+    let days_in_new_month = days_in_month(new_year, new_month);
+    let day = date.day().min(days_in_new_month);
+    chrono::NaiveDate::from_ymd_opt(new_year, new_month, day)
+        .unwrap_or(date)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let next_month = if month == 12 {
+        chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        chrono::NaiveDate::from_ymd_opt(year, month + 1, 1)
+    };
+    let first = chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+    (next_month.unwrap() - first).num_days() as u32
 }
 
 fn negate_duration(d: mesh_core::Duration) -> mesh_core::Duration {
