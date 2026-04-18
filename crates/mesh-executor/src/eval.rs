@@ -3248,15 +3248,38 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             {
                 return Ok(Value::Null);
             }
-            // Extract date and time-of-day from both temporal values
-            let (a_date, a_tod, a_kind) = temporal_to_date_tod(&a)?;
-            let (b_date, b_tod, b_kind) = temporal_to_date_tod(&b)?;
+            // Extract date and *local* time-of-day from each side
+            // along with an optional tz offset (Some iff the value
+            // was zoned). When both sides are zoned, shift the local
+            // tod back to UTC so tz differences contribute to the
+            // duration. Mixed zoned/local uses the local wall-clock
+            // on both sides — this is what Neo4j does.
+            let (mut a_date, mut a_tod, a_tz, a_kind) = temporal_to_date_tod(&a)?;
+            let (mut b_date, mut b_tod, b_tz, b_kind) = temporal_to_date_tod(&b)?;
+            if a_tz.is_some() && b_tz.is_some() {
+                let shift_to_utc = |date: &mut chrono::NaiveDate,
+                                    tod: &mut i128,
+                                    off: i32| {
+                    *tod -= (off as i128) * 1_000_000_000;
+                    while *tod < 0 {
+                        *tod += 86_400_000_000_000;
+                        *date -= chrono::Duration::days(1);
+                    }
+                    while *tod >= 86_400_000_000_000 {
+                        *tod -= 86_400_000_000_000;
+                        *date += chrono::Duration::days(1);
+                    }
+                };
+                shift_to_utc(&mut a_date, &mut a_tod, a_tz.unwrap());
+                shift_to_utc(&mut b_date, &mut b_tod, b_tz.unwrap());
+            }
             // When either side has no date (Time/LocalTime), collapse
             // to a time-only difference. Neo4j drops the calendar
             // component of the other side in this case.
             let time_only = a_kind == TemporalKind::TimeOnly
                 || b_kind == TemporalKind::TimeOnly;
-            let duration = match name {
+            let name_lc = name.to_ascii_lowercase();
+            let duration = match name_lc.as_str() {
                 "duration.inmonths" => {
                     let months = if time_only { 0 } else { month_diff(a_date, b_date) };
                     mesh_core::Duration {
@@ -3582,31 +3605,55 @@ enum TemporalKind {
     TimeOnly,
 }
 
-/// Extract (date, time-of-day nanoseconds, kind) from any temporal value.
-fn temporal_to_date_tod(v: &Value) -> Result<(chrono::NaiveDate, i128, TemporalKind)> {
+/// Extract (date, local time-of-day nanos, optional tz offset secs, kind)
+/// from any temporal value. "Zoned" means the value carries an explicit
+/// offset (DateTime always, Time only when a zone was supplied).
+fn temporal_to_date_tod(
+    v: &Value,
+) -> Result<(chrono::NaiveDate, i128, Option<i32>, TemporalKind)> {
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     match v {
         Value::Property(Property::Date(days)) => Ok((
             epoch + chrono::Duration::days(*days as i64),
             0,
+            None,
             TemporalKind::HasDate,
         )),
-        Value::Property(Property::DateTime { nanos: ns, .. })
-        | Value::Property(Property::LocalDateTime(ns)) => {
+        Value::Property(Property::DateTime {
+            nanos: ns,
+            tz_offset_secs,
+        }) => {
+            let local = match tz_offset_secs {
+                Some(off) => *ns + (*off as i128) * 1_000_000_000,
+                None => *ns,
+            };
+            let days = local.div_euclid(86_400_000_000_000);
+            let tod = local.rem_euclid(86_400_000_000_000);
+            let days_i64 = i64::try_from(days).map_err(|_| Error::TypeMismatch)?;
+            Ok((
+                epoch + chrono::Duration::days(days_i64),
+                tod,
+                *tz_offset_secs,
+                TemporalKind::HasDate,
+            ))
+        }
+        Value::Property(Property::LocalDateTime(ns)) => {
             let days = ns.div_euclid(86_400_000_000_000);
             let tod = ns.rem_euclid(86_400_000_000_000);
             let days_i64 = i64::try_from(days).map_err(|_| Error::TypeMismatch)?;
             Ok((
                 epoch + chrono::Duration::days(days_i64),
                 tod,
+                None,
                 TemporalKind::HasDate,
             ))
         }
-        Value::Property(Property::Time { nanos, .. }) => {
-            // Time value has no date, use epoch; caller should treat
-            // as time-only for duration.between semantics.
-            Ok((epoch, *nanos as i128, TemporalKind::TimeOnly))
-        }
+        Value::Property(Property::Time { nanos, tz_offset_secs }) => Ok((
+            epoch,
+            *nanos as i128,
+            *tz_offset_secs,
+            TemporalKind::TimeOnly,
+        )),
         _ => Err(Error::TypeMismatch),
     }
 }
