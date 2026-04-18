@@ -4599,7 +4599,31 @@ fn compare_props(a: &Property, b: &Property) -> Ordering {
             Property::DateTime { nanos: a, .. },
             Property::DateTime { nanos: b, .. },
         ) => a.cmp(b),
+        (Property::LocalDateTime(a), Property::LocalDateTime(b)) => a.cmp(b),
         (Property::Date(a), Property::Date(b)) => a.cmp(b),
+        (
+            Property::Time {
+                nanos: na,
+                tz_offset_secs: tza,
+            },
+            Property::Time {
+                nanos: nb,
+                tz_offset_secs: tzb,
+            },
+        ) => {
+            // Compare at the same instant: shift each local time to
+            // UTC by subtracting its offset. Unzoned Time has no
+            // offset — treat as UTC for ordering.
+            let a_utc = *na - (tza.unwrap_or(0) as i64) * 1_000_000_000;
+            let b_utc = *nb - (tzb.unwrap_or(0) as i64) * 1_000_000_000;
+            a_utc.cmp(&b_utc)
+        }
+        (Property::Duration(a), Property::Duration(b)) => {
+            // No total order in general, but TCK expects equal
+            // durations to compare equal. Use component-wise cmp.
+            (a.months, a.days, a.seconds, a.nanos)
+                .cmp(&(b.months, b.days, b.seconds, b.nanos))
+        }
         // Cross-type ordering: use type precedence
         // Neo4j order: Map > List > String > Boolean > Number
         _ => type_order_prop(a).cmp(&type_order_prop(b)),
@@ -4871,7 +4895,25 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
             Property::DateTime { nanos: a, .. },
             Property::DateTime { nanos: b, .. },
         ) => a.cmp(b),
+        (Property::LocalDateTime(a), Property::LocalDateTime(b)) => a.cmp(b),
         (Property::Date(a), Property::Date(b)) => a.cmp(b),
+        (
+            Property::Time {
+                nanos: na,
+                tz_offset_secs: tza,
+            },
+            Property::Time {
+                nanos: nb,
+                tz_offset_secs: tzb,
+            },
+        ) => {
+            // Compare in UTC: shift the wall-clock back by each
+            // offset. Treat an unzoned Time as UTC so ordering
+            // against a zoned Time stays total.
+            let a_utc = *na - (tza.unwrap_or(0) as i64) * 1_000_000_000;
+            let b_utc = *nb - (tzb.unwrap_or(0) as i64) * 1_000_000_000;
+            a_utc.cmp(&b_utc)
+        }
         (Property::Duration(a), Property::Duration(b)) => {
             return match op {
                 CompareOp::Eq => Ok(a == b),
