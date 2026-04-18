@@ -2767,6 +2767,15 @@ fn render_expr_name(expr: &Expr) -> Option<String> {
         Expr::InList { element, list } => {
             format!("{} IN {}", render_expr_name(element)?, render_expr_name(list)?)
         }
+        Expr::HasLabels { expr, labels } => {
+            let mut s = format!("({}", render_expr_name(expr)?);
+            for l in labels {
+                s.push(':');
+                s.push_str(l);
+            }
+            s.push(')');
+            s
+        }
         _ => return None,
     })
 }

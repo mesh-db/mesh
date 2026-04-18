@@ -1238,6 +1238,17 @@ fn render_expr_key(expr: &Expr) -> String {
         Expr::InList { element, list } => {
             format!("{} IN {}", render_expr_key(element), render_expr_key(list))
         }
+        Expr::HasLabels { expr, labels } => {
+            // Match the Cypher source-text form: `(var:Label:Label)`.
+            // TCK result headers use this shape so it has to round-trip.
+            let mut s = format!("({}", render_expr_key(expr));
+            for l in labels {
+                s.push(':');
+                s.push_str(l);
+            }
+            s.push(')');
+            s
+        }
         Expr::Case {
             scrutinee,
             branches,
@@ -1521,11 +1532,6 @@ fn plan_pattern_from_bound(
     pattern: &Pattern,
     pattern_idx: usize,
 ) -> Result<LogicalPlan> {
-    debug_assert!(
-        pattern.start.labels.is_empty() && pattern.start.properties.is_empty(),
-        "plan_pattern_from_bound requires a pure-reference start; \
-         the caller must validate this before dispatching"
-    );
     // shortestPath wrapping is lowered to a dedicated operator
     // here because this is the only context where both
     // endpoints are guaranteed to be bound in the input plan.
@@ -1543,7 +1549,24 @@ fn plan_pattern_from_bound(
     if working.path_var.is_some() {
         ensure_path_bindings(&mut working, pattern_idx)?;
     }
-    let plan = chain_hops(input, &working, &start_var, pattern_idx)?;
+    // A rebind that tightens the start with extra labels or inline
+    // properties (`MATCH (a1)-[r]->() WITH a1,r MATCH (a1:X)...`)
+    // turns those assertions into a pre-filter on the bound input
+    // row. The hop chain then runs against the filtered stream.
+    let mut plan = input;
+    if !working.start.labels.is_empty() {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: Expr::HasLabels {
+                expr: Box::new(Expr::Identifier(start_var.clone())),
+                labels: working.start.labels.clone(),
+            },
+        };
+    }
+    if !working.start.properties.is_empty() {
+        plan = wrap_with_pattern_prop_filter(plan, &start_var, &working.start.properties);
+    }
+    let plan = chain_hops(plan, &working, &start_var, pattern_idx)?;
     Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
 
@@ -2155,23 +2178,12 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         continue;
                     }
                     let start_var_name = pattern.start.var.as_deref();
-                    let start_is_pure_reference =
-                        pattern.start.labels.is_empty() && pattern.start.properties.is_empty();
 
                     let mut this_pattern_vars: HashSet<String> = HashSet::new();
                     collect_pattern_vars(pattern, &mut this_pattern_vars);
                     for var in &this_pattern_vars {
                         let is_bound_start =
                             start_var_name == Some(var.as_str()) && bound_vars.contains_key(var);
-                        if is_bound_start && !start_is_pure_reference {
-                            return Err(Error::Plan(format!(
-                                "re-referencing already-bound variable '{}' in a \
-                                 chained MATCH requires a pure-reference start node \
-                                 (no labels, no properties); \
-                                 move the label / property assertion into a WHERE clause",
-                                var
-                            )));
-                        }
                         // Variables from earlier clauses can be
                         // re-referenced if the type matches. Only
                         // reject actual type conflicts.

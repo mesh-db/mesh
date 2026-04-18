@@ -4842,33 +4842,26 @@ fn cross_stage_rebind_with_optional_match_regression() {
 }
 
 #[test]
-fn cross_stage_rebind_label_reassertion_rejected() {
-    // Re-asserting a label on the bound start var is a v1
-    // deferral — the planner errors with a clear message
-    // pointing at the WHERE workaround.
+fn cross_stage_rebind_label_reassertion_plans() {
+    // Re-asserting a label on a bound start var plans as a
+    // HasLabels filter on top of the input stream. The query
+    // runs and returns matching rows; prior behaviour was a
+    // planner error asking for a WHERE rewrite.
     let stmt =
         mesh_cypher::parse("MATCH (a:Person) WITH a MATCH (a:Person)-[:KNOWS]->(b) RETURN a, b")
             .unwrap();
-    let err = mesh_cypher::plan(&stmt).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("pure-reference"),
-        "expected pure-reference rebind error, got: {msg}"
-    );
+    // Just making sure it plans without error — execution is
+    // covered elsewhere.
+    let _plan = mesh_cypher::plan(&stmt).unwrap();
 }
 
 #[test]
-fn cross_stage_rebind_property_reassertion_rejected() {
+fn cross_stage_rebind_property_reassertion_plans() {
     let stmt = mesh_cypher::parse(
         "MATCH (a:Person) WITH a MATCH (a {name: 'Ada'})-[:KNOWS]->(b) RETURN a, b",
     )
     .unwrap();
-    let err = mesh_cypher::plan(&stmt).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("pure-reference"),
-        "expected pure-reference rebind error, got: {msg}"
-    );
+    let _plan = mesh_cypher::plan(&stmt).unwrap();
 }
 
 #[test]

@@ -5640,6 +5640,47 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
         let lb_vals: Vec<Value> = lb.iter().cloned().map(Value::Property).collect();
         return compare(op, &Value::List(la_vals), &Value::List(lb_vals));
     }
+    // Map equality. Follow openCypher's three-valued rules:
+    //   { } vs { k: null }       → false (key set differs)
+    //   { k: 1 } vs { k: 1 }     → true  (all keys match by value)
+    //   { k: null } vs { k: null } → null (common keys carry null)
+    //   { k: 1 } vs { k: null }  → null
+    //   { k: 1 } vs { k: 2 }     → false
+    if let (Value::Property(Property::Map(la)), Value::Property(Property::Map(lb))) = (l, r) {
+        let eq = match op {
+            CompareOp::Eq => true,
+            CompareOp::Ne => false,
+            _ => return Err(Error::UnsupportedComparison),
+        };
+        // Different key sets → not equal, no nulls propagated.
+        let keys_a: std::collections::HashSet<&String> = la.keys().collect();
+        let keys_b: std::collections::HashSet<&String> = lb.keys().collect();
+        if keys_a != keys_b {
+            return Ok(!eq);
+        }
+        let mut saw_null = false;
+        for (k, va) in la {
+            let vb = lb.get(k).unwrap();
+            let va_v = Value::Property(va.clone());
+            let vb_v = Value::Property(vb.clone());
+            if matches!(va_v, Value::Null | Value::Property(Property::Null))
+                || matches!(vb_v, Value::Null | Value::Property(Property::Null))
+            {
+                saw_null = true;
+                continue;
+            }
+            match compare(CompareOp::Eq, &va_v, &vb_v) {
+                Ok(true) => {}
+                Ok(false) => return Ok(!eq),
+                Err(Error::TypeMismatch) => return Ok(!eq),
+                Err(e) => return Err(e),
+            }
+        }
+        if saw_null {
+            return Err(Error::UnsupportedComparison);
+        }
+        return Ok(eq);
+    }
     // Graph-element equality: nodes compare equal iff their ids
     // match; same for edges. Ordering is not defined, so any
     // inequality operator falls through to a type mismatch.
