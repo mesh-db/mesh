@@ -2534,18 +2534,8 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                     Value::Property(Property::Map(m)) => {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                        // Extract base date and time-of-day from `date`, `datetime`, or `time` field
-                        let (base_date, base_tod_ns) = if let Some(Property::Date(d)) = m.get("date") {
-                            (Some(epoch + chrono::Duration::days(*d as i64)), 0i128)
-                        } else if let Some(Property::DateTime(ns)) = m.get("datetime") {
-                            let (secs, nsec) = nanos_to_secs_nanos(*ns);
-                            let date = chrono::DateTime::from_timestamp(secs, nsec)
-                                .map(|dt| dt.naive_utc().date());
-                            let tod = ns.rem_euclid(86_400_000_000_000);
-                            (date, tod)
-                        } else {
-                            (None, 0i128)
-                        };
+                        // Extract base date and time-of-day from any temporal-typed value
+                        let (base_date, base_tod_ns) = extract_base_date_tod(&m, &epoch);
                         let has_base = base_date.is_some();
                         let base = base_date.unwrap_or(epoch);
 
@@ -2600,16 +2590,9 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                     Value::Property(Property::Map(m)) => {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                        // Extract base date from `date` or `datetime` field
-                        let base_date = if let Some(Property::Date(d)) = m.get("date") {
-                            Some(epoch + chrono::Duration::days(*d as i64))
-                        } else if let Some(Property::DateTime(ns)) = m.get("datetime") {
-                            let days = ns.div_euclid(86_400_000_000_000);
-                            i64::try_from(days).ok().map(|d|
-                                epoch + chrono::Duration::days(d))
-                        } else {
-                            None
-                        };
+                        // Extract base date from any temporal-typed value under any of
+                        // these keys: date, datetime, localdatetime
+                        let base_date = extract_base_date(&m, &epoch);
                         let base_or_epoch = base_date.unwrap_or(epoch);
                         let has_base = base_date.is_some();
                         let target = build_date_from_map(&m, base_or_epoch, has_base);
@@ -2893,6 +2876,57 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
 }
 
 /// Extract epoch milliseconds from a temporal value.
+/// Extract a base date from a temporal-typed field in the map.
+/// Looks at keys `date`, `datetime`, `localdatetime`, `time` — any
+/// of which may carry a Date or DateTime value.
+fn extract_base_date(
+    m: &std::collections::HashMap<String, Property>,
+    epoch: &chrono::NaiveDate,
+) -> Option<chrono::NaiveDate> {
+    for key in ["date", "datetime", "localdatetime"] {
+        match m.get(key) {
+            Some(Property::Date(d)) => {
+                return Some(*epoch + chrono::Duration::days(*d as i64));
+            }
+            Some(Property::DateTime(ns)) => {
+                let days = ns.div_euclid(86_400_000_000_000);
+                if let Ok(d) = i64::try_from(days) {
+                    return Some(*epoch + chrono::Duration::days(d));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract (base_date, time_of_day_nanos) from the map's temporal fields.
+fn extract_base_date_tod(
+    m: &std::collections::HashMap<String, Property>,
+    epoch: &chrono::NaiveDate,
+) -> (Option<chrono::NaiveDate>, i128) {
+    for key in ["date", "datetime", "localdatetime"] {
+        match m.get(key) {
+            Some(Property::Date(d)) => {
+                return (Some(*epoch + chrono::Duration::days(*d as i64)), 0);
+            }
+            Some(Property::DateTime(ns)) => {
+                let days = ns.div_euclid(86_400_000_000_000);
+                let tod = ns.rem_euclid(86_400_000_000_000);
+                if let Ok(d) = i64::try_from(days) {
+                    return (Some(*epoch + chrono::Duration::days(d)), tod);
+                }
+            }
+            _ => {}
+        }
+    }
+    // `time` field: no date, just time-of-day
+    if let Some(Property::Time { nanos, .. }) = m.get("time") {
+        return (None, *nanos as i128);
+    }
+    (None, 0)
+}
+
 /// Build a date from a map of components, supporting multiple ways:
 /// - year+month+day (default)
 /// - year+week (+ optional dayOfWeek)
