@@ -2747,11 +2747,17 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                 }
             }
+            // Normalize: carry nanos overflow into seconds using
+            // div_euclid/rem_euclid so nanos are always non-negative
+            // (matching Neo4j's internal representation).
+            let total_ns = (seconds as i128) * 1_000_000_000 + (nanos as i128);
+            let new_seconds = total_ns.div_euclid(1_000_000_000) as i64;
+            let new_nanos = total_ns.rem_euclid(1_000_000_000) as i32;
             Ok(Value::Property(Property::Duration(mesh_core::Duration {
                 months,
                 days,
-                seconds,
-                nanos,
+                seconds: new_seconds,
+                nanos: new_nanos,
             })))
         }
 
@@ -3099,8 +3105,9 @@ fn duration_between_calendar(
         }
     }
 
-    let seconds = (tod_diff / 1_000_000_000) as i64;
-    let nanos = (tod_diff % 1_000_000_000) as i32;
+    // Normalize so nanos are always non-negative
+    let seconds = tod_diff.div_euclid(1_000_000_000) as i64;
+    let nanos = tod_diff.rem_euclid(1_000_000_000) as i32;
 
     mesh_core::Duration {
         months,
@@ -3409,19 +3416,19 @@ fn duration_to_iso_string(d: &mesh_core::Duration) -> String {
         any_date = true;
     }
 
-    let has_time = seconds != 0 || nanos != 0;
+    // Combine seconds and nanos into a signed total
+    let total_ns_signed: i128 = (seconds as i128) * 1_000_000_000 + (nanos as i128);
+    let has_time = total_ns_signed != 0;
     if has_time {
         result.push('T');
-        let sign = if seconds < 0 || (seconds == 0 && nanos < 0) {
-            "-"
-        } else {
-            ""
-        };
-        let abs_secs = seconds.unsigned_abs() as i64;
+        let negative = total_ns_signed < 0;
+        let abs_ns = total_ns_signed.unsigned_abs() as i64;
+        let abs_secs = abs_ns / 1_000_000_000;
+        let abs_nanos = (abs_ns % 1_000_000_000) as i32;
+        let sign = if negative { "-" } else { "" };
         let hours = abs_secs / 3600;
         let minutes = (abs_secs % 3600) / 60;
         let secs_only = abs_secs % 60;
-        let abs_nanos = nanos.unsigned_abs() as i64;
         if hours > 0 {
             result.push_str(&format!("{}{}H", sign, hours));
         }

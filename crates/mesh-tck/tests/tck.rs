@@ -399,11 +399,7 @@ fn format_iso_duration(d: &mesh_core::Duration) -> String {
     let nanos = d.nanos;
 
     // Split months into years and months
-    let (years, rem_months) = if months.abs() >= 12 {
-        (months / 12, months % 12)
-    } else {
-        (0, months)
-    };
+    let (years, rem_months) = (months / 12, months % 12);
 
     let mut result = String::from("P");
     let mut any_date = false;
@@ -420,20 +416,20 @@ fn format_iso_duration(d: &mesh_core::Duration) -> String {
         any_date = true;
     }
 
-    let has_time = seconds != 0 || nanos != 0;
+    // Combine seconds and nanos into a signed total. Neo4j stores nanos
+    // non-negative even when the duration is negative, so normalize.
+    let total_ns_signed: i128 = (seconds as i128) * 1_000_000_000 + (nanos as i128);
+    let has_time = total_ns_signed != 0;
     if has_time {
         result.push('T');
-        // Split seconds into hours, minutes, seconds
-        let abs_secs = seconds.abs();
-        let sign = if seconds < 0 || (seconds == 0 && nanos < 0) {
-            "-"
-        } else {
-            ""
-        };
+        let negative = total_ns_signed < 0;
+        let abs_ns = total_ns_signed.unsigned_abs() as i64;
+        let abs_secs = abs_ns / 1_000_000_000;
+        let abs_nanos = (abs_ns % 1_000_000_000) as i32;
+        let sign = if negative { "-" } else { "" };
         let hours = abs_secs / 3600;
         let minutes = (abs_secs % 3600) / 60;
         let secs_only = abs_secs % 60;
-        let abs_nanos = nanos.abs();
         if hours > 0 {
             result.push_str(&format!("{}{}H", sign, hours));
         }
@@ -442,7 +438,6 @@ fn format_iso_duration(d: &mesh_core::Duration) -> String {
         }
         if secs_only > 0 || abs_nanos > 0 || (hours == 0 && minutes == 0) {
             if abs_nanos > 0 {
-                // Format nanoseconds as fractional seconds
                 let frac_str = format!("{:09}", abs_nanos);
                 let trimmed = frac_str.trim_end_matches('0');
                 result.push_str(&format!("{}{}.{}S", sign, secs_only, trimmed));
