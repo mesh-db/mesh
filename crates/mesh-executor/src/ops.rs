@@ -2687,7 +2687,14 @@ fn render_expr_name(expr: &Expr) -> Option<String> {
         Expr::Identifier(s) => s.clone(),
         Expr::Property { var, key } => format!("{var}.{key}"),
         Expr::PropertyAccess { base, key } => {
-            format!("{}.{key}", render_expr_name(base)?)
+            // Match the source syntax's parenthesisation of a
+            // bracketed base: `(list[1]).k` round-trips, while a
+            // plain identifier base stays bare (`a.b`).
+            if matches!(base.as_ref(), Expr::IndexAccess { .. } | Expr::SliceAccess { .. }) {
+                format!("({}).{key}", render_expr_name(base)?)
+            } else {
+                format!("{}.{key}", render_expr_name(base)?)
+            }
         }
         Expr::Parameter(name) => format!("${name}"),
         Expr::Literal(Literal::String(s)) => format!("'{s}'"),

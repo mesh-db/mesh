@@ -441,6 +441,16 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     let has_all = labels.iter().all(|l| n.labels.contains(l));
                     Ok(Value::Property(Property::Bool(has_all)))
                 }
+                // `r:TYPE` on a relationship checks the edge type.
+                // Cypher allows a single token here; multiple labels
+                // don't apply to relationships but the matcher stays
+                // permissive by requiring *all* listed labels to
+                // equal the edge type (i.e. at most one distinct
+                // token).
+                Value::Edge(e) => {
+                    let has_all = labels.iter().all(|l| l == &e.edge_type);
+                    Ok(Value::Property(Property::Bool(has_all)))
+                }
                 Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                 _ => Ok(Value::Property(Property::Bool(false))),
             }
