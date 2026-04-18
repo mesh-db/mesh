@@ -1,3 +1,4 @@
+use chrono::Timelike;
 use cucumber::{given, then, when, World};
 use mesh_core::Property;
 use mesh_cypher::{parse, plan};
@@ -438,7 +439,31 @@ fn format_property(p: &Property) -> String {
             let secs = millis / 1000;
             let nanos = ((millis % 1000) * 1_000_000) as u32;
             if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
-                format!("'{}'", dt.format("%Y-%m-%dT%H:%M:%S"))
+                let naive = dt.naive_utc();
+                let time_part = naive.time();
+                if time_part.nanosecond() > 0 {
+                    // Include fractional seconds
+                    let frac = time_part.nanosecond();
+                    let frac_str = format!("{:09}", frac);
+                    let trimmed = frac_str.trim_end_matches('0');
+                    format!(
+                        "'{}'",
+                        format!(
+                            "{}T{}:{:02}:{:02}.{}",
+                            naive.date().format("%Y-%m-%d"),
+                            time_part.hour(),
+                            time_part.minute(),
+                            time_part.second(),
+                            trimmed
+                        )
+                    )
+                } else if time_part.second() > 0 {
+                    format!("'{}'", naive.format("%Y-%m-%dT%H:%M:%S"))
+                } else if time_part.hour() > 0 || time_part.minute() > 0 {
+                    format!("'{}'", naive.format("%Y-%m-%dT%H:%M"))
+                } else {
+                    format!("'{}'", naive.format("%Y-%m-%dT%H:%M"))
+                }
             } else {
                 format!("{millis}")
             }

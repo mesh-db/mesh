@@ -2453,29 +2453,34 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
                         // If a base date is provided, start from it
                         let base_date = if let Some(Property::Date(d)) = m.get("date") {
-                            epoch + chrono::Duration::days(*d as i64)
+                            Some(epoch + chrono::Duration::days(*d as i64))
                         } else {
-                            epoch
+                            None
                         };
-                        let year = map_int(&m, "year")
-                            .unwrap_or(base_date.year() as i64);
+                        let base_or_epoch = base_date.unwrap_or(epoch);
                         // Week-based date construction
                         if let Some(week) = map_int(&m, "week") {
-                            let dow = map_int(&m, "dayOfWeek").unwrap_or(1); // 1=Monday
-                            // ISO week date: week 1 is the week containing Jan 4
-                            let jan4 = chrono::NaiveDate::from_ymd_opt(year as i32, 1, 4).unwrap();
-                            let jan4_weekday = jan4.weekday().num_days_from_monday() as i64;
-                            let week1_monday = jan4 - chrono::Duration::days(jan4_weekday);
-                            let target = week1_monday
-                                + chrono::Duration::weeks(week - 1)
-                                + chrono::Duration::days(dow - 1);
+                            // For week-based dates, use ISO week year
+                            let year = map_int(&m, "year").unwrap_or_else(|| {
+                                base_or_epoch.iso_week().year() as i64
+                            });
+                            let dow = map_int(&m, "dayOfWeek").unwrap_or_else(|| {
+                                if base_date.is_some() {
+                                    base_or_epoch.weekday().num_days_from_monday() as i64 + 1
+                                } else {
+                                    1
+                                }
+                            });
+                            let target = iso_week_date(year, week, dow);
                             let days = target.signed_duration_since(epoch).num_days();
                             Ok(Value::Property(Property::Date(days as i32)))
                         } else {
+                            let year = map_int(&m, "year")
+                                .unwrap_or(base_or_epoch.year() as i64);
                             let month = map_int(&m, "month")
-                                .unwrap_or(base_date.month() as i64);
+                                .unwrap_or(base_or_epoch.month() as i64);
                             let day = map_int(&m, "day")
-                                .unwrap_or(base_date.day() as i64);
+                                .unwrap_or(base_or_epoch.day() as i64);
                             let days =
                                 chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
                                     .map(|d| d.signed_duration_since(epoch).num_days())
@@ -2700,6 +2705,15 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
 }
 
 /// Extract epoch milliseconds from a temporal value.
+/// Compute an ISO week-based date.
+fn iso_week_date(year: i64, week: i64, dow: i64) -> chrono::NaiveDate {
+    // ISO 8601: week 1 of a year contains January 4th.
+    let jan4 = chrono::NaiveDate::from_ymd_opt(year as i32, 1, 4).unwrap();
+    let jan4_weekday = jan4.weekday().num_days_from_monday() as i64;
+    let week1_monday = jan4 - chrono::Duration::days(jan4_weekday);
+    week1_monday + chrono::Duration::weeks(week - 1) + chrono::Duration::days(dow - 1)
+}
+
 /// Extract date component properties from a NaiveDate.
 fn temporal_date_prop(d: &chrono::NaiveDate, key: &str) -> Result<Value> {
     Ok(Value::Property(Property::Int64(match key {
