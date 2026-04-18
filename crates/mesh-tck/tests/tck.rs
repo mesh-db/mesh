@@ -244,6 +244,151 @@ fn normalize_labels(s: &str) -> String {
     out
 }
 
+/// Normalize property-map key order by sorting alphabetically. Our
+/// format_props_inline already sorts, but expected strings in TCK
+/// tables preserve creation order. Rewrite every `{ ... }` block in
+/// a string so both sides agree on key ordering.
+fn normalize_map_keys(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            // Find matching close brace, tracking nesting and quotes.
+            let start = i;
+            let mut depth = 0;
+            let mut in_str = false;
+            let mut str_char = '\'';
+            let mut end = i;
+            while end < chars.len() {
+                let c = chars[end];
+                if in_str {
+                    if c == str_char {
+                        in_str = false;
+                    }
+                } else {
+                    if c == '\'' || c == '"' {
+                        in_str = true;
+                        str_char = c;
+                    } else if c == '{' {
+                        depth += 1;
+                    } else if c == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                end += 1;
+            }
+            if end >= chars.len() || chars[end] != '}' {
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            // Contents from start+1 to end (exclusive).
+            let inner: String = chars[start + 1..end].iter().collect();
+            // Split on top-level commas. Recurse into nested maps.
+            let mut entries: Vec<(String, String)> = Vec::new();
+            let mut buf = String::new();
+            let mut d = 0;
+            let mut in_s = false;
+            let mut sc = '\'';
+            for ic in inner.chars() {
+                if in_s {
+                    if ic == sc {
+                        in_s = false;
+                    }
+                    buf.push(ic);
+                } else if ic == '\'' || ic == '"' {
+                    in_s = true;
+                    sc = ic;
+                    buf.push(ic);
+                } else if ic == '{' || ic == '[' || ic == '(' {
+                    d += 1;
+                    buf.push(ic);
+                } else if ic == '}' || ic == ']' || ic == ')' {
+                    d -= 1;
+                    buf.push(ic);
+                } else if ic == ',' && d == 0 {
+                    if let Some(entry) = split_kv(&buf) {
+                        entries.push(entry);
+                    } else {
+                        // Not a key:value entry — bail out, keep original.
+                        out.push_str(&s[start..=end]);
+                        i = end + 1;
+                        buf.clear();
+                        entries.clear();
+                        break;
+                    }
+                    buf.clear();
+                } else {
+                    buf.push(ic);
+                }
+            }
+            if !buf.trim().is_empty() {
+                if let Some(entry) = split_kv(&buf) {
+                    entries.push(entry);
+                } else {
+                    out.push_str(&s[start..=end]);
+                    i = end + 1;
+                    continue;
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push('{');
+            for (idx, (k, v)) in entries.iter().enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(k);
+                out.push_str(": ");
+                // Recursively normalize the value (handles nested maps).
+                out.push_str(&normalize_map_keys(v));
+            }
+            out.push('}');
+            i = end + 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Split a `key: value` entry on the first top-level colon. Returns
+/// `None` if the string doesn't look like a map entry (e.g. the
+/// block was actually a path literal or something else).
+fn split_kv(s: &str) -> Option<(String, String)> {
+    let trimmed = s.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut d = 0;
+    let mut in_s = false;
+    let mut sc = '\'';
+    for (idx, c) in chars.iter().enumerate() {
+        if in_s {
+            if *c == sc {
+                in_s = false;
+            }
+        } else if *c == '\'' || *c == '"' {
+            in_s = true;
+            sc = *c;
+        } else if *c == '{' || *c == '[' || *c == '(' {
+            d += 1;
+        } else if *c == '}' || *c == ']' || *c == ')' {
+            d -= 1;
+        } else if *c == ':' && d == 0 {
+            let k = trimmed[..idx].trim().to_string();
+            let v = trimmed[idx + 1..].trim().to_string();
+            if k.is_empty() {
+                return None;
+            }
+            return Some((k, v));
+        }
+    }
+    None
+}
+
 /// Normalize property formatting for comparison: ensure consistent
 /// whitespace around colons in `{key:val}` vs `{key: val}`.
 fn normalize_tck(s: &str) -> String {
@@ -303,7 +448,7 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
         .map(|row| {
             headers
                 .iter()
-                .map(|h| normalize_labels(&normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null)))))
+                .map(|h| normalize_map_keys(&normalize_labels(&normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null))))))
                 .collect()
         })
         .collect();
@@ -311,7 +456,7 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
 
     let mut expected_sorted: Vec<Vec<String>> = expected_rows
         .iter()
-        .map(|row| row.iter().map(|s| normalize_labels(&normalize_tck(s))).collect())
+        .map(|row| row.iter().map(|s| normalize_map_keys(&normalize_labels(&normalize_tck(s)))).collect())
         .collect();
     expected_sorted.sort();
 
@@ -339,14 +484,14 @@ fn then_result_in_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
         .map(|row| {
             headers
                 .iter()
-                .map(|h| normalize_labels(&normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null)))))
+                .map(|h| normalize_map_keys(&normalize_labels(&normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null))))))
                 .collect()
         })
         .collect();
 
     let expected_normalized: Vec<Vec<String>> = expected_rows
         .iter()
-        .map(|row| row.iter().map(|s| normalize_labels(&normalize_tck(s))).collect())
+        .map(|row| row.iter().map(|s| normalize_map_keys(&normalize_labels(&normalize_tck(s)))).collect())
         .collect();
 
     assert_eq!(
