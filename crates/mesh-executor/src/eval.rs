@@ -105,6 +105,60 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     .cloned()
                     .map(Value::Property)
                     .unwrap_or(Value::Null)),
+                // Temporal property access
+                Value::Property(Property::Date(days)) => {
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let d = epoch + chrono::Duration::days(days as i64);
+                    temporal_date_prop(&d, key)
+                }
+                Value::Property(Property::DateTime(ms)) => {
+                    let secs = ms / 1000;
+                    let nsec = ((ms % 1000) * 1_000_000) as u32;
+                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
+                        let naive = dt.naive_utc();
+                        let date = naive.date();
+                        match key.as_str() {
+                            "year" | "month" | "day" | "week" | "dayOfWeek" | "dayOfYear"
+                            | "quarter" | "ordinalDay" => temporal_date_prop(&date, key),
+                            "hour" => Ok(Value::Property(Property::Int64(naive.hour() as i64))),
+                            "minute" => Ok(Value::Property(Property::Int64(naive.minute() as i64))),
+                            "second" => Ok(Value::Property(Property::Int64(naive.second() as i64))),
+                            "millisecond" => Ok(Value::Property(Property::Int64(
+                                (nsec / 1_000_000) as i64,
+                            ))),
+                            "microsecond" => Ok(Value::Property(Property::Int64(
+                                (nsec / 1_000) as i64,
+                            ))),
+                            "nanosecond" => Ok(Value::Property(Property::Int64(nsec as i64))),
+                            "epochMillis" => Ok(Value::Property(Property::Int64(ms))),
+                            "epochSeconds" => Ok(Value::Property(Property::Int64(secs))),
+                            _ => Ok(Value::Null),
+                        }
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                Value::Property(Property::Duration(ref dur)) => match key.as_str() {
+                    "months" => Ok(Value::Property(Property::Int64(dur.months))),
+                    "days" => Ok(Value::Property(Property::Int64(dur.days))),
+                    "seconds" => Ok(Value::Property(Property::Int64(dur.seconds))),
+                    "nanosecondsOfSecond" | "nanoseconds" => {
+                        Ok(Value::Property(Property::Int64(dur.nanos as i64)))
+                    }
+                    "minutesOfHour" => {
+                        Ok(Value::Property(Property::Int64((dur.seconds % 3600) / 60)))
+                    }
+                    "secondsOfMinute" => {
+                        Ok(Value::Property(Property::Int64(dur.seconds % 60)))
+                    }
+                    "millisecondsOfSecond" => {
+                        Ok(Value::Property(Property::Int64((dur.nanos / 1_000_000) as i64)))
+                    }
+                    "microsecondsOfSecond" => {
+                        Ok(Value::Property(Property::Int64((dur.nanos / 1_000) as i64)))
+                    }
+                    _ => Ok(Value::Null),
+                },
                 _ => Ok(Value::Null),
             }
         }
@@ -2344,22 +2398,28 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         Ok(Value::Property(Property::DateTime(parse_datetime(&s)?)))
                     }
                     Value::Property(Property::Map(m)) => {
+                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
                         let year = map_int(&m, "year").unwrap_or(1970);
-                        let month = map_int(&m, "month").unwrap_or(1);
-                        let day = map_int(&m, "day").unwrap_or(1);
                         let hour = map_int(&m, "hour").unwrap_or(0);
                         let minute = map_int(&m, "minute").unwrap_or(0);
                         let second = map_int(&m, "second").unwrap_or(0);
                         let nanos = map_int(&m, "nanosecond").unwrap_or(0);
-                        let days_since_epoch =
+                        let days_since_epoch = if let Some(week) = map_int(&m, "week") {
+                            let dow = map_int(&m, "dayOfWeek").unwrap_or(1);
+                            let jan4 = chrono::NaiveDate::from_ymd_opt(year as i32, 1, 4).unwrap();
+                            let jan4_wd = jan4.weekday().num_days_from_monday() as i64;
+                            let week1_mon = jan4 - chrono::Duration::days(jan4_wd);
+                            let target = week1_mon
+                                + chrono::Duration::weeks(week - 1)
+                                + chrono::Duration::days(dow - 1);
+                            target.signed_duration_since(epoch).num_days()
+                        } else {
+                            let month = map_int(&m, "month").unwrap_or(1);
+                            let day = map_int(&m, "day").unwrap_or(1);
                             chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
-                                .map(|d| {
-                                    d.signed_duration_since(
-                                        chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                                    )
-                                    .num_days()
-                                })
-                                .unwrap_or(0);
+                                .map(|d| d.signed_duration_since(epoch).num_days())
+                                .unwrap_or(0)
+                        };
                         let millis = days_since_epoch * 86_400_000
                             + hour * 3_600_000
                             + minute * 60_000
@@ -2390,19 +2450,43 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         Ok(Value::Property(Property::Date(parse_date(&s)?)))
                     }
                     Value::Property(Property::Map(m)) => {
-                        let year = map_int(&m, "year").unwrap_or(1970);
-                        let month = map_int(&m, "month").unwrap_or(1);
-                        let day = map_int(&m, "day").unwrap_or(1);
-                        let days =
-                            chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
-                                .map(|d| {
-                                    d.signed_duration_since(
-                                        chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                                    )
-                                    .num_days()
-                                })
-                                .unwrap_or(0);
-                        Ok(Value::Property(Property::Date(days as i32)))
+                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                        // If a base date is provided, start from it
+                        let base_date = if let Some(Property::Date(d)) = m.get("date") {
+                            epoch + chrono::Duration::days(*d as i64)
+                        } else {
+                            epoch
+                        };
+                        let year = map_int(&m, "year")
+                            .unwrap_or(base_date.year() as i64);
+                        // Week-based date construction
+                        if let Some(week) = map_int(&m, "week") {
+                            let dow = map_int(&m, "dayOfWeek").unwrap_or(1); // 1=Monday
+                            // ISO week date: week 1 is the week containing Jan 4
+                            let jan4 = chrono::NaiveDate::from_ymd_opt(year as i32, 1, 4).unwrap();
+                            let jan4_weekday = jan4.weekday().num_days_from_monday() as i64;
+                            let week1_monday = jan4 - chrono::Duration::days(jan4_weekday);
+                            let target = week1_monday
+                                + chrono::Duration::weeks(week - 1)
+                                + chrono::Duration::days(dow - 1);
+                            let days = target.signed_duration_since(epoch).num_days();
+                            Ok(Value::Property(Property::Date(days as i32)))
+                        } else {
+                            let month = map_int(&m, "month")
+                                .unwrap_or(base_date.month() as i64);
+                            let day = map_int(&m, "day")
+                                .unwrap_or(base_date.day() as i64);
+                            let days =
+                                chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
+                                    .map(|d| d.signed_duration_since(epoch).num_days())
+                                    .unwrap_or(0);
+                            Ok(Value::Property(Property::Date(days as i32)))
+                        }
+                    }
+                    // date(datetime_value) - extract date from datetime
+                    Value::Property(Property::DateTime(ms)) => {
+                        let days = ms.div_euclid(86_400_000) as i32;
+                        Ok(Value::Property(Property::Date(days)))
                     }
                     _ => Err(Error::TypeMismatch),
                 }
@@ -2569,6 +2653,22 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             })))
         }
 
+        // Current-time namespace functions
+        "datetime.transaction" | "datetime.statement" | "datetime.realtime"
+        | "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
+            Ok(Value::Property(Property::DateTime(now_epoch_millis())))
+        }
+        "date.transaction" | "date.statement" | "date.realtime" => {
+            let days = now_epoch_millis().div_euclid(86_400_000);
+            let clamped = i32::try_from(days).unwrap_or(0);
+            Ok(Value::Property(Property::Date(clamped)))
+        }
+        "time.transaction" | "time.statement" | "time.realtime"
+        | "localtime.transaction" | "localtime.statement" | "localtime.realtime" => {
+            let millis = now_epoch_millis() % 86_400_000;
+            Ok(Value::Property(Property::DateTime(millis)))
+        }
+
         // Temporal truncation functions
         "datetime.truncate" | "localdatetime.truncate" | "date.truncate"
         | "time.truncate" | "localtime.truncate" => {
@@ -2600,6 +2700,20 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
 }
 
 /// Extract epoch milliseconds from a temporal value.
+/// Extract date component properties from a NaiveDate.
+fn temporal_date_prop(d: &chrono::NaiveDate, key: &str) -> Result<Value> {
+    Ok(Value::Property(Property::Int64(match key {
+        "year" => d.year() as i64,
+        "month" => d.month() as i64,
+        "day" => d.day() as i64,
+        "week" => d.iso_week().week() as i64,
+        "dayOfWeek" => d.weekday().num_days_from_monday() as i64 + 1,
+        "dayOfYear" | "ordinalDay" => d.ordinal() as i64,
+        "quarter" => ((d.month() - 1) / 3 + 1) as i64,
+        _ => return Ok(Value::Null),
+    })))
+}
+
 fn temporal_to_millis(v: &Value) -> Result<i64> {
     match v {
         Value::Property(Property::DateTime(ms)) => Ok(*ms),
