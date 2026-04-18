@@ -7,13 +7,16 @@
 //! plus `commit_buffered_commands` when the connection is inside an
 //! explicit transaction).
 //!
-//! Supports Bolt 4.4 only. Auth accepts any `HELLO` unconditionally —
-//! the server is not multi-tenant and there's no user store yet.
+//! Supports Bolt 4.4, 5.0, 5.1, 5.2, 5.3, and 5.4. Auth accepts any
+//! `HELLO` unconditionally when no `bolt_auth` config is loaded.
 //!
 //! State machine (per connection):
 //!
 //! ```text
-//!     Connected ──handshake──> Negotiated ──HELLO──> Ready
+//!     Connected ──handshake──> Negotiated
+//!     (Bolt 4.4)           Negotiated ──HELLO──> Ready
+//!     (Bolt 5.0)           Negotiated ──HELLO──> Ready  (auth in HELLO extras)
+//!     (Bolt 5.1+)          Negotiated ──HELLO──> Authenticating ──LOGON──> Ready
 //!     Ready ──RUN──> Streaming
 //!     Streaming ──PULL──> Ready
 //!     Ready ──BEGIN──> InTxReady
@@ -23,6 +26,9 @@
 //!     InTxReady ──ROLLBACK──> Ready  (drops accumulated batch)
 //!     *         ──RESET──> Ready  (also clears Failed and any tx)
 //!     *         ──GOODBYE──> <close>  (implicit rollback)
+//!     (Bolt 5.1+) Ready ──LOGOFF──> Authenticating  (needs fresh LOGON)
+//!     (Bolt 5.4+) *     ──TELEMETRY──> same-state  (server SUCCESSes, no-op)
+//!     (Bolt 4.4+) *     ──ROUTE──> same-state  (server replies with table)
 //! ```
 //!
 //! ## Explicit-transaction semantics
@@ -50,7 +56,7 @@
 use crate::value_conv::{bolt_params_to_param_map, field_names_from_rows, row_to_bolt_fields};
 use mesh_bolt::{
     perform_server_handshake, read_message, write_message, BoltError, BoltMessage, BoltValue,
-    BOLT_4_4,
+    BOLT_4_4, BOLT_5_0, BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4,
 };
 use mesh_cluster::GraphCommand;
 use mesh_executor::Row;
@@ -62,6 +68,10 @@ use tokio::net::TcpListener;
 /// Current connection phase used by the message-dispatch loop.
 #[derive(Debug)]
 enum Phase {
+    /// Bolt 5.1+ only: HELLO succeeded but LOGON has not. Every
+    /// message other than LOGON / RESET / GOODBYE is a protocol
+    /// error in this state.
+    Authenticating,
     /// Waiting for a `RUN` (auto-commit) or a `BEGIN`. `COMMIT` /
     /// `ROLLBACK` outside a transaction are protocol errors and get
     /// `IGNORED` + transition to `Failed`.
@@ -155,48 +165,55 @@ where
         }
         Err(e) => return Err(e.into()),
     };
-    if agreed != BOLT_4_4 {
-        // We only advertise Bolt 4.4, so anything else is a bug in
-        // perform_server_handshake.
-        anyhow::bail!("unexpected agreed version {:?}", agreed);
-    }
-    tracing::debug!("bolt handshake complete, speaking 4.4");
+    // Validate negotiated version against what we advertise.
+    let agreed_version = bolt_version_label(agreed)?;
+    let auth_in_logon = is_bolt_5_1_or_newer(agreed);
+    tracing::debug!(version = %agreed_version, "bolt handshake complete");
 
     // Phase 2: HELLO → SUCCESS (or FAILURE + close when auth is
-    // configured and the credentials don't match). On success the
-    // response carries a fixed server identification string so
-    // drivers log it cleanly.
+    // configured and the credentials don't match). In Bolt 5.1+ the
+    // auth fields live in LOGON instead of HELLO — we just skip the
+    // credential check in HELLO for those versions and validate LOGON
+    // later.
     let hello = read_message(&mut reader).await?;
     let hello_msg = BoltMessage::decode(&hello)?;
-    match hello_msg {
-        BoltMessage::Hello { extra } => {
-            if let Err(msg) = check_bolt_auth(auth.as_deref(), &extra) {
-                tracing::info!(error = %msg, "bolt auth rejected");
-                send(
-                    &mut writer,
-                    &failure("Neo.ClientError.Security.Unauthorized", &msg),
-                )
-                .await?;
-                writer.flush().await.ok();
-                // Bolt convention: close the connection after a
-                // HELLO failure. The driver sees the FAILURE
-                // first and translates it into an AuthError.
-                return Ok(());
-            }
-            let metadata = BoltValue::map([
-                ("server", BoltValue::String("Mesh/0.1.0".into())),
-                ("connection_id", BoltValue::String("mesh-bolt-1".into())),
-            ]);
-            send(&mut writer, &BoltMessage::Success { metadata }).await?;
-        }
-        other => {
-            anyhow::bail!("expected HELLO as first message, got {:?}", other);
+    let hello_extra = match hello_msg {
+        BoltMessage::Hello { extra } => extra,
+        other => anyhow::bail!("expected HELLO as first message, got {:?}", other),
+    };
+    if !auth_in_logon {
+        // Bolt 4.4 / 5.0: auth in HELLO.
+        if let Err(msg) = check_bolt_auth(auth.as_deref(), &hello_extra) {
+            tracing::info!(error = %msg, "bolt auth rejected");
+            send(
+                &mut writer,
+                &failure("Neo.ClientError.Security.Unauthorized", &msg),
+            )
+            .await?;
+            writer.flush().await.ok();
+            return Ok(());
         }
     }
+    let hello_success_meta = BoltValue::map([
+        ("server", BoltValue::String("Mesh/0.1.0".into())),
+        ("connection_id", BoltValue::String("mesh-bolt-1".into())),
+        ("hints", BoltValue::Map(vec![])),
+    ]);
+    send(
+        &mut writer,
+        &BoltMessage::Success {
+            metadata: hello_success_meta,
+        },
+    )
+    .await?;
 
-    // Phase 3: request/response loop. Each iteration reads one message
-    // and dispatches according to the current Phase.
-    let mut phase = Phase::Ready;
+    // Phase 3: request/response loop. For Bolt 5.1+ start in
+    // Authenticating phase and require LOGON before Ready.
+    let mut phase = if auth_in_logon {
+        Phase::Authenticating
+    } else {
+        Phase::Ready
+    };
     loop {
         let raw = match read_message(&mut reader).await {
             Ok(r) => r,
@@ -221,8 +238,68 @@ where
                 return Ok(());
             }
             (_, BoltMessage::Reset) => {
-                // RESET also implicitly rolls back any in-progress tx.
+                // RESET clears any in-progress tx. In Bolt 5.1+ it
+                // preserves the authentication state (returns to
+                // Ready, not Authenticating) per spec.
                 phase = Phase::Ready;
+                send(&mut writer, &empty_success()).await?;
+            }
+            // Bolt 5.4+ TELEMETRY — no-op, SUCCESS.
+            (_, BoltMessage::Telemetry { .. }) => {
+                send(&mut writer, &empty_success()).await?;
+            }
+            // Bolt 4.4+ ROUTE — reply with a single-node routing table
+            // pointing at this server.
+            (_, BoltMessage::Route { .. }) => {
+                send(&mut writer, &route_success()).await?;
+            }
+
+            // -- Authenticating phase (Bolt 5.1+) ----------------------
+            (Phase::Authenticating, BoltMessage::Logon { auth: auth_extra }) => {
+                if let Err(msg) = check_bolt_auth(auth.as_deref(), &auth_extra) {
+                    tracing::info!(error = %msg, "bolt auth rejected");
+                    send(
+                        &mut writer,
+                        &failure("Neo.ClientError.Security.Unauthorized", &msg),
+                    )
+                    .await?;
+                    writer.flush().await.ok();
+                    return Ok(());
+                }
+                phase = Phase::Ready;
+                send(&mut writer, &empty_success()).await?;
+            }
+            (Phase::Authenticating, _) => {
+                send(
+                    &mut writer,
+                    &failure(
+                        "Neo.ClientError.Security.Unauthorized",
+                        "LOGON required before any other message",
+                    ),
+                )
+                .await?;
+                phase = Phase::Failed;
+            }
+            // Bolt 5.1+ LOGOFF — clear auth, return to Authenticating.
+            (Phase::Ready, BoltMessage::Logoff) => {
+                phase = if auth_in_logon {
+                    Phase::Authenticating
+                } else {
+                    Phase::Ready
+                };
+                send(&mut writer, &empty_success()).await?;
+            }
+            // LOGON in Ready (re-auth): accept new credentials.
+            (Phase::Ready, BoltMessage::Logon { auth: auth_extra }) => {
+                if let Err(msg) = check_bolt_auth(auth.as_deref(), &auth_extra) {
+                    send(
+                        &mut writer,
+                        &failure("Neo.ClientError.Security.Unauthorized", &msg),
+                    )
+                    .await?;
+                    writer.flush().await.ok();
+                    return Ok(());
+                }
                 send(&mut writer, &empty_success()).await?;
             }
 
@@ -519,6 +596,57 @@ where
 fn empty_success() -> BoltMessage {
     BoltMessage::Success {
         metadata: BoltValue::Map(vec![]),
+    }
+}
+
+/// True if the negotiated version is Bolt 5.1 or newer. Those versions
+/// require auth in LOGON rather than HELLO.
+fn is_bolt_5_1_or_newer(v: [u8; 4]) -> bool {
+    // Version bytes are [0, range, minor, major]. We compare by (major, minor).
+    let major = v[3];
+    let minor = v[2];
+    major > 5 || (major == 5 && minor >= 1)
+}
+
+/// Map a negotiated version tuple to a display label, or bail if it's
+/// something we shouldn't have agreed on.
+fn bolt_version_label(v: [u8; 4]) -> anyhow::Result<&'static str> {
+    match v {
+        BOLT_5_4 => Ok("5.4"),
+        BOLT_5_3 => Ok("5.3"),
+        BOLT_5_2 => Ok("5.2"),
+        BOLT_5_1 => Ok("5.1"),
+        BOLT_5_0 => Ok("5.0"),
+        BOLT_4_4 => Ok("4.4"),
+        other => anyhow::bail!("unexpected agreed bolt version {:?}", other),
+    }
+}
+
+/// Reply to a ROUTE request with a single-node routing table pointing at
+/// this server. Mesh is single-node today; a real routing table for a
+/// clustered deployment would come from the cluster membership layer.
+fn route_success() -> BoltMessage {
+    // Routing-table shape expected by Neo4j drivers: `{rt: {ttl,
+    // servers, db}}` where servers is a list of `{addresses, role}`.
+    // Setting a long TTL and one "ROUTE/READ/WRITE" entry pointing to
+    // the driver's own address effectively tells the driver "talk
+    // directly to me".
+    let rt = BoltValue::map([
+        ("ttl", BoltValue::Int(9_223_372_036)),
+        (
+            "servers",
+            BoltValue::List(vec![BoltValue::map([
+                (
+                    "addresses",
+                    BoltValue::List(vec![BoltValue::String("".into())]),
+                ),
+                ("role", BoltValue::String("ROUTE".into())),
+            ])]),
+        ),
+        ("db", BoltValue::String("neo4j".into())),
+    ]);
+    BoltMessage::Success {
+        metadata: BoltValue::map([("rt", rt)]),
     }
 }
 

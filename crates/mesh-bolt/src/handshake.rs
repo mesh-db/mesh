@@ -31,11 +31,24 @@ pub const fn version_bytes(major: u8, minor: u8, range: u8) -> [u8; 4] {
     [0, range, minor, major]
 }
 
-/// The only version this server currently speaks: Bolt 4.4, no range.
+/// Bolt 4.4 — legacy version, kept for compatibility with older drivers.
 pub const BOLT_4_4: [u8; 4] = version_bytes(4, 4, 0);
+/// Bolt 5.0 — first major 5 version. Adds LOGON/LOGOFF auth split,
+/// adds timezone-aware DateTime (tags 0x49/0x69), removes old
+/// LocalDateTime tag 0x44 reuse semantics.
+pub const BOLT_5_0: [u8; 4] = version_bytes(5, 0, 0);
+/// Bolt 5.1 — adds UTC default for DateTime encoding.
+pub const BOLT_5_1: [u8; 4] = version_bytes(5, 1, 0);
+/// Bolt 5.2 — minor refinements.
+pub const BOLT_5_2: [u8; 4] = version_bytes(5, 2, 0);
+/// Bolt 5.3 — adds NOTIFICATION_CONFIG in HELLO extras.
+pub const BOLT_5_3: [u8; 4] = version_bytes(5, 3, 0);
+/// Bolt 5.4 — adds TELEMETRY message.
+pub const BOLT_5_4: [u8; 4] = version_bytes(5, 4, 0);
 
-/// All server-supported versions, in preference order.
-pub const SUPPORTED: &[[u8; 4]] = &[BOLT_4_4];
+/// All server-supported versions, in preference order (newest first).
+pub const SUPPORTED: &[[u8; 4]] =
+    &[BOLT_5_4, BOLT_5_3, BOLT_5_2, BOLT_5_1, BOLT_5_0, BOLT_4_4];
 
 /// Read the client's preamble + four version slots, decide which
 /// version to speak, and write the agreed version back. Returns the
@@ -153,8 +166,8 @@ mod tests {
 
         let server_task = tokio::spawn(async move { perform_server_handshake(&mut server).await });
 
-        // Bolt 5.0 only — not supported yet.
-        let preferences = [version_bytes(5, 0, 0), [0; 4], [0; 4], [0; 4]];
+        // Bolt 6.0 — not supported.
+        let preferences = [version_bytes(6, 0, 0), [0; 4], [0; 4], [0; 4]];
         let err = perform_client_handshake(&mut client, &preferences)
             .await
             .unwrap_err();
@@ -162,6 +175,34 @@ mod tests {
 
         let server_err = server_task.await.unwrap().unwrap_err();
         matches!(server_err, BoltError::NoCompatibleVersion(_));
+    }
+
+    #[tokio::test]
+    async fn bolt_5_4_preferred_when_offered() {
+        let (mut client, mut server) = duplex(64);
+        let server_task = tokio::spawn(async move { perform_server_handshake(&mut server).await });
+
+        // Client offers 5.4 + 4.4. Server should pick 5.4 (newer).
+        let preferences = [BOLT_5_4, BOLT_4_4, [0; 4], [0; 4]];
+        let agreed = perform_client_handshake(&mut client, &preferences)
+            .await
+            .unwrap();
+        assert_eq!(agreed, BOLT_5_4);
+        assert_eq!(server_task.await.unwrap().unwrap(), BOLT_5_4);
+    }
+
+    #[tokio::test]
+    async fn bolt_5_range_matches_5_1() {
+        let (mut client, mut server) = duplex(64);
+        let server_task = tokio::spawn(async move { perform_server_handshake(&mut server).await });
+
+        // "Bolt 5.4 with range 3" → 5.4/5.3/5.2/5.1 accepted. Server picks 5.4.
+        let preferences = [version_bytes(5, 4, 3), [0; 4], [0; 4], [0; 4]];
+        let agreed = perform_client_handshake(&mut client, &preferences)
+            .await
+            .unwrap();
+        assert_eq!(agreed, BOLT_5_4);
+        assert_eq!(server_task.await.unwrap().unwrap(), BOLT_5_4);
     }
 
     #[tokio::test]

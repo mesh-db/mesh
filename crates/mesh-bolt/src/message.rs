@@ -1,24 +1,28 @@
-//! Typed wrappers around the Bolt 4.4 message set. Each variant is
-//! encoded on the wire as a PackStream `Struct` with a well-known tag
-//! byte and a fixed-arity field list.
+//! Typed wrappers around the Bolt 4.4 and 5.x message set. Each variant
+//! is encoded on the wire as a PackStream `Struct` with a well-known
+//! tag byte and a fixed-arity field list.
 //!
-//! Tag byte reference (Bolt 4.4):
+//! Tag byte reference:
 //!
-//! | Message       | Tag    | Direction | Fields                              |
-//! |---------------|--------|-----------|-------------------------------------|
-//! | HELLO         | 0x01   | C → S     | `{extra}`                           |
-//! | GOODBYE       | 0x02   | C → S     | `{}`                                |
-//! | RESET         | 0x0F   | C → S     | `{}`                                |
-//! | RUN           | 0x10   | C → S     | `query`, `params`, `extra`          |
-//! | BEGIN         | 0x11   | C → S     | `{extra}`                           |
-//! | COMMIT        | 0x12   | C → S     | `{}`                                |
-//! | ROLLBACK      | 0x13   | C → S     | `{}`                                |
-//! | DISCARD       | 0x2F   | C → S     | `{extra}`                           |
-//! | PULL          | 0x3F   | C → S     | `{extra}`                           |
-//! | SUCCESS       | 0x70   | S → C     | `{metadata}`                        |
-//! | RECORD        | 0x71   | S → C     | `fields` (as a List)                |
-//! | IGNORED       | 0x7E   | S → C     | `{}`                                |
-//! | FAILURE       | 0x7F   | S → C     | `{metadata}` — `code` + `message`   |
+//! | Message       | Tag    | Version | Direction | Fields                              |
+//! |---------------|--------|---------|-----------|-------------------------------------|
+//! | HELLO         | 0x01   | 4.4+    | C → S     | `{extra}`                           |
+//! | GOODBYE       | 0x02   | 4.4+    | C → S     | `{}`                                |
+//! | RESET         | 0x0F   | 4.4+    | C → S     | `{}`                                |
+//! | RUN           | 0x10   | 4.4+    | C → S     | `query`, `params`, `extra`          |
+//! | BEGIN         | 0x11   | 4.4+    | C → S     | `{extra}`                           |
+//! | COMMIT        | 0x12   | 4.4+    | C → S     | `{}`                                |
+//! | ROLLBACK      | 0x13   | 4.4+    | C → S     | `{}`                                |
+//! | DISCARD       | 0x2F   | 4.4+    | C → S     | `{extra}`                           |
+//! | PULL          | 0x3F   | 4.4+    | C → S     | `{extra}`                           |
+//! | ROUTE         | 0x66   | 4.4+    | C → S     | `routing`, `bookmarks`, `extra`     |
+//! | LOGON         | 0x6A   | 5.1+    | C → S     | `{auth}`                            |
+//! | LOGOFF        | 0x6B   | 5.1+    | C → S     | `{}`                                |
+//! | TELEMETRY     | 0x54   | 5.4+    | C → S     | `{api}`                             |
+//! | SUCCESS       | 0x70   | 4.4+    | S → C     | `{metadata}`                        |
+//! | RECORD        | 0x71   | 4.4+    | S → C     | `fields` (as a List)                |
+//! | IGNORED       | 0x7E   | 4.4+    | S → C     | `{}`                                |
+//! | FAILURE       | 0x7F   | 4.4+    | S → C     | `{metadata}` — `code` + `message`   |
 
 use crate::error::{BoltError, Result};
 use crate::packstream;
@@ -33,6 +37,21 @@ pub const TAG_COMMIT: u8 = 0x12;
 pub const TAG_ROLLBACK: u8 = 0x13;
 pub const TAG_DISCARD: u8 = 0x2F;
 pub const TAG_PULL: u8 = 0x3F;
+/// TELEMETRY message introduced in Bolt 5.4. Reports driver API
+/// usage for observability. Server can safely no-op and SUCCESS.
+pub const TAG_TELEMETRY: u8 = 0x54;
+/// ROUTE message introduced in Bolt 4.4 for causal-cluster routing.
+/// Clients ask the server for a routing table; single-node Mesh
+/// replies with a synthetic table pointing at itself.
+pub const TAG_ROUTE: u8 = 0x66;
+/// LOGON message introduced in Bolt 5.1. Separates authentication
+/// from the initial HELLO so credentials can be refreshed mid-session.
+/// When present, the driver sends HELLO → (server SUCCESS) → LOGON.
+pub const TAG_LOGON: u8 = 0x6A;
+/// LOGOFF message introduced in Bolt 5.1. Clears session
+/// authentication; the connection returns to an unauthenticated
+/// state waiting for a fresh LOGON.
+pub const TAG_LOGOFF: u8 = 0x6B;
 pub const TAG_SUCCESS: u8 = 0x70;
 pub const TAG_RECORD: u8 = 0x71;
 pub const TAG_IGNORED: u8 = 0x7E;
@@ -52,13 +71,37 @@ pub const TAG_PATH: u8 = 0x50;
 /// Bolt 4.4 Date struct. Single field `[days: Int]` — days
 /// since the UNIX epoch (1970-01-01), UTC.
 pub const TAG_DATE: u8 = 0x44;
-/// Bolt 4.4 LocalDateTime struct. Fields `[seconds: Int, nanos: Int]`
+/// Bolt LocalDateTime struct (tag 0x64). Fields `[seconds: Int, nanos: Int]`
 /// — nanosecond-precision timestamp since the UNIX epoch without
-/// timezone information. We always emit this UTC-only form in v1;
-/// the timezone-aware `DateTime` variants (`0x46` / `0x66`) are
-/// follow-ups.
+/// timezone information. Used when the value has no timezone (a
+/// naive wall-clock time).
 pub const TAG_LOCAL_DATE_TIME: u8 = 0x64;
-/// Bolt 4.4 Duration struct. Fields
+/// Bolt DateTime with timezone offset (Bolt 5.0+, tag 0x49).
+/// Fields `[seconds: Int, nanos: Int, tz_offset_seconds: Int]`.
+/// In Bolt 5.0+, `seconds`/`nanos` are UTC instant; clients compute
+/// local wall-clock time from the offset.
+pub const TAG_DATE_TIME: u8 = 0x49;
+/// Legacy DateTime (Bolt 4.4, tag 0x46): same fields, but
+/// `seconds`/`nanos` represent local wall-clock time, not UTC.
+/// Kept for compatibility with drivers negotiating Bolt 4.4.
+pub const TAG_DATE_TIME_LEGACY: u8 = 0x46;
+/// Bolt DateTimeZoneId (Bolt 5.0+, tag 0x69). Fields
+/// `[seconds: Int, nanos: Int, tz_id: String]` — timezone carried as
+/// a named region (e.g. "Europe/Stockholm").
+pub const TAG_DATE_TIME_ZONE_ID: u8 = 0x69;
+/// Legacy DateTimeZoneId (Bolt 4.4, tag 0x66): same fields, local
+/// wall-clock semantics.
+pub const TAG_DATE_TIME_ZONE_ID_LEGACY: u8 = 0x66;
+/// Bolt Time struct (tag 0x54 — NOT the TELEMETRY tag; context disambiguates).
+/// Fields `[nanos: Int, tz_offset_seconds: Int]` — nanoseconds since
+/// midnight with timezone offset. TELEMETRY (0x54) is a message,
+/// Time (0x54) is a value; they never collide because messages and
+/// values have separate decoding contexts.
+pub const TAG_TIME: u8 = 0x54;
+/// Bolt LocalTime struct (tag 0x74). Fields `[nanos: Int]` —
+/// nanoseconds since midnight, no timezone.
+pub const TAG_LOCAL_TIME: u8 = 0x74;
+/// Bolt Duration struct. Fields
 /// `[months: Int, days: Int, seconds: Int, nanos: Int]`.
 pub const TAG_DURATION: u8 = 0x45;
 
@@ -88,6 +131,24 @@ pub enum BoltMessage {
     },
     Pull {
         extra: BoltValue,
+    },
+    /// Bolt 4.4+ routing request: `[routing: Map, bookmarks: List,
+    /// extra: Map]`. Returns a routing table in SUCCESS metadata.
+    Route {
+        routing: BoltValue,
+        bookmarks: BoltValue,
+        extra: BoltValue,
+    },
+    /// Bolt 5.1+ authentication: `{auth}` — the auth dict that used to
+    /// live in HELLO extra in earlier versions.
+    Logon {
+        auth: BoltValue,
+    },
+    /// Bolt 5.1+ clear auth.
+    Logoff,
+    /// Bolt 5.4+ driver telemetry: `{api: Int}`. Server can no-op.
+    Telemetry {
+        api: BoltValue,
     },
     Success {
         metadata: BoltValue,
@@ -135,6 +196,17 @@ impl BoltMessage {
             BoltMessage::Rollback => (TAG_ROLLBACK, vec![]),
             BoltMessage::Discard { extra } => (TAG_DISCARD, vec![extra.clone()]),
             BoltMessage::Pull { extra } => (TAG_PULL, vec![extra.clone()]),
+            BoltMessage::Route {
+                routing,
+                bookmarks,
+                extra,
+            } => (
+                TAG_ROUTE,
+                vec![routing.clone(), bookmarks.clone(), extra.clone()],
+            ),
+            BoltMessage::Logon { auth } => (TAG_LOGON, vec![auth.clone()]),
+            BoltMessage::Logoff => (TAG_LOGOFF, vec![]),
+            BoltMessage::Telemetry { api } => (TAG_TELEMETRY, vec![api.clone()]),
             BoltMessage::Success { metadata } => (TAG_SUCCESS, vec![metadata.clone()]),
             BoltMessage::Record { fields } => (TAG_RECORD, vec![BoltValue::List(fields.clone())]),
             BoltMessage::Ignored => (TAG_IGNORED, vec![]),
@@ -192,6 +264,23 @@ impl BoltMessage {
             TAG_PULL => {
                 let extra = one_field(fields, "PULL")?;
                 Ok(BoltMessage::Pull { extra })
+            }
+            TAG_ROUTE => {
+                let [routing, bookmarks, extra] = three_fields(fields, "ROUTE")?;
+                Ok(BoltMessage::Route {
+                    routing,
+                    bookmarks,
+                    extra,
+                })
+            }
+            TAG_LOGON => {
+                let auth = one_field(fields, "LOGON")?;
+                Ok(BoltMessage::Logon { auth })
+            }
+            TAG_LOGOFF => Ok(BoltMessage::Logoff),
+            TAG_TELEMETRY => {
+                let api = one_field(fields, "TELEMETRY")?;
+                Ok(BoltMessage::Telemetry { api })
             }
             TAG_SUCCESS => {
                 let metadata = one_field(fields, "SUCCESS")?;
@@ -323,5 +412,37 @@ mod tests {
         let bytes = packstream::encode(&bogus);
         let err = BoltMessage::decode(&bytes).unwrap_err();
         matches!(err, BoltError::UnknownMessageTag(0xAA));
+    }
+
+    #[test]
+    fn bolt_5_logon_round_trip() {
+        roundtrip(BoltMessage::Logon {
+            auth: BoltValue::map([
+                ("scheme", BoltValue::String("basic".into())),
+                ("principal", BoltValue::String("neo4j".into())),
+                ("credentials", BoltValue::String("s3cret".into())),
+            ]),
+        });
+    }
+
+    #[test]
+    fn bolt_5_logoff_round_trip() {
+        roundtrip(BoltMessage::Logoff);
+    }
+
+    #[test]
+    fn bolt_5_telemetry_round_trip() {
+        roundtrip(BoltMessage::Telemetry {
+            api: BoltValue::map([("api", BoltValue::Int(1))]),
+        });
+    }
+
+    #[test]
+    fn bolt_route_round_trip() {
+        roundtrip(BoltMessage::Route {
+            routing: BoltValue::map([("address", BoltValue::String("localhost:7687".into()))]),
+            bookmarks: BoltValue::List(vec![]),
+            extra: BoltValue::Map(vec![]),
+        });
     }
 }
