@@ -2864,6 +2864,14 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 // Default to current time
                 Value::Property(Property::DateTime(now_epoch_nanos()))
             };
+            let overrides = if arg_exprs.len() > 2 {
+                match eval_expr(&arg_exprs[2], ctx)? {
+                    Value::Property(Property::Map(m)) => Some(m),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             if matches!(temporal, Value::Null | Value::Property(Property::Null)) {
                 return Ok(Value::Null);
             }
@@ -2871,7 +2879,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 Value::Property(Property::String(s)) => s.to_ascii_lowercase(),
                 _ => return Err(Error::TypeMismatch),
             };
-            truncate_temporal(name, &unit_str, &temporal)
+            truncate_temporal(name, &unit_str, &temporal, overrides.as_ref())
         }
 
         _ => Err(Error::UnknownScalarFunction(name.to_string())),
@@ -2917,7 +2925,12 @@ fn temporal_to_nanos(v: &Value) -> Result<i128> {
 }
 
 /// Truncate a temporal value to the specified unit.
-fn truncate_temporal(name: &str, unit: &str, temporal: &Value) -> Result<Value> {
+fn truncate_temporal(
+    name: &str,
+    unit: &str,
+    temporal: &Value,
+    overrides: Option<&std::collections::HashMap<String, Property>>,
+) -> Result<Value> {
     match temporal {
         Value::Property(Property::DateTime(_)) | Value::Property(Property::Date(_)) => {
             let epoch_ns: i128 = match temporal {
@@ -2932,14 +2945,16 @@ fn truncate_temporal(name: &str, unit: &str, temporal: &Value) -> Result<Value> 
                 .unwrap_or_else(|| epoch.and_hms_opt(0, 0, 0).unwrap());
             let truncated = match unit.as_ref() {
                 "millennium" => {
-                    let y = ((dt.year() - 1) / 1000) * 1000 + 1;
+                    // Neo4j: year / 1000 * 1000 (e.g., 2017 → 2000)
+                    let y = (dt.year() / 1000) * 1000;
                     chrono::NaiveDate::from_ymd_opt(y, 1, 1)
                         .unwrap()
                         .and_hms_opt(0, 0, 0)
                         .unwrap()
                 }
                 "century" => {
-                    let y = ((dt.year() - 1) / 100) * 100 + 1;
+                    // Neo4j: year / 100 * 100 (e.g., 1984 → 1900)
+                    let y = (dt.year() / 100) * 100;
                     chrono::NaiveDate::from_ymd_opt(y, 1, 1)
                         .unwrap()
                         .and_hms_opt(0, 0, 0)
@@ -2994,6 +3009,51 @@ fn truncate_temporal(name: &str, unit: &str, temporal: &Value) -> Result<Value> 
                         "unsupported truncation unit: {unit}"
                     )));
                 }
+            };
+            // Apply overrides map (extra day/month/hour/etc. components)
+            let truncated = if let Some(ov) = overrides {
+                let mut year = truncated.year();
+                let mut month = truncated.month();
+                let mut day = truncated.day();
+                let mut hour = truncated.hour();
+                let mut minute = truncated.minute();
+                let mut second = truncated.second();
+                let mut nanosecond = truncated.nanosecond();
+                for (k, v) in ov.iter() {
+                    let n = match v {
+                        Property::Int64(n) => *n,
+                        _ => continue,
+                    };
+                    match k.as_str() {
+                        "year" => year = n as i32,
+                        "month" => month = n as u32,
+                        "day" => day = n as u32,
+                        "hour" => hour = n as u32,
+                        "minute" => minute = n as u32,
+                        "second" => second = n as u32,
+                        "nanosecond" => nanosecond = n as u32,
+                        "millisecond" => nanosecond = (n as u32) * 1_000_000,
+                        "microsecond" => nanosecond = (n as u32) * 1_000,
+                        "dayOfWeek" | "weekDay" => {
+                            // Adjust day based on weekday within week
+                            let current_dow =
+                                truncated.weekday().num_days_from_monday() as i64 + 1;
+                            let target_dow = n;
+                            let delta = target_dow - current_dow;
+                            let new_date = truncated.date()
+                                + chrono::Duration::days(delta);
+                            year = new_date.year();
+                            month = new_date.month();
+                            day = new_date.day();
+                        }
+                        _ => {}
+                    }
+                }
+                chrono::NaiveDate::from_ymd_opt(year, month, day)
+                    .and_then(|d| d.and_hms_nano_opt(hour, minute, second, nanosecond))
+                    .unwrap_or(truncated)
+            } else {
+                truncated
             };
             let diff = truncated
                 .signed_duration_since(epoch.and_hms_opt(0, 0, 0).unwrap());
