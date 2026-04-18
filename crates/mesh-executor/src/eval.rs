@@ -1503,6 +1503,57 @@ fn parse_date(s: &str) -> Result<i32> {
 }
 
 /// Parse a time string like "12:31:14.645876123" into nanoseconds since midnight.
+/// Parse a timezone offset string like "+01:00", "+0100", "+01", "-02:30", "Z".
+fn parse_tz_offset(s: &str) -> Option<i32> {
+    let s = s.trim();
+    if s == "Z" || s.is_empty() {
+        return Some(0);
+    }
+    let (sign, rest) = if let Some(r) = s.strip_prefix('+') {
+        (1, r)
+    } else if let Some(r) = s.strip_prefix('-') {
+        (-1, r)
+    } else {
+        // Not a simple offset (maybe a region name like "Europe/Stockholm")
+        // Approximate with 0 for now.
+        return None;
+    };
+    let clean: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+    let (h, m) = match clean.len() {
+        1 | 2 => (clean.parse::<i32>().ok()?, 0),
+        3 => (
+            clean[..1].parse::<i32>().ok()?,
+            clean[1..].parse::<i32>().ok()?,
+        ),
+        4 => (
+            clean[..2].parse::<i32>().ok()?,
+            clean[2..].parse::<i32>().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// Parse a time string, returning (time_nanos, optional timezone offset).
+fn parse_time_string_with_tz(s: &str) -> Result<(i64, Option<i32>)> {
+    let trimmed = s.trim();
+    // Extract timezone suffix
+    let (time_part, tz) = if let Some(idx) = trimmed.find('+').or_else(|| {
+        // Look for '-' but not the hyphens in dates
+        trimmed
+            .rfind(|c: char| c == '-' || c == '+' || c == 'Z')
+            .filter(|i| *i > 5)
+    }) {
+        (&trimmed[..idx], parse_tz_offset(&trimmed[idx..]))
+    } else if trimmed.ends_with('Z') {
+        (&trimmed[..trimmed.len() - 1], Some(0))
+    } else {
+        (trimmed, None)
+    };
+    let time_nanos = parse_time_string(time_part)?;
+    Ok((time_nanos, tz))
+}
+
 fn parse_time_string(s: &str) -> Result<i64> {
     let trimmed = s.trim();
     // Try parsing as HH:MM:SS.fffffffff, HH:MM:SS, HH:MM
@@ -2636,23 +2687,56 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 match v {
                     Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                     Value::Property(Property::Map(m)) => {
-                        let hour = map_int(&m, "hour").unwrap_or(0);
-                        let minute = map_int(&m, "minute").unwrap_or(0);
-                        let second = map_int(&m, "second").unwrap_or(0);
-                        let nanos = map_int(&m, "nanosecond").unwrap_or(0);
+                        // Extract base time-of-day if a temporal source is provided
+                        let base_tod: i64 = if let Some(Property::Time { nanos, .. }) = m.get("time") {
+                            *nanos
+                        } else if let Some(Property::DateTime(ns)) | Some(Property::LocalDateTime(ns)) = m.get("datetime").or(m.get("localdatetime")) {
+                            ns.rem_euclid(86_400_000_000_000) as i64
+                        } else {
+                            0
+                        };
+                        let base_h = base_tod / 3_600_000_000_000;
+                        let base_min = (base_tod % 3_600_000_000_000) / 60_000_000_000;
+                        let base_sec = (base_tod % 60_000_000_000) / 1_000_000_000;
+                        let base_ns = base_tod % 1_000_000_000;
+
+                        let has_explicit_time = m.contains_key("hour") || m.contains_key("minute")
+                            || m.contains_key("second") || m.contains_key("nanosecond")
+                            || m.contains_key("millisecond") || m.contains_key("microsecond");
+                        let has_any_base = m.contains_key("time") || m.contains_key("datetime")
+                            || m.contains_key("localdatetime");
+                        let default_when_missing = |b: i64| if has_explicit_time { 0 } else if has_any_base { b } else { 0 };
+
+                        let hour = map_int(&m, "hour").unwrap_or_else(|| default_when_missing(base_h));
+                        let minute = map_int(&m, "minute").unwrap_or_else(|| default_when_missing(base_min));
+                        let second = map_int(&m, "second").unwrap_or_else(|| default_when_missing(base_sec));
+                        let nanos = map_int(&m, "nanosecond")
+                            .or_else(|| map_int(&m, "millisecond").map(|ms| ms * 1_000_000))
+                            .or_else(|| map_int(&m, "microsecond").map(|us| us * 1_000))
+                            .unwrap_or_else(|| default_when_missing(base_ns));
                         let time_nanos =
                             hour * 3_600_000_000_000 + minute * 60_000_000_000
                             + second * 1_000_000_000 + nanos;
+                        // Timezone offset from map
+                        let tz_offset = if is_tz {
+                            if let Some(Property::String(tz)) = m.get("timezone") {
+                                parse_tz_offset(tz).or(Some(0))
+                            } else {
+                                Some(0)
+                            }
+                        } else {
+                            None
+                        };
                         Ok(Value::Property(Property::Time {
                             nanos: time_nanos,
-                            tz_offset_secs: if is_tz { Some(0) } else { None },
+                            tz_offset_secs: tz_offset,
                         }))
                     }
                     Value::Property(Property::String(s)) => {
-                        let time_nanos = parse_time_string(&s)?;
+                        let (time_nanos, tz) = parse_time_string_with_tz(&s)?;
                         Ok(Value::Property(Property::Time {
                             nanos: time_nanos,
-                            tz_offset_secs: if is_tz { Some(0) } else { None },
+                            tz_offset_secs: if is_tz { Some(tz.unwrap_or(0)) } else { None },
                         }))
                     }
                     _ => Err(Error::TypeMismatch),
