@@ -3269,11 +3269,144 @@ fn value_to_string(v: Value) -> Value {
         Value::Null => Value::Null,
         Value::Property(Property::String(s)) => Value::Property(Property::String(s)),
         Value::Property(Property::Int64(i)) => Value::Property(Property::String(i.to_string())),
-        Value::Property(Property::Float64(f)) => Value::Property(Property::String(f.to_string())),
+        Value::Property(Property::Float64(f)) => {
+            let s = if f == f.floor() && f.is_finite() {
+                format!("{:.1}", f)
+            } else {
+                f.to_string()
+            };
+            Value::Property(Property::String(s))
+        }
         Value::Property(Property::Bool(b)) => Value::Property(Property::String(b.to_string())),
         Value::Property(Property::Null) => Value::Null,
+        Value::Property(Property::Date(days)) => {
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let d = epoch + chrono::Duration::days(days as i64);
+            Value::Property(Property::String(d.format("%Y-%m-%d").to_string()))
+        }
+        Value::Property(Property::DateTime(ns)) => {
+            Value::Property(Property::String(format_datetime_string(ns)))
+        }
+        Value::Property(Property::Time {
+            nanos,
+            tz_offset_secs,
+        }) => Value::Property(Property::String(format_time_string(nanos, tz_offset_secs))),
+        Value::Property(Property::Duration(d)) => {
+            Value::Property(Property::String(duration_to_iso_string(&d)))
+        }
         other => Value::Property(Property::String(format!("{:?}", other))),
     }
+}
+
+/// Format a DateTime as ISO 8601 string.
+fn format_datetime_string(epoch_nanos: i128) -> String {
+    let days = epoch_nanos.div_euclid(86_400_000_000_000);
+    let tod_ns = epoch_nanos.rem_euclid(86_400_000_000_000);
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let date = epoch + chrono::Duration::days(days as i64);
+    let h = (tod_ns / 3_600_000_000_000) as u32;
+    let m = ((tod_ns % 3_600_000_000_000) / 60_000_000_000) as u32;
+    let s = ((tod_ns % 60_000_000_000) / 1_000_000_000) as u32;
+    let ns = (tod_ns % 1_000_000_000) as u32;
+    let date_str = date.format("%Y-%m-%d").to_string();
+    if ns > 0 {
+        let frac = format!("{:09}", ns);
+        let trimmed = frac.trim_end_matches('0');
+        format!("{date_str}T{h:02}:{m:02}:{s:02}.{trimmed}")
+    } else if s > 0 {
+        format!("{date_str}T{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{date_str}T{h:02}:{m:02}")
+    }
+}
+
+/// Format a Time as ISO 8601 string.
+fn format_time_string(nanos: i64, tz_offset_secs: Option<i32>) -> String {
+    let total_secs = nanos / 1_000_000_000;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    let subsec_nanos = (nanos % 1_000_000_000) as u32;
+    let time_str = if subsec_nanos > 0 {
+        let frac = format!("{:09}", subsec_nanos);
+        let trimmed = frac.trim_end_matches('0');
+        format!("{h:02}:{m:02}:{s:02}.{trimmed}")
+    } else if s > 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{h:02}:{m:02}")
+    };
+    let tz_str = match tz_offset_secs {
+        Some(0) => "Z".to_string(),
+        Some(offset) => {
+            let sign = if offset >= 0 { '+' } else { '-' };
+            let abs = offset.unsigned_abs();
+            let oh = abs / 3600;
+            let om = (abs % 3600) / 60;
+            format!("{sign}{oh:02}:{om:02}")
+        }
+        None => String::new(),
+    };
+    format!("{time_str}{tz_str}")
+}
+
+/// Format a Duration as ISO 8601 string.
+fn duration_to_iso_string(d: &mesh_core::Duration) -> String {
+    let months = d.months;
+    let days = d.days;
+    let seconds = d.seconds;
+    let nanos = d.nanos;
+
+    let years = months / 12;
+    let rem_months = months % 12;
+
+    let mut result = String::from("P");
+    let mut any_date = false;
+    if years != 0 {
+        result.push_str(&format!("{}Y", years));
+        any_date = true;
+    }
+    if rem_months != 0 {
+        result.push_str(&format!("{}M", rem_months));
+        any_date = true;
+    }
+    if days != 0 {
+        result.push_str(&format!("{}D", days));
+        any_date = true;
+    }
+
+    let has_time = seconds != 0 || nanos != 0;
+    if has_time {
+        result.push('T');
+        let sign = if seconds < 0 || (seconds == 0 && nanos < 0) {
+            "-"
+        } else {
+            ""
+        };
+        let abs_secs = seconds.unsigned_abs() as i64;
+        let hours = abs_secs / 3600;
+        let minutes = (abs_secs % 3600) / 60;
+        let secs_only = abs_secs % 60;
+        let abs_nanos = nanos.unsigned_abs() as i64;
+        if hours > 0 {
+            result.push_str(&format!("{}{}H", sign, hours));
+        }
+        if minutes > 0 {
+            result.push_str(&format!("{}{}M", sign, minutes));
+        }
+        if secs_only > 0 || abs_nanos > 0 || (hours == 0 && minutes == 0) {
+            if abs_nanos > 0 {
+                let frac_str = format!("{:09}", abs_nanos);
+                let trimmed = frac_str.trim_end_matches('0');
+                result.push_str(&format!("{}{}.{}S", sign, secs_only, trimmed));
+            } else {
+                result.push_str(&format!("{}{}S", sign, secs_only));
+            }
+        }
+    } else if !any_date {
+        result.push_str("T0S");
+    }
+    result
 }
 
 pub(crate) fn compare_values(a: &Value, b: &Value) -> Ordering {
