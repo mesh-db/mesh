@@ -2399,23 +2399,38 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                     Value::Property(Property::Map(m)) => {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                        let year = map_int(&m, "year").unwrap_or(1970);
+                        // Extract base date/datetime if provided
+                        let base_date = if let Some(Property::Date(d)) = m.get("date") {
+                            Some(epoch + chrono::Duration::days(*d as i64))
+                        } else if let Some(Property::DateTime(ms)) = m.get("datetime") {
+                            let secs = ms / 1000;
+                            chrono::DateTime::from_timestamp(secs, 0)
+                                .map(|dt| dt.naive_utc().date())
+                        } else {
+                            None
+                        };
+                        let base = base_date.unwrap_or(epoch);
                         let hour = map_int(&m, "hour").unwrap_or(0);
                         let minute = map_int(&m, "minute").unwrap_or(0);
                         let second = map_int(&m, "second").unwrap_or(0);
                         let nanos = map_int(&m, "nanosecond").unwrap_or(0);
                         let days_since_epoch = if let Some(week) = map_int(&m, "week") {
-                            let dow = map_int(&m, "dayOfWeek").unwrap_or(1);
-                            let jan4 = chrono::NaiveDate::from_ymd_opt(year as i32, 1, 4).unwrap();
-                            let jan4_wd = jan4.weekday().num_days_from_monday() as i64;
-                            let week1_mon = jan4 - chrono::Duration::days(jan4_wd);
-                            let target = week1_mon
-                                + chrono::Duration::weeks(week - 1)
-                                + chrono::Duration::days(dow - 1);
+                            let year = map_int(&m, "year").unwrap_or_else(|| {
+                                base.iso_week().year() as i64
+                            });
+                            let dow = map_int(&m, "dayOfWeek").unwrap_or_else(|| {
+                                if base_date.is_some() {
+                                    base.weekday().num_days_from_monday() as i64 + 1
+                                } else {
+                                    1
+                                }
+                            });
+                            let target = iso_week_date(year, week, dow);
                             target.signed_duration_since(epoch).num_days()
                         } else {
-                            let month = map_int(&m, "month").unwrap_or(1);
-                            let day = map_int(&m, "day").unwrap_or(1);
+                            let year = map_int(&m, "year").unwrap_or(base.year() as i64);
+                            let month = map_int(&m, "month").unwrap_or(base.month() as i64);
+                            let day = map_int(&m, "day").unwrap_or(base.day() as i64);
                             chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
                                 .map(|d| d.signed_duration_since(epoch).num_days())
                                 .unwrap_or(0)
