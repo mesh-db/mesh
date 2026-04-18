@@ -89,37 +89,24 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 }
                 Value::Property(Property::DateTime {
                     nanos,
-                    tz_offset_secs,        tz_name: _,
-
-                }) => Ok(datetime_accessor(*nanos, *tz_offset_secs, key)),
+                    tz_offset_secs,
+                    tz_name,
+                }) => Ok(datetime_accessor(
+                    *nanos,
+                    *tz_offset_secs,
+                    tz_name.as_deref(),
+                    key,
+                )),
                 Value::Property(Property::LocalDateTime(ns)) => {
-                    Ok(datetime_accessor(*ns, None, key))
+                    Ok(datetime_accessor(*ns, None, None, key))
                 }
                 Value::Property(Property::Time {
                     nanos,
                     tz_offset_secs,
                 }) => Ok(time_accessor(*nanos, *tz_offset_secs, key)),
-                Value::Property(Property::Duration(ref dur)) => match key.as_str() {
-                    "months" => Ok(Value::Property(Property::Int64(dur.months))),
-                    "days" => Ok(Value::Property(Property::Int64(dur.days))),
-                    "seconds" => Ok(Value::Property(Property::Int64(dur.seconds))),
-                    "nanosecondsOfSecond" | "nanoseconds" => {
-                        Ok(Value::Property(Property::Int64(dur.nanos as i64)))
-                    }
-                    "minutesOfHour" => {
-                        Ok(Value::Property(Property::Int64((dur.seconds % 3600) / 60)))
-                    }
-                    "secondsOfMinute" => {
-                        Ok(Value::Property(Property::Int64(dur.seconds % 60)))
-                    }
-                    "millisecondsOfSecond" => {
-                        Ok(Value::Property(Property::Int64((dur.nanos / 1_000_000) as i64)))
-                    }
-                    "microsecondsOfSecond" => {
-                        Ok(Value::Property(Property::Int64((dur.nanos / 1_000) as i64)))
-                    }
-                    _ => Ok(Value::Null),
-                },
+                Value::Property(Property::Duration(ref dur)) => {
+                    Ok(duration_accessor(dur, key))
+                }
                 _ => Ok(Value::Null),
             }
         }
@@ -152,37 +139,24 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 }
                 Value::Property(Property::DateTime {
                     nanos,
-                    tz_offset_secs,        tz_name: _,
-
-                }) => Ok(datetime_accessor(nanos, tz_offset_secs, key)),
+                    tz_offset_secs,
+                    tz_name,
+                }) => Ok(datetime_accessor(
+                    nanos,
+                    tz_offset_secs,
+                    tz_name.as_deref(),
+                    key,
+                )),
                 Value::Property(Property::LocalDateTime(ns)) => {
-                    Ok(datetime_accessor(ns, None, key))
+                    Ok(datetime_accessor(ns, None, None, key))
                 }
                 Value::Property(Property::Time {
                     nanos,
                     tz_offset_secs,
                 }) => Ok(time_accessor(nanos, tz_offset_secs, key)),
-                Value::Property(Property::Duration(ref dur)) => match key.as_str() {
-                    "months" => Ok(Value::Property(Property::Int64(dur.months))),
-                    "days" => Ok(Value::Property(Property::Int64(dur.days))),
-                    "seconds" => Ok(Value::Property(Property::Int64(dur.seconds))),
-                    "nanosecondsOfSecond" | "nanoseconds" => {
-                        Ok(Value::Property(Property::Int64(dur.nanos as i64)))
-                    }
-                    "minutesOfHour" => {
-                        Ok(Value::Property(Property::Int64((dur.seconds % 3600) / 60)))
-                    }
-                    "secondsOfMinute" => {
-                        Ok(Value::Property(Property::Int64(dur.seconds % 60)))
-                    }
-                    "millisecondsOfSecond" => {
-                        Ok(Value::Property(Property::Int64((dur.nanos / 1_000_000) as i64)))
-                    }
-                    "microsecondsOfSecond" => {
-                        Ok(Value::Property(Property::Int64((dur.nanos / 1_000) as i64)))
-                    }
-                    _ => Ok(Value::Null),
-                },
+                Value::Property(Property::Duration(ref dur)) => {
+                    Ok(duration_accessor(dur, key))
+                }
                 _ => Ok(Value::Null),
             }
         }
@@ -3066,6 +3040,20 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                                 None => (Some(0), None),
                             }
                         };
+                        // If we inherited a zone *name*, re-resolve
+                        // its offset against the new local wall-clock.
+                        // Without this, projecting a datetime from
+                        // Oct to March would keep the original Oct
+                        // offset (+01:00) rather than moving to the
+                        // DST-correct one (+02:00).
+                        let (tz_offset, tz_name_opt) = if let Some(name) = &tz_name_opt {
+                            match parse_tz_name_local(name, local_nanos) {
+                                Some((off, canonical)) => (Some(off), Some(canonical)),
+                                None => (tz_offset, tz_name_opt),
+                            }
+                        } else {
+                            (tz_offset, tz_name_opt)
+                        };
                         // If the map *explicitly* supplied a timezone
                         // alongside a zoned base value, we rotate the
                         // wall-clock to the new zone — the same instant
@@ -3073,7 +3061,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         // explicit override we just reuse the base's
                         // tod, so nothing to rotate.)
                         if !is_local && m.contains_key("timezone") {
-                            if let Some(base_off) = base_tz_offset(&m) {
+                            if let Some(base_off) = base_tz_offset(&m, local_nanos) {
                                 if let Some(new_off) = tz_offset {
                                     let shift = (new_off - base_off) as i128 * 1_000_000_000;
                                     local_nanos += shift;
@@ -3782,13 +3770,29 @@ fn extract_tz_offset(
 /// keys) when the caller needs to rotate the wall-clock against a
 /// timezone override. Returns `None` if no base value carries an
 /// offset.
-fn base_tz_offset(m: &std::collections::HashMap<String, Property>) -> Option<i32> {
+///
+/// `pivot` is the final local wall-clock being built. When the base
+/// is a zoned DateTime with a named zone, we re-resolve the offset
+/// *at the pivot instant* rather than reusing the offset captured
+/// when the base was constructed — zones move across DST.
+fn base_tz_offset(
+    m: &std::collections::HashMap<String, Property>,
+    pivot: i128,
+) -> Option<i32> {
     for key in ["datetime", "time"] {
         match m.get(key) {
             Some(Property::DateTime {
                 tz_offset_secs: Some(o),
+                tz_name,
                 ..
-            }) => return Some(*o),
+            }) => {
+                if let Some(name) = tz_name.as_deref() {
+                    if let Some((off, _)) = parse_tz_name_local(name, pivot) {
+                        return Some(off);
+                    }
+                }
+                return Some(*o);
+            }
             Some(Property::Time {
                 tz_offset_secs: Some(o),
                 ..
@@ -4013,6 +4017,43 @@ fn temporal_date_prop(d: &chrono::NaiveDate, key: &str) -> Result<Value> {
     })))
 }
 
+/// Accessors on a Duration value. The field set mirrors Neo4j's:
+/// `years`, `quarters`, `months`, `weeks`, `days`, `hours`,
+/// `minutes`, `seconds`, `milli/micro/nanoseconds` return cumulative
+/// totals; the `...OfX` variants return the component-of-parent
+/// residue (e.g. `monthsOfYear = months % 12`).
+fn duration_accessor(d: &mesh_core::Duration, key: &str) -> Value {
+    let months = d.months;
+    let days = d.days;
+    let seconds = d.seconds;
+    let nanos = d.nanos as i64;
+    let total_ns: i128 = (seconds as i128) * 1_000_000_000 + nanos as i128;
+    let int = |v: i64| Value::Property(Property::Int64(v));
+    match key {
+        "years" => int(months / 12),
+        "quarters" => int(months / 3),
+        "months" => int(months),
+        "weeks" => int(days / 7),
+        "days" => int(days),
+        "hours" => int(seconds / 3600),
+        "minutes" => int(seconds / 60),
+        "seconds" => int(seconds),
+        "milliseconds" => int((total_ns / 1_000_000) as i64),
+        "microseconds" => int((total_ns / 1_000) as i64),
+        "nanoseconds" => int(total_ns as i64),
+        "quartersOfYear" => int((months % 12) / 3),
+        "monthsOfQuarter" => int(months % 3),
+        "monthsOfYear" => int(months % 12),
+        "daysOfWeek" => int(days % 7),
+        "minutesOfHour" => int((seconds % 3600) / 60),
+        "secondsOfMinute" => int(seconds % 60),
+        "millisecondsOfSecond" => int(nanos / 1_000_000),
+        "microsecondsOfSecond" => int(nanos / 1_000),
+        "nanosecondsOfSecond" => int(nanos),
+        _ => Value::Null,
+    }
+}
+
 /// Format a tz offset as `+HH:MM` / `-HH:MM` / `Z`.
 fn format_offset_str(offset: i32) -> String {
     if offset == 0 {
@@ -4076,7 +4117,12 @@ fn time_accessor(nanos: i64, tz_offset_secs: Option<i32>, key: &str) -> Value {
 /// UTC-epoch nanoseconds stored on the value; `tz_offset_secs` is
 /// None for LocalDateTime, Some(offset) for DateTime. The local
 /// wall-clock is derived by shifting `utc_nanos` by the offset.
-fn datetime_accessor(utc_nanos: i128, tz_offset_secs: Option<i32>, key: &str) -> Value {
+fn datetime_accessor(
+    utc_nanos: i128,
+    tz_offset_secs: Option<i32>,
+    tz_name: Option<&str>,
+    key: &str,
+) -> Value {
     let local = match tz_offset_secs {
         Some(off) => utc_nanos + (off as i128) * 1_000_000_000,
         None => utc_nanos,
@@ -4110,7 +4156,18 @@ fn datetime_accessor(utc_nanos: i128, tz_offset_secs: Option<i32>, key: &str) ->
         "epochSeconds" => Value::Property(Property::Int64(
             utc_nanos.div_euclid(1_000_000_000) as i64,
         )),
-        "timezone" | "offset" => match tz_offset_secs {
+        // `timezone` reports the IANA name when one is on the value,
+        // so `datetime({..., timezone: 'Europe/Stockholm'}).timezone`
+        // round-trips. `offset` always reports the numeric `±HH:MM`
+        // (or `Z`) derived from `tz_offset_secs`.
+        "timezone" => match tz_name {
+            Some(name) => Value::Property(Property::String(name.to_string())),
+            None => match tz_offset_secs {
+                Some(o) => Value::Property(Property::String(format_offset_str(o))),
+                None => Value::Null,
+            },
+        },
+        "offset" => match tz_offset_secs {
             Some(o) => Value::Property(Property::String(format_offset_str(o))),
             None => Value::Null,
         },
