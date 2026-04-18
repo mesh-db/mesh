@@ -878,6 +878,26 @@ fn build_delete_clause(pair: Pair<Rule>) -> Result<DeleteClause> {
             Rule::delete_items => {
                 for item in inner.into_inner() {
                     let expr = build_expression(item)?;
+                    // openCypher: DELETE targets must be graph-element
+                    // expressions (Node / Edge / Path). Label predicates
+                    // (`n:Label`), comparisons, and other boolean-valued
+                    // expressions belong in WHERE or REMOVE, not DELETE.
+                    if matches!(
+                        expr,
+                        Expr::HasLabels { .. }
+                            | Expr::Compare { .. }
+                            | Expr::And(_, _)
+                            | Expr::Or(_, _)
+                            | Expr::Xor(_, _)
+                            | Expr::Not(_)
+                            | Expr::IsNull { .. }
+                            | Expr::InList { .. }
+                    ) {
+                        return Err(Error::Parse(
+                            "DELETE targets must evaluate to a node, edge, or path (no label / boolean predicates)"
+                                .into(),
+                        ));
+                    }
                     // Extract variable name for backwards compatibility
                     if let Expr::Identifier(ref name) = expr {
                         vars.push(name.clone());
