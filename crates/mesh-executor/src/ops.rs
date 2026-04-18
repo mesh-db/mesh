@@ -313,6 +313,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             edge_var,
             dst_var,
             dst_labels,
+            edge_properties,
             edge_types,
             direction,
         } => Box::new(EdgeExpandOp::new(
@@ -321,6 +322,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             edge_var.clone(),
             dst_var.clone(),
             dst_labels.clone(),
+            edge_properties.clone(),
             edge_types.clone(),
             *direction,
         )),
@@ -2014,6 +2016,7 @@ struct EdgeExpandOp {
     edge_var: Option<String>,
     dst_var: String,
     dst_labels: Vec<String>,
+    edge_properties: Vec<(String, Expr)>,
     edge_types: Vec<String>,
     direction: Direction,
     current_row: Option<Row>,
@@ -2028,6 +2031,7 @@ impl EdgeExpandOp {
         edge_var: Option<String>,
         dst_var: String,
         dst_labels: Vec<String>,
+        edge_properties: Vec<(String, Expr)>,
         edge_types: Vec<String>,
         direction: Direction,
     ) -> Self {
@@ -2037,6 +2041,7 @@ impl EdgeExpandOp {
             edge_var,
             dst_var,
             dst_labels,
+            edge_properties,
             edge_types,
             direction,
             current_row: None,
@@ -2061,6 +2066,35 @@ impl Operator for EdgeExpandOp {
                     && !self.edge_types.iter().any(|t| t == &edge.edge_type)
                 {
                     continue;
+                }
+                // Inline edge property filter: every (key, value)
+                // must match the traversed edge's property of the
+                // same name via `=` equality. Missing keys fail the
+                // check (matching Neo4j).
+                if !self.edge_properties.is_empty() {
+                    let base = self
+                        .current_row
+                        .as_ref()
+                        .expect("pending edges without source row");
+                    let ectx = ctx.eval_ctx(base);
+                    let mut ok = true;
+                    for (key, expr) in &self.edge_properties {
+                        let expected = eval_expr(expr, &ectx)?;
+                        let actual = match edge.properties.get(key) {
+                            Some(v) => Value::Property(v.clone()),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        if !values_equal(&actual, &expected) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
                 }
 
                 let neighbor = match ctx.store.get_node(neighbor_id)? {
@@ -2094,8 +2128,19 @@ impl Operator for EdgeExpandOp {
                         Direction::Outgoing => ctx.store.outgoing(src_id)?,
                         Direction::Incoming => ctx.store.incoming(src_id)?,
                         Direction::Both => {
+                            // For undirected traversal, a self-loop
+                            // appears once as outgoing and once as
+                            // incoming. The Cypher spec visits each
+                            // physical edge once, so dedupe by
+                            // edge_id before emitting.
                             let mut all = ctx.store.outgoing(src_id)?;
-                            all.extend(ctx.store.incoming(src_id)?);
+                            let mut seen: std::collections::HashSet<EdgeId> =
+                                all.iter().map(|(e, _)| *e).collect();
+                            for (e, n) in ctx.store.incoming(src_id)? {
+                                if seen.insert(e) {
+                                    all.push((e, n));
+                                }
+                            }
                             all
                         }
                     };
@@ -2266,8 +2311,19 @@ impl Operator for OptionalEdgeExpandOp {
                         Direction::Outgoing => ctx.store.outgoing(src_id)?,
                         Direction::Incoming => ctx.store.incoming(src_id)?,
                         Direction::Both => {
+                            // For undirected traversal, a self-loop
+                            // appears once as outgoing and once as
+                            // incoming. The Cypher spec visits each
+                            // physical edge once, so dedupe by
+                            // edge_id before emitting.
                             let mut all = ctx.store.outgoing(src_id)?;
-                            all.extend(ctx.store.incoming(src_id)?);
+                            let mut seen: std::collections::HashSet<EdgeId> =
+                                all.iter().map(|(e, _)| *e).collect();
+                            for (e, n) in ctx.store.incoming(src_id)? {
+                                if seen.insert(e) {
+                                    all.push((e, n));
+                                }
+                            }
                             all
                         }
                     };

@@ -51,6 +51,10 @@ pub enum LogicalPlan {
         edge_var: Option<String>,
         dst_var: String,
         dst_labels: Vec<String>,
+        /// Inline edge property filter — `[r:TYPE {name: 'monkey'}]`
+        /// lowers into an equality check the executor runs per
+        /// traversed edge. Same shape as node-pattern properties.
+        edge_properties: Vec<(String, Expr)>,
         edge_types: Vec<String>,
         direction: Direction,
     },
@@ -1755,6 +1759,7 @@ fn chain_hops(
                 edge_var: hop.rel.var.clone(),
                 dst_var: dst_var.clone(),
                 dst_labels: hop.target.labels.clone(),
+                edge_properties: hop.rel.properties.clone(),
                 edge_types: hop.rel.edge_types.clone(),
                 direction: hop.rel.direction,
             }
@@ -2004,6 +2009,12 @@ fn expr_is_row_independent(e: &Expr) -> bool {
 fn collect_pattern_vars(pattern: &Pattern, out: &mut HashSet<String>) {
     if let Some(var) = &pattern.start.var {
         out.insert(var.clone());
+    }
+    // `OPTIONAL MATCH p = (a)-->(b) RETURN p` needs `p` to bind to
+    // null when the pattern doesn't match. Include the path var in
+    // the set the null-row fallback populates.
+    if let Some(pv) = &pattern.path_var {
+        out.insert(pv.clone());
     }
     for hop in &pattern.hops {
         if let Some(var) = &hop.rel.var {
@@ -2891,9 +2902,18 @@ fn apply_optional_match(
             continue;
         }
 
+        // `OPTIONAL MATCH p = ...` needs every hop to bind both an
+        // edge var and a target var so BindPath (below) can extract
+        // the sequence from each row. Synthesise names when the
+        // source pattern omitted them.
+        let mut working = pattern.clone();
+        if working.path_var.is_some() {
+            ensure_path_bindings(&mut working, bound_vars.len())?;
+        }
+
         let mut current_var = start_var;
 
-        for (i, hop) in pattern.hops.iter().enumerate() {
+        for (i, hop) in working.hops.iter().enumerate() {
             let dst_var = hop
                 .target
                 .var
@@ -2937,6 +2957,23 @@ fn apply_optional_match(
                 bound_vars.insert(ev.clone(), VarType::Edge);
             }
             current_var = dst_var;
+        }
+
+        // Bind the path variable after all hops have run. BindPath
+        // handles the optional case: when any referenced node/edge
+        // var is null (because the left-join fired its fallback),
+        // `path_var` comes out null, which is exactly what
+        // `OPTIONAL MATCH p = ...` should produce.
+        if working.path_var.is_some() {
+            let start_var_for_bind = working
+                .start
+                .var
+                .clone()
+                .unwrap_or_else(|| format!("__opt_start_{}", bound_vars.len()));
+            plan = wrap_with_bind_path(plan, &working, &start_var_for_bind, 0);
+            if let Some(pv) = &working.path_var {
+                bound_vars.insert(pv.clone(), VarType::Path);
+            }
         }
     }
 
