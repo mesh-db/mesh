@@ -908,6 +908,12 @@ impl Operator for SetPropertyOp {
                 for action in actions {
                     match action {
                         Action::SetKey { var, key, prop } => match row.get_mut(&var) {
+                            // openCypher: SET on a null target (from
+                            // OPTIONAL MATCH that didn't bind) is a
+                            // silent no-op rather than an error.
+                            Some(Value::Null)
+                            | Some(Value::Property(Property::Null))
+                            | None => continue,
                             // openCypher: SET a.key = null removes the
                             // property rather than storing a null value.
                             Some(Value::Node(n)) => {
@@ -929,6 +935,9 @@ impl Operator for SetPropertyOp {
                             _ => return Err(Error::UnboundVariable(var)),
                         },
                         Action::AddLabels { var, labels } => match row.get_mut(&var) {
+                            Some(Value::Null)
+                            | Some(Value::Property(Property::Null))
+                            | None => continue,
                             Some(Value::Node(n)) => {
                                 for label in labels {
                                     if !n.labels.contains(&label) {
@@ -940,6 +949,9 @@ impl Operator for SetPropertyOp {
                             _ => return Err(Error::UnboundVariable(var)),
                         },
                         Action::Replace { var, props } => match row.get_mut(&var) {
+                            Some(Value::Null)
+                            | Some(Value::Property(Property::Null))
+                            | None => continue,
                             Some(Value::Node(n)) => {
                                 n.properties.clear();
                                 for (k, v) in props {
@@ -961,6 +973,9 @@ impl Operator for SetPropertyOp {
                             _ => return Err(Error::UnboundVariable(var)),
                         },
                         Action::Merge { var, props } => match row.get_mut(&var) {
+                            Some(Value::Null)
+                            | Some(Value::Property(Property::Null))
+                            | None => continue,
                             Some(Value::Node(n)) => {
                                 for (k, v) in props {
                                     if matches!(v, Property::Null) {
@@ -1025,6 +1040,11 @@ impl Operator for RemoveOp {
                 for item in &self.items {
                     match item {
                         RemoveSpec::Property { var, key } => match row.get_mut(var) {
+                            // Null target (from OPTIONAL MATCH) is a
+                            // no-op, matching Neo4j's REMOVE semantics.
+                            Some(Value::Null)
+                            | Some(Value::Property(Property::Null))
+                            | None => continue,
                             Some(Value::Node(n)) => {
                                 n.properties.remove(key);
                                 updated_nodes.insert(var.clone());
@@ -1036,6 +1056,9 @@ impl Operator for RemoveOp {
                             _ => return Err(Error::UnboundVariable(var.clone())),
                         },
                         RemoveSpec::Labels { var, labels } => match row.get_mut(var) {
+                            Some(Value::Null)
+                            | Some(Value::Property(Property::Null))
+                            | None => continue,
                             Some(Value::Node(n)) => {
                                 n.labels.retain(|l| !labels.contains(l));
                                 updated_nodes.insert(var.clone());

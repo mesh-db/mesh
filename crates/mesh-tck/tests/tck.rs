@@ -708,8 +708,14 @@ fn format_property(p: &Property) -> String {
             }
         }
         Property::String(s) => {
+            // Match openCypher's expected single-quoted display form
+            // so TCK rows compare character-for-character: escape
+            // the single-quote delimiter and the usual C-style
+            // controls. Backslashes go first so the added escapes
+            // we insert below don't get re-escaped.
             let escaped = s
                 .replace('\\', "\\\\")
+                .replace('\'', "\\'")
                 .replace('\n', "\\n")
                 .replace('\r', "\\r")
                 .replace('\t', "\\t");
