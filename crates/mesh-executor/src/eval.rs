@@ -2159,7 +2159,92 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
             *a,
             negate_duration(*b),
         ))))),
+        // Duration * number — multiplies every component. Fractional
+        // results cascade: 0.5 years becomes 6 months, 0.5 days
+        // becomes 12 hours, etc. (Matches Neo4j, which documents
+        // Duration scalar arithmetic.)
+        (BinaryOp::Mul, Dur(d), Property::Int64(n)) => {
+            Some(Ok(Value::Property(Dur(scale_duration(*d, *n as f64)))))
+        }
+        (BinaryOp::Mul, Property::Int64(n), Dur(d)) => {
+            Some(Ok(Value::Property(Dur(scale_duration(*d, *n as f64)))))
+        }
+        (BinaryOp::Mul, Dur(d), Property::Float64(n)) => {
+            Some(Ok(Value::Property(Dur(scale_duration(*d, *n)))))
+        }
+        (BinaryOp::Mul, Property::Float64(n), Dur(d)) => {
+            Some(Ok(Value::Property(Dur(scale_duration(*d, *n)))))
+        }
+        (BinaryOp::Div, Dur(d), Property::Int64(n)) => {
+            if *n == 0 {
+                return Some(Err(Error::DivideByZero));
+            }
+            Some(Ok(Value::Property(Dur(scale_duration(*d, 1.0 / (*n as f64))))))
+        }
+        (BinaryOp::Div, Dur(d), Property::Float64(n)) => {
+            if *n == 0.0 {
+                return Some(Err(Error::DivideByZero));
+            }
+            Some(Ok(Value::Property(Dur(scale_duration(*d, 1.0 / *n)))))
+        }
         _ => None,
+    }
+}
+
+/// Multiply every component of a Duration by `factor`. Fractional
+/// date-level results (years / months / weeks / days) cascade into
+/// days + seconds using Neo4j's mean month of 30.436875 days, but
+/// integer sub-day components stay where they are — `32H` doesn't
+/// get promoted to `1D8H`.
+fn scale_duration(d: mesh_core::Duration, factor: f64) -> mesh_core::Duration {
+    const DAY_SECS: i128 = 86_400;
+    const SECS_PER_MONTH: f64 = 30.436875 * 86_400.0;
+    // Scaled months: whole goes to `months`, fractional cascades
+    // into days+sub-day seconds below.
+    let scaled_months = d.months as f64 * factor;
+    let whole_months = scaled_months.trunc() as i64;
+    let frac_month_ns = ((scaled_months - whole_months as f64) * SECS_PER_MONTH * 1e9)
+        .round() as i128;
+
+    // Scaled days: whole goes to `days`, fractional cascades too.
+    let scaled_days = d.days as f64 * factor;
+    let whole_days = scaled_days.trunc() as i64;
+    let frac_day_ns = ((scaled_days - whole_days as f64) * (DAY_SECS as f64) * 1e9)
+        .round() as i128;
+
+    // Sub-day: scale seconds+nanos independently so a nanosecond
+    // that doesn't cleanly divide (1 * 0.5 = 0.5) gets truncated
+    // rather than rounded up to 1. Floating-point at nanosecond
+    // precision is lossy; Neo4j drops sub-nanosecond precision.
+    let scaled_secs_f = d.seconds as f64 * factor;
+    let whole_secs_f = scaled_secs_f.trunc();
+    let frac_sec_ns = ((scaled_secs_f - whole_secs_f) * 1e9).round() as i128;
+    let scaled_nanos = (d.nanos as f64 * factor).trunc() as i128;
+    let scaled_sub_ns = (whole_secs_f as i128) * 1_000_000_000 + frac_sec_ns + scaled_nanos;
+
+    // Cascade the fractional date-level pieces (which CAN legally
+    // cross the 24h boundary) into `days`, leaving the scaled
+    // sub-day portion in seconds+nanos.
+    let cascaded_ns = frac_month_ns + frac_day_ns;
+    let carry_days = cascaded_ns.div_euclid(DAY_SECS * 1_000_000_000);
+    let cascaded_remainder_ns = cascaded_ns.rem_euclid(DAY_SECS * 1_000_000_000);
+    let days_out = whole_days.wrapping_add(carry_days as i64);
+
+    let total_ns = scaled_sub_ns + cascaded_remainder_ns;
+    let mut seconds_out = (total_ns / 1_000_000_000) as i64;
+    let mut nanos_out = (total_ns % 1_000_000_000) as i32;
+    if seconds_out > 0 && nanos_out < 0 {
+        seconds_out -= 1;
+        nanos_out += 1_000_000_000;
+    } else if seconds_out < 0 && nanos_out > 0 {
+        seconds_out += 1;
+        nanos_out -= 1_000_000_000;
+    }
+    mesh_core::Duration {
+        months: whole_months,
+        days: days_out,
+        seconds: seconds_out,
+        nanos: nanos_out,
     }
 }
 
@@ -2214,13 +2299,20 @@ fn datetime_add_duration(epoch_nanos: i128, d: mesh_core::Duration) -> i128 {
 /// so drivers can't silently drop a time-of-day component they
 /// meant to apply.
 fn date_add_duration(days: i32, d: mesh_core::Duration) -> Result<Value> {
-    // Ignore sub-day components (seconds, nanos) since Date has
-    // no time-of-day component.
+    // Sub-day components normally don't affect a Date, but Neo4j
+    // cascades whole 24h chunks of the Duration's seconds into
+    // the `days` slot when applying to a Date (so a duration built
+    // up from fractional years/months lands on the right calendar
+    // day even if the canonical storage kept some spill in seconds).
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     let base = epoch + chrono::Duration::days(days as i64);
-    // Apply months using calendar arithmetic
+    // Truncate toward zero so a negative partial day (`-56950s`)
+    // doesn't borrow a whole day, but a full positive day (`+86400s`
+    // or more) still cascades. Matches Neo4j's date+duration rules.
+    let seconds_day_carry = (d.seconds as i64) / 86_400;
     let new_date = add_months_to_date(base, d.months);
-    let final_date = new_date + chrono::Duration::days(d.days);
+    let final_date = new_date
+        + chrono::Duration::days(d.days.wrapping_add(seconds_day_carry));
     let new_days = final_date.signed_duration_since(epoch).num_days();
     let clamped = i32::try_from(new_days).map_err(|_| Error::TypeMismatch)?;
     Ok(Value::Property(Property::Date(clamped)))
@@ -3404,14 +3496,22 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             };
             let mut months = 0_i64;
             let mut days = 0_i64;
-            let mut sub_day_nanos = 0_i128;
+            // Sub-day accumulator split in two so we know which
+            // nanoseconds came from *fractional date-part components*
+            // (those cascade into whole days at the end) versus
+            // *time-part components* (which stay as seconds/nanos —
+            // `duration({seconds: -2, ms: 1})` must canonicalise to
+            // `PT-1.999S`, not `P-1DT…`).
+            let mut date_frac_ns = 0_i128;
+            let mut time_ns = 0_i128;
             // Mean-month size used when a fractional month or year
             // cascades into smaller units: 365.2425 / 12 days.
             const SECS_PER_MONTH: f64 = 30.436875 * 86400.0;
             const SECS_PER_DAY: i64 = 86_400;
             // Cascade a fractional number of *days* — year/month/week/
             // day fractions all boil down to this — into whole days
-            // plus a sub-day nanosecond remainder.
+            // plus a sub-day nanosecond remainder that we'll
+            // collapse back to days at the end.
             let mut push_days_f = |total_days: f64,
                                    days: &mut i64,
                                    sub_day_nanos: &mut i128| {
@@ -3436,7 +3536,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         push_days_f(
                             frac_months * SECS_PER_MONTH / (SECS_PER_DAY as f64),
                             &mut days,
-                            &mut sub_day_nanos,
+                            &mut date_frac_ns,
                         );
                     }
                     "months" => {
@@ -3446,34 +3546,34 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         push_days_f(
                             frac * SECS_PER_MONTH / (SECS_PER_DAY as f64),
                             &mut days,
-                            &mut sub_day_nanos,
+                            &mut date_frac_ns,
                         );
                     }
                     "weeks" => {
-                        push_days_f(as_f64 * 7.0, &mut days, &mut sub_day_nanos);
+                        push_days_f(as_f64 * 7.0, &mut days, &mut date_frac_ns);
                     }
                     "days" => {
-                        push_days_f(as_f64, &mut days, &mut sub_day_nanos);
+                        push_days_f(as_f64, &mut days, &mut date_frac_ns);
                     }
                     // Sub-day components stay as seconds+nanos; Neo4j
                     // does not cascade integer seconds into days.
                     "hours" => {
-                        sub_day_nanos += (as_f64 * 3600.0 * 1e9).round() as i128;
+                        time_ns += (as_f64 * 3600.0 * 1e9).round() as i128;
                     }
                     "minutes" => {
-                        sub_day_nanos += (as_f64 * 60.0 * 1e9).round() as i128;
+                        time_ns += (as_f64 * 60.0 * 1e9).round() as i128;
                     }
                     "seconds" => {
-                        sub_day_nanos += (as_f64 * 1e9).round() as i128;
+                        time_ns += (as_f64 * 1e9).round() as i128;
                     }
                     "milliseconds" => {
-                        sub_day_nanos += (as_f64 * 1_000_000.0).round() as i128;
+                        time_ns += (as_f64 * 1_000_000.0).round() as i128;
                     }
                     "microseconds" => {
-                        sub_day_nanos += (as_f64 * 1000.0).round() as i128;
+                        time_ns += (as_f64 * 1000.0).round() as i128;
                     }
                     "nanoseconds" => {
-                        sub_day_nanos += as_f64.round() as i128;
+                        time_ns += as_f64.round() as i128;
                     }
                     other => {
                         return Err(Error::UnknownScalarFunction(format!(
@@ -3482,10 +3582,16 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                 }
             }
-            // Split sub-day nanos into (seconds, nanos). Both share a
-            // sign (Neo4j's canonical form keeps seconds and nanos
-            // matching so negative durations print cleanly).
-            let total_ns = sub_day_nanos;
+            // Finalise. Date-fraction nanos always cascade into
+            // whole days; time-part nanos stay as seconds even if
+            // they sum past 24h (so `{days:1, ms:-1}` canonicalises
+            // to `P1DT-0.001S`, not `PT23H59M59.999S`). Both streams
+            // then combine into the final seconds/nanos.
+            let day_ns: i128 = (SECS_PER_DAY as i128) * 1_000_000_000;
+            let date_day_carry = date_frac_ns.div_euclid(day_ns);
+            let date_sub_day_ns = date_frac_ns.rem_euclid(day_ns);
+            days = days.wrapping_add(date_day_carry as i64);
+            let total_ns = date_sub_day_ns + time_ns;
             let mut seconds = (total_ns / 1_000_000_000) as i64;
             let mut nanos = (total_ns % 1_000_000_000) as i32;
             if seconds > 0 && nanos < 0 {
