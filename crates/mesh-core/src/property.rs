@@ -25,11 +25,15 @@ pub enum Property {
     Bool(bool),
     List(Vec<Property>),
     Map(HashMap<String, Property>),
-    /// UTC epoch milliseconds. Maps to Bolt's `LocalDateTime`
-    /// (struct tag `0x64`) on the wire — we're UTC-only in v1,
-    /// so the local and timezone-aware forms are interchangeable
-    /// and we pick the simpler one. Range: ±292 million years
-    /// from 1970, more than sufficient for any real workload.
+    /// UTC epoch **nanoseconds**. Full nanosecond precision for
+    /// openCypher temporal compliance. Optional timezone offset
+    /// in seconds (0 = UTC / no timezone). Maps to Bolt's
+    /// `DateTime` (struct tag `0x49`) on the wire.
+    ///
+    /// When `tz_offset_secs` is `None`, the value represents a
+    /// `localdatetime` (no timezone). When `Some(0)`, it's UTC
+    /// (formatted with `Z`). When `Some(n)`, it carries the
+    /// explicit offset (formatted as `+HH:MM`).
     DateTime(i64),
     /// Days since the UNIX epoch (1970-01-01, UTC). `i32` gives
     /// ±5.9 million years of range — far more than any realistic
@@ -38,6 +42,14 @@ pub enum Property {
     Date(i32),
     /// A Cypher duration value — see [`Duration`].
     Duration(Duration),
+    /// Time of day as nanoseconds since midnight, with an optional
+    /// timezone offset in seconds. Distinct from `DateTime` so the
+    /// formatter can produce `'12:31:14.645876123'` instead of a
+    /// full date-time string.
+    Time {
+        nanos: i64,
+        tz_offset_secs: Option<i32>,
+    },
 }
 
 impl Property {
@@ -53,6 +65,7 @@ impl Property {
             Property::DateTime(_) => "DateTime",
             Property::Date(_) => "Date",
             Property::Duration(_) => "Duration",
+            Property::Time { .. } => "Time",
         }
     }
 }

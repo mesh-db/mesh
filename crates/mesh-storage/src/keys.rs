@@ -126,13 +126,12 @@ pub(crate) fn encode_index_value(value: &Property) -> Option<Vec<u8>> {
             Some(out)
         }
         Property::Bool(b) => Some(vec![INDEX_VALUE_BOOL, u8::from(*b)]),
-        Property::DateTime(ms) => {
-            // Big-endian epoch-millis so lexicographic byte order
-            // matches temporal order. The type tag keeps DateTimes
-            // disjoint from Int64s even though both are i64-shaped.
+        Property::DateTime(nanos) => {
+            // Big-endian epoch-nanos so lexicographic byte order
+            // matches temporal order.
             let mut out = Vec::with_capacity(1 + 8);
             out.push(INDEX_VALUE_DATETIME);
-            out.extend_from_slice(&ms.to_be_bytes());
+            out.extend_from_slice(&nanos.to_be_bytes());
             Some(out)
         }
         Property::Date(days) => {
@@ -145,7 +144,8 @@ pub(crate) fn encode_index_value(value: &Property) -> Option<Vec<u8>> {
         // on the reference date), so we refuse to index it — matches
         // how Neo4j treats `Duration` in schema indexes.
         Property::Duration(_) => None,
-        Property::Float64(_) | Property::List(_) | Property::Map(_) | Property::Null => None,
+        Property::Float64(_) | Property::List(_) | Property::Map(_) | Property::Null
+        | Property::Time { .. } => None,
     }
 }
 

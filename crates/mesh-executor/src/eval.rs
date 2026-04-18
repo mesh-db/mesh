@@ -88,8 +88,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     temporal_date_prop(&d, key)
                 }
                 Value::Property(Property::DateTime(ms)) => {
-                    let secs = ms / 1000;
-                    let nsec = ((ms % 1000) * 1_000_000) as u32;
+                    let (secs, nsec) = nanos_to_secs_nanos(*ms);
                     if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
                         let naive = dt.naive_utc();
                         let date = naive.date();
@@ -167,8 +166,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     temporal_date_prop(&d, key)
                 }
                 Value::Property(Property::DateTime(ms)) => {
-                    let secs = ms / 1000;
-                    let nsec = ((ms % 1000) * 1_000_000) as u32;
+                    let (secs, nsec) = nanos_to_secs_nanos(ms);
                     if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
                         let naive = dt.naive_utc();
                         let date = naive.date();
@@ -1400,16 +1398,19 @@ fn map_int(m: &std::collections::HashMap<String, Property>, key: &str) -> Option
     }
 }
 
-fn now_epoch_millis() -> i64 {
+fn now_epoch_nanos() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    // `as_millis` returns u128. Saturating cast is fine — the
-    // realistic range (current year through year 292 million)
-    // fits well within i64::MAX, and pre-1970 timestamps would
-    // return a zero duration from the `unwrap_or_default` above.
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+    i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// Convenience: epoch nanos → (secs, subsec_nanos)
+fn nanos_to_secs_nanos(epoch_nanos: i64) -> (i64, u32) {
+    let secs = epoch_nanos.div_euclid(1_000_000_000);
+    let nsec = epoch_nanos.rem_euclid(1_000_000_000) as u32;
+    (secs, nsec)
 }
 
 /// Parse an ISO 8601 / RFC 3339 datetime string into UTC epoch
@@ -1437,7 +1438,7 @@ fn parse_datetime(s: &str) -> Result<i64> {
     // drivers emit). Chrono's `DateTime::parse_from_rfc3339`
     // accepts both `Z` and explicit offsets.
     if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(trimmed) {
-        return Ok(dt.timestamp_millis());
+        return Ok(dt.timestamp_nanos_opt().unwrap_or(0));
     }
     // Try ISO 8601 formats with timezone offsets (with and without colons)
     for fmt in [
@@ -1449,7 +1450,7 @@ fn parse_datetime(s: &str) -> Result<i64> {
         "%Y-%m-%dT%H:%M%:z",
     ] {
         if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(trimmed, fmt) {
-            return Ok(dt.timestamp_millis());
+            return Ok(dt.timestamp_nanos_opt().unwrap_or(0));
         }
     }
     // Fall back to a few naive forms. Each is interpreted as
@@ -1464,7 +1465,7 @@ fn parse_datetime(s: &str) -> Result<i64> {
         "%Y-%m-%d %H:%M:%S",
     ] {
         if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
-            return Ok(ndt.and_utc().timestamp_millis());
+            return Ok(ndt.and_utc().timestamp_nanos_opt().unwrap_or(0));
         }
     }
     Err(Error::UnknownScalarFunction(format!(
@@ -1486,6 +1487,22 @@ fn parse_date(s: &str) -> Result<i32> {
             "date() {s:?} is outside the representable i32 day range"
         ))
     })
+}
+
+/// Parse a time string like "12:31:14.645876123" into nanoseconds since midnight.
+fn parse_time_string(s: &str) -> Result<i64> {
+    let trimmed = s.trim();
+    // Try parsing as HH:MM:SS.fffffffff, HH:MM:SS, HH:MM
+    for fmt in ["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"] {
+        if let Ok(t) = chrono::NaiveTime::parse_from_str(trimmed, fmt) {
+            let secs = t.num_seconds_from_midnight() as i64;
+            let nanos = t.nanosecond() as i64;
+            return Ok(secs * 1_000_000_000 + nanos);
+        }
+    }
+    Err(Error::UnknownScalarFunction(format!(
+        "time() could not parse {s:?} as HH:MM:SS"
+    )))
 }
 
 /// Parse an ISO 8601 duration string into a
@@ -1697,12 +1714,12 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
             datetime_add_duration(*ms, negate_duration(*d)),
         )))),
         (BinaryOp::Sub, DateTime(a), DateTime(b)) => {
-            let diff_ms = a.wrapping_sub(*b);
+            let diff_ns = a.wrapping_sub(*b);
             Some(Ok(Value::Property(Dur(mesh_core::Duration {
                 months: 0,
                 days: 0,
-                seconds: diff_ms.div_euclid(1000),
-                nanos: (diff_ms.rem_euclid(1000) * 1_000_000) as i32,
+                seconds: diff_ns.div_euclid(1_000_000_000),
+                nanos: diff_ns.rem_euclid(1_000_000_000) as i32,
             }))))
         }
         (BinaryOp::Add, Date(days), Dur(d)) | (BinaryOp::Add, Dur(d), Date(days)) => {
@@ -1730,14 +1747,14 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
 /// track: a month is 30 days, a day is 86_400 seconds. Callers
 /// who need strict calendar semantics should use the component
 /// fields on `Duration` directly and apply their own math.
-fn datetime_add_duration(ms: i64, d: mesh_core::Duration) -> i64 {
-    let approx_day_ms: i64 = 86_400_000;
-    let approx_month_ms: i64 = 30 * approx_day_ms;
-    let nanos_as_ms = (d.nanos as i64) / 1_000_000;
-    ms.wrapping_add(d.months.wrapping_mul(approx_month_ms))
-        .wrapping_add(d.days.wrapping_mul(approx_day_ms))
-        .wrapping_add(d.seconds.wrapping_mul(1_000))
-        .wrapping_add(nanos_as_ms)
+fn datetime_add_duration(epoch_nanos: i64, d: mesh_core::Duration) -> i64 {
+    let nanos_per_day: i64 = 86_400_000_000_000;
+    let nanos_per_month: i64 = 30 * nanos_per_day;
+    epoch_nanos
+        .wrapping_add(d.months.wrapping_mul(nanos_per_month))
+        .wrapping_add(d.days.wrapping_mul(nanos_per_day))
+        .wrapping_add(d.seconds.wrapping_mul(1_000_000_000))
+        .wrapping_add(d.nanos as i64)
 }
 
 /// Add a [`Duration`] to a day-count `Date`. Only the `months`
@@ -2458,7 +2475,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         // send it as a Bolt parameter, which goes through the
         // wire-format path (Bolt LocalDateTime struct).
         "datetime" | "localdatetime" => match arg_exprs.len() {
-            0 => Ok(Value::Property(Property::DateTime(now_epoch_millis()))),
+            0 => Ok(Value::Property(Property::DateTime(now_epoch_nanos()))),
             1 => {
                 let v = eval_expr(&arg_exprs[0], ctx)?;
                 match v {
@@ -2504,12 +2521,12 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                                 .map(|d| d.signed_duration_since(epoch).num_days())
                                 .unwrap_or(0)
                         };
-                        let millis = days_since_epoch * 86_400_000
-                            + hour * 3_600_000
-                            + minute * 60_000
-                            + second * 1000
-                            + nanos / 1_000_000;
-                        Ok(Value::Property(Property::DateTime(millis)))
+                        let epoch_nanos = days_since_epoch * 86_400_000_000_000
+                            + hour * 3_600_000_000_000
+                            + minute * 60_000_000_000
+                            + second * 1_000_000_000
+                            + nanos;
+                        Ok(Value::Property(Property::DateTime(epoch_nanos)))
                     }
                     _ => Err(Error::TypeMismatch),
                 }
@@ -2520,7 +2537,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         },
         "date" => match arg_exprs.len() {
             0 => {
-                let days = now_epoch_millis().div_euclid(86_400_000);
+                let days = now_epoch_nanos().div_euclid(86_400_000_000_000);
                 let clamped = i32::try_from(days).map_err(|_| {
                     Error::UnknownScalarFunction(format!("date() overflowed i32 days: {days}"))
                 })?;
@@ -2574,7 +2591,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                     // date(datetime_value) - extract date from datetime
                     Value::Property(Property::DateTime(ms)) => {
-                        let days = ms.div_euclid(86_400_000) as i32;
+                        let days = ms.div_euclid(86_400_000_000_000) as i32;
                         Ok(Value::Property(Property::Date(days)))
                     }
                     _ => Err(Error::TypeMismatch),
@@ -2584,10 +2601,15 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 "date() takes zero or one argument".into(),
             )),
         },
-        "time" | "localtime" => match arg_exprs.len() {
+        "time" | "localtime" => {
+            let is_tz = name == "time";
+            match arg_exprs.len() {
             0 => {
-                let millis = now_epoch_millis() % 86_400_000;
-                Ok(Value::Property(Property::DateTime(millis)))
+                let time_nanos = now_epoch_nanos() % 86_400_000_000_000;
+                Ok(Value::Property(Property::Time {
+                    nanos: time_nanos,
+                    tz_offset_secs: if is_tz { Some(0) } else { None },
+                }))
             }
             1 => {
                 let v = eval_expr(&arg_exprs[0], ctx)?;
@@ -2598,27 +2620,35 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         let minute = map_int(&m, "minute").unwrap_or(0);
                         let second = map_int(&m, "second").unwrap_or(0);
                         let nanos = map_int(&m, "nanosecond").unwrap_or(0);
-                        let millis =
-                            hour * 3_600_000 + minute * 60_000 + second * 1000 + nanos / 1_000_000;
-                        Ok(Value::Property(Property::DateTime(millis)))
+                        let time_nanos =
+                            hour * 3_600_000_000_000 + minute * 60_000_000_000
+                            + second * 1_000_000_000 + nanos;
+                        Ok(Value::Property(Property::Time {
+                            nanos: time_nanos,
+                            tz_offset_secs: if is_tz { Some(0) } else { None },
+                        }))
                     }
-                    Value::Property(Property::String(s)) => Ok(Value::Property(
-                        Property::DateTime(parse_datetime(&s).unwrap_or(0)),
-                    )),
+                    Value::Property(Property::String(s)) => {
+                        let time_nanos = parse_time_string(&s)?;
+                        Ok(Value::Property(Property::Time {
+                            nanos: time_nanos,
+                            tz_offset_secs: if is_tz { Some(0) } else { None },
+                        }))
+                    }
                     _ => Err(Error::TypeMismatch),
                 }
             }
             _ => Err(Error::UnknownScalarFunction(
                 "time() takes zero or one argument".into(),
             )),
-        },
+        }},
         "timestamp" => {
             if !arg_exprs.is_empty() {
                 return Err(Error::UnknownScalarFunction(
                     "timestamp() takes no arguments".into(),
                 ));
             }
-            Ok(Value::Property(Property::Int64(now_epoch_millis())))
+            Ok(Value::Property(Property::Int64(now_epoch_nanos())))
         }
         "duration" => {
             // `duration({months: 1, days: 2, seconds: 30, nanos: 0})`
@@ -2729,11 +2759,11 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 return Ok(Value::Null);
             }
             // Extract epoch millis from both temporal values
-            let a_millis = temporal_to_millis(&a)?;
-            let b_millis = temporal_to_millis(&b)?;
-            let diff_millis = b_millis - a_millis;
-            let diff_secs = diff_millis / 1000;
-            let remaining_nanos = ((diff_millis % 1000) * 1_000_000) as i32;
+            let a_nanos = temporal_to_nanos(&a)?;
+            let b_nanos = temporal_to_nanos(&b)?;
+            let diff_nanos = b_nanos - a_nanos;
+            let diff_secs = diff_nanos / 1_000_000_000;
+            let remaining_nanos = (diff_nanos % 1_000_000_000) as i32;
             Ok(Value::Property(Property::Duration(mesh_core::Duration {
                 months: 0,
                 days: 0,
@@ -2745,17 +2775,26 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         // Current-time namespace functions
         "datetime.transaction" | "datetime.statement" | "datetime.realtime"
         | "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
-            Ok(Value::Property(Property::DateTime(now_epoch_millis())))
+            Ok(Value::Property(Property::DateTime(now_epoch_nanos())))
         }
         "date.transaction" | "date.statement" | "date.realtime" => {
-            let days = now_epoch_millis().div_euclid(86_400_000);
+            let days = now_epoch_nanos().div_euclid(86_400_000_000_000);
             let clamped = i32::try_from(days).unwrap_or(0);
             Ok(Value::Property(Property::Date(clamped)))
         }
-        "time.transaction" | "time.statement" | "time.realtime"
-        | "localtime.transaction" | "localtime.statement" | "localtime.realtime" => {
-            let millis = now_epoch_millis() % 86_400_000;
-            Ok(Value::Property(Property::DateTime(millis)))
+        "time.transaction" | "time.statement" | "time.realtime" => {
+            let time_nanos = now_epoch_nanos() % 86_400_000_000_000;
+            Ok(Value::Property(Property::Time {
+                nanos: time_nanos,
+                tz_offset_secs: Some(0),
+            }))
+        }
+        "localtime.transaction" | "localtime.statement" | "localtime.realtime" => {
+            let time_nanos = now_epoch_nanos() % 86_400_000_000_000;
+            Ok(Value::Property(Property::Time {
+                nanos: time_nanos,
+                tz_offset_secs: None,
+            }))
         }
 
         // Temporal truncation functions
@@ -2772,7 +2811,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 eval_expr(&arg_exprs[1], ctx)?
             } else {
                 // Default to current time
-                Value::Property(Property::DateTime(now_epoch_millis()))
+                Value::Property(Property::DateTime(now_epoch_nanos()))
             };
             if matches!(temporal, Value::Null | Value::Property(Property::Null)) {
                 return Ok(Value::Null);
@@ -2818,10 +2857,10 @@ fn temporal_date_prop(d: &chrono::NaiveDate, key: &str) -> Result<Value> {
     })))
 }
 
-fn temporal_to_millis(v: &Value) -> Result<i64> {
+fn temporal_to_nanos(v: &Value) -> Result<i64> {
     match v {
         Value::Property(Property::DateTime(ms)) => Ok(*ms),
-        Value::Property(Property::Date(days)) => Ok(*days as i64 * 86_400_000),
+        Value::Property(Property::Date(days)) => Ok(*days as i64 * 86_400_000_000_000),
         _ => Err(Error::TypeMismatch),
     }
 }
@@ -2830,14 +2869,13 @@ fn temporal_to_millis(v: &Value) -> Result<i64> {
 fn truncate_temporal(name: &str, unit: &str, temporal: &Value) -> Result<Value> {
     match temporal {
         Value::Property(Property::DateTime(_)) | Value::Property(Property::Date(_)) => {
-            let millis = match temporal {
-                Value::Property(Property::DateTime(ms)) => *ms,
-                Value::Property(Property::Date(days)) => *days as i64 * 86_400_000,
+            let epoch_ns = match temporal {
+                Value::Property(Property::DateTime(ns)) => *ns,
+                Value::Property(Property::Date(days)) => *days as i64 * 86_400_000_000_000,
                 _ => unreachable!(),
             };
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let secs = millis / 1000;
-            let nanos = ((millis % 1000) * 1_000_000) as u32;
+            let (secs, nanos) = nanos_to_secs_nanos(epoch_ns);
             let dt = chrono::DateTime::from_timestamp(secs, nanos)
                 .map(|d| d.naive_utc())
                 .unwrap_or_else(|| epoch.and_hms_opt(0, 0, 0).unwrap());
@@ -2908,12 +2946,14 @@ fn truncate_temporal(name: &str, unit: &str, temporal: &Value) -> Result<Value> 
             };
             let diff = truncated
                 .signed_duration_since(epoch.and_hms_opt(0, 0, 0).unwrap());
-            let result_millis = diff.num_milliseconds();
-            if name.starts_with("date.") || name.starts_with("date.") {
-                let days = (result_millis / 86_400_000) as i32;
+            // Use seconds + nanoseconds to build epoch nanos
+            let result_nanos = diff.num_seconds() * 1_000_000_000
+                + diff.subsec_nanos() as i64;
+            if name.starts_with("date.") {
+                let days = diff.num_days() as i32;
                 Ok(Value::Property(Property::Date(days)))
             } else {
-                Ok(Value::Property(Property::DateTime(result_millis)))
+                Ok(Value::Property(Property::DateTime(result_nanos)))
             }
         }
         _ => {
@@ -3029,7 +3069,8 @@ fn type_order_prop(p: &Property) -> u8 {
         Property::String(_) => 6,
         Property::Bool(_) => 7,
         Property::Int64(_) | Property::Float64(_) => 8,
-        Property::Date(_) | Property::DateTime(_) | Property::Duration(_) => 9,
+        Property::Date(_) | Property::DateTime(_) | Property::Duration(_)
+        | Property::Time { .. } => 9,
         Property::Null => 10,
     }
 }
@@ -3044,7 +3085,10 @@ fn type_order_value(v: &Value) -> u8 {
         Value::Property(Property::String(_)) => 6,
         Value::Property(Property::Bool(_)) => 7,
         Value::Property(Property::Int64(_) | Property::Float64(_)) => 8,
-        Value::Property(Property::Date(_) | Property::DateTime(_) | Property::Duration(_)) => 9,
+        Value::Property(
+            Property::Date(_) | Property::DateTime(_) | Property::Duration(_)
+            | Property::Time { .. },
+        ) => 9,
         Value::Null | Value::Property(Property::Null) => 10,
     }
 }
@@ -3079,10 +3123,13 @@ pub(crate) fn value_key(v: &Value) -> String {
             out.push('}');
             out
         }
-        Value::Property(Property::DateTime(ms)) => format!("dt:{}", ms),
+        Value::Property(Property::DateTime(ns)) => format!("dt:{}", ns),
         Value::Property(Property::Date(days)) => format!("d:{}", days),
         Value::Property(Property::Duration(d)) => {
             format!("dur:{},{},{},{}", d.months, d.days, d.seconds, d.nanos)
+        }
+        Value::Property(Property::Time { nanos, tz_offset_secs }) => {
+            format!("t:{},{:?}", nanos, tz_offset_secs)
         }
         Value::Node(n) => format!("N:{}", n.id),
         Value::Edge(e) => format!("E:{}", e.id),

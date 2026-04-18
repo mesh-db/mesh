@@ -5746,16 +5746,16 @@ fn datetime_now_returns_recent_epoch_millis() {
     let before = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as i64;
+        .as_nanos() as i64;
     let rows = run(&store, "RETURN datetime() AS now");
     let got = match rows[0].get("now") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        Some(Value::Property(Property::DateTime(ns))) => *ns,
         other => panic!("expected DateTime, got {other:?}"),
     };
     let after = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as i64;
+        .as_nanos() as i64;
     assert!(
         got >= before && got <= after,
         "datetime() {got} out of range [{before}, {after}]"
@@ -5841,8 +5841,8 @@ fn datetime_plus_duration_advances_datetime() {
     };
     let delta = plus - base;
     assert!(
-        (60_000..60_050).contains(&delta),
-        "delta = {delta}, expected ~60000"
+        (59_900_000_000..60_200_000_000).contains(&delta),
+        "delta = {delta}, expected ~60_000_000_000"
     );
 }
 
@@ -5901,7 +5901,7 @@ fn datetime_ordering_works_in_where() {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_millis() as i64;
+                .as_nanos() as i64;
             assert!(ts < now);
         })
         .unwrap();
@@ -5934,7 +5934,7 @@ fn datetime_parses_rfc3339_with_z() {
         other => panic!("expected DateTime, got {other:?}"),
     };
     // 2025-01-01T00:00:00Z = 1735689600 seconds since epoch
-    assert_eq!(ms, 1_735_689_600_000);
+    assert_eq!(ms, 1_735_689_600_000_000_000);
 }
 
 #[test]
@@ -5946,7 +5946,7 @@ fn datetime_parses_with_offset() {
         Some(Value::Property(Property::DateTime(ms))) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
-    assert_eq!(ms, 1_735_689_600_000);
+    assert_eq!(ms, 1_735_689_600_000_000_000);
 }
 
 #[test]
@@ -5957,7 +5957,7 @@ fn datetime_parses_naive_as_utc() {
         Some(Value::Property(Property::DateTime(ms))) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
-    assert_eq!(ms, 1_735_689_600_000);
+    assert_eq!(ms, 1_735_689_600_000_000_000);
 }
 
 #[test]
@@ -5968,7 +5968,7 @@ fn datetime_parses_with_fractional_seconds() {
         Some(Value::Property(Property::DateTime(ms))) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
-    assert_eq!(ms, 1_735_689_600_500);
+    assert_eq!(ms, 1_735_689_600_500_000_000);
 }
 
 #[test]
@@ -5980,7 +5980,7 @@ fn datetime_parses_space_separator() {
         Some(Value::Property(Property::DateTime(ms))) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
-    assert_eq!(ms, 1_735_689_600_000);
+    assert_eq!(ms, 1_735_689_600_000_000_000);
 }
 
 #[test]
@@ -6397,7 +6397,7 @@ fn duration_string_plus_datetime_advances() {
         Some(Value::Property(Property::DateTime(ms))) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
-    assert_eq!(ms, 1_735_689_600_000 + 3_600_000);
+    assert_eq!(ms, 1_735_689_600_000_000_000 + 3_600_000_000_000);
 }
 
 #[test]

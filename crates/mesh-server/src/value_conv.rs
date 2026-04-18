@@ -165,22 +165,30 @@ fn property_to_bolt(p: &Property) -> BoltValue {
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             BoltValue::Map(pairs)
         }
-        Property::DateTime(ms) => datetime_to_bolt(*ms),
+        Property::DateTime(nanos) => datetime_to_bolt(*nanos),
         Property::Date(days) => BoltValue::Struct {
             tag: TAG_DATE,
             fields: vec![BoltValue::Int(*days as i64)],
         },
         Property::Duration(d) => duration_to_bolt(*d),
+        Property::Time { nanos, tz_offset_secs } => {
+            // Bolt LocalTime (tag 0x74): nanoseconds since midnight
+            let tag = if tz_offset_secs.is_some() { 0x54 } else { 0x74 };
+            let mut fields = vec![BoltValue::Int(*nanos)];
+            if let Some(offset) = tz_offset_secs {
+                fields.push(BoltValue::Int(*offset as i64));
+            }
+            BoltValue::Struct { tag, fields }
+        }
     }
 }
 
-/// Encode a UTC epoch-millis `DateTime` as a Bolt 4.4
-/// `LocalDateTime` struct. Splits the millis into `(seconds,
-/// nanos)` — Bolt's `LocalDateTime` field layout — with the
-/// nanos field carrying the sub-second remainder.
-fn datetime_to_bolt(ms: i64) -> BoltValue {
-    let seconds = ms.div_euclid(1000);
-    let nanos = (ms.rem_euclid(1000) as i32) * 1_000_000;
+/// Encode a UTC epoch-nanos `DateTime` as a Bolt 4.4
+/// `LocalDateTime` struct. Splits the nanos into `(seconds,
+/// nanos)` — Bolt's `LocalDateTime` field layout.
+fn datetime_to_bolt(epoch_nanos: i64) -> BoltValue {
+    let seconds = epoch_nanos.div_euclid(1_000_000_000);
+    let nanos = epoch_nanos.rem_euclid(1_000_000_000) as i32;
     BoltValue::Struct {
         tag: TAG_LOCAL_DATE_TIME,
         fields: vec![BoltValue::Int(seconds), BoltValue::Int(nanos as i64)],

@@ -404,8 +404,13 @@ fn format_property(p: &Property) -> String {
                 }
             } else {
                 let s = format!("{f}");
-                // Use scientific notation only for very large values
-                if f.abs() >= 1e15 && !s.contains('e') && !s.contains('E') {
+                // Use scientific notation for very large or very small values
+                // but not for moderately small values like 0.00001
+                let needs_sci = (f.abs() >= 1e15
+                    || (f.abs() > 0.0 && f.abs() < 1e-15))
+                    && !s.contains('e')
+                    && !s.contains('E');
+                if needs_sci {
                     format!("{f:e}")
                 } else {
                     s
@@ -435,9 +440,9 @@ fn format_property(p: &Property) -> String {
                 .collect();
             format!("{{{}}}", entries.join(", "))
         }
-        Property::DateTime(millis) => {
-            let secs = millis / 1000;
-            let nanos = ((millis % 1000) * 1_000_000) as u32;
+        Property::DateTime(epoch_nanos) => {
+            let secs = epoch_nanos / 1_000_000_000;
+            let nanos = (epoch_nanos % 1_000_000_000) as u32;
             if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
                 let naive = dt.naive_utc();
                 let time_part = naive.time();
@@ -465,7 +470,7 @@ fn format_property(p: &Property) -> String {
                     format!("'{}'", naive.format("%Y-%m-%dT%H:%M"))
                 }
             } else {
-                format!("{millis}")
+                format!("{epoch_nanos}")
             }
         }
         Property::Date(days) => {
@@ -479,6 +484,34 @@ fn format_property(p: &Property) -> String {
         }
         Property::Duration(_) => {
             format!("{p:?}")
+        }
+        Property::Time { nanos, tz_offset_secs } => {
+            let total_secs = nanos / 1_000_000_000;
+            let h = total_secs / 3600;
+            let m = (total_secs % 3600) / 60;
+            let s = total_secs % 60;
+            let subsec_nanos = (nanos % 1_000_000_000) as u32;
+            let time_str = if subsec_nanos > 0 {
+                let frac = format!("{:09}", subsec_nanos);
+                let trimmed = frac.trim_end_matches('0');
+                format!("{h:02}:{m:02}:{s:02}.{trimmed}")
+            } else if s > 0 {
+                format!("{h:02}:{m:02}:{s:02}")
+            } else {
+                format!("{h:02}:{m:02}")
+            };
+            let tz_str = match tz_offset_secs {
+                Some(0) => "Z".to_string(),
+                Some(offset) => {
+                    let sign = if *offset >= 0 { '+' } else { '-' };
+                    let abs = offset.unsigned_abs();
+                    let oh = abs / 3600;
+                    let om = (abs % 3600) / 60;
+                    format!("{sign}{oh:02}:{om:02}")
+                }
+                None => String::new(),
+            };
+            format!("'{time_str}{tz_str}'")
         }
     }
 }
