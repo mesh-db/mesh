@@ -4870,6 +4870,25 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
         let lb_vals: Vec<Value> = lb.iter().cloned().map(Value::Property).collect();
         return compare(op, &Value::List(la_vals), &Value::List(lb_vals));
     }
+    // Graph-element equality: nodes compare equal iff their ids
+    // match; same for edges. Ordering is not defined, so any
+    // inequality operator falls through to a type mismatch.
+    if let (Value::Node(a), Value::Node(b)) = (l, r) {
+        let eq = a.id == b.id;
+        return Ok(match op {
+            CompareOp::Eq => eq,
+            CompareOp::Ne => !eq,
+            _ => return Err(Error::UnsupportedComparison),
+        });
+    }
+    if let (Value::Edge(a), Value::Edge(b)) = (l, r) {
+        let eq = a.id == b.id;
+        return Ok(match op {
+            CompareOp::Eq => eq,
+            CompareOp::Ne => !eq,
+            _ => return Err(Error::UnsupportedComparison),
+        });
+    }
     let (lp, rp) = match (l, r) {
         (Value::Property(lp), Value::Property(rp)) => (lp, rp),
         _ => return Err(Error::TypeMismatch),

@@ -1578,17 +1578,40 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             }
         }
         Rule::comparison => {
+            // `comparison := compound ~ (comparison_op ~ compound)?`.
+            // Each `compound` is an add_expr plus an optional postfix
+            // (`IS [NOT] NULL`, `IN ...`, or a label test). Build the
+            // two sides independently, then combine with the outer
+            // comparison operator if it's present.
+            let mut inner = pair.into_inner();
+            let left_pair = inner
+                .next()
+                .ok_or_else(|| Error::Parse("empty comparison".into()))?;
+            let left = build_expression(left_pair)?;
+            match inner.next() {
+                None => Ok(left),
+                Some(op_pair) => {
+                    let op = build_compare_op(op_pair)?;
+                    let right_pair = inner
+                        .next()
+                        .ok_or_else(|| Error::Parse("missing comparison rhs".into()))?;
+                    let right = build_expression(right_pair)?;
+                    Ok(Expr::Compare {
+                        op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    })
+                }
+            }
+        }
+        Rule::compound => {
+            // `compound := add_expr ~ (null_predicate | in_predicate | label_predicate)?`.
             let mut inner = pair.into_inner();
             let left = build_expression(
                 inner
                     .next()
-                    .ok_or_else(|| Error::Parse("empty comparison".into()))?,
+                    .ok_or_else(|| Error::Parse("empty compound".into()))?,
             )?;
-            // The comparison tail is either a `null_predicate`
-            // (postfix IS NULL / IS NOT NULL) or a binary
-            // `comparison_op primary` pair. The grammar tries
-            // `null_predicate` first so it doesn't conflict with
-            // the binary form.
             match inner.next() {
                 None => Ok(left),
                 Some(tail) if tail.as_rule() == Rule::label_predicate => {
@@ -1636,19 +1659,10 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                         inner: Box::new(left),
                     })
                 }
-                Some(op_pair) => {
-                    let op = build_compare_op(op_pair)?;
-                    let right = build_expression(
-                        inner
-                            .next()
-                            .ok_or_else(|| Error::Parse("missing comparison rhs".into()))?,
-                    )?;
-                    Ok(Expr::Compare {
-                        op,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    })
-                }
+                Some(tail) => Err(Error::Parse(format!(
+                    "unexpected compound tail rule: {:?}",
+                    tail.as_rule()
+                ))),
             }
         }
         Rule::add_expr => {
