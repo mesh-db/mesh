@@ -3650,7 +3650,10 @@ fn expr_to_count(val: Value) -> Result<i64> {
     match val {
         Value::Null | Value::Property(Property::Null) => Ok(0),
         Value::Property(Property::Int64(n)) if n >= 0 => Ok(n),
-        Value::Property(Property::Float64(f)) if f >= 0.0 => Ok(f as i64),
+        // openCypher: SKIP/LIMIT require an integer. Float values
+        // (including integer-valued floats) are rejected as
+        // InvalidArgumentType — they'd only be valid after an
+        // explicit cast, which the user must write themselves.
         _ => Err(Error::TypeMismatch),
     }
 }
