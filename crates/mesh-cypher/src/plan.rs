@@ -2922,7 +2922,7 @@ fn classify_return_items(
             let alias = item
                 .alias
                 .clone()
-                .unwrap_or_else(|| format!("{}_{}", name.to_lowercase(), idx));
+                .unwrap_or_else(|| render_expr_key(&item.expr));
             aggregates.push(AggregateSpec {
                 alias,
                 function: func,
