@@ -3630,9 +3630,13 @@ fn extract_base_date_tod(
 ) -> (Option<chrono::NaiveDate>, i128) {
     // Check any of the temporal-source keys; accept any temporal value
     // type under any key (TCK tests sometimes put a LocalDateTime
-    // under "time" or a Time under "datetime").
+    // under "time" or a Time under "datetime"). When both a
+    // date-bearing key and a time-bearing key are present, the date
+    // wins for the calendar portion and the time wins for the tod —
+    // the `"time"` key is checked last so its tod overrides.
     let mut base_date: Option<chrono::NaiveDate> = None;
     let mut base_tod: i128 = 0;
+    let has_time_key = m.contains_key("time");
     for key in ["date", "datetime", "localdatetime", "time"] {
         match m.get(key) {
             Some(Property::Date(d)) => {
@@ -3647,7 +3651,10 @@ fn extract_base_date_tod(
                 // DateTime stores UTC nanos but the TCK feeds it into
                 // datetime()/date() maps expecting the *local* date
                 // and time-of-day as the "base". Shift by the offset
-                // before splitting.
+                // before splitting. If the map also has a "time" key
+                // the dedicated time value wins for the tod — so skip
+                // setting base_tod here when we know a time override
+                // is coming later.
                 let local = match tz_offset_secs {
                     Some(off) => *ns + (*off as i128) * 1_000_000_000,
                     None => *ns,
@@ -3658,7 +3665,7 @@ fn extract_base_date_tod(
                     if base_date.is_none() {
                         base_date = Some(*epoch + chrono::Duration::days(d));
                     }
-                    if base_tod == 0 {
+                    if base_tod == 0 && !(has_time_key && key != "time") {
                         base_tod = tod;
                     }
                 }
@@ -3670,7 +3677,7 @@ fn extract_base_date_tod(
                     if base_date.is_none() {
                         base_date = Some(*epoch + chrono::Duration::days(d));
                     }
-                    if base_tod == 0 {
+                    if base_tod == 0 && !(has_time_key && key != "time") {
                         base_tod = tod;
                     }
                 }
