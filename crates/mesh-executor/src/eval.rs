@@ -1243,6 +1243,19 @@ pub(crate) fn eval_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<
     }
 
     // String and list concatenation only live on `+`.
+    // Normalize Property::List to Value::List for uniform handling
+    let left = match left {
+        Value::Property(Property::List(items)) => {
+            Value::List(items.into_iter().map(Value::Property).collect())
+        }
+        other => other,
+    };
+    let right = match right {
+        Value::Property(Property::List(items)) => {
+            Value::List(items.into_iter().map(Value::Property).collect())
+        }
+        other => other,
+    };
     if op == BinaryOp::Add {
         match (&left, &right) {
             (Value::Property(Property::String(a)), Value::Property(Property::String(b))) => {
