@@ -87,36 +87,17 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     let d = epoch + chrono::Duration::days(*days as i64);
                     temporal_date_prop(&d, key)
                 }
-                Value::Property(Property::DateTime { nanos: ms, .. })
-                | Value::Property(Property::LocalDateTime(ms)) => {
-                    let (secs, nsec) = nanos_to_secs_nanos(*ms);
-                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
-                        let naive = dt.naive_utc();
-                        let date = naive.date();
-                        match key.as_str() {
-                            "year" | "month" | "day" | "week" | "weekYear" | "dayOfWeek"
-                            | "weekDay" | "dayOfYear" | "quarter" | "ordinalDay"
-                            | "dayOfQuarter" => temporal_date_prop(&date, key),
-                            "hour" => Ok(Value::Property(Property::Int64(naive.hour() as i64))),
-                            "minute" => Ok(Value::Property(Property::Int64(naive.minute() as i64))),
-                            "second" => Ok(Value::Property(Property::Int64(naive.second() as i64))),
-                            "millisecond" => Ok(Value::Property(Property::Int64(
-                                (nsec / 1_000_000) as i64,
-                            ))),
-                            "microsecond" => Ok(Value::Property(Property::Int64(
-                                (nsec / 1_000) as i64,
-                            ))),
-                            "nanosecond" => Ok(Value::Property(Property::Int64(nsec as i64))),
-                            "epochMillis" => Ok(Value::Property(Property::Int64(
-                                (*ms / 1_000_000) as i64,
-                            ))),
-                            "epochSeconds" => Ok(Value::Property(Property::Int64(secs))),
-                            _ => Ok(Value::Null),
-                        }
-                    } else {
-                        Ok(Value::Null)
-                    }
+                Value::Property(Property::DateTime {
+                    nanos,
+                    tz_offset_secs,
+                }) => Ok(datetime_accessor(*nanos, *tz_offset_secs, key)),
+                Value::Property(Property::LocalDateTime(ns)) => {
+                    Ok(datetime_accessor(*ns, None, key))
                 }
+                Value::Property(Property::Time {
+                    nanos,
+                    tz_offset_secs,
+                }) => Ok(time_accessor(*nanos, *tz_offset_secs, key)),
                 Value::Property(Property::Duration(ref dur)) => match key.as_str() {
                     "months" => Ok(Value::Property(Property::Int64(dur.months))),
                     "days" => Ok(Value::Property(Property::Int64(dur.days))),
@@ -168,35 +149,17 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     let d = epoch + chrono::Duration::days(days as i64);
                     temporal_date_prop(&d, key)
                 }
-                Value::Property(Property::DateTime { nanos: ms, .. }) => {
-                    let (secs, nsec) = nanos_to_secs_nanos(ms);
-                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
-                        let naive = dt.naive_utc();
-                        let date = naive.date();
-                        match key.as_str() {
-                            "year" | "month" | "day" | "week" | "weekYear" | "dayOfWeek"
-                            | "weekDay" | "dayOfYear" | "quarter" | "ordinalDay"
-                            | "dayOfQuarter" => temporal_date_prop(&date, key),
-                            "hour" => Ok(Value::Property(Property::Int64(naive.hour() as i64))),
-                            "minute" => Ok(Value::Property(Property::Int64(naive.minute() as i64))),
-                            "second" => Ok(Value::Property(Property::Int64(naive.second() as i64))),
-                            "millisecond" => Ok(Value::Property(Property::Int64(
-                                (nsec / 1_000_000) as i64,
-                            ))),
-                            "microsecond" => Ok(Value::Property(Property::Int64(
-                                (nsec / 1_000) as i64,
-                            ))),
-                            "nanosecond" => Ok(Value::Property(Property::Int64(nsec as i64))),
-                            "epochMillis" => Ok(Value::Property(Property::Int64(
-                                (ms / 1_000_000) as i64,
-                            ))),
-                            "epochSeconds" => Ok(Value::Property(Property::Int64(secs))),
-                            _ => Ok(Value::Null),
-                        }
-                    } else {
-                        Ok(Value::Null)
-                    }
+                Value::Property(Property::DateTime {
+                    nanos,
+                    tz_offset_secs,
+                }) => Ok(datetime_accessor(nanos, tz_offset_secs, key)),
+                Value::Property(Property::LocalDateTime(ns)) => {
+                    Ok(datetime_accessor(ns, None, key))
                 }
+                Value::Property(Property::Time {
+                    nanos,
+                    tz_offset_secs,
+                }) => Ok(time_accessor(nanos, tz_offset_secs, key)),
                 Value::Property(Property::Duration(ref dur)) => match key.as_str() {
                     "months" => Ok(Value::Property(Property::Int64(dur.months))),
                     "days" => Ok(Value::Property(Property::Int64(dur.days))),
@@ -1893,13 +1856,23 @@ fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
 fn consume_segment(s: &str) -> Option<((i64, Option<i32>), char, &str)> {
     let bytes = s.as_bytes();
     let mut i = 0;
+    // Per-component sign. ISO 8601 permits forms like `P1DT-0.001S`
+    // where individual fields carry their own sign.
+    let negative = if i < bytes.len() && bytes[i] == b'-' {
+        i += 1;
+        true
+    } else {
+        false
+    };
+    let digit_start = i;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
     }
-    if i == 0 {
-        return None; // no leading digits
+    if i == digit_start {
+        return None; // no digits after optional sign
     }
-    let whole: i64 = s[..i].parse().ok()?;
+    let whole: i64 = s[digit_start..i].parse().ok()?;
+    let whole = if negative { -whole } else { whole };
 
     // Optional fractional part for seconds: `.` then more digits.
     let (frac_nanos, i) = if i < bytes.len() && bytes[i] == b'.' {
@@ -1924,7 +1897,8 @@ fn consume_segment(s: &str) -> Option<((i64, Option<i32>), char, &str)> {
             }
         }
         let n: i32 = padded.parse().ok()?;
-        (Some(n), j)
+        let signed = if negative { -n } else { n };
+        (Some(signed), j)
     } else {
         (None, i)
     };
@@ -1933,9 +1907,6 @@ fn consume_segment(s: &str) -> Option<((i64, Option<i32>), char, &str)> {
         return None; // no unit letter
     }
     let unit = s[i..].chars().next()?;
-    // Unit letter is exactly one ASCII character (Y/M/W/D/H/S)
-    // so `unit.len_utf8() == 1`. Guard against multi-byte just
-    // in case someone passes garbage.
     let unit_len = unit.len_utf8();
     Some(((whole, frac_nanos), unit, &s[i + unit_len..]))
 }
@@ -3488,19 +3459,33 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             Ok(Value::Property(Property::Duration(duration)))
         }
 
-        // Current-time namespace functions
+        // Current-time namespace functions. They normally take no
+        // args, but the TCK exercises null propagation by calling
+        // `<func>(null)`, so accept a single null arg too.
         "datetime.transaction" | "datetime.statement" | "datetime.realtime" => {
+            if let Some(null) = null_arg(arg_exprs, ctx)? {
+                return Ok(null);
+            }
             Ok(Value::Property(Property::DateTime { nanos: now_epoch_nanos(), tz_offset_secs: Some(0) }))
         }
         "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
+            if let Some(null) = null_arg(arg_exprs, ctx)? {
+                return Ok(null);
+            }
             Ok(Value::Property(Property::LocalDateTime(now_epoch_nanos())))
         }
         "date.transaction" | "date.statement" | "date.realtime" => {
+            if let Some(null) = null_arg(arg_exprs, ctx)? {
+                return Ok(null);
+            }
             let days = now_epoch_nanos().div_euclid(86_400_000_000_000);
             let clamped = i32::try_from(days).unwrap_or(0);
             Ok(Value::Property(Property::Date(clamped)))
         }
         "time.transaction" | "time.statement" | "time.realtime" => {
+            if let Some(null) = null_arg(arg_exprs, ctx)? {
+                return Ok(null);
+            }
             let time_nanos = (now_epoch_nanos() % 86_400_000_000_000) as i64;
             Ok(Value::Property(Property::Time {
                 nanos: time_nanos,
@@ -3508,6 +3493,9 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             }))
         }
         "localtime.transaction" | "localtime.statement" | "localtime.realtime" => {
+            if let Some(null) = null_arg(arg_exprs, ctx)? {
+                return Ok(null);
+            }
             let time_nanos = (now_epoch_nanos() % 86_400_000_000_000) as i64;
             Ok(Value::Property(Property::Time {
                 nanos: time_nanos,
@@ -3789,6 +3777,117 @@ fn temporal_date_prop(d: &chrono::NaiveDate, key: &str) -> Result<Value> {
         }
         _ => return Ok(Value::Null),
     })))
+}
+
+/// Format a tz offset as `+HH:MM` / `-HH:MM` / `Z`.
+fn format_offset_str(offset: i32) -> String {
+    if offset == 0 {
+        return "Z".to_string();
+    }
+    let sign = if offset >= 0 { '+' } else { '-' };
+    let abs = offset.unsigned_abs();
+    let oh = abs / 3600;
+    let om = (abs % 3600) / 60;
+    format!("{sign}{oh:02}:{om:02}")
+}
+
+/// Shared accessor for the time-of-day components of a Time or the
+/// time portion of a DateTime / LocalDateTime. `tod_nanos` is the
+/// *local* time-of-day in nanoseconds since midnight.
+fn temporal_tod_prop(tod_nanos: i64, key: &str) -> Option<Value> {
+    let ns_of_sec = (tod_nanos % 1_000_000_000) as i64;
+    let total_secs = tod_nanos / 1_000_000_000;
+    let val: i64 = match key {
+        "hour" => total_secs / 3600,
+        "minute" => (total_secs % 3600) / 60,
+        "second" => total_secs % 60,
+        "millisecond" => ns_of_sec / 1_000_000,
+        "microsecond" => ns_of_sec / 1_000,
+        "nanosecond" => ns_of_sec,
+        _ => return None,
+    };
+    Some(Value::Property(Property::Int64(val)))
+}
+
+/// Accessors on a Time value. `tz_offset_secs` is None for LocalTime.
+fn time_accessor(nanos: i64, tz_offset_secs: Option<i32>, key: &str) -> Value {
+    if let Some(v) = temporal_tod_prop(nanos, key) {
+        return v;
+    }
+    match key {
+        "timezone" | "offset" => match tz_offset_secs {
+            Some(o) => Value::Property(Property::String(format_offset_str(o))),
+            None => Value::Null,
+        },
+        "offsetMinutes" => match tz_offset_secs {
+            Some(o) => Value::Property(Property::Int64((o / 60) as i64)),
+            None => Value::Null,
+        },
+        "offsetSeconds" => match tz_offset_secs {
+            Some(o) => Value::Property(Property::Int64(o as i64)),
+            None => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
+
+/// Accessors on a DateTime / LocalDateTime. `utc_nanos` is the
+/// UTC-epoch nanoseconds stored on the value; `tz_offset_secs` is
+/// None for LocalDateTime, Some(offset) for DateTime. The local
+/// wall-clock is derived by shifting `utc_nanos` by the offset.
+fn datetime_accessor(utc_nanos: i128, tz_offset_secs: Option<i32>, key: &str) -> Value {
+    let local = match tz_offset_secs {
+        Some(off) => utc_nanos + (off as i128) * 1_000_000_000,
+        None => utc_nanos,
+    };
+    let local_secs = local.div_euclid(1_000_000_000) as i64;
+    let ns_of_sec = local.rem_euclid(1_000_000_000) as i64;
+    let tod = local.rem_euclid(86_400_000_000_000) as i64;
+    let days = local.div_euclid(86_400_000_000_000) as i64;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let date = epoch + chrono::Duration::days(days);
+    // Calendar accessors land on the local date.
+    match key {
+        "year" | "month" | "day" | "week" | "weekYear" | "dayOfWeek"
+        | "weekDay" | "dayOfYear" | "quarter" | "ordinalDay" | "dayOfQuarter" => {
+            return temporal_date_prop(&date, key).unwrap_or(Value::Null);
+        }
+        _ => {}
+    }
+    if let Some(v) = temporal_tod_prop(tod, key) {
+        return v;
+    }
+    match key {
+        // epoch* stay on the UTC instant — that's the point of them.
+        "epochMillis" => {
+            let utc_secs = utc_nanos.div_euclid(1_000_000_000) as i64;
+            let utc_nsec = utc_nanos.rem_euclid(1_000_000_000) as i64;
+            Value::Property(Property::Int64(
+                utc_secs * 1000 + utc_nsec / 1_000_000,
+            ))
+        }
+        "epochSeconds" => Value::Property(Property::Int64(
+            utc_nanos.div_euclid(1_000_000_000) as i64,
+        )),
+        "timezone" | "offset" => match tz_offset_secs {
+            Some(o) => Value::Property(Property::String(format_offset_str(o))),
+            None => Value::Null,
+        },
+        "offsetMinutes" => match tz_offset_secs {
+            Some(o) => Value::Property(Property::Int64((o / 60) as i64)),
+            None => Value::Null,
+        },
+        "offsetSeconds" => match tz_offset_secs {
+            Some(o) => Value::Property(Property::Int64(o as i64)),
+            None => Value::Null,
+        },
+        _ => {
+            // Suppress the unused-variable warning when no branch
+            // above consumes the fine-grained pieces.
+            let _ = (local_secs, ns_of_sec);
+            Value::Null
+        }
+    }
 }
 
 /// Classification of a temporal value for duration.between:
@@ -4240,6 +4339,25 @@ fn math_unary(
         Value::Null => Ok(Value::Null),
         Value::Property(Property::Int64(i)) => Ok(Value::Property(Property::Float64(f(i as f64)))),
         Value::Property(Property::Float64(x)) => Ok(Value::Property(Property::Float64(f(x)))),
+        _ => Err(Error::TypeMismatch),
+    }
+}
+
+/// Return `Some(Value::Null)` if the single-arg call was given null
+/// (or Property::Null). Returns `None` for zero args or a non-null
+/// single arg, so the caller can fall through to its normal path.
+/// Anything else (more than one arg) is a TypeMismatch.
+fn null_arg(args: &[Expr], ctx: &EvalCtx) -> Result<Option<Value>> {
+    match args.len() {
+        0 => Ok(None),
+        1 => {
+            let v = eval_expr(&args[0], ctx)?;
+            if matches!(v, Value::Null | Value::Property(Property::Null)) {
+                Ok(Some(Value::Null))
+            } else {
+                Ok(None)
+            }
+        }
         _ => Err(Error::TypeMismatch),
     }
 }
