@@ -204,10 +204,16 @@ fn normalize_tck(s: &str) -> String {
     let mut i = 0;
     while i < chars.len() {
         out.push(chars[i]);
+        // Add space after colon in map property notation (key:val → key: val)
+        // but NOT in time strings (12:34:56) or timezone offsets (+02:00)
         if chars[i] == ':' && i > 0 && i + 1 < chars.len() {
             let before = chars[i - 1];
             let after = chars[i + 1];
-            if (before.is_alphanumeric() || before == '_' || before == '`')
+            // Only add space when before is a letter/underscore (map key)
+            // and after is not a space or special char.
+            // Skip when before is a digit (time/timezone notation).
+            if (before.is_alphabetic() || before == '_' || before == '`')
+                && !before.is_ascii_digit()
                 && after != ' '
                 && after != '\''
                 && after != '{'
