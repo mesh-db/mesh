@@ -25,16 +25,16 @@ pub enum Property {
     Bool(bool),
     List(Vec<Property>),
     Map(HashMap<String, Property>),
-    /// UTC epoch **nanoseconds** with optional timezone offset in
-    /// seconds. When `tz_offset_secs` is Some, the datetime is
-    /// timezone-aware; formatters append 'Z' for offset 0 or `+HH:MM`
-    /// otherwise. The nanos value is always UTC; the offset is purely
-    /// a display/metadata hint. Historically stored as bare i128 in
-    /// earlier revisions; the tuple form adds back the timezone info
-    /// that the TCK expects preserved across `datetime()` round-trips.
+    /// UTC epoch **nanoseconds** with an optional timezone offset
+    /// and optional IANA region name. The nanos value is always UTC;
+    /// `tz_offset_secs` is the offset at this instant (used for the
+    /// `+HH:MM` / `Z` suffix), and `tz_name` — when set — is the
+    /// zone identifier (e.g. `"Europe/Stockholm"`) that produced
+    /// that offset, rendered as a `[Region/City]` suffix.
     DateTime {
         nanos: i128,
         tz_offset_secs: Option<i32>,
+        tz_name: Option<String>,
     },
     /// Local (naive) datetime as epoch nanoseconds.
     /// Formatters omit any timezone suffix.

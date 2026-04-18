@@ -32,6 +32,11 @@ bcrypt = { version = "0.15", default-features = false, features = ["std"] }
 # `date(string)`). Storage and wire formats use raw epoch counts, so
 # chrono never touches the persistence path.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# chrono-tz: IANA zone database used by `datetime({..., timezone:
+# 'Europe/Stockholm'})`. Resolves the instant-specific offset at the
+# supplied wall-clock and round-trips the region name through the
+# `[Region/City]` suffix on output.
+chrono-tz = { version = "0.10", default-features = false }
 
 [profile.release]
 lto = "thin"

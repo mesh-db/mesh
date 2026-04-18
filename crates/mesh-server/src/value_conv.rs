@@ -165,7 +165,7 @@ fn property_to_bolt(p: &Property) -> BoltValue {
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             BoltValue::Map(pairs)
         }
-        Property::DateTime { nanos, tz_offset_secs } => {
+        Property::DateTime { nanos, tz_offset_secs, .. } => {
             // Bolt 5 DateTime (tag 0x49): [seconds, nanos, tz_offset_secs].
             // The offset rides on the wire so drivers can reconstruct
             // the original presentation zone. We default to 0 ("Z")
@@ -416,6 +416,7 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             Ok(Property::DateTime {
                 nanos: epoch_nanos,
                 tz_offset_secs: Some(tz_offset as i32),
+                tz_name: None,
             })
         }
         mesh_bolt::TAG_DATE_TIME_ZONE_ID | mesh_bolt::TAG_DATE_TIME_ZONE_ID_LEGACY => {
@@ -434,6 +435,7 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             Ok(Property::DateTime {
                 nanos: epoch_nanos,
                 tz_offset_secs: None,
+                tz_name: None,
             })
         }
         mesh_bolt::TAG_LOCAL_TIME => {

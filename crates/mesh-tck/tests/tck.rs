@@ -736,24 +736,38 @@ fn format_property(p: &Property) -> String {
                 .collect();
             format!("{{{}}}", entries.join(", "))
         }
-        Property::DateTime { nanos, tz_offset_secs } => {
+        Property::DateTime {
+            nanos,
+            tz_offset_secs,
+            tz_name,
+        } => {
             let shifted = match tz_offset_secs {
                 Some(offset) => *nanos + (*offset as i128) * 1_000_000_000,
                 None => *nanos,
             };
             let body = format_datetime_body(shifted);
             let tz_str = match tz_offset_secs {
-                Some(0) => "Z".to_string(),
+                Some(0) if tz_name.is_none() => "Z".to_string(),
+                Some(0) => "+00:00".to_string(),
                 Some(offset) => {
                     let sign = if *offset >= 0 { '+' } else { '-' };
                     let abs = offset.unsigned_abs();
                     let oh = abs / 3600;
                     let om = (abs % 3600) / 60;
-                    format!("{sign}{oh:02}:{om:02}")
+                    let os = abs % 60;
+                    if os > 0 {
+                        format!("{sign}{oh:02}:{om:02}:{os:02}")
+                    } else {
+                        format!("{sign}{oh:02}:{om:02}")
+                    }
                 }
                 None => "Z".to_string(),
             };
-            format!("'{body}{tz_str}'")
+            let zone_str = match tz_name {
+                Some(name) => format!("[{name}]"),
+                None => String::new(),
+            };
+            format!("'{body}{tz_str}{zone_str}'")
         }
         Property::LocalDateTime(epoch_nanos) => {
             format!("'{}'", format_datetime_body(*epoch_nanos))
@@ -792,7 +806,12 @@ fn format_property(p: &Property) -> String {
                     let abs = offset.unsigned_abs();
                     let oh = abs / 3600;
                     let om = (abs % 3600) / 60;
-                    format!("{sign}{oh:02}:{om:02}")
+                    let os = abs % 60;
+                    if os > 0 {
+                        format!("{sign}{oh:02}:{om:02}:{os:02}")
+                    } else {
+                        format!("{sign}{oh:02}:{om:02}")
+                    }
                 }
                 None => String::new(),
             };

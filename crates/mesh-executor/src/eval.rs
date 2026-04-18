@@ -89,7 +89,8 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 }
                 Value::Property(Property::DateTime {
                     nanos,
-                    tz_offset_secs,
+                    tz_offset_secs,        tz_name: _,
+
                 }) => Ok(datetime_accessor(*nanos, *tz_offset_secs, key)),
                 Value::Property(Property::LocalDateTime(ns)) => {
                     Ok(datetime_accessor(*ns, None, key))
@@ -151,7 +152,8 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 }
                 Value::Property(Property::DateTime {
                     nanos,
-                    tz_offset_secs,
+                    tz_offset_secs,        tz_name: _,
+
                 }) => Ok(datetime_accessor(nanos, tz_offset_secs, key)),
                 Value::Property(Property::LocalDateTime(ns)) => {
                     Ok(datetime_accessor(ns, None, key))
@@ -1394,29 +1396,45 @@ fn nanos_to_secs_nanos(epoch_nanos: i128) -> (i64, u32) {
 /// millisecond precision is truncated toward zero since our
 /// on-the-wire DateTime is millis-resolution.
 fn parse_datetime(s: &str) -> Result<i128> {
-    parse_datetime_with_tz(s).map(|(ns, _)| ns)
+    parse_datetime_with_tz(s).map(|(ns, _, _)| ns)
 }
 
-/// Like `parse_datetime` but also returns the parsed timezone offset
-/// in seconds (or `None` if the string was naive / UTC-without-Z).
-fn parse_datetime_with_tz(s: &str) -> Result<(i128, Option<i32>)> {
+/// Parse a datetime string, returning `(utc_nanos, tz_offset_secs,
+/// tz_name)`. The offset is `None` for naive inputs; the name is
+/// set when the string carried an `[IANA/Region]` suffix.
+fn parse_datetime_with_tz(s: &str) -> Result<(i128, Option<i32>, Option<String>)> {
     use chrono::{DateTime, FixedOffset, NaiveDateTime, Offset};
     let trimmed = s.trim();
-    // Strip bracketed timezone names like [Europe/Stockholm]
-    let trimmed = if let Some(idx) = trimmed.find('[') {
-        trimmed[..idx].trim()
-    } else {
-        trimmed
+    // An `[IANA/Region]` suffix overrides any explicit offset — when
+    // both are present, the offset is just a display hint but the
+    // canonical zone is the name. We parse the body to get the UTC
+    // instant, then (if a name was supplied) re-resolve the offset
+    // against the zone db so it stays correct for DST.
+    let (body, tz_name) = match (trimmed.rfind('['), trimmed.rfind(']')) {
+        (Some(open), Some(close)) if close > open => {
+            let name = trimmed[open + 1..close].to_string();
+            (&trimmed[..open], Some(name))
+        }
+        _ => (trimmed, None),
     };
-    // Track whether the input carried a timezone marker (Z or explicit
-    // offset). If so, report Some(offset); otherwise None (naive).
+    let trimmed = body.trim();
     let has_tz_marker = trimmed.ends_with('Z')
         || trimmed.rfind(|c: char| c == '+' || c == '-')
             .map(|i| i > 5)
             .unwrap_or(false);
+    let finalise = |nanos: i128, tz: Option<i32>| {
+        if let Some(name) = tz_name.as_deref() {
+            match parse_tz_name(name, nanos) {
+                Some((off, canonical)) => (nanos, Some(off), Some(canonical)),
+                None => (nanos, tz, None),
+            }
+        } else {
+            (nanos, tz, None)
+        }
+    };
     if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(trimmed) {
         let offset = dt.offset().fix().local_minus_utc();
-        return Ok((datetime_to_nanos(&dt), Some(offset)));
+        return Ok(finalise(datetime_to_nanos(&dt), Some(offset)));
     }
     for fmt in [
         "%Y-%m-%dT%H:%M:%S%.f%:z",
@@ -1428,7 +1446,7 @@ fn parse_datetime_with_tz(s: &str) -> Result<(i128, Option<i32>)> {
     ] {
         if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(trimmed, fmt) {
             let offset = dt.offset().fix().local_minus_utc();
-            return Ok((datetime_to_nanos(&dt), Some(offset)));
+            return Ok(finalise(datetime_to_nanos(&dt), Some(offset)));
         }
     }
     for fmt in [
@@ -1440,14 +1458,9 @@ fn parse_datetime_with_tz(s: &str) -> Result<(i128, Option<i32>)> {
     ] {
         if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
             let tz = if has_tz_marker { Some(0) } else { None };
-            return Ok((datetime_to_nanos(&ndt.and_utc()), tz));
+            return Ok(finalise(datetime_to_nanos(&ndt.and_utc()), tz));
         }
     }
-    // Fallback: split at 'T' and use our flexible date/time parsers.
-    // This covers forms chrono can't: compact basic ISO dates
-    // (`YYYYMMDD`), week dates (`YYYY-Www-D`), ordinal dates
-    // (`YYYY-DDD`), and compact times (`HHMMSS`), each with or
-    // without a tz suffix.
     if let Some((date_part, time_part)) = trimmed.split_once('T') {
         if let Some(date) = parse_iso_date(date_part) {
             let (tod_nanos, tz) = parse_time_string_with_tz(time_part)?;
@@ -1458,7 +1471,7 @@ fn parse_datetime_with_tz(s: &str) -> Result<(i128, Option<i32>)> {
                 Some(off) => local_nanos - (off as i128) * 1_000_000_000,
                 None => local_nanos,
             };
-            return Ok((nanos, tz));
+            return Ok(finalise(nanos, tz));
         }
     }
     Err(Error::UnknownScalarFunction(format!(
@@ -1574,24 +1587,75 @@ fn parse_tz_offset(s: &str) -> Option<i32> {
     } else if let Some(r) = s.strip_prefix('-') {
         (-1, r)
     } else {
-        // Not a simple offset (maybe a region name like "Europe/Stockholm")
-        // Approximate with 0 for now.
+        // Not a simple offset — caller may retry via
+        // `parse_tz_name_offset` if this is a region name like
+        // `Europe/Stockholm`.
         return None;
     };
     let clean: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
-    let (h, m) = match clean.len() {
-        1 | 2 => (clean.parse::<i32>().ok()?, 0),
+    // Accept HH, HHMM, HHMMSS and their colon-separated variants.
+    // The digit-only string's length pins the layout.
+    let (h, m, sec) = match clean.len() {
+        1 | 2 => (clean.parse::<i32>().ok()?, 0, 0),
         3 => (
             clean[..1].parse::<i32>().ok()?,
             clean[1..].parse::<i32>().ok()?,
+            0,
         ),
         4 => (
             clean[..2].parse::<i32>().ok()?,
             clean[2..].parse::<i32>().ok()?,
+            0,
+        ),
+        5 => (
+            clean[..1].parse::<i32>().ok()?,
+            clean[1..3].parse::<i32>().ok()?,
+            clean[3..].parse::<i32>().ok()?,
+        ),
+        6 => (
+            clean[..2].parse::<i32>().ok()?,
+            clean[2..4].parse::<i32>().ok()?,
+            clean[4..].parse::<i32>().ok()?,
         ),
         _ => return None,
     };
-    Some(sign * (h * 3600 + m * 60))
+    Some(sign * (h * 3600 + m * 60 + sec))
+}
+
+/// Resolve an IANA timezone name (e.g. `"Europe/Stockholm"`) into
+/// an (offset_seconds, canonical_name) pair at a given UTC instant.
+/// Returns `None` if the name isn't a recognised IANA zone.
+fn parse_tz_name(s: &str, utc_nanos: i128) -> Option<(i32, String)> {
+    use chrono::{Offset, TimeZone};
+    let tz: chrono_tz::Tz = s.trim().parse().ok()?;
+    // Resolve the offset at the given instant — zones with DST
+    // report different offsets at different times of year, so we
+    // need the actual moment being referenced.
+    let secs = utc_nanos.div_euclid(1_000_000_000) as i64;
+    let nsec = utc_nanos.rem_euclid(1_000_000_000) as u32;
+    let utc_dt = chrono::DateTime::from_timestamp(secs, nsec)?;
+    let offset = tz
+        .offset_from_utc_datetime(&utc_dt.naive_utc())
+        .fix()
+        .local_minus_utc();
+    Some((offset, tz.name().to_string()))
+}
+
+/// Same as `parse_tz_name` but for a *local* wall-clock. Used when
+/// the caller has built up local nanos from a map and needs to
+/// figure out the correct UTC offset at that local time. Falls
+/// back to the UTC interpretation on ambiguous local times (DST
+/// fall-back), which matches Neo4j's documented behavior.
+fn parse_tz_name_local(s: &str, local_nanos: i128) -> Option<(i32, String)> {
+    use chrono::{Offset, TimeZone};
+    let tz: chrono_tz::Tz = s.trim().parse().ok()?;
+    let secs = local_nanos.div_euclid(1_000_000_000) as i64;
+    let nsec = local_nanos.rem_euclid(1_000_000_000) as u32;
+    let naive = chrono::DateTime::from_timestamp(secs, nsec)?.naive_utc();
+    let resolved = tz.from_local_datetime(&naive).earliest()
+        .or_else(|| tz.from_local_datetime(&naive).latest())?;
+    let offset = resolved.offset().fix().local_minus_utc();
+    Some((offset, tz.name().to_string()))
 }
 
 /// Parse a time string, returning (time_nanos, optional timezone offset).
@@ -1820,16 +1884,25 @@ fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
             cursor = rest;
         }
     }
-    // Normalize nanos to be within [0, 1e9) by flowing overflow
-    // into `seconds`. Keeps the output canonical for formatters.
+    // Normalize nanos so |nanos| < 1e9 and the sign agrees with
+    // `seconds`. Neo4j's canonical form keeps seconds and nanos
+    // both non-negative or both non-positive so negative durations
+    // print cleanly (`PT-1.999S` rather than `PT-2S` + `PT+0.001S`).
     let ns_per_sec: i32 = 1_000_000_000;
     while nanos >= ns_per_sec {
         nanos -= ns_per_sec;
         seconds = seconds.wrapping_add(1);
     }
-    while nanos < 0 {
+    while nanos <= -ns_per_sec {
         nanos += ns_per_sec;
         seconds = seconds.wrapping_sub(1);
+    }
+    if seconds > 0 && nanos < 0 {
+        seconds -= 1;
+        nanos += ns_per_sec;
+    } else if seconds < 0 && nanos > 0 {
+        seconds += 1;
+        nanos -= ns_per_sec;
     }
 
     let mut dur = mesh_core::Duration {
@@ -1948,6 +2021,7 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
             DateTime {
                 nanos: ns,
                 tz_offset_secs: tz,
+                tz_name: name,
             },
             Dur(d),
         )
@@ -1957,21 +2031,25 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
             DateTime {
                 nanos: ns,
                 tz_offset_secs: tz,
+                tz_name: name,
             },
         ) => Some(Ok(Value::Property(DateTime {
             nanos: datetime_add_duration(*ns, *d),
             tz_offset_secs: *tz,
+            tz_name: name.clone(),
         }))),
         (
             BinaryOp::Sub,
             DateTime {
                 nanos: ns,
                 tz_offset_secs: tz,
+                tz_name: name,
             },
             Dur(d),
         ) => Some(Ok(Value::Property(DateTime {
             nanos: datetime_add_duration(*ns, negate_duration(*d)),
             tz_offset_secs: *tz,
+            tz_name: name.clone(),
         }))),
         (
             BinaryOp::Sub,
@@ -2863,25 +2941,26 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             // `wrap` takes the epoch nanos (always UTC) and an
             // optional timezone offset (None → localdatetime, Some(0)
             // → UTC "Z", Some(n) → `+HH:MM`).
-            let wrap = |ns: i128, tz: Option<i32>| -> Value {
+            let wrap = |ns: i128, tz: Option<i32>, tz_name: Option<String>| -> Value {
                 if is_local {
                     Value::Property(Property::LocalDateTime(ns))
                 } else {
                     Value::Property(Property::DateTime {
                         nanos: ns,
                         tz_offset_secs: tz,
+                        tz_name,
                     })
                 }
             };
             match arg_exprs.len() {
-            0 => Ok(wrap(now_epoch_nanos(), Some(0))),
+            0 => Ok(wrap(now_epoch_nanos(), Some(0), None)),
             1 => {
                 let v = eval_expr(&arg_exprs[0], ctx)?;
                 match v {
                     Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                     Value::Property(Property::String(s)) => {
-                        let (ns, tz) = parse_datetime_with_tz(&s)?;
-                        Ok(wrap(ns, tz))
+                        let (ns, tz, tz_name) = parse_datetime_with_tz(&s)?;
+                        Ok(wrap(ns, tz, tz_name))
                     }
                     Value::Property(Property::Map(m)) => {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
@@ -2939,10 +3018,13 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         // named region) or inherit from a base
                         // datetime/time. For datetime() (not localdatetime())
                         // we default to UTC when nothing else is specified.
-                        let tz_offset = if is_local {
-                            None
+                        let (tz_offset, tz_name_opt) = if is_local {
+                            (None, None)
                         } else {
-                            extract_tz_offset(&m).or(Some(0))
+                            match extract_tz_spec(&m, Some(local_nanos)) {
+                                Some((off, name)) => (Some(off), name),
+                                None => (Some(0), None),
+                            }
                         };
                         // Time components in the map are *local* to the
                         // given zone (Neo4j convention). Shift them back
@@ -2951,7 +3033,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                             Some(offset) => local_nanos - (offset as i128) * 1_000_000_000,
                             None => local_nanos,
                         };
-                        Ok(wrap(epoch_nanos, tz_offset))
+                        Ok(wrap(epoch_nanos, tz_offset, tz_name_opt))
                     }
                     // datetime(other_temporal) — project from another
                     // temporal. Date: promote to midnight of that day.
@@ -2961,14 +3043,15 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     // for localdatetime().
                     Value::Property(Property::Date(days)) => {
                         let ns = (days as i128) * 86_400_000_000_000;
-                        Ok(wrap(ns, Some(0)))
+                        Ok(wrap(ns, Some(0), None))
                     }
                     Value::Property(Property::LocalDateTime(ns)) => {
-                        Ok(wrap(ns, Some(0)))
+                        Ok(wrap(ns, Some(0), None))
                     }
                     Value::Property(Property::DateTime {
                         nanos,
                         tz_offset_secs,
+                        tz_name,
                     }) => {
                         if is_local {
                             // Strip to local wall-clock nanos.
@@ -2976,9 +3059,9 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                                 Some(off) => nanos + (off as i128) * 1_000_000_000,
                                 None => nanos,
                             };
-                            Ok(wrap(local, None))
+                            Ok(wrap(local, None, None))
                         } else {
-                            Ok(wrap(nanos, tz_offset_secs.or(Some(0))))
+                            Ok(wrap(nanos, tz_offset_secs.or(Some(0)), tz_name))
                         }
                     }
                     _ => Err(Error::TypeMismatch),
@@ -3019,7 +3102,8 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     // so DST boundaries round to the *local* day.
                     Value::Property(Property::DateTime {
                         nanos,
-                        tz_offset_secs,
+                        tz_offset_secs,        tz_name: _,
+
                     }) => {
                         let local = match tz_offset_secs {
                             Some(off) => nanos + (off as i128) * 1_000_000_000,
@@ -3075,7 +3159,8 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                                     }
                                     Some(Property::DateTime {
                                         nanos: ns,
-                                        tz_offset_secs,
+                                        tz_offset_secs,        tz_name: _,
+
                                     }) => {
                                         // DateTime's nanos are UTC; the
                                         // "base time-of-day" we inherit
@@ -3221,7 +3306,8 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                     Value::Property(Property::DateTime {
                         nanos,
-                        tz_offset_secs,
+                        tz_offset_secs,        tz_name: _,
+
                     }) => {
                         let local = match tz_offset_secs {
                             Some(off) => nanos + (off as i128) * 1_000_000_000,
@@ -3276,8 +3362,22 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             };
             let mut months = 0_i64;
             let mut days = 0_i64;
-            let mut seconds = 0_i64;
-            let mut nanos = 0_i32;
+            let mut sub_day_nanos = 0_i128;
+            // Mean-month size used when a fractional month or year
+            // cascades into smaller units: 365.2425 / 12 days.
+            const SECS_PER_MONTH: f64 = 30.436875 * 86400.0;
+            const SECS_PER_DAY: i64 = 86_400;
+            // Cascade a fractional number of *days* — year/month/week/
+            // day fractions all boil down to this — into whole days
+            // plus a sub-day nanosecond remainder.
+            let mut push_days_f = |total_days: f64,
+                                   days: &mut i64,
+                                   sub_day_nanos: &mut i128| {
+                let whole = total_days.trunc() as i64;
+                *days = days.wrapping_add(whole);
+                let frac = total_days - whole as f64;
+                *sub_day_nanos += (frac * (SECS_PER_DAY as f64) * 1e9).round() as i128;
+            };
             for (k, v) in &entries {
                 let as_f64 = match v {
                     Property::Int64(i) => *i as f64,
@@ -3285,52 +3385,53 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     Property::Null => continue,
                     _ => return Err(Error::TypeMismatch),
                 };
-                // Use f64 arithmetic to handle fractional cascading
                 match k.as_str() {
                     "years" => {
                         let total_months = as_f64 * 12.0;
-                        months += total_months as i64;
-                        let frac_months = total_months - (total_months as i64 as f64);
-                        days += (frac_months * 30.0) as i64;
+                        let whole = total_months.trunc() as i64;
+                        months = months.wrapping_add(whole);
+                        let frac_months = total_months - whole as f64;
+                        push_days_f(
+                            frac_months * SECS_PER_MONTH / (SECS_PER_DAY as f64),
+                            &mut days,
+                            &mut sub_day_nanos,
+                        );
                     }
                     "months" => {
-                        months += as_f64 as i64;
-                        let frac = as_f64 - (as_f64 as i64 as f64);
-                        days += (frac * 30.0) as i64;
+                        let whole = as_f64.trunc() as i64;
+                        months = months.wrapping_add(whole);
+                        let frac = as_f64 - whole as f64;
+                        push_days_f(
+                            frac * SECS_PER_MONTH / (SECS_PER_DAY as f64),
+                            &mut days,
+                            &mut sub_day_nanos,
+                        );
                     }
                     "weeks" => {
-                        days += (as_f64 * 7.0) as i64;
+                        push_days_f(as_f64 * 7.0, &mut days, &mut sub_day_nanos);
                     }
                     "days" => {
-                        days += as_f64 as i64;
-                        let frac = as_f64 - (as_f64 as i64 as f64);
-                        seconds += (frac * 86400.0) as i64;
+                        push_days_f(as_f64, &mut days, &mut sub_day_nanos);
                     }
+                    // Sub-day components stay as seconds+nanos; Neo4j
+                    // does not cascade integer seconds into days.
                     "hours" => {
-                        seconds += (as_f64 * 3600.0) as i64;
-                        let frac = as_f64 * 3600.0 - ((as_f64 * 3600.0) as i64 as f64);
-                        nanos += (frac * 1_000_000_000.0) as i32;
+                        sub_day_nanos += (as_f64 * 3600.0 * 1e9).round() as i128;
                     }
                     "minutes" => {
-                        seconds += (as_f64 * 60.0) as i64;
-                        let frac = as_f64 * 60.0 - ((as_f64 * 60.0) as i64 as f64);
-                        nanos += (frac * 1_000_000_000.0) as i32;
+                        sub_day_nanos += (as_f64 * 60.0 * 1e9).round() as i128;
                     }
                     "seconds" => {
-                        seconds += as_f64 as i64;
-                        let frac = as_f64 - (as_f64 as i64 as f64);
-                        nanos += (frac * 1_000_000_000.0) as i32;
+                        sub_day_nanos += (as_f64 * 1e9).round() as i128;
                     }
                     "milliseconds" => {
-                        let total_nanos = as_f64 * 1_000_000.0;
-                        seconds += (total_nanos / 1_000_000_000.0) as i64;
-                        nanos += (total_nanos % 1_000_000_000.0) as i32;
+                        sub_day_nanos += (as_f64 * 1_000_000.0).round() as i128;
                     }
                     "microseconds" => {
-                        nanos += (as_f64 * 1000.0) as i32;
+                        sub_day_nanos += (as_f64 * 1000.0).round() as i128;
                     }
                     "nanoseconds" => {
-                        nanos += as_f64 as i32;
+                        sub_day_nanos += as_f64.round() as i128;
                     }
                     other => {
                         return Err(Error::UnknownScalarFunction(format!(
@@ -3339,17 +3440,24 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                 }
             }
-            // Normalize: carry nanos overflow into seconds using
-            // div_euclid/rem_euclid so nanos are always non-negative
-            // (matching Neo4j's internal representation).
-            let total_ns = (seconds as i128) * 1_000_000_000 + (nanos as i128);
-            let new_seconds = total_ns.div_euclid(1_000_000_000) as i64;
-            let new_nanos = total_ns.rem_euclid(1_000_000_000) as i32;
+            // Split sub-day nanos into (seconds, nanos). Both share a
+            // sign (Neo4j's canonical form keeps seconds and nanos
+            // matching so negative durations print cleanly).
+            let total_ns = sub_day_nanos;
+            let mut seconds = (total_ns / 1_000_000_000) as i64;
+            let mut nanos = (total_ns % 1_000_000_000) as i32;
+            if seconds > 0 && nanos < 0 {
+                seconds -= 1;
+                nanos += 1_000_000_000;
+            } else if seconds < 0 && nanos > 0 {
+                seconds += 1;
+                nanos -= 1_000_000_000;
+            }
             Ok(Value::Property(Property::Duration(mesh_core::Duration {
                 months,
                 days,
-                seconds: new_seconds,
-                nanos: new_nanos,
+                seconds,
+                nanos,
             })))
         }
 
@@ -3466,7 +3574,11 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             if let Some(null) = null_arg(arg_exprs, ctx)? {
                 return Ok(null);
             }
-            Ok(Value::Property(Property::DateTime { nanos: now_epoch_nanos(), tz_offset_secs: Some(0) }))
+            Ok(Value::Property(Property::DateTime {
+                nanos: now_epoch_nanos(),
+                tz_offset_secs: Some(0),
+                tz_name: None,
+            }))
         }
         "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
             if let Some(null) = null_arg(arg_exprs, ctx)? {
@@ -3520,6 +3632,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 Value::Property(Property::DateTime {
                     nanos: now_epoch_nanos(),
                     tz_offset_secs: Some(0),
+                    tz_name: None,
                 })
             };
             let overrides = if arg_exprs.len() > 2 {
@@ -3559,7 +3672,8 @@ fn extract_base_date(
             }
             Some(Property::DateTime {
                 nanos: ns,
-                tz_offset_secs,
+                tz_offset_secs,        tz_name: _,
+
             }) => {
                 // Use the *local* day for the base, matching the
                 // Neo4j behavior where date() / datetime() work in
@@ -3592,20 +3706,49 @@ fn extract_base_date(
 fn extract_tz_offset(
     m: &std::collections::HashMap<String, Property>,
 ) -> Option<i32> {
+    extract_tz_spec(m, None).map(|(off, _)| off)
+}
+
+/// Resolve `(offset_seconds, tz_name)` from a construction map.
+/// Preference order:
+///   1. explicit `timezone:` string — either an IANA name (resolved
+///      against `local_nanos` so DST is correct), or a `+HH:MM`-style
+///      offset.
+///   2. `datetime:` / `time:` base value already carrying an offset
+///      (and optionally a name, for datetimes).
+///
+/// Returns `None` if nothing in the map specifies a zone.
+fn extract_tz_spec(
+    m: &std::collections::HashMap<String, Property>,
+    local_nanos: Option<i128>,
+) -> Option<(i32, Option<String>)> {
     if let Some(Property::String(tz)) = m.get("timezone") {
-        return parse_tz_offset(tz).or(Some(0));
+        if let Some(off) = parse_tz_offset(tz) {
+            return Some((off, None));
+        }
+        // Named zone. Resolve against the supplied local wall-clock
+        // if we have it; otherwise fall back to the epoch and accept
+        // the historical offset.
+        let pivot = local_nanos.unwrap_or(0);
+        if let Some((off, name)) = parse_tz_name_local(tz, pivot) {
+            return Some((off, Some(name)));
+        }
+        // Unknown zone string — preserve a literal offset of 0 so
+        // the rest of the query still runs, and leave the name as
+        // None so we don't emit a bogus [Region/City] suffix.
+        return Some((0, None));
     }
-    // Inherit from base datetime/time, if any
     for key in ["datetime", "time"] {
         match m.get(key) {
             Some(Property::DateTime {
                 tz_offset_secs: Some(o),
+                tz_name,
                 ..
-            }) => return Some(*o),
+            }) => return Some((*o, tz_name.clone())),
             Some(Property::Time {
                 tz_offset_secs: Some(o),
                 ..
-            }) => return Some(*o),
+            }) => return Some((*o, None)),
             _ => {}
         }
     }
@@ -3634,7 +3777,8 @@ fn extract_base_date_tod(
             }
             Some(Property::DateTime {
                 nanos: ns,
-                tz_offset_secs,
+                tz_offset_secs,        tz_name: _,
+
             }) => {
                 // DateTime stores UTC nanos but the TCK feeds it into
                 // datetime()/date() maps expecting the *local* date
@@ -3788,7 +3932,14 @@ fn format_offset_str(offset: i32) -> String {
     let abs = offset.unsigned_abs();
     let oh = abs / 3600;
     let om = (abs % 3600) / 60;
-    format!("{sign}{oh:02}:{om:02}")
+    let os = abs % 60;
+    // Include the seconds component only when non-zero, matching the
+    // `+HH:MM[:SS]` form Neo4j round-trips.
+    if os > 0 {
+        format!("{sign}{oh:02}:{om:02}:{os:02}")
+    } else {
+        format!("{sign}{oh:02}:{om:02}")
+    }
 }
 
 /// Shared accessor for the time-of-day components of a Time or the
@@ -3915,7 +4066,8 @@ fn temporal_to_date_tod(
         )),
         Value::Property(Property::DateTime {
             nanos: ns,
-            tz_offset_secs,
+            tz_offset_secs,        tz_name: _,
+
         }) => {
             let local = match tz_offset_secs {
                 Some(off) => *ns + (*off as i128) * 1_000_000_000,
@@ -4054,7 +4206,8 @@ fn truncate_time_value(
         ),
         Value::Property(Property::DateTime {
             nanos,
-            tz_offset_secs,
+            tz_offset_secs,        tz_name: _,
+
         }) => {
             let local = match tz_offset_secs {
                 Some(off) => *nanos + (*off as i128) * 1_000_000_000,
@@ -4152,6 +4305,10 @@ fn truncate_temporal(
             // the value was authored. Shift back to UTC at the end.
             let source_tz: Option<i32> = match temporal {
                 Value::Property(Property::DateTime { tz_offset_secs, .. }) => *tz_offset_secs,
+                _ => None,
+            };
+            let source_tz_name: Option<String> = match temporal {
+                Value::Property(Property::DateTime { tz_name, .. }) => tz_name.clone(),
                 _ => None,
             };
             let epoch_ns: i128 = match temporal {
@@ -4314,6 +4471,7 @@ fn truncate_temporal(
                 Ok(Value::Property(Property::DateTime {
                     nanos: utc_nanos,
                     tz_offset_secs: source_tz,
+                    tz_name: source_tz_name.clone(),
                 }))
             }
         }
@@ -4396,9 +4554,11 @@ fn value_to_string(v: Value) -> Value {
         Value::Property(Property::DateTime {
             nanos,
             tz_offset_secs,
+            tz_name,
         }) => Value::Property(Property::String(format_datetime_with_tz(
             nanos,
             tz_offset_secs,
+            tz_name.as_deref(),
         ))),
         Value::Property(Property::LocalDateTime(ns)) => {
             Value::Property(Property::String(format_datetime_string(ns)))
@@ -4439,24 +4599,30 @@ fn format_datetime_string(epoch_nanos: i128) -> String {
 /// Format a DateTime (UTC epoch nanos + optional tz offset) as ISO 8601.
 /// Shifts the nanos by the offset so the rendered time is local, then
 /// appends the offset suffix (`Z` for 0, `+HH:MM` otherwise).
-fn format_datetime_with_tz(epoch_nanos: i128, tz_offset_secs: Option<i32>) -> String {
+fn format_datetime_with_tz(
+    epoch_nanos: i128,
+    tz_offset_secs: Option<i32>,
+    tz_name: Option<&str>,
+) -> String {
     let shifted = match tz_offset_secs {
         Some(offset) => epoch_nanos + (offset as i128) * 1_000_000_000,
         None => epoch_nanos,
     };
     let body = format_datetime_string(shifted);
+    // When a zone name is set, always render the offset explicitly
+    // (even for UTC) so the form is `...+00:00[Zone]` rather than
+    // `...Z[Zone]` — matches Neo4j and the TCK expectations.
     let tz_str = match tz_offset_secs {
-        Some(0) => "Z".to_string(),
-        Some(offset) => {
-            let sign = if offset >= 0 { '+' } else { '-' };
-            let abs = offset.unsigned_abs();
-            let oh = abs / 3600;
-            let om = (abs % 3600) / 60;
-            format!("{sign}{oh:02}:{om:02}")
-        }
+        Some(0) if tz_name.is_none() => "Z".to_string(),
+        Some(0) => "+00:00".to_string(),
+        Some(offset) => format_offset_str(offset),
         None => String::new(),
     };
-    format!("{body}{tz_str}")
+    let zone_str = match tz_name {
+        Some(name) => format!("[{name}]"),
+        None => String::new(),
+    };
+    format!("{body}{tz_str}{zone_str}")
 }
 
 /// Format a Time as ISO 8601 string.
@@ -4476,14 +4642,7 @@ fn format_time_string(nanos: i64, tz_offset_secs: Option<i32>) -> String {
         format!("{h:02}:{m:02}")
     };
     let tz_str = match tz_offset_secs {
-        Some(0) => "Z".to_string(),
-        Some(offset) => {
-            let sign = if offset >= 0 { '+' } else { '-' };
-            let abs = offset.unsigned_abs();
-            let oh = abs / 3600;
-            let om = (abs % 3600) / 60;
-            format!("{sign}{oh:02}:{om:02}")
-        }
+        Some(offset) => format_offset_str(offset),
         None => String::new(),
     };
     format!("{time_str}{tz_str}")
@@ -4693,8 +4852,8 @@ pub(crate) fn value_key(v: &Value) -> String {
             out.push('}');
             out
         }
-        Value::Property(Property::DateTime { nanos, tz_offset_secs }) => {
-            format!("dt:{},{:?}", nanos, tz_offset_secs)
+        Value::Property(Property::DateTime { nanos, tz_offset_secs, tz_name }) => {
+            format!("dt:{},{:?},{:?}", nanos, tz_offset_secs, tz_name)
         }
         Value::Property(Property::LocalDateTime(ns)) => format!("ldt:{}", ns),
         Value::Property(Property::Date(days)) => format!("d:{}", days),
