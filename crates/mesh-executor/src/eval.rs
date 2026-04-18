@@ -2610,16 +2610,26 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         let base_sec = ((base_tod_ns % 60_000_000_000) / 1_000_000_000) as i64;
                         let base_ns = (base_tod_ns % 1_000_000_000) as i64;
 
-                        let has_explicit_time = m.contains_key("hour") || m.contains_key("minute")
-                            || m.contains_key("second") || m.contains_key("nanosecond")
-                            || m.contains_key("millisecond") || m.contains_key("microsecond");
-                        let hour = map_int(&m, "hour").unwrap_or(if has_explicit_time { 0 } else { base_hour });
-                        let minute = map_int(&m, "minute").unwrap_or(if has_explicit_time { 0 } else { base_min });
-                        let second = map_int(&m, "second").unwrap_or(if has_explicit_time { 0 } else { base_sec });
+                        // Neo4j semantics: when a time-carrying base (datetime/time)
+                        // is given, missing time fields inherit from the base. When
+                        // no base is given, missing time fields default to 0.
+                        let has_time_base = m.contains_key("datetime")
+                            || m.contains_key("localdatetime")
+                            || m.contains_key("time");
+                        let default_tod = |base_val: i64| {
+                            if has_time_base {
+                                base_val
+                            } else {
+                                0
+                            }
+                        };
+                        let hour = map_int(&m, "hour").unwrap_or_else(|| default_tod(base_hour));
+                        let minute = map_int(&m, "minute").unwrap_or_else(|| default_tod(base_min));
+                        let second = map_int(&m, "second").unwrap_or_else(|| default_tod(base_sec));
                         let nanos = map_int(&m, "nanosecond")
                             .or_else(|| map_int(&m, "millisecond").map(|ms| ms * 1_000_000))
                             .or_else(|| map_int(&m, "microsecond").map(|us| us * 1_000))
-                            .unwrap_or(if has_explicit_time { 0 } else { base_ns });
+                            .unwrap_or_else(|| default_tod(base_ns));
                         let epoch_nanos: i128 = (days_since_epoch as i128) * 86_400_000_000_000
                             + (hour as i128) * 3_600_000_000_000
                             + (minute as i128) * 60_000_000_000
@@ -2700,20 +2710,17 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         let base_sec = (base_tod % 60_000_000_000) / 1_000_000_000;
                         let base_ns = base_tod % 1_000_000_000;
 
-                        let has_explicit_time = m.contains_key("hour") || m.contains_key("minute")
-                            || m.contains_key("second") || m.contains_key("nanosecond")
-                            || m.contains_key("millisecond") || m.contains_key("microsecond");
                         let has_any_base = m.contains_key("time") || m.contains_key("datetime")
                             || m.contains_key("localdatetime");
-                        let default_when_missing = |b: i64| if has_explicit_time { 0 } else if has_any_base { b } else { 0 };
+                        let default_tod = |b: i64| if has_any_base { b } else { 0 };
 
-                        let hour = map_int(&m, "hour").unwrap_or_else(|| default_when_missing(base_h));
-                        let minute = map_int(&m, "minute").unwrap_or_else(|| default_when_missing(base_min));
-                        let second = map_int(&m, "second").unwrap_or_else(|| default_when_missing(base_sec));
+                        let hour = map_int(&m, "hour").unwrap_or_else(|| default_tod(base_h));
+                        let minute = map_int(&m, "minute").unwrap_or_else(|| default_tod(base_min));
+                        let second = map_int(&m, "second").unwrap_or_else(|| default_tod(base_sec));
                         let nanos = map_int(&m, "nanosecond")
                             .or_else(|| map_int(&m, "millisecond").map(|ms| ms * 1_000_000))
                             .or_else(|| map_int(&m, "microsecond").map(|us| us * 1_000))
-                            .unwrap_or_else(|| default_when_missing(base_ns));
+                            .unwrap_or_else(|| default_tod(base_ns));
                         let time_nanos =
                             hour * 3_600_000_000_000 + minute * 60_000_000_000
                             + second * 1_000_000_000 + nanos;
@@ -3070,20 +3077,26 @@ fn build_date_from_map(
     // Quarter-based construction
     if let Some(quarter) = map_int(m, "quarter") {
         let year = map_int(m, "year").unwrap_or(base.year() as i64);
-        let month = ((quarter - 1) * 3 + 1) as u32;
-        let day = map_int(m, "dayOfQuarter")
-            .or_else(|| map_int(m, "day"))
-            .map(|d| d as u32)
-            .unwrap_or_else(|| {
-                // Preserve day-of-quarter from base if same month alignment
-                let base_q = (base.month() - 1) / 3 + 1;
-                if base_q == quarter as u32 {
-                    base.day()
-                } else {
-                    1
-                }
-            });
-        return chrono::NaiveDate::from_ymd_opt(year as i32, month, day).unwrap_or(base);
+        let q_start_month = ((quarter - 1) * 3 + 1) as u32;
+        let q_start = chrono::NaiveDate::from_ymd_opt(year as i32, q_start_month, 1);
+        // Compute day-of-quarter: explicit in map, else derive from base.
+        let day_of_quarter = map_int(m, "dayOfQuarter").unwrap_or_else(|| {
+            if has_base {
+                // Day-of-quarter from base = (base - base's quarter start) + 1
+                let base_q_start_month = ((base.month() - 1) / 3) * 3 + 1;
+                let base_q_start =
+                    chrono::NaiveDate::from_ymd_opt(base.year(), base_q_start_month, 1).unwrap();
+                base.signed_duration_since(base_q_start).num_days() + 1
+            } else if let Some(day) = map_int(m, "day") {
+                day
+            } else {
+                1
+            }
+        });
+        if let Some(start) = q_start {
+            return start + chrono::Duration::days(day_of_quarter - 1);
+        }
+        return base;
     }
     // Default: year + month + day
     let year = map_int(m, "year").unwrap_or(base.year() as i64);
