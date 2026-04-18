@@ -1578,31 +1578,44 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             }
         }
         Rule::comparison => {
-            // `comparison := compound ~ (comparison_op ~ compound)?`.
-            // Each `compound` is an add_expr plus an optional postfix
-            // (`IS [NOT] NULL`, `IN ...`, or a label test). Build the
-            // two sides independently, then combine with the outer
-            // comparison operator if it's present.
+            // `comparison := compound (comparison_op compound)*`.
+            // A single pair compiles to `Compare`. A chain like
+            // `1 < x < 3` expands to `(1 < x) AND (x < 3)` — the
+            // middle operand is reused for both comparisons, matching
+            // Cypher's Python-style interpretation of chained
+            // comparisons.
             let mut inner = pair.into_inner();
-            let left_pair = inner
+            let first_pair = inner
                 .next()
                 .ok_or_else(|| Error::Parse("empty comparison".into()))?;
-            let left = build_expression(left_pair)?;
-            match inner.next() {
-                None => Ok(left),
-                Some(op_pair) => {
-                    let op = build_compare_op(op_pair)?;
-                    let right_pair = inner
-                        .next()
-                        .ok_or_else(|| Error::Parse("missing comparison rhs".into()))?;
-                    let right = build_expression(right_pair)?;
-                    Ok(Expr::Compare {
-                        op,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    })
-                }
+            let first = build_expression(first_pair)?;
+            let mut operands = vec![first];
+            let mut ops = Vec::new();
+            while let Some(op_pair) = inner.next() {
+                let op = build_compare_op(op_pair)?;
+                let rhs_pair = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("missing comparison rhs".into()))?;
+                operands.push(build_expression(rhs_pair)?);
+                ops.push(op);
             }
+            if ops.is_empty() {
+                return Ok(operands.into_iter().next().unwrap());
+            }
+            // Build comparisons for each adjacent pair and AND them.
+            let mut terms: Vec<Expr> = Vec::with_capacity(ops.len());
+            for (i, op) in ops.iter().enumerate() {
+                terms.push(Expr::Compare {
+                    op: op.clone(),
+                    left: Box::new(operands[i].clone()),
+                    right: Box::new(operands[i + 1].clone()),
+                });
+            }
+            let mut folded = terms.remove(0);
+            for t in terms {
+                folded = Expr::And(Box::new(folded), Box::new(t));
+            }
+            Ok(folded)
         }
         Rule::compound => {
             // `compound := add_expr ~ (null_predicate | in_predicate | label_predicate)?`.

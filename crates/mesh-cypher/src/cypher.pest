@@ -260,10 +260,11 @@ xor_expr = { and_expr ~ (kw_xor ~ and_expr)* }
 and_expr = { not_expr ~ (kw_and ~ not_expr)* }
 not_expr = { (kw_not ~ not_expr) | comparison }
 // A comparison is one `compound` (an `add_expr` plus any trailing
-// `IS NULL` / `IN ...` / label test) optionally compared to another
-// `compound`. Splitting like this lets `x IS NULL = y IS NULL` parse
-// as `(x IS NULL) = (y IS NULL)` instead of bailing at the `=`.
-comparison = { compound ~ (comparison_op ~ compound)? }
+// `IS NULL` / `IN ...` / label test) optionally followed by one or
+// more `comparison_op compound` tails. Supporting a chain lets
+// `1 < n.num < 3` parse Python-style (AST builder splits the chain
+// into `1 < n.num AND n.num < 3`).
+comparison = { compound ~ (comparison_op ~ compound)* }
 compound = { add_expr ~ (null_predicate | in_predicate | label_predicate)? }
 in_predicate = { kw_in ~ add_expr }
 label_predicate = { label_spec+ }
