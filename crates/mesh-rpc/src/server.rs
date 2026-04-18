@@ -846,6 +846,7 @@ fn count_index_seeks(plan: &mesh_cypher::LogicalPlan) -> u64 {
         | P::Foreach { input, .. }
         | P::CallSubquery { input, .. }
         | P::Identity { input }
+        | P::CoalesceNullRow { input, .. }
         | P::LoadCsv {
             input: Some(input), ..
         } => count_index_seeks(input),

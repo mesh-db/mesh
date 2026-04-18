@@ -160,6 +160,15 @@ pub enum LogicalPlan {
     Identity {
         input: Box<LogicalPlan>,
     },
+    /// Standalone OPTIONAL MATCH semantics: forward all rows from
+    /// `input` if it produces at least one; otherwise emit a single
+    /// row with `null_vars` bound to Value::Null. Wraps the fresh
+    /// scan when OPTIONAL MATCH is the first clause or has no
+    /// preceding row stream to left-join against.
+    CoalesceNullRow {
+        input: Box<LogicalPlan>,
+        null_vars: Vec<String>,
+    },
     /// Match-or-create a single node. If at least one node matches the
     /// `(labels, properties)` pattern, returns one row per match (binding
     /// the existing node to `var`). If none match, creates exactly one
@@ -631,6 +640,13 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             buf.push_str(&format!("{indent}Identity(*)\n"));
             format_plan_inner(input, buf, depth + 1);
         }
+        LogicalPlan::CoalesceNullRow { input, null_vars } => {
+            buf.push_str(&format!(
+                "{indent}CoalesceNullRow({})\n",
+                null_vars.join(", ")
+            ));
+            format_plan_inner(input, buf, depth + 1);
+        }
         LogicalPlan::Unwind { var, .. } => {
             buf.push_str(&format!("{indent}Unwind(AS {var})\n"));
         }
@@ -851,6 +867,7 @@ where
         }
         | LogicalPlan::BindPath { input, .. }
         | LogicalPlan::ShortestPath { input, .. }
+        | LogicalPlan::CoalesceNullRow { input, .. }
         | LogicalPlan::Identity { input } => walk_plan_exprs(input, visit),
         LogicalPlan::Skip { input, count } | LogicalPlan::Limit { input, count } => {
             visit(count)?;
@@ -2811,12 +2828,25 @@ fn apply_optional_match(
     for pattern in &clause.patterns {
         if pattern.hops.is_empty() {
             // Bare-node OPTIONAL MATCH: scan for matching nodes.
-            // If none match, the caller produces a null-bound row.
+            // If none match, wrap with CoalesceNullRow so the null
+            // row semantics propagate.
             let fresh = plan_pattern(pattern, 0, ctx)?;
+            let mut pattern_vars: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            collect_pattern_vars(pattern, &mut pattern_vars);
+            let null_vars: Vec<String> = pattern_vars.into_iter().collect();
+            let optional = LogicalPlan::CoalesceNullRow {
+                input: Box::new(fresh),
+                null_vars,
+            };
             collect_pattern_vars_typed(pattern, bound_vars)?;
-            plan = LogicalPlan::CartesianProduct {
-                left: Box::new(plan),
-                right: Box::new(fresh),
+            plan = if matches!(plan, LogicalPlan::SeedRow) {
+                optional
+            } else {
+                LogicalPlan::CartesianProduct {
+                    left: Box::new(plan),
+                    right: Box::new(optional),
+                }
             };
             continue;
         }
@@ -2827,14 +2857,19 @@ fn apply_optional_match(
             .unwrap_or_else(|| format!("__opt_start_{}", bound_vars.len()));
         if !bound_vars.contains_key(&start_var) {
             // Standalone OPTIONAL MATCH — the start var is not yet
-            // bound. Plan it like a regular MATCH: fresh scan + hops.
-            // The "optional" semantics are handled by the caller
-            // (OPTIONAL MATCH as first clause returns NULL rows if
-            // nothing matches, but that's the same as an empty result
-            // set which the match already produces).
+            // bound. Plan it like a regular MATCH, then wrap with
+            // CoalesceNullRow so the empty-result case emits a
+            // single row with all pattern vars null-bound.
             let fresh = plan_pattern(pattern, 0, ctx)?;
+            let mut pattern_vars: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            collect_pattern_vars(pattern, &mut pattern_vars);
+            let null_vars: Vec<String> = pattern_vars.into_iter().collect();
             collect_pattern_vars_typed(pattern, bound_vars)?;
-            plan = fresh;
+            plan = LogicalPlan::CoalesceNullRow {
+                input: Box::new(fresh),
+                null_vars,
+            };
             continue;
         }
 

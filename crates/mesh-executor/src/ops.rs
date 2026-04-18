@@ -377,6 +377,9 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             aggregates.clone(),
         )),
         LogicalPlan::Identity { input } => Box::new(IdentityOp::new(child!(input))),
+        LogicalPlan::CoalesceNullRow { input, null_vars } => Box::new(
+            CoalesceNullRowOp::new(child!(input), null_vars.clone()),
+        ),
         LogicalPlan::Distinct { input } => Box::new(DistinctOp::new(child!(input))),
         LogicalPlan::OrderBy { input, sort_items } => {
             Box::new(OrderByOp::new(child!(input), sort_items.clone()))
@@ -795,6 +798,12 @@ impl Operator for DeleteOp {
                         Some(Value::Edge(e)) => {
                             ctx.writer.delete_edge(e.id)?;
                         }
+                        // openCypher: DELETE silently ignores null.
+                        // Common source: OPTIONAL MATCH with no match
+                        // binds the var to null and the subsequent
+                        // DELETE is a no-op.
+                        Some(Value::Null)
+                        | Some(Value::Property(Property::Null)) => continue,
                         _ => return Err(Error::UnboundVariable(var.clone())),
                     }
                 }
@@ -2476,6 +2485,55 @@ impl IdentityOp {
 impl Operator for IdentityOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         self.input.next(ctx)
+    }
+}
+
+/// Passes input rows through; if the input produces zero rows,
+/// emits exactly one row with `null_vars` bound to Value::Null.
+/// Implements standalone OPTIONAL MATCH semantics (e.g.
+/// `OPTIONAL MATCH (n) RETURN n` on an empty graph yields one
+/// row with n=null rather than the empty result set).
+struct CoalesceNullRowOp {
+    input: Box<dyn Operator>,
+    null_vars: Vec<String>,
+    produced_any: bool,
+    done: bool,
+}
+
+impl CoalesceNullRowOp {
+    fn new(input: Box<dyn Operator>, null_vars: Vec<String>) -> Self {
+        Self {
+            input,
+            null_vars,
+            produced_any: false,
+            done: false,
+        }
+    }
+}
+
+impl Operator for CoalesceNullRowOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.done {
+            return Ok(None);
+        }
+        match self.input.next(ctx)? {
+            Some(row) => {
+                self.produced_any = true;
+                Ok(Some(row))
+            }
+            None => {
+                self.done = true;
+                if self.produced_any {
+                    Ok(None)
+                } else {
+                    let mut row = Row::new();
+                    for v in &self.null_vars {
+                        row.insert(v.clone(), Value::Null);
+                    }
+                    Ok(Some(row))
+                }
+            }
+        }
     }
 }
 
