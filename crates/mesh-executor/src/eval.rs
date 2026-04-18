@@ -2787,18 +2787,46 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             {
                 return Ok(Value::Null);
             }
-            // Extract epoch millis from both temporal values
-            let a_nanos = temporal_to_nanos(&a)?;
-            let b_nanos = temporal_to_nanos(&b)?;
-            let diff_nanos = b_nanos - a_nanos;
-            let diff_secs = (diff_nanos / 1_000_000_000) as i64;
-            let remaining_nanos = (diff_nanos % 1_000_000_000) as i32;
-            Ok(Value::Property(Property::Duration(mesh_core::Duration {
-                months: 0,
-                days: 0,
-                seconds: diff_secs,
-                nanos: remaining_nanos,
-            })))
+            // Extract date and time-of-day from both temporal values
+            let (a_date, a_tod) = temporal_to_date_tod(&a)?;
+            let (b_date, b_tod) = temporal_to_date_tod(&b)?;
+            let duration = match name {
+                "duration.inmonths" => {
+                    let months = month_diff(a_date, b_date);
+                    mesh_core::Duration {
+                        months,
+                        days: 0,
+                        seconds: 0,
+                        nanos: 0,
+                    }
+                }
+                "duration.indays" => {
+                    let days = b_date.signed_duration_since(a_date).num_days();
+                    mesh_core::Duration {
+                        months: 0,
+                        days,
+                        seconds: 0,
+                        nanos: 0,
+                    }
+                }
+                "duration.inseconds" => {
+                    let days = b_date.signed_duration_since(a_date).num_days();
+                    let total_nanos = (days as i128) * 86_400_000_000_000 + b_tod - a_tod;
+                    let seconds = (total_nanos / 1_000_000_000) as i64;
+                    let nanos = (total_nanos % 1_000_000_000) as i32;
+                    mesh_core::Duration {
+                        months: 0,
+                        days: 0,
+                        seconds,
+                        nanos,
+                    }
+                }
+                _ => {
+                    // duration.between: compute calendar-aware components
+                    duration_between_calendar(a_date, a_tod, b_date, b_tod)
+                }
+            };
+            Ok(Value::Property(Property::Duration(duration)))
         }
 
         // Current-time namespace functions
@@ -2955,6 +2983,97 @@ fn temporal_date_prop(d: &chrono::NaiveDate, key: &str) -> Result<Value> {
         }
         _ => return Ok(Value::Null),
     })))
+}
+
+/// Extract (date, time-of-day nanoseconds) from any temporal value.
+fn temporal_to_date_tod(v: &Value) -> Result<(chrono::NaiveDate, i128)> {
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    match v {
+        Value::Property(Property::Date(days)) => {
+            Ok((epoch + chrono::Duration::days(*days as i64), 0))
+        }
+        Value::Property(Property::DateTime(ns)) => {
+            let days = ns.div_euclid(86_400_000_000_000);
+            let tod = ns.rem_euclid(86_400_000_000_000);
+            let days_i64 = i64::try_from(days).map_err(|_| Error::TypeMismatch)?;
+            Ok((epoch + chrono::Duration::days(days_i64), tod))
+        }
+        Value::Property(Property::Time { nanos, .. }) => {
+            // Time value has no date, use epoch
+            Ok((epoch, *nanos as i128))
+        }
+        _ => Err(Error::TypeMismatch),
+    }
+}
+
+/// Calculate the month difference between two dates.
+fn month_diff(a: chrono::NaiveDate, b: chrono::NaiveDate) -> i64 {
+    let a_months = a.year() as i64 * 12 + (a.month() as i64 - 1);
+    let b_months = b.year() as i64 * 12 + (b.month() as i64 - 1);
+    let mut diff = b_months - a_months;
+    // Adjust for day-of-month not reached
+    if diff > 0 && b.day() < a.day() {
+        diff -= 1;
+    } else if diff < 0 && b.day() > a.day() {
+        diff += 1;
+    }
+    diff
+}
+
+/// Compute a calendar-aware duration between two temporal points
+/// (date + time-of-day nanoseconds). Matches Neo4j's duration.between
+/// semantics.
+fn duration_between_calendar(
+    a_date: chrono::NaiveDate,
+    a_tod: i128,
+    b_date: chrono::NaiveDate,
+    b_tod: i128,
+) -> mesh_core::Duration {
+    // Compute years/months/days first, then time difference
+    let mut months = month_diff(a_date, b_date);
+    // Compute the reference date after applying months
+    let after_months = add_months_to_date(a_date, months);
+    let mut days = b_date.signed_duration_since(after_months).num_days();
+
+    // Now compute time difference
+    let mut tod_diff = b_tod - a_tod;
+    // If tod_diff is negative and days > 0, borrow a day
+    if tod_diff < 0 && days > 0 {
+        days -= 1;
+        tod_diff += 86_400_000_000_000;
+    } else if tod_diff > 0 && days < 0 {
+        days += 1;
+        tod_diff -= 86_400_000_000_000;
+    }
+
+    // If months and days have opposite signs, adjust
+    if months > 0 && days < 0 {
+        months -= 1;
+        let after_months = add_months_to_date(a_date, months);
+        days = b_date.signed_duration_since(after_months).num_days();
+        if tod_diff < 0 && days > 0 {
+            days -= 1;
+            tod_diff += 86_400_000_000_000;
+        }
+    } else if months < 0 && days > 0 {
+        months += 1;
+        let after_months = add_months_to_date(a_date, months);
+        days = b_date.signed_duration_since(after_months).num_days();
+        if tod_diff > 0 && days < 0 {
+            days += 1;
+            tod_diff -= 86_400_000_000_000;
+        }
+    }
+
+    let seconds = (tod_diff / 1_000_000_000) as i64;
+    let nanos = (tod_diff % 1_000_000_000) as i32;
+
+    mesh_core::Duration {
+        months,
+        days,
+        seconds,
+        nanos,
+    }
 }
 
 fn temporal_to_nanos(v: &Value) -> Result<i128> {

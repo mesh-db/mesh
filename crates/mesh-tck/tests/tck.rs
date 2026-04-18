@@ -391,6 +391,72 @@ fn split_kv(s: &str) -> Option<(String, String)> {
 
 /// Normalize property formatting for comparison: ensure consistent
 /// whitespace around colons in `{key:val}` vs `{key: val}`.
+/// Format a Duration as ISO 8601: [-]P[nY][nM][nD][T[nH][nM][nS]]
+fn format_iso_duration(d: &mesh_core::Duration) -> String {
+    let months = d.months;
+    let days = d.days;
+    let seconds = d.seconds;
+    let nanos = d.nanos;
+
+    // Split months into years and months
+    let (years, rem_months) = if months.abs() >= 12 {
+        (months / 12, months % 12)
+    } else {
+        (0, months)
+    };
+
+    let mut result = String::from("P");
+    let mut any_date = false;
+    if years != 0 {
+        result.push_str(&format!("{}Y", years));
+        any_date = true;
+    }
+    if rem_months != 0 {
+        result.push_str(&format!("{}M", rem_months));
+        any_date = true;
+    }
+    if days != 0 {
+        result.push_str(&format!("{}D", days));
+        any_date = true;
+    }
+
+    let has_time = seconds != 0 || nanos != 0;
+    if has_time {
+        result.push('T');
+        // Split seconds into hours, minutes, seconds
+        let abs_secs = seconds.abs();
+        let sign = if seconds < 0 || (seconds == 0 && nanos < 0) {
+            "-"
+        } else {
+            ""
+        };
+        let hours = abs_secs / 3600;
+        let minutes = (abs_secs % 3600) / 60;
+        let secs_only = abs_secs % 60;
+        let abs_nanos = nanos.abs();
+        if hours > 0 {
+            result.push_str(&format!("{}{}H", sign, hours));
+        }
+        if minutes > 0 {
+            result.push_str(&format!("{}{}M", sign, minutes));
+        }
+        if secs_only > 0 || abs_nanos > 0 || (hours == 0 && minutes == 0) {
+            if abs_nanos > 0 {
+                // Format nanoseconds as fractional seconds
+                let frac_str = format!("{:09}", abs_nanos);
+                let trimmed = frac_str.trim_end_matches('0');
+                result.push_str(&format!("{}{}.{}S", sign, secs_only, trimmed));
+            } else {
+                result.push_str(&format!("{}{}S", sign, secs_only));
+            }
+        }
+    } else if !any_date {
+        // Zero duration
+        result.push_str("T0S");
+    }
+    result
+}
+
 fn normalize_tck(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
@@ -688,8 +754,8 @@ fn format_property(p: &Property) -> String {
                 format!("{days}")
             }
         }
-        Property::Duration(_) => {
-            format!("{p:?}")
+        Property::Duration(d) => {
+            format!("'{}'", format_iso_duration(d))
         }
         Property::Time { nanos, tz_offset_secs } => {
             let total_secs = nanos / 1_000_000_000;
