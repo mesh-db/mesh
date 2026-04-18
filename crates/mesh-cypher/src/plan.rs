@@ -2006,8 +2006,33 @@ fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarTy
 fn infer_expr_type(expr: &Expr, bound_vars: &HashMap<String, VarType>) -> VarType {
     match expr {
         Expr::Identifier(name) => bound_vars.get(name).copied().unwrap_or(VarType::Node),
-        Expr::Literal(_) | Expr::Parameter(_) => VarType::Scalar,
-        Expr::Call { .. } | Expr::BinaryOp { .. } | Expr::UnaryOp { .. } => VarType::Scalar,
+        // An identifier that came from an earlier Node/Edge/Path
+        // binding produces the same type when projected verbatim.
+        // Everything else — literals, computed values, list /
+        // map literals, property access, function calls — is a
+        // scalar value that can't be re-used as a graph pattern
+        // var in a downstream MATCH.
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::List(_)
+        | Expr::Map(_)
+        | Expr::Property { .. }
+        | Expr::PropertyAccess { .. }
+        | Expr::IndexAccess { .. }
+        | Expr::SliceAccess { .. }
+        | Expr::Case { .. }
+        | Expr::Compare { .. }
+        | Expr::And(_, _)
+        | Expr::Or(_, _)
+        | Expr::Xor(_, _)
+        | Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::HasLabels { .. }
+        | Expr::InList { .. }
+        | Expr::ListComprehension { .. }
+        | Expr::Call { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. } => VarType::Scalar,
         _ => VarType::Node,
     }
 }
