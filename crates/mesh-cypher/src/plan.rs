@@ -1348,11 +1348,11 @@ fn build_create_pattern(
     var_idx: &mut HashMap<String, usize>,
     bound_vars: &HashMap<String, VarType>,
 ) -> Result<()> {
-    let start_idx = add_create_node(nodes, var_idx, bound_vars, &pattern.start);
+    let start_idx = add_create_node(nodes, var_idx, bound_vars, &pattern.start)?;
     let mut prev_idx = start_idx;
 
     for hop in &pattern.hops {
-        let target_idx = add_create_node(nodes, var_idx, bound_vars, &hop.target);
+        let target_idx = add_create_node(nodes, var_idx, bound_vars, &hop.target)?;
 
         if hop.rel.edge_types.len() != 1 {
             return Err(Error::Plan(
@@ -1388,10 +1388,20 @@ fn add_create_node(
     var_idx: &mut HashMap<String, usize>,
     bound_vars: &HashMap<String, VarType>,
     pattern: &NodePattern,
-) -> usize {
+) -> Result<usize> {
     if let Some(name) = &pattern.var {
         if let Some(&idx) = var_idx.get(name) {
-            return idx;
+            // Re-encountering the same variable within the same
+            // CREATE clause: labels/properties on subsequent
+            // occurrences would silently be dropped (or silently
+            // conflict), so reject with VariableAlreadyBound.
+            if !pattern.labels.is_empty() || !pattern.properties.is_empty() {
+                return Err(Error::Plan(format!(
+                    "variable '{}' already defined with a different type",
+                    name
+                )));
+            }
+            return Ok(idx);
         }
     }
     let idx = nodes.len();
@@ -1407,7 +1417,7 @@ fn add_create_node(
     if let Some(name) = &pattern.var {
         var_idx.insert(name.clone(), idx);
     }
-    idx
+    Ok(idx)
 }
 
 fn plan_pattern(
@@ -2377,6 +2387,40 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 bound_vars.insert(lc.alias.clone(), VarType::Scalar);
             }
             ReadingClause::Create(patterns) => {
+                // Reject CREATE on already-bound nodes that attempt
+                // to re-declare labels, properties, or emit a bare
+                // node pattern — openCypher's VariableAlreadyBound
+                // rule. Pure references (as an endpoint of a new
+                // edge with no extra decoration) are still allowed
+                // because that's the canonical way to attach new
+                // edges to an existing node.
+                for pattern in patterns {
+                    if let Some(var) = &pattern.start.var {
+                        if bound_vars.contains_key(var)
+                            && (!pattern.start.labels.is_empty()
+                                || !pattern.start.properties.is_empty()
+                                || pattern.hops.is_empty())
+                        {
+                            return Err(Error::Plan(format!(
+                                "variable '{}' already defined with a different type",
+                                var
+                            )));
+                        }
+                    }
+                    for hop in &pattern.hops {
+                        if let Some(var) = &hop.target.var {
+                            if bound_vars.contains_key(var)
+                                && (!hop.target.labels.is_empty()
+                                    || !hop.target.properties.is_empty())
+                            {
+                                return Err(Error::Plan(format!(
+                                    "variable '{}' already defined with a different type",
+                                    var
+                                )));
+                            }
+                        }
+                    }
+                }
                 let mut nodes: Vec<CreateNodeSpec> = Vec::new();
                 let mut edges: Vec<CreateEdgeSpec> = Vec::new();
                 let mut var_idx: HashMap<String, usize> = HashMap::new();
