@@ -2982,6 +2982,34 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         };
                         Ok(wrap(epoch_nanos, tz_offset))
                     }
+                    // datetime(other_temporal) — project from another
+                    // temporal. Date: promote to midnight of that day.
+                    // LocalDateTime: identity for localdatetime(),
+                    // wrapped with UTC for datetime().
+                    // DateTime: identity for datetime(), strip offset
+                    // for localdatetime().
+                    Value::Property(Property::Date(days)) => {
+                        let ns = (days as i128) * 86_400_000_000_000;
+                        Ok(wrap(ns, Some(0)))
+                    }
+                    Value::Property(Property::LocalDateTime(ns)) => {
+                        Ok(wrap(ns, Some(0)))
+                    }
+                    Value::Property(Property::DateTime {
+                        nanos,
+                        tz_offset_secs,
+                    }) => {
+                        if is_local {
+                            // Strip to local wall-clock nanos.
+                            let local = match tz_offset_secs {
+                                Some(off) => nanos + (off as i128) * 1_000_000_000,
+                                None => nanos,
+                            };
+                            Ok(wrap(local, None))
+                        } else {
+                            Ok(wrap(nanos, tz_offset_secs.or(Some(0))))
+                        }
+                    }
                     _ => Err(Error::TypeMismatch),
                 }
             }
@@ -3015,9 +3043,27 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         let days = target.signed_duration_since(epoch).num_days();
                         Ok(Value::Property(Property::Date(days as i32)))
                     }
-                    // date(datetime_value) - extract date from datetime
-                    Value::Property(Property::DateTime { nanos: ms, .. }) => {
-                        let days = ms.div_euclid(86_400_000_000_000) as i32;
+                    // date(datetime_value) — extract local calendar
+                    // date from a zoned DateTime. Shift by the offset
+                    // so DST boundaries round to the *local* day.
+                    Value::Property(Property::DateTime {
+                        nanos,
+                        tz_offset_secs,
+                    }) => {
+                        let local = match tz_offset_secs {
+                            Some(off) => nanos + (off as i128) * 1_000_000_000,
+                            None => nanos,
+                        };
+                        let days = local.div_euclid(86_400_000_000_000) as i32;
+                        Ok(Value::Property(Property::Date(days)))
+                    }
+                    Value::Property(Property::LocalDateTime(ns)) => {
+                        let days = ns.div_euclid(86_400_000_000_000) as i32;
+                        Ok(Value::Property(Property::Date(days)))
+                    }
+                    // date(date_value) — identity, but keeps the
+                    // existing Property::Date alive.
+                    Value::Property(Property::Date(days)) => {
                         Ok(Value::Property(Property::Date(days)))
                     }
                     _ => Err(Error::TypeMismatch),
@@ -3056,8 +3102,23 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                                         tod = *nanos;
                                         break;
                                     }
-                                    Some(Property::DateTime { nanos: ns, .. })
-                                    | Some(Property::LocalDateTime(ns)) => {
+                                    Some(Property::DateTime {
+                                        nanos: ns,
+                                        tz_offset_secs,
+                                    }) => {
+                                        // DateTime's nanos are UTC; the
+                                        // "base time-of-day" we inherit
+                                        // is the *local* wall-clock tod.
+                                        let local = match tz_offset_secs {
+                                            Some(off) => {
+                                                *ns + (*off as i128) * 1_000_000_000
+                                            }
+                                            None => *ns,
+                                        };
+                                        tod = local.rem_euclid(86_400_000_000_000) as i64;
+                                        break;
+                                    }
+                                    Some(Property::LocalDateTime(ns)) => {
                                         tod = ns.rem_euclid(86_400_000_000_000) as i64;
                                         break;
                                     }
@@ -3095,15 +3156,62 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         let time_nanos =
                             hour * 3_600_000_000_000 + minute * 60_000_000_000
                             + second * 1_000_000_000 + nanos;
-                        // Timezone offset from map
+                        // Timezone: explicit `timezone:` in the map
+                        // wins. If absent, inherit from the base
+                        // temporal value (time() / datetime() under
+                        // any key). Otherwise default to UTC for
+                        // time(), or None for localtime().
                         let tz_offset = if is_tz {
-                            if let Some(Property::String(tz)) = m.get("timezone") {
-                                parse_tz_offset(tz).or(Some(0))
-                            } else {
-                                Some(0)
-                            }
+                            extract_tz_offset(&m).or(Some(0))
                         } else {
                             None
+                        };
+                        // If the map supplies a timezone override
+                        // but carries a zoned base value, Neo4j
+                        // *rotates* the time to the new zone — the
+                        // wall-clock shifts by (new - old) offset so
+                        // the same instant is represented.
+                        let time_nanos = if is_tz {
+                            if let Some(Property::String(_)) = m.get("timezone") {
+                                let base_tz: Option<i32> = {
+                                    let mut tz = None;
+                                    for key in ["time", "datetime"] {
+                                        match m.get(key) {
+                                            Some(Property::Time {
+                                                tz_offset_secs: Some(o),
+                                                ..
+                                            }) => {
+                                                tz = Some(*o);
+                                                break;
+                                            }
+                                            Some(Property::DateTime {
+                                                tz_offset_secs: Some(o),
+                                                ..
+                                            }) => {
+                                                tz = Some(*o);
+                                                break;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    tz
+                                };
+                                match (base_tz, tz_offset) {
+                                    (Some(old), Some(new)) => {
+                                        let diff = (new - old) as i64;
+                                        let mut out =
+                                            time_nanos + diff * 1_000_000_000;
+                                        let day = 86_400_000_000_000_i64;
+                                        out = ((out % day) + day) % day;
+                                        out
+                                    }
+                                    _ => time_nanos,
+                                }
+                            } else {
+                                time_nanos
+                            }
+                        } else {
+                            time_nanos
                         };
                         Ok(Value::Property(Property::Time {
                             nanos: time_nanos,
@@ -3115,6 +3223,47 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         Ok(Value::Property(Property::Time {
                             nanos: time_nanos,
                             tz_offset_secs: if is_tz { Some(tz.unwrap_or(0)) } else { None },
+                        }))
+                    }
+                    // Project the time-of-day out of another temporal
+                    // value. For zoned sources (DateTime, zoned Time)
+                    // the nanos are UTC; shift by the offset so the
+                    // resulting local time of day matches the source's
+                    // local wall-clock.
+                    Value::Property(Property::Time {
+                        nanos,
+                        tz_offset_secs,
+                    }) => Ok(Value::Property(Property::Time {
+                        nanos,
+                        tz_offset_secs: if is_tz {
+                            Some(tz_offset_secs.unwrap_or(0))
+                        } else {
+                            None
+                        },
+                    })),
+                    Value::Property(Property::LocalDateTime(ns)) => {
+                        let tod = ns.rem_euclid(86_400_000_000_000) as i64;
+                        Ok(Value::Property(Property::Time {
+                            nanos: tod,
+                            tz_offset_secs: if is_tz { Some(0) } else { None },
+                        }))
+                    }
+                    Value::Property(Property::DateTime {
+                        nanos,
+                        tz_offset_secs,
+                    }) => {
+                        let local = match tz_offset_secs {
+                            Some(off) => nanos + (off as i128) * 1_000_000_000,
+                            None => nanos,
+                        };
+                        let tod = local.rem_euclid(86_400_000_000_000) as i64;
+                        Ok(Value::Property(Property::Time {
+                            nanos: tod,
+                            tz_offset_secs: if is_tz {
+                                Some(tz_offset_secs.unwrap_or(0))
+                            } else {
+                                None
+                            },
                         }))
                     }
                     _ => Err(Error::TypeMismatch),
@@ -3420,7 +3569,23 @@ fn extract_base_date(
             Some(Property::Date(d)) => {
                 return Some(*epoch + chrono::Duration::days(*d as i64));
             }
-            Some(Property::DateTime { nanos: ns, .. }) | Some(Property::LocalDateTime(ns)) => {
+            Some(Property::DateTime {
+                nanos: ns,
+                tz_offset_secs,
+            }) => {
+                // Use the *local* day for the base, matching the
+                // Neo4j behavior where date() / datetime() work in
+                // the zone the source DateTime was authored in.
+                let local = match tz_offset_secs {
+                    Some(off) => *ns + (*off as i128) * 1_000_000_000,
+                    None => *ns,
+                };
+                let days = local.div_euclid(86_400_000_000_000);
+                if let Ok(d) = i64::try_from(days) {
+                    return Some(*epoch + chrono::Duration::days(d));
+                }
+            }
+            Some(Property::LocalDateTime(ns)) => {
                 let days = ns.div_euclid(86_400_000_000_000);
                 if let Ok(d) = i64::try_from(days) {
                     return Some(*epoch + chrono::Duration::days(d));
@@ -3475,7 +3640,30 @@ fn extract_base_date_tod(
                     base_date = Some(*epoch + chrono::Duration::days(*d as i64));
                 }
             }
-            Some(Property::DateTime { nanos: ns, .. }) | Some(Property::LocalDateTime(ns)) => {
+            Some(Property::DateTime {
+                nanos: ns,
+                tz_offset_secs,
+            }) => {
+                // DateTime stores UTC nanos but the TCK feeds it into
+                // datetime()/date() maps expecting the *local* date
+                // and time-of-day as the "base". Shift by the offset
+                // before splitting.
+                let local = match tz_offset_secs {
+                    Some(off) => *ns + (*off as i128) * 1_000_000_000,
+                    None => *ns,
+                };
+                let days = local.div_euclid(86_400_000_000_000);
+                let tod = local.rem_euclid(86_400_000_000_000);
+                if let Ok(d) = i64::try_from(days) {
+                    if base_date.is_none() {
+                        base_date = Some(*epoch + chrono::Duration::days(d));
+                    }
+                    if base_tod == 0 {
+                        base_tod = tod;
+                    }
+                }
+            }
+            Some(Property::LocalDateTime(ns)) => {
                 let days = ns.div_euclid(86_400_000_000_000);
                 let tod = ns.rem_euclid(86_400_000_000_000);
                 if let Ok(d) = i64::try_from(days) {
