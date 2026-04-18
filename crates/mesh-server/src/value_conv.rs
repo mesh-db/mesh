@@ -165,7 +165,7 @@ fn property_to_bolt(p: &Property) -> BoltValue {
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             BoltValue::Map(pairs)
         }
-        Property::DateTime(nanos) => datetime_to_bolt(*nanos),
+        Property::DateTime(nanos) | Property::LocalDateTime(nanos) => datetime_to_bolt(*nanos),
         Property::Date(days) => BoltValue::Struct {
             tag: TAG_DATE,
             fields: vec![BoltValue::Int(*days as i64)],

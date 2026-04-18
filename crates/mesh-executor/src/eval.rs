@@ -87,7 +87,8 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     let d = epoch + chrono::Duration::days(*days as i64);
                     temporal_date_prop(&d, key)
                 }
-                Value::Property(Property::DateTime(ms)) => {
+                Value::Property(Property::DateTime(ms))
+                | Value::Property(Property::LocalDateTime(ms)) => {
                     let (secs, nsec) = nanos_to_secs_nanos(*ms);
                     if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
                         let naive = dt.naive_utc();
@@ -2523,14 +2524,23 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         // need to build a specific DateTime from components should
         // send it as a Bolt parameter, which goes through the
         // wire-format path (Bolt LocalDateTime struct).
-        "datetime" | "localdatetime" => match arg_exprs.len() {
-            0 => Ok(Value::Property(Property::DateTime(now_epoch_nanos()))),
+        "datetime" | "localdatetime" => {
+            let is_local = name == "localdatetime";
+            let wrap = |ns: i128| -> Value {
+                if is_local {
+                    Value::Property(Property::LocalDateTime(ns))
+                } else {
+                    Value::Property(Property::DateTime(ns))
+                }
+            };
+            match arg_exprs.len() {
+            0 => Ok(wrap(now_epoch_nanos())),
             1 => {
                 let v = eval_expr(&arg_exprs[0], ctx)?;
                 match v {
                     Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                     Value::Property(Property::String(s)) => {
-                        Ok(Value::Property(Property::DateTime(parse_datetime(&s)?)))
+                        Ok(wrap(parse_datetime(&s)?))
                     }
                     Value::Property(Property::Map(m)) => {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
@@ -2564,7 +2574,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                             + (minute as i128) * 60_000_000_000
                             + (second as i128) * 1_000_000_000
                             + (nanos as i128);
-                        Ok(Value::Property(Property::DateTime(epoch_nanos)))
+                        Ok(wrap(epoch_nanos))
                     }
                     _ => Err(Error::TypeMismatch),
                 }
@@ -2572,7 +2582,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             _ => Err(Error::UnknownScalarFunction(
                 "datetime() takes zero or one argument".into(),
             )),
-        },
+        }},
         "date" => match arg_exprs.len() {
             0 => {
                 let days = now_epoch_nanos().div_euclid(86_400_000_000_000);
@@ -2819,9 +2829,11 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         }
 
         // Current-time namespace functions
-        "datetime.transaction" | "datetime.statement" | "datetime.realtime"
-        | "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
+        "datetime.transaction" | "datetime.statement" | "datetime.realtime" => {
             Ok(Value::Property(Property::DateTime(now_epoch_nanos())))
+        }
+        "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
+            Ok(Value::Property(Property::LocalDateTime(now_epoch_nanos())))
         }
         "date.transaction" | "date.statement" | "date.realtime" => {
             let days = now_epoch_nanos().div_euclid(86_400_000_000_000);
@@ -2894,7 +2906,7 @@ fn extract_base_date(
             Some(Property::Date(d)) => {
                 return Some(*epoch + chrono::Duration::days(*d as i64));
             }
-            Some(Property::DateTime(ns)) => {
+            Some(Property::DateTime(ns)) | Some(Property::LocalDateTime(ns)) => {
                 let days = ns.div_euclid(86_400_000_000_000);
                 if let Ok(d) = i64::try_from(days) {
                     return Some(*epoch + chrono::Duration::days(d));
@@ -2916,7 +2928,7 @@ fn extract_base_date_tod(
             Some(Property::Date(d)) => {
                 return (Some(*epoch + chrono::Duration::days(*d as i64)), 0);
             }
-            Some(Property::DateTime(ns)) => {
+            Some(Property::DateTime(ns)) | Some(Property::LocalDateTime(ns)) => {
                 let days = ns.div_euclid(86_400_000_000_000);
                 let tod = ns.rem_euclid(86_400_000_000_000);
                 if let Ok(d) = i64::try_from(days) {
@@ -3119,7 +3131,8 @@ fn duration_between_calendar(
 
 fn temporal_to_nanos(v: &Value) -> Result<i128> {
     match v {
-        Value::Property(Property::DateTime(ms)) => Ok(*ms),
+        Value::Property(Property::DateTime(ns))
+        | Value::Property(Property::LocalDateTime(ns)) => Ok(*ns),
         Value::Property(Property::Date(days)) => Ok(*days as i128 * 86_400_000_000_000),
         _ => Err(Error::TypeMismatch),
     }
@@ -3133,9 +3146,12 @@ fn truncate_temporal(
     overrides: Option<&std::collections::HashMap<String, Property>>,
 ) -> Result<Value> {
     match temporal {
-        Value::Property(Property::DateTime(_)) | Value::Property(Property::Date(_)) => {
+        Value::Property(Property::DateTime(_))
+        | Value::Property(Property::LocalDateTime(_))
+        | Value::Property(Property::Date(_)) => {
             let epoch_ns: i128 = match temporal {
-                Value::Property(Property::DateTime(ns)) => *ns,
+                Value::Property(Property::DateTime(ns))
+                | Value::Property(Property::LocalDateTime(ns)) => *ns,
                 Value::Property(Property::Date(days)) => *days as i128 * 86_400_000_000_000,
                 _ => unreachable!(),
             };
@@ -3264,6 +3280,8 @@ fn truncate_temporal(
             if name.starts_with("date.") {
                 let days = diff.num_days() as i32;
                 Ok(Value::Property(Property::Date(days)))
+            } else if name.starts_with("localdatetime.") {
+                Ok(Value::Property(Property::LocalDateTime(result_nanos)))
             } else {
                 Ok(Value::Property(Property::DateTime(result_nanos)))
             }
@@ -3326,6 +3344,10 @@ fn value_to_string(v: Value) -> Value {
             Value::Property(Property::String(d.format("%Y-%m-%d").to_string()))
         }
         Value::Property(Property::DateTime(ns)) => {
+            // DateTime has UTC timezone — append Z
+            Value::Property(Property::String(format!("{}Z", format_datetime_string(ns))))
+        }
+        Value::Property(Property::LocalDateTime(ns)) => {
             Value::Property(Property::String(format_datetime_string(ns)))
         }
         Value::Property(Property::Time {
@@ -3514,8 +3536,8 @@ fn type_order_prop(p: &Property) -> u8 {
         Property::String(_) => 6,
         Property::Bool(_) => 7,
         Property::Int64(_) | Property::Float64(_) => 8,
-        Property::Date(_) | Property::DateTime(_) | Property::Duration(_)
-        | Property::Time { .. } => 9,
+        Property::Date(_) | Property::DateTime(_) | Property::LocalDateTime(_)
+        | Property::Duration(_) | Property::Time { .. } => 9,
         Property::Null => 10,
     }
 }
@@ -3531,8 +3553,8 @@ fn type_order_value(v: &Value) -> u8 {
         Value::Property(Property::Bool(_)) => 7,
         Value::Property(Property::Int64(_) | Property::Float64(_)) => 8,
         Value::Property(
-            Property::Date(_) | Property::DateTime(_) | Property::Duration(_)
-            | Property::Time { .. },
+            Property::Date(_) | Property::DateTime(_) | Property::LocalDateTime(_)
+            | Property::Duration(_) | Property::Time { .. },
         ) => 9,
         Value::Null | Value::Property(Property::Null) => 10,
     }
@@ -3569,6 +3591,7 @@ pub(crate) fn value_key(v: &Value) -> String {
             out
         }
         Value::Property(Property::DateTime(ns)) => format!("dt:{}", ns),
+        Value::Property(Property::LocalDateTime(ns)) => format!("ldt:{}", ns),
         Value::Property(Property::Date(days)) => format!("d:{}", days),
         Value::Property(Property::Duration(d)) => {
             format!("dur:{},{},{},{}", d.months, d.days, d.seconds, d.nanos)

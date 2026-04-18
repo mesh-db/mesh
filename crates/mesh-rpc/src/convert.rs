@@ -43,6 +43,7 @@ pub fn property_to_proto(p: &Property) -> Result<proto::Property, ConvertError> 
         Property::List(_)
         | Property::Map(_)
         | Property::DateTime(_)
+        | Property::LocalDateTime(_)
         | Property::Date(_)
         | Property::Duration(_)
         | Property::Time { .. } => return Err(ConvertError::UnsupportedProperty),

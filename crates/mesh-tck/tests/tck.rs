@@ -391,6 +391,29 @@ fn split_kv(s: &str) -> Option<(String, String)> {
 
 /// Normalize property formatting for comparison: ensure consistent
 /// whitespace around colons in `{key:val}` vs `{key: val}`.
+/// Format datetime nanoseconds as "YYYY-MM-DDTHH:MM[:SS[.nnnn]]"
+/// without timezone suffix. Caller adds the suffix.
+fn format_datetime_body(epoch_nanos: i128) -> String {
+    let days = epoch_nanos.div_euclid(86_400_000_000_000);
+    let tod_ns = epoch_nanos.rem_euclid(86_400_000_000_000);
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let date = epoch + chrono::Duration::days(days as i64);
+    let h = (tod_ns / 3_600_000_000_000) as u32;
+    let m = ((tod_ns % 3_600_000_000_000) / 60_000_000_000) as u32;
+    let s = ((tod_ns % 60_000_000_000) / 1_000_000_000) as u32;
+    let ns = (tod_ns % 1_000_000_000) as u32;
+    let date_str = date.format("%Y-%m-%d").to_string();
+    if ns > 0 {
+        let frac = format!("{:09}", ns);
+        let trimmed = frac.trim_end_matches('0');
+        format!("{date_str}T{h:02}:{m:02}:{s:02}.{trimmed}")
+    } else if s > 0 {
+        format!("{date_str}T{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{date_str}T{h:02}:{m:02}")
+    }
+}
+
 /// Format a Duration as ISO 8601: [-]P[nY][nM][nD][T[nH][nM][nS]]
 fn format_iso_duration(d: &mesh_core::Duration) -> String {
     let months = d.months;
@@ -708,37 +731,10 @@ fn format_property(p: &Property) -> String {
             format!("{{{}}}", entries.join(", "))
         }
         Property::DateTime(epoch_nanos) => {
-            let secs = (epoch_nanos / 1_000_000_000) as i64;
-            let nanos = (epoch_nanos % 1_000_000_000) as u32;
-            if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
-                let naive = dt.naive_utc();
-                let time_part = naive.time();
-                if time_part.nanosecond() > 0 {
-                    // Include fractional seconds
-                    let frac = time_part.nanosecond();
-                    let frac_str = format!("{:09}", frac);
-                    let trimmed = frac_str.trim_end_matches('0');
-                    format!(
-                        "'{}'",
-                        format!(
-                            "{}T{}:{:02}:{:02}.{}",
-                            naive.date().format("%Y-%m-%d"),
-                            time_part.hour(),
-                            time_part.minute(),
-                            time_part.second(),
-                            trimmed
-                        )
-                    )
-                } else if time_part.second() > 0 {
-                    format!("'{}'", naive.format("%Y-%m-%dT%H:%M:%S"))
-                } else if time_part.hour() > 0 || time_part.minute() > 0 {
-                    format!("'{}'", naive.format("%Y-%m-%dT%H:%M"))
-                } else {
-                    format!("'{}'", naive.format("%Y-%m-%dT%H:%M"))
-                }
-            } else {
-                format!("{epoch_nanos}")
-            }
+            format!("'{}Z'", format_datetime_body(*epoch_nanos))
+        }
+        Property::LocalDateTime(epoch_nanos) => {
+            format!("'{}'", format_datetime_body(*epoch_nanos))
         }
         Property::Date(days) => {
             if let Some(d) = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)

@@ -25,12 +25,12 @@ pub enum Property {
     Bool(bool),
     List(Vec<Property>),
     Map(HashMap<String, Property>),
-    /// UTC epoch **nanoseconds**. Stored as `i128` so we can
-    /// represent the full openCypher temporal range (years 1 to
-    /// 9999) at nanosecond precision — `i64` nanoseconds only
-    /// cover roughly ±292 years from 1970. Maps to Bolt's
-    /// `DateTime` (struct tag `0x49`) on the wire.
+    /// UTC epoch **nanoseconds**. Always represents a timezone-aware
+    /// datetime. Formatters append 'Z' or an offset.
     DateTime(i128),
+    /// Local (naive) datetime as epoch nanoseconds.
+    /// Formatters omit any timezone suffix.
+    LocalDateTime(i128),
     /// Days since the UNIX epoch (1970-01-01, UTC). `i32` gives
     /// ±5.9 million years of range — far more than any realistic
     /// calendar application. Maps to Bolt `Date` (struct tag
@@ -59,6 +59,7 @@ impl Property {
             Property::List(_) => "List",
             Property::Map(_) => "Map",
             Property::DateTime(_) => "DateTime",
+            Property::LocalDateTime(_) => "LocalDateTime",
             Property::Date(_) => "Date",
             Property::Duration(_) => "Duration",
             Property::Time { .. } => "Time",

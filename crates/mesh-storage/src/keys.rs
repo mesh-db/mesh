@@ -146,7 +146,7 @@ pub(crate) fn encode_index_value(value: &Property) -> Option<Vec<u8>> {
         // how Neo4j treats `Duration` in schema indexes.
         Property::Duration(_) => None,
         Property::Float64(_) | Property::List(_) | Property::Map(_) | Property::Null
-        | Property::Time { .. } => None,
+        | Property::Time { .. } | Property::LocalDateTime(_) => None,
     }
 }
 
