@@ -3066,6 +3066,78 @@ fn extract_nested_aggregates(
                 args: new_args,
             }
         }
+        Expr::Not(inner) => Expr::Not(Box::new(extract_nested_aggregates(inner, out, idx))),
+        Expr::And(a, b) => Expr::And(
+            Box::new(extract_nested_aggregates(a, out, idx)),
+            Box::new(extract_nested_aggregates(b, out, idx)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(extract_nested_aggregates(a, out, idx)),
+            Box::new(extract_nested_aggregates(b, out, idx)),
+        ),
+        Expr::Xor(a, b) => Expr::Xor(
+            Box::new(extract_nested_aggregates(a, out, idx)),
+            Box::new(extract_nested_aggregates(b, out, idx)),
+        ),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: Box::new(extract_nested_aggregates(left, out, idx)),
+            right: Box::new(extract_nested_aggregates(right, out, idx)),
+        },
+        Expr::IsNull { negated, inner } => Expr::IsNull {
+            negated: *negated,
+            inner: Box::new(extract_nested_aggregates(inner, out, idx)),
+        },
+        Expr::PropertyAccess { base, key } => Expr::PropertyAccess {
+            base: Box::new(extract_nested_aggregates(base, out, idx)),
+            key: key.clone(),
+        },
+        Expr::IndexAccess { base, index } => Expr::IndexAccess {
+            base: Box::new(extract_nested_aggregates(base, out, idx)),
+            index: Box::new(extract_nested_aggregates(index, out, idx)),
+        },
+        Expr::SliceAccess { base, start, end } => Expr::SliceAccess {
+            base: Box::new(extract_nested_aggregates(base, out, idx)),
+            start: start
+                .as_deref()
+                .map(|e| Box::new(extract_nested_aggregates(e, out, idx))),
+            end: end
+                .as_deref()
+                .map(|e| Box::new(extract_nested_aggregates(e, out, idx))),
+        },
+        Expr::List(items) => Expr::List(
+            items
+                .iter()
+                .map(|e| extract_nested_aggregates(e, out, idx))
+                .collect(),
+        ),
+        Expr::Map(entries) => Expr::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), extract_nested_aggregates(v, out, idx)))
+                .collect(),
+        ),
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => Expr::Case {
+            scrutinee: scrutinee
+                .as_deref()
+                .map(|s| Box::new(extract_nested_aggregates(s, out, idx))),
+            branches: branches
+                .iter()
+                .map(|(c, r)| {
+                    (
+                        extract_nested_aggregates(c, out, idx),
+                        extract_nested_aggregates(r, out, idx),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_deref()
+                .map(|e| Box::new(extract_nested_aggregates(e, out, idx))),
+        },
         other => other.clone(),
     }
 }
@@ -3109,6 +3181,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
                     .unwrap_or(false)
         }
         Expr::List(items) => items.iter().any(contains_aggregate),
+        Expr::Map(entries) => entries.iter().any(|(_, v)| contains_aggregate(v)),
         Expr::ListComprehension {
             source,
             predicate,
