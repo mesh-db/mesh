@@ -1369,6 +1369,13 @@ fn build_create_pattern(
     let mut prev_idx = start_idx;
 
     for hop in &pattern.hops {
+        // openCypher: CREATE requires each relationship to be a
+        // single, directed, non-variable-length hop.
+        if hop.rel.var_length.is_some() {
+            return Err(Error::Plan(
+                "CREATE does not support variable-length relationships".into(),
+            ));
+        }
         let target_idx = add_create_node(nodes, var_idx, bound_vars, &hop.target)?;
 
         if hop.rel.edge_types.len() != 1 {
