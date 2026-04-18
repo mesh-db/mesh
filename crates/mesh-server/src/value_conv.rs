@@ -165,19 +165,20 @@ fn property_to_bolt(p: &Property) -> BoltValue {
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             BoltValue::Map(pairs)
         }
-        Property::DateTime(nanos) => {
-            // DateTime = UTC-aware: Bolt 5 DateTime (tag 0x49) with
-            // offset 0 ("Z"). Drivers that negotiated Bolt 4.4 will
-            // also accept this tag — the encoding is wire-compatible
-            // at the PackStream layer.
+        Property::DateTime { nanos, tz_offset_secs } => {
+            // Bolt 5 DateTime (tag 0x49): [seconds, nanos, tz_offset_secs].
+            // The offset rides on the wire so drivers can reconstruct
+            // the original presentation zone. We default to 0 ("Z")
+            // when the value was parsed without an explicit offset.
             let seconds = nanos.div_euclid(1_000_000_000) as i64;
             let subsec = nanos.rem_euclid(1_000_000_000) as i64;
+            let offset = tz_offset_secs.unwrap_or(0) as i64;
             BoltValue::Struct {
                 tag: mesh_bolt::TAG_DATE_TIME,
                 fields: vec![
                     BoltValue::Int(seconds),
                     BoltValue::Int(subsec),
-                    BoltValue::Int(0),
+                    BoltValue::Int(offset),
                 ],
             }
         }
@@ -409,10 +410,13 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             }
             let seconds = temporal_int(fields, 0, tag, "DateTime seconds")?;
             let nanos = temporal_int(fields, 1, tag, "DateTime nanos")?;
-            let _tz_offset = temporal_int(fields, 2, tag, "DateTime tz_offset")?;
+            let tz_offset = temporal_int(fields, 2, tag, "DateTime tz_offset")?;
             let epoch_nanos: i128 =
                 (seconds as i128) * 1_000_000_000 + (nanos as i128);
-            Ok(Property::DateTime(epoch_nanos))
+            Ok(Property::DateTime {
+                nanos: epoch_nanos,
+                tz_offset_secs: Some(tz_offset as i32),
+            })
         }
         mesh_bolt::TAG_DATE_TIME_ZONE_ID | mesh_bolt::TAG_DATE_TIME_ZONE_ID_LEGACY => {
             // Zoned DateTime with named timezone (e.g. "Europe/Stockholm").
@@ -427,7 +431,10 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             let nanos = temporal_int(fields, 1, tag, "DateTimeZoneId nanos")?;
             let epoch_nanos: i128 =
                 (seconds as i128) * 1_000_000_000 + (nanos as i128);
-            Ok(Property::DateTime(epoch_nanos))
+            Ok(Property::DateTime {
+                nanos: epoch_nanos,
+                tz_offset_secs: None,
+            })
         }
         mesh_bolt::TAG_LOCAL_TIME => {
             if fields.len() != 1 {

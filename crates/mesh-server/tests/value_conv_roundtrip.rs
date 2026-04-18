@@ -44,7 +44,7 @@ fn roundtrip_property(p: Property) -> Property {
 #[test]
 fn datetime_roundtrip_preserves_epoch_millis() {
     // 2025-01-01T00:00:00Z = 1_735_689_600_000 ms since epoch
-    let input = Property::DateTime(1_735_689_600_000);
+    let input = Property::DateTime { nanos: 1_735_689_600_000, tz_offset_secs: Some(0) };
     let out = roundtrip_property(input.clone());
     assert_eq!(out, input);
 }
@@ -53,7 +53,7 @@ fn datetime_roundtrip_preserves_epoch_millis() {
 fn datetime_roundtrip_with_sub_second_fraction() {
     // Ensure the millisecond granularity survives the
     // seconds/nanos split the Bolt LocalDateTime struct uses.
-    let input = Property::DateTime(1_735_689_600_123);
+    let input = Property::DateTime { nanos: 1_735_689_600_123, tz_offset_secs: Some(0) };
     let out = roundtrip_property(input.clone());
     assert_eq!(out, input);
 }
@@ -64,7 +64,7 @@ fn datetime_roundtrip_pre_epoch() {
     // correctly — div_euclid/rem_euclid on negative `ms` should
     // land at the right seconds+nanos pair rather than drifting
     // by one whole second.
-    let input = Property::DateTime(-315_619_200_000); // 1960-01-01
+    let input = Property::DateTime { nanos: -315_619_200_000, tz_offset_secs: Some(0) }; // 1960-01-01
     let out = roundtrip_property(input.clone());
     assert_eq!(out, input);
 }
@@ -255,7 +255,7 @@ fn path_with_repeated_node_dedupes_in_wire() {
 
 #[test]
 fn datetime_emits_local_date_time_tag() {
-    let input = Property::DateTime(1_735_689_600_000);
+    let input = Property::DateTime { nanos: 1_735_689_600_000, tz_offset_secs: Some(0) };
     let mut row = Row::new();
     row.insert("v".into(), Value::Property(input));
     let bolt = row_to_bolt_fields(&row, &["v".to_string()]);

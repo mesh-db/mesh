@@ -87,7 +87,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     let d = epoch + chrono::Duration::days(*days as i64);
                     temporal_date_prop(&d, key)
                 }
-                Value::Property(Property::DateTime(ms))
+                Value::Property(Property::DateTime { nanos: ms, .. })
                 | Value::Property(Property::LocalDateTime(ms)) => {
                     let (secs, nsec) = nanos_to_secs_nanos(*ms);
                     if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
@@ -168,7 +168,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     let d = epoch + chrono::Duration::days(days as i64);
                     temporal_date_prop(&d, key)
                 }
-                Value::Property(Property::DateTime(ms)) => {
+                Value::Property(Property::DateTime { nanos: ms, .. }) => {
                     let (secs, nsec) = nanos_to_secs_nanos(ms);
                     if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
                         let naive = dt.naive_utc();
@@ -1431,7 +1431,13 @@ fn nanos_to_secs_nanos(epoch_nanos: i128) -> (i64, u32) {
 /// millisecond precision is truncated toward zero since our
 /// on-the-wire DateTime is millis-resolution.
 fn parse_datetime(s: &str) -> Result<i128> {
-    use chrono::{DateTime, FixedOffset, NaiveDateTime};
+    parse_datetime_with_tz(s).map(|(ns, _)| ns)
+}
+
+/// Like `parse_datetime` but also returns the parsed timezone offset
+/// in seconds (or `None` if the string was naive / UTC-without-Z).
+fn parse_datetime_with_tz(s: &str) -> Result<(i128, Option<i32>)> {
+    use chrono::{DateTime, FixedOffset, NaiveDateTime, Offset};
     let trimmed = s.trim();
     // Strip bracketed timezone names like [Europe/Stockholm]
     let trimmed = if let Some(idx) = trimmed.find('[') {
@@ -1439,13 +1445,16 @@ fn parse_datetime(s: &str) -> Result<i128> {
     } else {
         trimmed
     };
-    // Try RFC 3339 first (fastest path for the canonical form
-    // drivers emit). Chrono's `DateTime::parse_from_rfc3339`
-    // accepts both `Z` and explicit offsets.
+    // Track whether the input carried a timezone marker (Z or explicit
+    // offset). If so, report Some(offset); otherwise None (naive).
+    let has_tz_marker = trimmed.ends_with('Z')
+        || trimmed.rfind(|c: char| c == '+' || c == '-')
+            .map(|i| i > 5)
+            .unwrap_or(false);
     if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(trimmed) {
-        return Ok(datetime_to_nanos(&dt));
+        let offset = dt.offset().fix().local_minus_utc();
+        return Ok((datetime_to_nanos(&dt), Some(offset)));
     }
-    // Try ISO 8601 formats with timezone offsets (with and without colons)
     for fmt in [
         "%Y-%m-%dT%H:%M:%S%.f%:z",
         "%Y-%m-%dT%H:%M:%S%:z",
@@ -1455,13 +1464,10 @@ fn parse_datetime(s: &str) -> Result<i128> {
         "%Y-%m-%dT%H:%M%:z",
     ] {
         if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(trimmed, fmt) {
-            return Ok(datetime_to_nanos(&dt));
+            let offset = dt.offset().fix().local_minus_utc();
+            return Ok((datetime_to_nanos(&dt), Some(offset)));
         }
     }
-    // Fall back to a few naive forms. Each is interpreted as
-    // UTC. Formats are tried in descending specificity so a
-    // string with a sub-second component doesn't get truncated
-    // by a coarser format.
     for fmt in [
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%dT%H:%M:%S",
@@ -1470,7 +1476,26 @@ fn parse_datetime(s: &str) -> Result<i128> {
         "%Y-%m-%d %H:%M:%S",
     ] {
         if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
-            return Ok(datetime_to_nanos(&ndt.and_utc()));
+            let tz = if has_tz_marker { Some(0) } else { None };
+            return Ok((datetime_to_nanos(&ndt.and_utc()), tz));
+        }
+    }
+    // Fallback: split at 'T' and use our flexible date/time parsers.
+    // This covers forms chrono can't: compact basic ISO dates
+    // (`YYYYMMDD`), week dates (`YYYY-Www-D`), ordinal dates
+    // (`YYYY-DDD`), and compact times (`HHMMSS`), each with or
+    // without a tz suffix.
+    if let Some((date_part, time_part)) = trimmed.split_once('T') {
+        if let Some(date) = parse_iso_date(date_part) {
+            let (tod_nanos, tz) = parse_time_string_with_tz(time_part)?;
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let days = date.signed_duration_since(epoch).num_days() as i128;
+            let local_nanos = days * 86_400_000_000_000 + tod_nanos as i128;
+            let nanos = match tz {
+                Some(off) => local_nanos - (off as i128) * 1_000_000_000,
+                None => local_nanos,
+            };
+            return Ok((nanos, tz));
         }
     }
     Err(Error::UnknownScalarFunction(format!(
@@ -1491,8 +1516,8 @@ fn datetime_to_nanos<Tz: chrono::TimeZone>(dt: &chrono::DateTime<Tz>) -> i128 {
 fn parse_date(s: &str) -> Result<i32> {
     use chrono::NaiveDate;
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid calendar date");
-    let parsed = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").map_err(|_| {
-        Error::UnknownScalarFunction(format!("date() could not parse {s:?} as YYYY-MM-DD"))
+    let parsed = parse_iso_date(s.trim()).ok_or_else(|| {
+        Error::UnknownScalarFunction(format!("date() could not parse {s:?} as ISO 8601 date"))
     })?;
     let days = parsed.signed_duration_since(epoch).num_days();
     i32::try_from(days).map_err(|_| {
@@ -1500,6 +1525,78 @@ fn parse_date(s: &str) -> Result<i32> {
             "date() {s:?} is outside the representable i32 day range"
         ))
     })
+}
+
+/// Parse an ISO 8601 date in any supported form:
+///   YYYY-MM-DD, YYYYMMDD, YYYY-MM, YYYYMM, YYYY,
+///   YYYY-Www-D, YYYYWwwD, YYYY-Www, YYYYWww,
+///   YYYY-DDD, YYYYDDD.
+/// Missing components default to the first valid unit (Jan, day 1, week 1).
+fn parse_iso_date(s: &str) -> Option<chrono::NaiveDate> {
+    use chrono::NaiveDate;
+    // Strip sign/year. ISO allows ±YYYYY for extended years; stick to 4-digit for now.
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 || !bytes[..4].iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // ISO 8601 only permits ASCII digits, '-', and 'W' in the body
+    // of a date. Reject anything else so alternative separators
+    // (e.g. `YYYY/MM/DD`) fail rather than get quietly parsed.
+    if s[4..]
+        .chars()
+        .any(|c| !(c.is_ascii_digit() || c == '-' || c == 'W'))
+    {
+        return None;
+    }
+    let year: i32 = s[..4].parse().ok()?;
+    let rest = &s[4..];
+    // Year only
+    if rest.is_empty() {
+        return NaiveDate::from_ymd_opt(year, 1, 1);
+    }
+    // Week date: '-Www-D' | '-Www' | 'WwwD' | 'Www'
+    if let Some(w) = rest.strip_prefix("-W").or_else(|| rest.strip_prefix('W')) {
+        let digits: String = w.chars().filter(|c| c.is_ascii_digit()).collect();
+        let week: u32 = digits.get(..2)?.parse().ok()?;
+        let dow: u32 = match digits.len() {
+            2 => 1,
+            3 => digits[2..3].parse().ok()?,
+            _ => return None,
+        };
+        return chrono::NaiveDate::from_isoywd_opt(
+            year,
+            week,
+            match dow {
+                1 => chrono::Weekday::Mon,
+                2 => chrono::Weekday::Tue,
+                3 => chrono::Weekday::Wed,
+                4 => chrono::Weekday::Thu,
+                5 => chrono::Weekday::Fri,
+                6 => chrono::Weekday::Sat,
+                7 => chrono::Weekday::Sun,
+                _ => return None,
+            },
+        );
+    }
+    // Ordinal date: YYYY-DDD or YYYYDDD (3 digits only, month would be 2)
+    let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 3 {
+        let ordinal: u32 = digits.parse().ok()?;
+        return NaiveDate::from_yo_opt(year, ordinal);
+    }
+    // Calendar date: YYYY-MM, YYYYMM, YYYY-MM-DD, YYYYMMDD
+    match digits.len() {
+        2 => {
+            let month: u32 = digits.parse().ok()?;
+            NaiveDate::from_ymd_opt(year, month, 1)
+        }
+        4 => {
+            let month: u32 = digits[..2].parse().ok()?;
+            let day: u32 = digits[2..].parse().ok()?;
+            NaiveDate::from_ymd_opt(year, month, day)
+        }
+        _ => None,
+    }
 }
 
 /// Parse a time string like "12:31:14.645876123" into nanoseconds since midnight.
@@ -1537,18 +1634,28 @@ fn parse_tz_offset(s: &str) -> Option<i32> {
 /// Parse a time string, returning (time_nanos, optional timezone offset).
 fn parse_time_string_with_tz(s: &str) -> Result<(i64, Option<i32>)> {
     let trimmed = s.trim();
-    // Extract timezone suffix
-    let (time_part, tz) = if let Some(idx) = trimmed.find('+').or_else(|| {
-        // Look for '-' but not the hyphens in dates
-        trimmed
-            .rfind(|c: char| c == '-' || c == '+' || c == 'Z')
-            .filter(|i| *i > 5)
-    }) {
-        (&trimmed[..idx], parse_tz_offset(&trimmed[idx..]))
-    } else if trimmed.ends_with('Z') {
+    // A tz suffix starts with the LAST '+', '-', or 'Z' in the string
+    // — but only if that character sits at a legal split point. We
+    // require at least two digits before the sign so plain `-0130`
+    // (which is a tz attached to a compact time) still parses, while
+    // `HH:MM:SS` on its own doesn't get mis-split.
+    let (time_part, tz) = if trimmed.ends_with('Z') {
         (&trimmed[..trimmed.len() - 1], Some(0))
     } else {
-        (trimmed, None)
+        let tz_idx = trimmed.rfind(|c: char| c == '+' || c == '-');
+        match tz_idx {
+            Some(idx) if idx >= 2 => {
+                let before = &trimmed[..idx];
+                let suffix = &trimmed[idx..];
+                let parsed = parse_tz_offset(suffix);
+                if parsed.is_some() {
+                    (before, parsed)
+                } else {
+                    (trimmed, None)
+                }
+            }
+            _ => (trimmed, None),
+        }
     };
     let time_nanos = parse_time_string(time_part)?;
     Ok((time_nanos, tz))
@@ -1556,7 +1663,7 @@ fn parse_time_string_with_tz(s: &str) -> Result<(i64, Option<i32>)> {
 
 fn parse_time_string(s: &str) -> Result<i64> {
     let trimmed = s.trim();
-    // Try parsing as HH:MM:SS.fffffffff, HH:MM:SS, HH:MM
+    // Extended forms with ':' separators.
     for fmt in ["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"] {
         if let Ok(t) = chrono::NaiveTime::parse_from_str(trimmed, fmt) {
             let secs = t.num_seconds_from_midnight() as i64;
@@ -1564,9 +1671,45 @@ fn parse_time_string(s: &str) -> Result<i64> {
             return Ok(secs * 1_000_000_000 + nanos);
         }
     }
-    Err(Error::UnknownScalarFunction(format!(
-        "time() could not parse {s:?} as HH:MM:SS"
-    )))
+    // Compact (basic) forms: "HH", "HHMM", "HHMMSS", "HHMMSS.fff".
+    let (body, frac_ns) = match trimmed.split_once('.') {
+        Some((b, frac)) => {
+            // Pad/truncate fractional digits to 9.
+            let digits: String = frac.chars().filter(|c| c.is_ascii_digit()).collect();
+            let mut padded = digits.clone();
+            while padded.len() < 9 {
+                padded.push('0');
+            }
+            let ns: i64 = padded[..9].parse().unwrap_or(0);
+            (b, ns)
+        }
+        None => (trimmed, 0_i64),
+    };
+    let all_digits = body.chars().all(|c| c.is_ascii_digit());
+    if !all_digits {
+        return Err(Error::UnknownScalarFunction(format!(
+            "time() could not parse {s:?} as HH:MM:SS"
+        )));
+    }
+    let (h, m, sec): (i64, i64, i64) = match body.len() {
+        2 => (body.parse().unwrap_or(0), 0, 0),
+        4 => (
+            body[..2].parse().unwrap_or(0),
+            body[2..].parse().unwrap_or(0),
+            0,
+        ),
+        6 => (
+            body[..2].parse().unwrap_or(0),
+            body[2..4].parse().unwrap_or(0),
+            body[4..].parse().unwrap_or(0),
+        ),
+        _ => {
+            return Err(Error::UnknownScalarFunction(format!(
+                "time() could not parse {s:?} as HH:MM:SS"
+            )));
+        }
+    };
+    Ok((h * 3600 + m * 60 + sec) * 1_000_000_000 + frac_ns)
 }
 
 /// Parse an ISO 8601 duration string into a
@@ -1615,23 +1758,69 @@ fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
     let mut seconds = 0_i64;
     let mut nanos = 0_i32;
 
+    // Fractional cascade helpers. Neo4j's fractional semantics:
+    //   frac year  → 12 frac months
+    //   frac month → 30.436875 frac days  (Gregorian mean)
+    //   frac week  →  7 frac days
+    //   frac day   → 86400 frac seconds
+    //   frac hour  → 3600 frac seconds
+    //   frac minute → 60 frac seconds
+    // Fractional seconds go directly to nanos. Fractions in the
+    // date part cascade through all smaller units.
+    let secs_per_month: f64 = 30.436875 * 86400.0;
+
+    // `frac` is encoded as nanos-scaled i32 (up to 9 decimal digits).
+    let frac_to_f64 = |frac: i32| -> f64 { (frac as f64) / 1e9 };
+
+    let add_seconds_f = |seconds: &mut i64, nanos: &mut i32, add: f64| {
+        let whole_secs = add.trunc() as i64;
+        let frac_secs = add - (whole_secs as f64);
+        let add_nanos = (frac_secs * 1e9).round() as i32;
+        *seconds = seconds.wrapping_add(whole_secs);
+        *nanos = nanos.wrapping_add(add_nanos);
+    };
+
     // Date-part segments: Y (years), M (months), W (weeks), D
-    // (days). Each is `<digits><letter>`. Order isn't enforced
-    // by the grammar — the standard requires it but real-world
-    // inputs are lenient, so we accept any order.
+    // (days). Each is `<digits>[.<digits>]<letter>`. Order isn't
+    // enforced — the standard requires it but real-world inputs
+    // are lenient, so we accept any order.
     let mut cursor = date_part;
     while !cursor.is_empty() {
         let (n, unit, rest) = consume_segment(cursor).ok_or_else(bad)?;
-        // Date part can't have fractional components.
         let (whole, frac) = n;
-        if frac.is_some() {
-            return Err(bad());
-        }
         match unit {
-            'Y' => months = months.wrapping_add(whole.wrapping_mul(12)),
-            'M' => months = months.wrapping_add(whole),
-            'W' => days = days.wrapping_add(whole.wrapping_mul(7)),
-            'D' => days = days.wrapping_add(whole),
+            'Y' => {
+                months = months.wrapping_add(whole.wrapping_mul(12));
+                if let Some(f) = frac {
+                    let f_months = frac_to_f64(f) * 12.0;
+                    let extra_months = f_months.trunc() as i64;
+                    months = months.wrapping_add(extra_months);
+                    let leftover_months = f_months - (extra_months as f64);
+                    add_seconds_f(&mut seconds, &mut nanos, leftover_months * secs_per_month);
+                }
+            }
+            'M' => {
+                months = months.wrapping_add(whole);
+                if let Some(f) = frac {
+                    add_seconds_f(&mut seconds, &mut nanos, frac_to_f64(f) * secs_per_month);
+                }
+            }
+            'W' => {
+                days = days.wrapping_add(whole.wrapping_mul(7));
+                if let Some(f) = frac {
+                    let f_days = frac_to_f64(f) * 7.0;
+                    let extra_days = f_days.trunc() as i64;
+                    days = days.wrapping_add(extra_days);
+                    let leftover = f_days - (extra_days as f64);
+                    add_seconds_f(&mut seconds, &mut nanos, leftover * 86400.0);
+                }
+            }
+            'D' => {
+                days = days.wrapping_add(whole);
+                if let Some(f) = frac {
+                    add_seconds_f(&mut seconds, &mut nanos, frac_to_f64(f) * 86400.0);
+                }
+            }
             _ => return Err(bad()),
         }
         cursor = rest;
@@ -1646,16 +1835,16 @@ fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
             let (whole, frac) = n;
             match unit {
                 'H' => {
-                    if frac.is_some() {
-                        return Err(bad());
-                    }
                     seconds = seconds.wrapping_add(whole.wrapping_mul(3600));
+                    if let Some(f) = frac {
+                        add_seconds_f(&mut seconds, &mut nanos, frac_to_f64(f) * 3600.0);
+                    }
                 }
                 'M' => {
-                    if frac.is_some() {
-                        return Err(bad());
-                    }
                     seconds = seconds.wrapping_add(whole.wrapping_mul(60));
+                    if let Some(f) = frac {
+                        add_seconds_f(&mut seconds, &mut nanos, frac_to_f64(f) * 60.0);
+                    }
                 }
                 'S' => {
                     seconds = seconds.wrapping_add(whole);
@@ -1667,6 +1856,17 @@ fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
             }
             cursor = rest;
         }
+    }
+    // Normalize nanos to be within [0, 1e9) by flowing overflow
+    // into `seconds`. Keeps the output canonical for formatters.
+    let ns_per_sec: i32 = 1_000_000_000;
+    while nanos >= ns_per_sec {
+        nanos -= ns_per_sec;
+        seconds = seconds.wrapping_add(1);
+    }
+    while nanos < 0 {
+        nanos += ns_per_sec;
+        seconds = seconds.wrapping_sub(1);
     }
 
     let mut dur = mesh_core::Duration {
@@ -1772,13 +1972,43 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
     };
     match (op, l, r) {
         // DateTime + Duration
-        (BinaryOp::Add, DateTime(ns), Dur(d)) | (BinaryOp::Add, Dur(d), DateTime(ns)) => Some(Ok(
-            Value::Property(DateTime(datetime_add_duration(*ns, *d))),
-        )),
-        (BinaryOp::Sub, DateTime(ns), Dur(d)) => Some(Ok(Value::Property(DateTime(
-            datetime_add_duration(*ns, negate_duration(*d)),
-        )))),
-        (BinaryOp::Sub, DateTime(a), DateTime(b))
+        (
+            BinaryOp::Add,
+            DateTime {
+                nanos: ns,
+                tz_offset_secs: tz,
+            },
+            Dur(d),
+        )
+        | (
+            BinaryOp::Add,
+            Dur(d),
+            DateTime {
+                nanos: ns,
+                tz_offset_secs: tz,
+            },
+        ) => Some(Ok(Value::Property(DateTime {
+            nanos: datetime_add_duration(*ns, *d),
+            tz_offset_secs: *tz,
+        }))),
+        (
+            BinaryOp::Sub,
+            DateTime {
+                nanos: ns,
+                tz_offset_secs: tz,
+            },
+            Dur(d),
+        ) => Some(Ok(Value::Property(DateTime {
+            nanos: datetime_add_duration(*ns, negate_duration(*d)),
+            tz_offset_secs: *tz,
+        }))),
+        (
+            BinaryOp::Sub,
+            DateTime {
+                nanos: a, ..
+            },
+            DateTime { nanos: b, .. },
+        )
         | (BinaryOp::Sub, LocalDateTime(a), LocalDateTime(b)) => {
             let diff_ns = a.wrapping_sub(*b);
             Some(Ok(Value::Property(Dur(mesh_core::Duration {
@@ -2659,21 +2889,28 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         // wire-format path (Bolt LocalDateTime struct).
         "datetime" | "localdatetime" => {
             let is_local = name == "localdatetime";
-            let wrap = |ns: i128| -> Value {
+            // `wrap` takes the epoch nanos (always UTC) and an
+            // optional timezone offset (None → localdatetime, Some(0)
+            // → UTC "Z", Some(n) → `+HH:MM`).
+            let wrap = |ns: i128, tz: Option<i32>| -> Value {
                 if is_local {
                     Value::Property(Property::LocalDateTime(ns))
                 } else {
-                    Value::Property(Property::DateTime(ns))
+                    Value::Property(Property::DateTime {
+                        nanos: ns,
+                        tz_offset_secs: tz,
+                    })
                 }
             };
             match arg_exprs.len() {
-            0 => Ok(wrap(now_epoch_nanos())),
+            0 => Ok(wrap(now_epoch_nanos(), Some(0))),
             1 => {
                 let v = eval_expr(&arg_exprs[0], ctx)?;
                 match v {
                     Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                     Value::Property(Property::String(s)) => {
-                        Ok(wrap(parse_datetime(&s)?))
+                        let (ns, tz) = parse_datetime_with_tz(&s)?;
+                        Ok(wrap(ns, tz))
                     }
                     Value::Property(Property::Map(m)) => {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
@@ -2722,12 +2959,28 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         } else {
                             default_tod(base_ns)
                         };
-                        let epoch_nanos: i128 = (days_since_epoch as i128) * 86_400_000_000_000
+                        let local_nanos: i128 = (days_since_epoch as i128) * 86_400_000_000_000
                             + (hour as i128) * 3_600_000_000_000
                             + (minute as i128) * 60_000_000_000
                             + (second as i128) * 1_000_000_000
                             + (nanos as i128);
-                        Ok(wrap(epoch_nanos))
+                        // Pull timezone from the map (string offset or
+                        // named region) or inherit from a base
+                        // datetime/time. For datetime() (not localdatetime())
+                        // we default to UTC when nothing else is specified.
+                        let tz_offset = if is_local {
+                            None
+                        } else {
+                            extract_tz_offset(&m).or(Some(0))
+                        };
+                        // Time components in the map are *local* to the
+                        // given zone (Neo4j convention). Shift them back
+                        // to UTC so the stored `nanos` is always UTC.
+                        let epoch_nanos = match tz_offset {
+                            Some(offset) => local_nanos - (offset as i128) * 1_000_000_000,
+                            None => local_nanos,
+                        };
+                        Ok(wrap(epoch_nanos, tz_offset))
                     }
                     _ => Err(Error::TypeMismatch),
                 }
@@ -2763,7 +3016,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         Ok(Value::Property(Property::Date(days as i32)))
                     }
                     // date(datetime_value) - extract date from datetime
-                    Value::Property(Property::DateTime(ms)) => {
+                    Value::Property(Property::DateTime { nanos: ms, .. }) => {
                         let days = ms.div_euclid(86_400_000_000_000) as i32;
                         Ok(Value::Property(Property::Date(days)))
                     }
@@ -2803,7 +3056,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                                         tod = *nanos;
                                         break;
                                     }
-                                    Some(Property::DateTime(ns))
+                                    Some(Property::DateTime { nanos: ns, .. })
                                     | Some(Property::LocalDateTime(ns)) => {
                                         tod = ns.rem_euclid(86_400_000_000_000) as i64;
                                         break;
@@ -3065,7 +3318,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
 
         // Current-time namespace functions
         "datetime.transaction" | "datetime.statement" | "datetime.realtime" => {
-            Ok(Value::Property(Property::DateTime(now_epoch_nanos())))
+            Ok(Value::Property(Property::DateTime { nanos: now_epoch_nanos(), tz_offset_secs: Some(0) }))
         }
         "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
             Ok(Value::Property(Property::LocalDateTime(now_epoch_nanos())))
@@ -3104,7 +3357,10 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 eval_expr(&arg_exprs[1], ctx)?
             } else {
                 // Default to current time
-                Value::Property(Property::DateTime(now_epoch_nanos()))
+                Value::Property(Property::DateTime {
+                    nanos: now_epoch_nanos(),
+                    tz_offset_secs: Some(0),
+                })
             };
             let overrides = if arg_exprs.len() > 2 {
                 match eval_expr(&arg_exprs[2], ctx)? {
@@ -3141,7 +3397,7 @@ fn extract_base_date(
             Some(Property::Date(d)) => {
                 return Some(*epoch + chrono::Duration::days(*d as i64));
             }
-            Some(Property::DateTime(ns)) | Some(Property::LocalDateTime(ns)) => {
+            Some(Property::DateTime { nanos: ns, .. }) | Some(Property::LocalDateTime(ns)) => {
                 let days = ns.div_euclid(86_400_000_000_000);
                 if let Ok(d) = i64::try_from(days) {
                     return Some(*epoch + chrono::Duration::days(d));
@@ -3154,6 +3410,32 @@ fn extract_base_date(
 }
 
 /// Extract (base_date, time_of_day_nanos) from the map's temporal fields.
+/// Extract a timezone offset (in seconds) from a datetime/time/localdatetime
+/// construction map. Looks at an explicit `timezone` string first, then
+/// any temporal-source value that carries an offset.
+fn extract_tz_offset(
+    m: &std::collections::HashMap<String, Property>,
+) -> Option<i32> {
+    if let Some(Property::String(tz)) = m.get("timezone") {
+        return parse_tz_offset(tz).or(Some(0));
+    }
+    // Inherit from base datetime/time, if any
+    for key in ["datetime", "time"] {
+        match m.get(key) {
+            Some(Property::DateTime {
+                tz_offset_secs: Some(o),
+                ..
+            }) => return Some(*o),
+            Some(Property::Time {
+                tz_offset_secs: Some(o),
+                ..
+            }) => return Some(*o),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn extract_base_date_tod(
     m: &std::collections::HashMap<String, Property>,
     epoch: &chrono::NaiveDate,
@@ -3170,7 +3452,7 @@ fn extract_base_date_tod(
                     base_date = Some(*epoch + chrono::Duration::days(*d as i64));
                 }
             }
-            Some(Property::DateTime(ns)) | Some(Property::LocalDateTime(ns)) => {
+            Some(Property::DateTime { nanos: ns, .. }) | Some(Property::LocalDateTime(ns)) => {
                 let days = ns.div_euclid(86_400_000_000_000);
                 let tod = ns.rem_euclid(86_400_000_000_000);
                 if let Ok(d) = i64::try_from(days) {
@@ -3309,7 +3591,7 @@ fn temporal_to_date_tod(v: &Value) -> Result<(chrono::NaiveDate, i128, TemporalK
             0,
             TemporalKind::HasDate,
         )),
-        Value::Property(Property::DateTime(ns))
+        Value::Property(Property::DateTime { nanos: ns, .. })
         | Value::Property(Property::LocalDateTime(ns)) => {
             let days = ns.div_euclid(86_400_000_000_000);
             let tod = ns.rem_euclid(86_400_000_000_000);
@@ -3402,7 +3684,7 @@ fn duration_between_calendar(
 
 fn temporal_to_nanos(v: &Value) -> Result<i128> {
     match v {
-        Value::Property(Property::DateTime(ns))
+        Value::Property(Property::DateTime { nanos: ns, .. })
         | Value::Property(Property::LocalDateTime(ns)) => Ok(*ns),
         Value::Property(Property::Date(days)) => Ok(*days as i128 * 86_400_000_000_000),
         _ => Err(Error::TypeMismatch),
@@ -3417,14 +3699,18 @@ fn truncate_temporal(
     overrides: Option<&std::collections::HashMap<String, Property>>,
 ) -> Result<Value> {
     match temporal {
-        Value::Property(Property::DateTime(_))
+        Value::Property(Property::DateTime { .. })
         | Value::Property(Property::LocalDateTime(_))
         | Value::Property(Property::Date(_)) => {
             let epoch_ns: i128 = match temporal {
-                Value::Property(Property::DateTime(ns))
+                Value::Property(Property::DateTime { nanos: ns, .. })
                 | Value::Property(Property::LocalDateTime(ns)) => *ns,
                 Value::Property(Property::Date(days)) => *days as i128 * 86_400_000_000_000,
                 _ => unreachable!(),
+            };
+            let source_tz: Option<i32> = match temporal {
+                Value::Property(Property::DateTime { tz_offset_secs, .. }) => *tz_offset_secs,
+                _ => None,
             };
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
             let (secs, nanos) = nanos_to_secs_nanos(epoch_ns);
@@ -3554,7 +3840,10 @@ fn truncate_temporal(
             } else if name.starts_with("localdatetime.") {
                 Ok(Value::Property(Property::LocalDateTime(result_nanos)))
             } else {
-                Ok(Value::Property(Property::DateTime(result_nanos)))
+                Ok(Value::Property(Property::DateTime {
+                    nanos: result_nanos,
+                    tz_offset_secs: source_tz,
+                }))
             }
         }
         _ => {
@@ -3614,10 +3903,13 @@ fn value_to_string(v: Value) -> Value {
             let d = epoch + chrono::Duration::days(days as i64);
             Value::Property(Property::String(d.format("%Y-%m-%d").to_string()))
         }
-        Value::Property(Property::DateTime(ns)) => {
-            // DateTime has UTC timezone — append Z
-            Value::Property(Property::String(format!("{}Z", format_datetime_string(ns))))
-        }
+        Value::Property(Property::DateTime {
+            nanos,
+            tz_offset_secs,
+        }) => Value::Property(Property::String(format_datetime_with_tz(
+            nanos,
+            tz_offset_secs,
+        ))),
         Value::Property(Property::LocalDateTime(ns)) => {
             Value::Property(Property::String(format_datetime_string(ns)))
         }
@@ -3652,6 +3944,29 @@ fn format_datetime_string(epoch_nanos: i128) -> String {
     } else {
         format!("{date_str}T{h:02}:{m:02}")
     }
+}
+
+/// Format a DateTime (UTC epoch nanos + optional tz offset) as ISO 8601.
+/// Shifts the nanos by the offset so the rendered time is local, then
+/// appends the offset suffix (`Z` for 0, `+HH:MM` otherwise).
+fn format_datetime_with_tz(epoch_nanos: i128, tz_offset_secs: Option<i32>) -> String {
+    let shifted = match tz_offset_secs {
+        Some(offset) => epoch_nanos + (offset as i128) * 1_000_000_000,
+        None => epoch_nanos,
+    };
+    let body = format_datetime_string(shifted);
+    let tz_str = match tz_offset_secs {
+        Some(0) => "Z".to_string(),
+        Some(offset) => {
+            let sign = if offset >= 0 { '+' } else { '-' };
+            let abs = offset.unsigned_abs();
+            let oh = abs / 3600;
+            let om = (abs % 3600) / 60;
+            format!("{sign}{oh:02}:{om:02}")
+        }
+        None => String::new(),
+    };
+    format!("{body}{tz_str}")
 }
 
 /// Format a Time as ISO 8601 string.
@@ -3790,7 +4105,10 @@ fn compare_props(a: &Property, b: &Property) -> Ordering {
         // months vs 90 days depends on the reference date) so it
         // just compares equal — queries that need a deterministic
         // order over durations should project a specific field.
-        (Property::DateTime(a), Property::DateTime(b)) => a.cmp(b),
+        (
+            Property::DateTime { nanos: a, .. },
+            Property::DateTime { nanos: b, .. },
+        ) => a.cmp(b),
         (Property::Date(a), Property::Date(b)) => a.cmp(b),
         // Cross-type ordering: use type precedence
         // Neo4j order: Map > List > String > Boolean > Number
@@ -3807,7 +4125,7 @@ fn type_order_prop(p: &Property) -> u8 {
         Property::String(_) => 6,
         Property::Bool(_) => 7,
         Property::Int64(_) | Property::Float64(_) => 8,
-        Property::Date(_) | Property::DateTime(_) | Property::LocalDateTime(_)
+        Property::Date(_) | Property::DateTime { .. } | Property::LocalDateTime(_)
         | Property::Duration(_) | Property::Time { .. } => 9,
         Property::Null => 10,
     }
@@ -3824,7 +4142,7 @@ fn type_order_value(v: &Value) -> u8 {
         Value::Property(Property::Bool(_)) => 7,
         Value::Property(Property::Int64(_) | Property::Float64(_)) => 8,
         Value::Property(
-            Property::Date(_) | Property::DateTime(_) | Property::LocalDateTime(_)
+            Property::Date(_) | Property::DateTime { .. } | Property::LocalDateTime(_)
             | Property::Duration(_) | Property::Time { .. },
         ) => 9,
         Value::Null | Value::Property(Property::Null) => 10,
@@ -3861,7 +4179,9 @@ pub(crate) fn value_key(v: &Value) -> String {
             out.push('}');
             out
         }
-        Value::Property(Property::DateTime(ns)) => format!("dt:{}", ns),
+        Value::Property(Property::DateTime { nanos, tz_offset_secs }) => {
+            format!("dt:{},{:?}", nanos, tz_offset_secs)
+        }
         Value::Property(Property::LocalDateTime(ns)) => format!("ldt:{}", ns),
         Value::Property(Property::Date(days)) => format!("d:{}", days),
         Value::Property(Property::Duration(d)) => {
@@ -4057,7 +4377,10 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
         // orderings by their epoch-offset components. Duration
         // only supports equality because component ordering
         // isn't well-defined (months-vs-days).
-        (Property::DateTime(a), Property::DateTime(b)) => a.cmp(b),
+        (
+            Property::DateTime { nanos: a, .. },
+            Property::DateTime { nanos: b, .. },
+        ) => a.cmp(b),
         (Property::Date(a), Property::Date(b)) => a.cmp(b),
         (Property::Duration(a), Property::Duration(b)) => {
             return match op {

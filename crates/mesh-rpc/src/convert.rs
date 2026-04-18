@@ -42,7 +42,7 @@ pub fn property_to_proto(p: &Property) -> Result<proto::Property, ConvertError> 
         // replication of temporal property values is a follow-up.
         Property::List(_)
         | Property::Map(_)
-        | Property::DateTime(_)
+        | Property::DateTime { .. }
         | Property::LocalDateTime(_)
         | Property::Date(_)
         | Property::Duration(_)

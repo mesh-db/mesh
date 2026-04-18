@@ -25,9 +25,17 @@ pub enum Property {
     Bool(bool),
     List(Vec<Property>),
     Map(HashMap<String, Property>),
-    /// UTC epoch **nanoseconds**. Always represents a timezone-aware
-    /// datetime. Formatters append 'Z' or an offset.
-    DateTime(i128),
+    /// UTC epoch **nanoseconds** with optional timezone offset in
+    /// seconds. When `tz_offset_secs` is Some, the datetime is
+    /// timezone-aware; formatters append 'Z' for offset 0 or `+HH:MM`
+    /// otherwise. The nanos value is always UTC; the offset is purely
+    /// a display/metadata hint. Historically stored as bare i128 in
+    /// earlier revisions; the tuple form adds back the timezone info
+    /// that the TCK expects preserved across `datetime()` round-trips.
+    DateTime {
+        nanos: i128,
+        tz_offset_secs: Option<i32>,
+    },
     /// Local (naive) datetime as epoch nanoseconds.
     /// Formatters omit any timezone suffix.
     LocalDateTime(i128),
@@ -58,7 +66,7 @@ impl Property {
             Property::Bool(_) => "Bool",
             Property::List(_) => "List",
             Property::Map(_) => "Map",
-            Property::DateTime(_) => "DateTime",
+            Property::DateTime { .. } => "DateTime",
             Property::LocalDateTime(_) => "LocalDateTime",
             Property::Date(_) => "Date",
             Property::Duration(_) => "Duration",

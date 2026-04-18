@@ -5749,7 +5749,7 @@ fn datetime_now_returns_recent_epoch_millis() {
         .as_nanos() as i128;
     let rows = run(&store, "RETURN datetime() AS now");
     let got = match rows[0].get("now") {
-        Some(Value::Property(Property::DateTime(ns))) => *ns,
+        Some(Value::Property(Property::DateTime { nanos: ns, .. })) => *ns,
         other => panic!("expected DateTime, got {other:?}"),
     };
     let after = std::time::SystemTime::now()
@@ -5832,11 +5832,11 @@ fn datetime_plus_duration_advances_datetime() {
                  datetime() AS base",
     );
     let plus = match rows[0].get("plus_minute") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        Some(Value::Property(Property::DateTime { nanos: ms, .. })) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
     let base = match rows[0].get("base") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        Some(Value::Property(Property::DateTime { nanos: ms, .. })) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
     let delta = plus - base;
@@ -5898,7 +5898,7 @@ fn datetime_ordering_works_in_where() {
             );
             assert_eq!(rows.len(), 1);
             let ts = match rows[0].get("ts") {
-                Some(Value::Property(Property::DateTime(ms))) => *ms,
+                Some(Value::Property(Property::DateTime { nanos: ms, .. })) => *ms,
                 other => panic!("expected DateTime, got {other:?}"),
             };
             let now = std::time::SystemTime::now()
@@ -5933,7 +5933,7 @@ fn datetime_parses_rfc3339_with_z() {
     let (store, _d) = open_store();
     let rows = run(&store, "RETURN datetime('2025-01-01T00:00:00Z') AS dt");
     let ms = match rows[0].get("dt") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        Some(Value::Property(Property::DateTime { nanos: ms, .. })) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
     // 2025-01-01T00:00:00Z = 1735689600 seconds since epoch
@@ -5946,7 +5946,7 @@ fn datetime_parses_with_offset() {
     // 2025-01-01T05:00:00+05:00 == 2025-01-01T00:00:00Z
     let rows = run(&store, "RETURN datetime('2025-01-01T05:00:00+05:00') AS dt");
     let ms = match rows[0].get("dt") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        Some(Value::Property(Property::DateTime { nanos: ms, .. })) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
     assert_eq!(ms, 1_735_689_600_000_000_000);
@@ -5957,7 +5957,7 @@ fn datetime_parses_naive_as_utc() {
     let (store, _d) = open_store();
     let rows = run(&store, "RETURN datetime('2025-01-01T00:00:00') AS dt");
     let ms = match rows[0].get("dt") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        Some(Value::Property(Property::DateTime { nanos: ms, .. })) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
     assert_eq!(ms, 1_735_689_600_000_000_000);
@@ -5968,7 +5968,7 @@ fn datetime_parses_with_fractional_seconds() {
     let (store, _d) = open_store();
     let rows = run(&store, "RETURN datetime('2025-01-01T00:00:00.500Z') AS dt");
     let ms = match rows[0].get("dt") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        Some(Value::Property(Property::DateTime { nanos: ms, .. })) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
     assert_eq!(ms, 1_735_689_600_500_000_000);
@@ -5980,7 +5980,7 @@ fn datetime_parses_space_separator() {
     // Common relaxation — sqlite/postgres use a space.
     let rows = run(&store, "RETURN datetime('2025-01-01 00:00:00') AS dt");
     let ms = match rows[0].get("dt") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        Some(Value::Property(Property::DateTime { nanos: ms, .. })) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
     assert_eq!(ms, 1_735_689_600_000_000_000);
@@ -6050,7 +6050,7 @@ fn date_bad_string_errors() {
     let err = mesh_executor::execute(&plan, &store).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("date()") && msg.contains("YYYY-MM-DD"),
+        msg.contains("date()") && msg.contains("ISO 8601"),
         "got: {msg}"
     );
 }
@@ -6397,7 +6397,7 @@ fn duration_string_plus_datetime_advances() {
         "RETURN datetime('2025-01-01T00:00:00Z') + duration('PT1H') AS later",
     );
     let ms = match rows[0].get("later") {
-        Some(Value::Property(Property::DateTime(ms))) => *ms,
+        Some(Value::Property(Property::DateTime { nanos: ms, .. })) => *ms,
         other => panic!("expected DateTime, got {other:?}"),
     };
     assert_eq!(ms, 1_735_689_600_000_000_000 + 3_600_000_000_000);
