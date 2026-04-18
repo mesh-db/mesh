@@ -190,7 +190,13 @@ set_tail = { kw_set ~ set_items }
 set_items = { set_item ~ ("," ~ set_item)* }
 set_item = { set_label_item | set_prop_item | set_merge_item | set_replace_item }
 set_label_item = { identifier ~ label_spec+ }
-set_prop_item = { property_access ~ "=" ~ expression }
+// `SET x.k = v` normally — but Cypher also allows a parenthesized
+// expression on the left (`SET (n).k = v`) so the LHS can be any
+// `(expr).identifier` shape. We handle both forms: the bare
+// `property_access` path is the fast case; the parenthesised one
+// requires the expression to resolve to a node or edge at runtime.
+set_prop_item = { (set_paren_lhs | property_access) ~ "=" ~ expression }
+set_paren_lhs = { "(" ~ expression ~ ")" ~ "." ~ identifier }
 set_merge_item = { identifier ~ "+=" ~ properties }
 set_replace_item = { identifier ~ "=" ~ properties }
 

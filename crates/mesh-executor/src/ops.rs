@@ -263,7 +263,13 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             input,
             detach,
             vars,
-        } => Box::new(DeleteOp::new(child!(input), *detach, vars.clone())),
+            exprs,
+        } => Box::new(DeleteOp::new(
+            child!(input),
+            *detach,
+            vars.clone(),
+            exprs.clone(),
+        )),
         LogicalPlan::SetProperty { input, assignments } => {
             Box::new(SetPropertyOp::new(child!(input), assignments.clone()))
         }
@@ -772,15 +778,18 @@ impl Operator for CartesianProductOp {
 struct DeleteOp {
     input: Box<dyn Operator>,
     detach: bool,
+    #[allow(dead_code)]
     vars: Vec<String>,
+    exprs: Vec<Expr>,
 }
 
 impl DeleteOp {
-    fn new(input: Box<dyn Operator>, detach: bool, vars: Vec<String>) -> Self {
+    fn new(input: Box<dyn Operator>, detach: bool, vars: Vec<String>, exprs: Vec<Expr>) -> Self {
         Self {
             input,
             detach,
             vars,
+            exprs,
         }
     }
 }
@@ -790,9 +799,10 @@ impl Operator for DeleteOp {
         match self.input.next(ctx)? {
             None => Ok(None),
             Some(row) => {
-                for var in &self.vars {
-                    match row.get(var) {
-                        Some(Value::Node(n)) => {
+                for expr in &self.exprs {
+                    let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
+                    match v {
+                        Value::Node(n) => {
                             if self.detach {
                                 ctx.writer.detach_delete_node(n.id)?;
                             } else {
@@ -804,16 +814,15 @@ impl Operator for DeleteOp {
                                 ctx.writer.detach_delete_node(n.id)?;
                             }
                         }
-                        Some(Value::Edge(e)) => {
+                        Value::Edge(e) => {
                             ctx.writer.delete_edge(e.id)?;
                         }
                         // openCypher: DELETE silently ignores null.
                         // Common source: OPTIONAL MATCH with no match
                         // binds the var to null and the subsequent
                         // DELETE is a no-op.
-                        Some(Value::Null)
-                        | Some(Value::Property(Property::Null)) => continue,
-                        _ => return Err(Error::UnboundVariable(var.clone())),
+                        Value::Null | Value::Property(Property::Null) => continue,
+                        _ => return Err(Error::TypeMismatch),
                     }
                 }
                 Ok(Some(row))

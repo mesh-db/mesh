@@ -1370,20 +1370,52 @@ fn build_set_item(pair: Pair<Rule>) -> Result<SetItem> {
         }
         Rule::set_prop_item => {
             let mut inner = pair.into_inner();
-            let prop_access = inner
+            let target = inner
                 .next()
                 .ok_or_else(|| Error::Parse("set prop missing target".into()))?;
-            let mut pa = prop_access.into_inner();
-            let var = pa
-                .next()
-                .ok_or_else(|| Error::Parse("set target missing var".into()))?
-                .as_str()
-                .to_string();
-            let key = pa
-                .next()
-                .ok_or_else(|| Error::Parse("set target missing key".into()))?
-                .as_str()
-                .to_string();
+            let (var, key) = match target.as_rule() {
+                Rule::property_access => {
+                    let mut pa = target.into_inner();
+                    let var = pa
+                        .next()
+                        .ok_or_else(|| Error::Parse("set target missing var".into()))?
+                        .as_str()
+                        .to_string();
+                    let key = pa
+                        .next()
+                        .ok_or_else(|| Error::Parse("set target missing key".into()))?
+                        .as_str()
+                        .to_string();
+                    (var, key)
+                }
+                Rule::set_paren_lhs => {
+                    // `(expr).key` — pull out the inner expression's
+                    // identifier + the trailing key. v1 only handles
+                    // the degenerate `(var).key` case; anything more
+                    // complex would need SetProperty to accept an
+                    // expression for the target, which it doesn't.
+                    let mut parts = target.into_inner();
+                    let expr_pair = parts
+                        .next()
+                        .ok_or_else(|| Error::Parse("paren LHS missing inner".into()))?;
+                    let key_pair = parts
+                        .next()
+                        .ok_or_else(|| Error::Parse("paren LHS missing key".into()))?;
+                    let expr = build_expression(expr_pair)?;
+                    let var = match expr {
+                        Expr::Identifier(name) => name,
+                        _ => {
+                            return Err(Error::Parse(
+                                "SET target `(expr).key` currently only supports a \
+                                 bare identifier inside the parentheses"
+                                    .into(),
+                            ))
+                        }
+                    };
+                    (var, key_pair.as_str().to_string())
+                }
+                r => return Err(Error::Parse(format!("unexpected set target: {:?}", r))),
+            };
             let expr_pair = inner
                 .next()
                 .ok_or_else(|| Error::Parse("set prop missing value".into()))?;
@@ -1778,11 +1810,19 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 .next()
                 .ok_or_else(|| Error::Parse("empty unary_expr".into()))?;
             if first.as_rule() == Rule::op_neg {
-                let operand = build_expression(
-                    inner
-                        .next()
-                        .ok_or_else(|| Error::Parse("unary - missing operand".into()))?,
-                )?;
+                let operand_pair = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("unary - missing operand".into()))?;
+                // `-<integer>` takes the integer in negated form so
+                // `i64::MIN` (`-9223372036854775808`) parses — parsing
+                // the positive half alone overflows i64.
+                if let Some(lit) = peel_to_integer_literal(&operand_pair) {
+                    let combined = format!("-{}", lit);
+                    if let Ok(n) = parse_integer(&combined) {
+                        return Ok(Expr::Literal(Literal::Integer(n)));
+                    }
+                }
+                let operand = build_expression(operand_pair)?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Neg,
                     operand: Box::new(operand),
@@ -2344,6 +2384,42 @@ fn unescape_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// Drill through trivial wrapper rules (`add_expr`, `mul_expr`,
+/// `pow_expr`, `unary_expr`, `primary`, `compound`, `comparison`,
+/// `base_primary`, `literal`) looking for a bare integer literal.
+/// Returns its source text if the chain is nothing but wrappers +
+/// integer, or `None` otherwise.
+fn peel_to_integer_literal(pair: &Pair<Rule>) -> Option<String> {
+    let mut current = pair.clone();
+    loop {
+        match current.as_rule() {
+            Rule::integer => return Some(current.as_str().to_string()),
+            Rule::literal
+            | Rule::primary
+            | Rule::base_primary
+            | Rule::add_expr
+            | Rule::mul_expr
+            | Rule::pow_expr
+            | Rule::unary_expr
+            | Rule::compound
+            | Rule::comparison
+            | Rule::not_expr
+            | Rule::and_expr
+            | Rule::xor_expr
+            | Rule::or_expr
+            | Rule::expression => {
+                let mut inner = current.into_inner();
+                let single = inner.next()?;
+                if inner.next().is_some() {
+                    return None;
+                }
+                current = single;
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn parse_integer(s: &str) -> Result<i64> {

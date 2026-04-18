@@ -127,7 +127,14 @@ pub enum LogicalPlan {
     Delete {
         input: Box<LogicalPlan>,
         detach: bool,
+        /// Variable-only entries — preserved for the simple
+        /// `DELETE a, b` case where `vars` is enough to drive
+        /// the executor without having to re-parse.
         vars: Vec<String>,
+        /// Full DELETE target expressions. Superset of `vars`:
+        /// includes property access (`DELETE m.key`), index
+        /// access (`DELETE list[0]`), etc.
+        exprs: Vec<Expr>,
     },
     SetProperty {
         input: Box<LogicalPlan>,
@@ -603,6 +610,7 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             input,
             detach,
             vars,
+            ..
         } => {
             let kind = if *detach { "DetachDelete" } else { "Delete" };
             buf.push_str(&format!("{indent}{kind}({})\n", vars.join(", ")));
@@ -2568,6 +2576,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     input: Box::new(current),
                     detach: dc.detach,
                     vars: dc.vars.clone(),
+                    exprs: dc.exprs.clone(),
                 });
             }
             ReadingClause::Remove(items) => {
@@ -2665,6 +2674,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
             input: Box::new(plan),
             detach: delete_clause.detach,
             vars: delete_clause.vars.clone(),
+            exprs: delete_clause.exprs.clone(),
         };
     }
     if !terminal.set_items.is_empty() {
