@@ -2905,10 +2905,20 @@ fn apply_optional_match(
 /// only the names introduced by this WITH's items.
 fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Result<LogicalPlan> {
     let has_aggregates = !w.star
-        && w.items.iter().any(|it| matches!(
-            &it.expr,
-            Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some()
-        ));
+        && w.items.iter().any(|it| contains_aggregate(&it.expr));
+
+    // InvalidAggregation: ORDER BY on a non-aggregating WITH can't
+    // introduce aggregates — the projection defines the row set and
+    // aggregates would have nothing to group over.
+    if !has_aggregates {
+        for sort in &w.order_by {
+            if contains_aggregate(&sort.expr) {
+                return Err(Error::Plan(
+                    "ORDER BY on a non-aggregating WITH cannot reference an aggregate".into(),
+                ));
+            }
+        }
+    }
 
     // openCypher: `WHERE` attached to `WITH` can reference BOTH the
     // variables bound before the WITH and the aliases introduced by
