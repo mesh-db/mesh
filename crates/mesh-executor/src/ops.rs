@@ -897,12 +897,22 @@ impl Operator for SetPropertyOp {
                 for action in actions {
                     match action {
                         Action::SetKey { var, key, prop } => match row.get_mut(&var) {
+                            // openCypher: SET a.key = null removes the
+                            // property rather than storing a null value.
                             Some(Value::Node(n)) => {
-                                n.properties.insert(key, prop);
+                                if matches!(prop, Property::Null) {
+                                    n.properties.remove(&key);
+                                } else {
+                                    n.properties.insert(key, prop);
+                                }
                                 updated_nodes.insert(var);
                             }
                             Some(Value::Edge(e)) => {
-                                e.properties.insert(key, prop);
+                                if matches!(prop, Property::Null) {
+                                    e.properties.remove(&key);
+                                } else {
+                                    e.properties.insert(key, prop);
+                                }
                                 updated_edges.insert(var);
                             }
                             _ => return Err(Error::UnboundVariable(var)),
@@ -922,14 +932,18 @@ impl Operator for SetPropertyOp {
                             Some(Value::Node(n)) => {
                                 n.properties.clear();
                                 for (k, v) in props {
-                                    n.properties.insert(k, v);
+                                    if !matches!(v, Property::Null) {
+                                        n.properties.insert(k, v);
+                                    }
                                 }
                                 updated_nodes.insert(var);
                             }
                             Some(Value::Edge(e)) => {
                                 e.properties.clear();
                                 for (k, v) in props {
-                                    e.properties.insert(k, v);
+                                    if !matches!(v, Property::Null) {
+                                        e.properties.insert(k, v);
+                                    }
                                 }
                                 updated_edges.insert(var);
                             }
@@ -938,13 +952,21 @@ impl Operator for SetPropertyOp {
                         Action::Merge { var, props } => match row.get_mut(&var) {
                             Some(Value::Node(n)) => {
                                 for (k, v) in props {
-                                    n.properties.insert(k, v);
+                                    if matches!(v, Property::Null) {
+                                        n.properties.remove(&k);
+                                    } else {
+                                        n.properties.insert(k, v);
+                                    }
                                 }
                                 updated_nodes.insert(var);
                             }
                             Some(Value::Edge(e)) => {
                                 for (k, v) in props {
-                                    e.properties.insert(k, v);
+                                    if matches!(v, Property::Null) {
+                                        e.properties.remove(&k);
+                                    } else {
+                                        e.properties.insert(k, v);
+                                    }
                                 }
                                 updated_edges.insert(var);
                             }
