@@ -1600,45 +1600,38 @@ impl MergeNodeOp {
     /// via `ctx.writer`; stash the resulting nodes in
     /// `self.merged_nodes`. Idempotent — subsequent calls are
     /// no-ops once `self.merge_done` is set.
-    fn run_merge_once(&mut self, ctx: &ExecCtx) -> Result<()> {
-        if self.merge_done {
-            return Ok(());
-        }
-        // Evaluate the pattern property expressions (literals or
-        // parameters) once against an empty row + the per-query param
-        // map. The grammar guarantees no row references in pattern
-        // values, so an empty row is sufficient.
-        let empty = Row::new();
+    /// Resolve the pattern properties against `base`, scan the
+    /// store, and either match existing nodes or create a fresh
+    /// one. Returns the resulting node set — can be called
+    /// multiple times with different `base` rows for
+    /// input-driven merges.
+    fn run_merge_for(&mut self, ctx: &ExecCtx, base: &Row) -> Result<Vec<Node>> {
         let resolved_props: Vec<(String, Property)> = self
             .properties
             .iter()
             .map(|(k, expr)| {
-                let v = eval_expr(expr, &ctx.eval_ctx(&empty))?;
+                let v = eval_expr(expr, &ctx.eval_ctx(base))?;
                 Ok((k.clone(), value_to_property(v)?))
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Scan for existing matches: by-label index when one is
-        // given, else a full node scan. Any extra labels beyond
-        // the first get filtered per-node.
         let candidate_ids: Vec<NodeId> = if let Some(primary) = self.labels.first() {
             ctx.store.nodes_by_label(primary)?
         } else {
             ctx.store.all_node_ids()?
         };
+        let mut merged_nodes: Vec<Node> = Vec::new();
         for id in candidate_ids {
             if let Some(node) = ctx.store.get_node(id)? {
                 if has_all_labels(&node, &self.labels)
                     && matches_pattern_props(&node, &resolved_props)
                 {
-                    self.merged_nodes.push(node);
+                    merged_nodes.push(node);
                 }
             }
         }
 
-        if self.merged_nodes.is_empty() {
-            // Create path — no match, synthesize one node,
-            // apply ON CREATE SET, persist.
+        if merged_nodes.is_empty() {
             let mut node = Node::new();
             for label in &self.labels {
                 node.labels.push(label.clone());
@@ -1646,31 +1639,32 @@ impl MergeNodeOp {
             for (k, prop) in resolved_props {
                 node.properties.insert(k, prop);
             }
-            apply_merge_actions(&mut node, &self.on_create, &self.var, ctx)?;
+            apply_merge_actions(&mut node, &self.on_create, &self.var, ctx, base)?;
             ctx.writer.put_node(&node)?;
-            self.merged_nodes.push(node);
+            merged_nodes.push(node);
         } else if !self.on_match.is_empty() {
-            // Match path with ON MATCH SET — apply to every
-            // matched node and persist each. The outer `if !is_empty`
-            // skips the loop in the common no-ON-MATCH case.
-            for node in self.merged_nodes.iter_mut() {
-                apply_merge_actions(node, &self.on_match, &self.var, ctx)?;
+            for node in merged_nodes.iter_mut() {
+                apply_merge_actions(node, &self.on_match, &self.var, ctx, base)?;
                 ctx.writer.put_node(node)?;
             }
         }
-        self.merge_done = true;
-        Ok(())
+        Ok(merged_nodes)
     }
 }
 
 impl Operator for MergeNodeOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        self.run_merge_once(ctx)?;
-
-        // Top-level case (no upstream): drain merged_nodes once.
-        // The output row starts empty and gets the merged node
-        // bound into `var`.
+        // Top-level producer: no upstream context, so the pattern
+        // properties can only reference literals / parameters.
+        // Run the merge once against an empty row, then emit
+        // each result.
         if self.input.is_none() {
+            if !self.merge_done {
+                let empty = Row::new();
+                let nodes = self.run_merge_for(ctx, &empty)?;
+                self.merged_nodes = nodes;
+                self.merge_done = true;
+            }
             if self.cursor < self.merged_nodes.len() {
                 let node = self.merged_nodes[self.cursor].clone();
                 self.cursor += 1;
@@ -1681,13 +1675,12 @@ impl Operator for MergeNodeOp {
             return Ok(None);
         }
 
-        // Input-driven case: each merged node cross-joins with
-        // every upstream row. The loop alternates between
-        // "drain merged_nodes against the current upstream row"
-        // and "pull the next upstream row". Because merged_nodes
-        // is computed once (by run_merge_once), the node set is
-        // the same for every input row — the only thing that
-        // changes row-to-row is `current_input_row`.
+        // Input-driven case: evaluate pattern properties *per
+        // input row* so references like `MERGE (:City {name:
+        // person.bornIn})` resolve against the bound `person`.
+        // Each incoming row produces its own merged-node set,
+        // which is then cross-joined with that row before
+        // emission.
         loop {
             if let Some(base) = self.current_input_row.as_ref() {
                 if self.cursor < self.merged_nodes.len() {
@@ -1698,12 +1691,13 @@ impl Operator for MergeNodeOp {
                     return Ok(Some(row));
                 }
             }
-            // Pull a fresh upstream row and restart the drain.
             match self.input.as_mut().unwrap().next(ctx)? {
                 None => return Ok(None),
                 Some(row) => {
-                    self.current_input_row = Some(row);
+                    let nodes = self.run_merge_for(ctx, &row)?;
+                    self.merged_nodes = nodes;
                     self.cursor = 0;
+                    self.current_input_row = Some(row);
                 }
             }
         }
@@ -1930,11 +1924,14 @@ fn apply_merge_actions(
     actions: &[SetAssignment],
     var: &str,
     exec_ctx: &ExecCtx,
+    base_row: &Row,
 ) -> Result<()> {
     if actions.is_empty() {
         return Ok(());
     }
-    let mut row = Row::new();
+    // Start from the upstream row so `ON CREATE SET n.prop = other.field`
+    // can resolve `other` — then overlay the merged node under `var`.
+    let mut row = base_row.clone();
     row.insert(var.to_string(), Value::Node(node.clone()));
     for action in actions {
         let sub_ctx = exec_ctx.eval_ctx(&row);

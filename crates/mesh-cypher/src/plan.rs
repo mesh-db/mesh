@@ -2323,7 +2323,17 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         on_create,
                         on_match,
                     });
-                    bound_vars.insert(var, VarType::Node);
+                    bound_vars.insert(var.clone(), VarType::Node);
+                    // `MERGE p = (a)` — bind a zero-length path.
+                    if let Some(pv) = &mc.pattern.path_var {
+                        plan = Some(LogicalPlan::BindPath {
+                            input: Box::new(plan.take().unwrap()),
+                            path_var: pv.clone(),
+                            node_vars: vec![var],
+                            edge_vars: Vec::new(),
+                        });
+                        bound_vars.insert(pv.clone(), VarType::Path);
+                    }
                 } else {
                     // --- edge merge (single or multi-hop) ---
                     // Decompose: first MergeNode for each intermediate
@@ -2376,8 +2386,12 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         }
                     }
 
-                    // Phase 3: MergeEdge for each hop.
-                    let mut current_src = start_var;
+                    // Phase 3: MergeEdge for each hop. Track the
+                    // node/edge sequence so we can bind a path var
+                    // at the end if the pattern declared one.
+                    let mut current_src = start_var.clone();
+                    let mut path_nodes = vec![start_var.clone()];
+                    let mut path_edges: Vec<String> = Vec::new();
                     for (hi, hop) in mc.pattern.hops.iter().enumerate() {
                         if hop.rel.var_length.is_some() {
                             return Err(Error::Plan(
@@ -2417,9 +2431,20 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             on_create: on_create.clone(),
                             on_match: on_match.clone(),
                         });
-                        bound_vars.insert(edge_var, VarType::Node);
+                        path_edges.push(edge_var.clone());
+                        path_nodes.push(dst_var.clone());
+                        bound_vars.insert(edge_var, VarType::Edge);
                         bound_vars.insert(dst_var.clone(), VarType::Node);
                         current_src = dst_var;
+                    }
+                    if let Some(pv) = &mc.pattern.path_var {
+                        plan = Some(LogicalPlan::BindPath {
+                            input: Box::new(plan.take().unwrap()),
+                            path_var: pv.clone(),
+                            node_vars: path_nodes,
+                            edge_vars: path_edges,
+                        });
+                        bound_vars.insert(pv.clone(), VarType::Path);
                     }
                 }
                 stage_pattern_offset += 1;
