@@ -382,6 +382,11 @@ pub struct AggregateSpec {
     pub alias: String,
     pub function: AggregateFn,
     pub arg: AggregateArg,
+    /// Second argument, used by aggregates that need a constant
+    /// parameter alongside the per-row value. Right now this is just
+    /// `percentileDisc` / `percentileCont` — both take the fraction
+    /// in `[0.0, 1.0]` as their second argument.
+    pub extra_arg: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3074,6 +3079,7 @@ fn classify_return_items(
                 unreachable!()
             };
             let func = aggregate_fn_from_name(name).unwrap();
+            let mut percentile_extra: Option<Expr> = None;
             let agg_arg = match args {
                 CallArgs::Star => {
                     if !matches!(func, AggregateFn::Count) {
@@ -3082,8 +3088,10 @@ fn classify_return_items(
                     AggregateArg::Star
                 }
                 CallArgs::Exprs(es) if es.len() == 1 => AggregateArg::Expr(es[0].clone()),
-                // percentileDisc/percentileCont take 2 args (expr, percentile)
-                // We use only the first arg for aggregation; the second is a constant
+                // percentileDisc/percentileCont take 2 args: the
+                // collected value, then the percentile in [0.0, 1.0].
+                // We stash the second arg on the AggregateSpec so the
+                // operator can resolve the percentile at finalize time.
                 CallArgs::Exprs(es)
                     if es.len() == 2
                         && matches!(
@@ -3091,6 +3099,7 @@ fn classify_return_items(
                             AggregateFn::PercentileDisc | AggregateFn::PercentileCont
                         ) =>
                 {
+                    percentile_extra = Some(es[1].clone());
                     AggregateArg::Expr(es[0].clone())
                 }
                 CallArgs::Exprs(_) => {
@@ -3114,17 +3123,20 @@ fn classify_return_items(
                 alias,
                 function: func,
                 arg: agg_arg,
+                extra_arg: percentile_extra,
             });
         } else {
             if contains_aggregate(&item.expr) {
-                let mut rewrites: Vec<(String, AggregateFn, AggregateArg)> = Vec::new();
+                let mut rewrites: Vec<(String, AggregateFn, AggregateArg, Option<Expr>)> =
+                    Vec::new();
                 let rewritten =
                     extract_nested_aggregates(&item.expr, &mut rewrites, &mut synth_idx);
-                for (alias, func, arg) in rewrites {
+                for (alias, func, arg, extra_arg) in rewrites {
                     aggregates.push(AggregateSpec {
                         alias,
                         function: func,
                         arg,
+                        extra_arg,
                     });
                 }
                 let alias = item
@@ -3145,16 +3157,27 @@ fn classify_return_items(
 
 fn extract_nested_aggregates(
     expr: &Expr,
-    out: &mut Vec<(String, AggregateFn, AggregateArg)>,
+    out: &mut Vec<(String, AggregateFn, AggregateArg, Option<Expr>)>,
     idx: &mut usize,
 ) -> Expr {
     match expr {
         Expr::Call { name, args } if aggregate_fn_from_name(name).is_some() => {
             let func = aggregate_fn_from_name(name).unwrap();
+            let mut extra: Option<Expr> = None;
             let agg_arg = match args {
                 CallArgs::Star => AggregateArg::Star,
                 CallArgs::Exprs(es) if es.len() == 1 => AggregateArg::Expr(es[0].clone()),
                 CallArgs::Exprs(es) if es.is_empty() => AggregateArg::Star,
+                CallArgs::Exprs(es)
+                    if es.len() == 2
+                        && matches!(
+                            func,
+                            AggregateFn::PercentileDisc | AggregateFn::PercentileCont
+                        ) =>
+                {
+                    extra = Some(es[1].clone());
+                    AggregateArg::Expr(es[0].clone())
+                }
                 CallArgs::DistinctExprs(es) if es.len() == 1 => {
                     AggregateArg::DistinctExpr(es[0].clone())
                 }
@@ -3162,7 +3185,7 @@ fn extract_nested_aggregates(
             };
             let alias = format!("__agg_{}_{}", name.to_lowercase(), *idx);
             *idx += 1;
-            out.push((alias.clone(), func, agg_arg));
+            out.push((alias.clone(), func, agg_arg, extra));
             Expr::Identifier(alias)
         }
         Expr::BinaryOp { op, left, right } => Expr::BinaryOp {

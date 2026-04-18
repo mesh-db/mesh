@@ -3316,6 +3316,31 @@ impl AggregateOp {
                     }
                 }
                 entry.agg_states[i].update(&spec.arg, &ctx.eval_ctx(&row))?;
+                // The percentile is a constant expression — evaluate
+                // it once against the first row we see and stash it
+                // in the state so finalize() has a number to use.
+                if let Some(extra_expr) = &spec.extra_arg {
+                    let need_resolve = matches!(
+                        &entry.agg_states[i],
+                        AggState::PercentileDisc { percentile: None, .. }
+                            | AggState::PercentileCont { percentile: None, .. }
+                    );
+                    if need_resolve {
+                        let pv = eval_expr(extra_expr, &ctx.eval_ctx(&row))?;
+                        let p = match pv {
+                            Value::Property(Property::Float64(f)) => f,
+                            Value::Property(Property::Int64(i)) => i as f64,
+                            _ => 0.0,
+                        };
+                        match &mut entry.agg_states[i] {
+                            AggState::PercentileDisc { percentile, .. }
+                            | AggState::PercentileCont { percentile, .. } => {
+                                *percentile = Some(p);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
 
@@ -3398,8 +3423,14 @@ enum AggState {
         sum_sq: f64,
         count: i64,
     },
-    PercentileDisc(Vec<Value>),
-    PercentileCont(Vec<Value>),
+    PercentileDisc {
+        items: Vec<Value>,
+        percentile: Option<f64>,
+    },
+    PercentileCont {
+        items: Vec<Value>,
+        percentile: Option<f64>,
+    },
 }
 
 impl AggState {
@@ -3428,8 +3459,14 @@ impl AggState {
                 sum_sq: 0.0,
                 count: 0,
             },
-            AggregateFn::PercentileDisc => AggState::PercentileDisc(Vec::new()),
-            AggregateFn::PercentileCont => AggState::PercentileCont(Vec::new()),
+            AggregateFn::PercentileDisc => AggState::PercentileDisc {
+                items: Vec::new(),
+                percentile: None,
+            },
+            AggregateFn::PercentileCont => AggState::PercentileCont {
+                items: Vec::new(),
+                percentile: None,
+            },
         }
     }
 
@@ -3514,7 +3551,8 @@ impl AggState {
                     items.push(v);
                 }
             }
-            AggState::PercentileDisc(items) | AggState::PercentileCont(items) => {
+            AggState::PercentileDisc { items, .. }
+            | AggState::PercentileCont { items, .. } => {
                 let v = expr_arg_value(arg, ctx)?;
                 if !matches!(v, Value::Null) {
                     items.push(v);
@@ -3586,24 +3624,11 @@ impl AggState {
                     Value::Property(Property::Float64(variance.max(0.0).sqrt()))
                 }
             }
-            AggState::PercentileDisc(items) => {
-                if items.is_empty() {
-                    Value::Null
-                } else {
-                    // For percentileDisc, we use the last element as a simple fallback.
-                    // The actual percentile value is passed as a second argument to the
-                    // aggregate call, but our aggregate framework doesn't support multi-arg
-                    // aggregates directly. For now, return the first item as a placeholder.
-                    // This will be improved with proper percentile support.
-                    items.first().cloned().unwrap_or(Value::Null)
-                }
+            AggState::PercentileDisc { items, percentile } => {
+                percentile_disc(items, percentile.unwrap_or(0.0))
             }
-            AggState::PercentileCont(items) => {
-                if items.is_empty() {
-                    Value::Null
-                } else {
-                    items.first().cloned().unwrap_or(Value::Null)
-                }
+            AggState::PercentileCont { items, percentile } => {
+                percentile_cont(items, percentile.unwrap_or(0.0))
             }
         }
     }
@@ -3614,6 +3639,64 @@ fn expr_arg_value(arg: &AggregateArg, ctx: &EvalCtx) -> Result<Value> {
         AggregateArg::Star => Err(Error::AggregateTypeError),
         AggregateArg::Expr(e) | AggregateArg::DistinctExpr(e) => eval_expr(e, ctx),
     }
+}
+
+/// Coerce a collected aggregate value into an f64 for percentile
+/// math. Unhandled types fall back to NaN; the caller sorts NaN
+/// out of the stream before computing the percentile.
+fn value_to_f64(v: &Value) -> f64 {
+    match v {
+        Value::Property(Property::Int64(i)) => *i as f64,
+        Value::Property(Property::Float64(f)) => *f,
+        _ => f64::NAN,
+    }
+}
+
+/// `percentileDisc(expr, p)` — discrete percentile. Returns the
+/// smallest value at or above the `p`-ranked position. Numbers only;
+/// non-numeric values get sorted to the end and are effectively
+/// ignored unless the percentile lands on one.
+fn percentile_disc(items: &[Value], p: f64) -> Value {
+    let mut nums: Vec<(f64, Value)> = items
+        .iter()
+        .map(|v| (value_to_f64(v), v.clone()))
+        .filter(|(f, _)| !f.is_nan())
+        .collect();
+    if nums.is_empty() {
+        return Value::Null;
+    }
+    nums.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let p = p.clamp(0.0, 1.0);
+    let n = nums.len();
+    // Neo4j spec: ceil(p * n) - 1, clamped at 0.
+    let idx = ((p * n as f64).ceil() as isize - 1).max(0) as usize;
+    nums[idx.min(n - 1)].1.clone()
+}
+
+/// `percentileCont(expr, p)` — continuous percentile. Linearly
+/// interpolates between the two ranks that bracket the fractional
+/// position `p * (n - 1)`. Returns a Float64.
+fn percentile_cont(items: &[Value], p: f64) -> Value {
+    let mut nums: Vec<f64> = items
+        .iter()
+        .map(value_to_f64)
+        .filter(|f| !f.is_nan())
+        .collect();
+    if nums.is_empty() {
+        return Value::Null;
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p = p.clamp(0.0, 1.0);
+    let n = nums.len();
+    if n == 1 {
+        return Value::Property(Property::Float64(nums[0]));
+    }
+    let pos = p * (n as f64 - 1.0);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let frac = pos - lo as f64;
+    let v = nums[lo] + (nums[hi] - nums[lo]) * frac;
+    Value::Property(Property::Float64(v))
 }
 
 struct SkipOp {
