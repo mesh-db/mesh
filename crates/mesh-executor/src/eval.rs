@@ -439,7 +439,15 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             }
             match compare(*op, &vl, &vr) {
                 Ok(b) => Ok(Value::Property(Property::Bool(b))),
-                Err(Error::TypeMismatch) | Err(Error::UnsupportedComparison) => Ok(Value::Null),
+                Err(Error::TypeMismatch) => match op {
+                    // `=` / `<>` between values of incomparable types
+                    // are well-defined: they're simply `false` / `true`.
+                    // Ordering operators (`<`, `<=`, ...) stay null.
+                    CompareOp::Eq => Ok(Value::Property(Property::Bool(false))),
+                    CompareOp::Ne => Ok(Value::Property(Property::Bool(true))),
+                    _ => Ok(Value::Null),
+                },
+                Err(Error::UnsupportedComparison) => Ok(Value::Null),
                 Err(e) => Err(e),
             }
         }
@@ -1418,15 +1426,37 @@ fn parse_datetime_with_tz(s: &str) -> Result<(i128, Option<i32>, Option<String>)
         _ => (trimmed, None),
     };
     let trimmed = body.trim();
+    // A "tz marker" in the body is either a trailing `Z` or a `+`/`-`
+    // that follows the time-of-day portion. The date separators at
+    // positions 4 and 7 (`YYYY-MM-DD`) must not be misread as an
+    // offset, so look only past the `T` that separates date from time.
     let has_tz_marker = trimmed.ends_with('Z')
-        || trimmed.rfind(|c: char| c == '+' || c == '-')
-            .map(|i| i > 5)
-            .unwrap_or(false);
+        || trimmed.find('T').and_then(|t_idx| {
+            trimmed[t_idx..]
+                .rfind(|c: char| c == '+' || c == '-')
+                .map(|i| i > 0)
+        }).unwrap_or(false);
     let finalise = |nanos: i128, tz: Option<i32>| {
         if let Some(name) = tz_name.as_deref() {
-            match parse_tz_name(name, nanos) {
-                Some((off, canonical)) => (nanos, Some(off), Some(canonical)),
-                None => (nanos, tz, None),
+            // If the string already carried an explicit offset (e.g.
+            // `...+02:00[Europe/Stockholm]`), `nanos` is already the
+            // UTC instant — just look up the canonical zone name. If
+            // the string only carried `[Region/City]`, the time we
+            // parsed is the *local* wall-clock; re-resolve to UTC
+            // against the zone db so the stored instant is correct.
+            if tz.is_some() {
+                match parse_tz_name(name, nanos) {
+                    Some((off, canonical)) => (nanos, Some(off), Some(canonical)),
+                    None => (nanos, tz, None),
+                }
+            } else {
+                match parse_tz_name_local(name, nanos) {
+                    Some((off, canonical)) => {
+                        let utc = nanos - (off as i128) * 1_000_000_000;
+                        (utc, Some(off), Some(canonical))
+                    }
+                    None => (nanos, tz, None),
+                }
             }
         } else {
             (nanos, tz, None)
@@ -1851,6 +1881,16 @@ fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
             _ => return Err(bad()),
         }
         cursor = rest;
+    }
+    // Cascade whole 24h chunks of the date-part's fractional seconds
+    // into `days`. Neo4j's canonical output for a form like `P0.75M`
+    // is `P22DT19H51M49.5S`, not `PT547H51M49.5S`. Time-part segments
+    // below don't participate — `PT24H` stays as hours.
+    {
+        const SECS_PER_DAY: i64 = 86_400;
+        let carry = seconds.div_euclid(SECS_PER_DAY);
+        seconds = seconds.rem_euclid(SECS_PER_DAY);
+        days = days.wrapping_add(carry);
     }
 
     if let Some(mut cursor) = time_part {
@@ -3009,7 +3049,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                         } else {
                             default_tod(base_ns)
                         };
-                        let local_nanos: i128 = (days_since_epoch as i128) * 86_400_000_000_000
+                        let mut local_nanos: i128 = (days_since_epoch as i128) * 86_400_000_000_000
                             + (hour as i128) * 3_600_000_000_000
                             + (minute as i128) * 60_000_000_000
                             + (second as i128) * 1_000_000_000
@@ -3026,6 +3066,20 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                                 None => (Some(0), None),
                             }
                         };
+                        // If the map *explicitly* supplied a timezone
+                        // alongside a zoned base value, we rotate the
+                        // wall-clock to the new zone — the same instant
+                        // gets a new local representation. (Without an
+                        // explicit override we just reuse the base's
+                        // tod, so nothing to rotate.)
+                        if !is_local && m.contains_key("timezone") {
+                            if let Some(base_off) = base_tz_offset(&m) {
+                                if let Some(new_off) = tz_offset {
+                                    let shift = (new_off - base_off) as i128 * 1_000_000_000;
+                                    local_nanos += shift;
+                                }
+                            }
+                        }
                         // Time components in the map are *local* to the
                         // given zone (Neo4j convention). Shift them back
                         // to UTC so the stored `nanos` is always UTC.
@@ -3509,7 +3563,11 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             let name_lc = name.to_ascii_lowercase();
             let duration = match name_lc.as_str() {
                 "duration.inmonths" => {
-                    let months = if time_only { 0 } else { month_diff(a_date, b_date) };
+                    let months = if time_only {
+                        0
+                    } else {
+                        month_diff_tod(a_date, a_tod, b_date, b_tod)
+                    };
                     mesh_core::Duration {
                         months,
                         days: 0,
@@ -3518,10 +3576,21 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                 }
                 "duration.indays" => {
+                    // Floor-toward-zero. Raw day count is the
+                    // calendar diff; subtract one whole day if we
+                    // haven't yet crossed back through the source's
+                    // time-of-day (so 21:40 on day N to 00:00 on
+                    // day N+338 is 337 days, not 338).
                     let days = if time_only {
                         0
                     } else {
-                        b_date.signed_duration_since(a_date).num_days()
+                        let mut d = b_date.signed_duration_since(a_date).num_days();
+                        if d > 0 && b_tod < a_tod {
+                            d -= 1;
+                        } else if d < 0 && b_tod > a_tod {
+                            d += 1;
+                        }
+                        d
                     };
                     mesh_core::Duration {
                         months: 0,
@@ -3707,6 +3776,27 @@ fn extract_tz_offset(
     m: &std::collections::HashMap<String, Property>,
 ) -> Option<i32> {
     extract_tz_spec(m, None).map(|(off, _)| off)
+}
+
+/// Offset of the *base* temporal value (under `datetime:` or `time:`
+/// keys) when the caller needs to rotate the wall-clock against a
+/// timezone override. Returns `None` if no base value carries an
+/// offset.
+fn base_tz_offset(m: &std::collections::HashMap<String, Property>) -> Option<i32> {
+    for key in ["datetime", "time"] {
+        match m.get(key) {
+            Some(Property::DateTime {
+                tz_offset_secs: Some(o),
+                ..
+            }) => return Some(*o),
+            Some(Property::Time {
+                tz_offset_secs: Some(o),
+                ..
+            }) => return Some(*o),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Resolve `(offset_seconds, tz_name)` from a construction map.
@@ -4118,6 +4208,30 @@ fn month_diff(a: chrono::NaiveDate, b: chrono::NaiveDate) -> i64 {
     diff
 }
 
+/// Like `month_diff`, but rounds *toward zero*. If the two endpoints
+/// land on the same day-of-month at different times, the one with
+/// the earlier tod has "not yet reached" the other month, so we
+/// shave off one whole month. Used by `duration.inMonths`.
+fn month_diff_tod(
+    a_date: chrono::NaiveDate,
+    a_tod: i128,
+    b_date: chrono::NaiveDate,
+    b_tod: i128,
+) -> i64 {
+    let mut diff = month_diff(a_date, b_date);
+    if diff == 0 {
+        return 0;
+    }
+    if a_date.day() == b_date.day() {
+        if diff > 0 && b_tod < a_tod {
+            diff -= 1;
+        } else if diff < 0 && b_tod > a_tod {
+            diff += 1;
+        }
+    }
+    diff
+}
+
 /// Compute a calendar-aware duration between two temporal points
 /// (date + time-of-day nanoseconds). Matches Neo4j's duration.between
 /// semantics.
@@ -4232,10 +4346,23 @@ fn truncate_time_value(
             )));
         }
     };
-    // Override fields: hour/minute/second/millisecond/microsecond/nanosecond.
+    // Override fields: hour/minute/second/millisecond/microsecond/nanosecond,
+    // plus an optional `timezone` that rotates the output zone (only
+    // meaningful for `time.truncate`, since localtime has no zone).
     let mut final_nanos = truncated;
+    let mut override_tz: Option<i32> = None;
     if let Some(ov) = overrides {
         for (k, v) in ov.iter() {
+            if k == "timezone" {
+                if let Property::String(tz) = v {
+                    if let Some(off) = parse_tz_offset(tz) {
+                        override_tz = Some(off);
+                    } else if let Some((off, _)) = parse_tz_name_local(tz, 0) {
+                        override_tz = Some(off);
+                    }
+                }
+                continue;
+            }
             let n = match v {
                 Property::Int64(n) => *n,
                 _ => continue,
@@ -4257,29 +4384,33 @@ fn truncate_time_value(
                     let sub_second = final_nanos.rem_euclid(1_000_000_000);
                     final_nanos = minute_aligned + (n as i128) * 1_000_000_000 + sub_second;
                 }
+                // Sub-second overrides add on top of whatever sub-second
+                // precision the truncation unit preserved, so `truncate
+                // ('millisecond', ..., {nanosecond: 2})` keeps the
+                // millisecond portion and tacks on 2 nanoseconds.
                 "millisecond" => {
-                    let second_aligned = final_nanos - final_nanos.rem_euclid(1_000_000_000);
-                    final_nanos = second_aligned + (n as i128) * 1_000_000;
+                    final_nanos += (n as i128) * 1_000_000;
                 }
                 "microsecond" => {
-                    let second_aligned = final_nanos - final_nanos.rem_euclid(1_000_000_000);
-                    final_nanos = second_aligned + (n as i128) * 1_000;
+                    final_nanos += (n as i128) * 1_000;
                 }
                 "nanosecond" => {
-                    let second_aligned = final_nanos - final_nanos.rem_euclid(1_000_000_000);
-                    final_nanos = second_aligned + (n as i128);
+                    final_nanos += n as i128;
                 }
                 _ => {}
             }
         }
     }
+    // Pick the output zone: override wins, otherwise inherit from
+    // the source; `localtime.truncate` stays zone-less either way.
+    let tz_offset_secs = if is_zoned {
+        Some(override_tz.or(source_tz).unwrap_or(0))
+    } else {
+        None
+    };
     Ok(Value::Property(Property::Time {
         nanos: final_nanos as i64,
-        tz_offset_secs: if is_zoned {
-            Some(source_tz.unwrap_or(0))
-        } else {
-            None
-        },
+        tz_offset_secs,
     }))
 }
 
@@ -4399,14 +4530,32 @@ fn truncate_temporal(
                         .and_hms_opt(dt.hour(), dt.minute(), dt.second())
                         .unwrap()
                 }
-                "millisecond" | "microsecond" => dt,
+                "millisecond" => {
+                    // Drop sub-millisecond precision — floor the
+                    // nanoseconds to the nearest 1e6.
+                    let ns = (dt.nanosecond() / 1_000_000) * 1_000_000;
+                    dt.date()
+                        .and_hms_nano_opt(dt.hour(), dt.minute(), dt.second(), ns)
+                        .unwrap_or(dt)
+                }
+                "microsecond" => {
+                    let ns = (dt.nanosecond() / 1_000) * 1_000;
+                    dt.date()
+                        .and_hms_nano_opt(dt.hour(), dt.minute(), dt.second(), ns)
+                        .unwrap_or(dt)
+                }
                 _ => {
                     return Err(Error::UnknownScalarFunction(format!(
                         "unsupported truncation unit: {unit}"
                     )));
                 }
             };
-            // Apply overrides map (extra day/month/hour/etc. components)
+            // Apply overrides map (extra day/month/hour/etc. components).
+            // An override `timezone:` key also steers the output zone —
+            // for datetime.truncate this replaces whatever zone came
+            // from the source temporal. Captured here, applied after
+            // we've rebuilt the final naive wall-clock.
+            let mut override_tz: Option<(i32, Option<String>)> = None;
             let truncated = if let Some(ov) = overrides {
                 let mut year = truncated.year();
                 let mut month = truncated.month();
@@ -4416,6 +4565,20 @@ fn truncate_temporal(
                 let mut second = truncated.second();
                 let mut nanosecond = truncated.nanosecond();
                 for (k, v) in ov.iter() {
+                    if k == "timezone" {
+                        if let Property::String(tz) = v {
+                            if let Some(off) = parse_tz_offset(tz) {
+                                override_tz = Some((off, None));
+                            } else {
+                                // Defer zone-name resolution — we need
+                                // the final local wall-clock (post
+                                // override) to pick the right DST
+                                // offset. Stash the name for now.
+                                override_tz = Some((0, Some(tz.clone())));
+                            }
+                        }
+                        continue;
+                    }
                     let n = match v {
                         Property::Int64(n) => *n,
                         _ => continue,
@@ -4427,9 +4590,18 @@ fn truncate_temporal(
                         "hour" => hour = n as u32,
                         "minute" => minute = n as u32,
                         "second" => second = n as u32,
-                        "nanosecond" => nanosecond = n as u32,
-                        "millisecond" => nanosecond = (n as u32) * 1_000_000,
-                        "microsecond" => nanosecond = (n as u32) * 1_000,
+                        // Neo4j treats sub-second overrides as
+                        // *additive* on top of whatever the truncation
+                        // unit left behind, so `truncate('millisecond',
+                        // ..., {nanosecond: 2})` yields `.645000002`
+                        // rather than `.000000002`.
+                        "nanosecond" => nanosecond = nanosecond.wrapping_add(n as u32),
+                        "millisecond" => {
+                            nanosecond = nanosecond.wrapping_add((n as u32) * 1_000_000)
+                        }
+                        "microsecond" => {
+                            nanosecond = nanosecond.wrapping_add((n as u32) * 1_000)
+                        }
                         "dayOfWeek" | "weekDay" => {
                             // Adjust day based on weekday within week
                             let current_dow =
@@ -4462,16 +4634,27 @@ fn truncate_temporal(
             } else if name.starts_with("localdatetime.") {
                 Ok(Value::Property(Property::LocalDateTime(result_nanos)))
             } else {
-                // `result_nanos` is local wall-clock; shift back to
-                // UTC so the stored DateTime nanos are always UTC.
-                let utc_nanos = match source_tz {
+                // `result_nanos` is local wall-clock. Choose which
+                // zone to report: a `timezone:` override wins,
+                // otherwise fall back to the source's zone. For a
+                // zone name override we resolve against the final
+                // local wall-clock so DST lands on the right side.
+                let (out_offset, out_name) = match &override_tz {
+                    Some((_, Some(name))) => match parse_tz_name_local(name, result_nanos) {
+                        Some((off, canonical)) => (Some(off), Some(canonical)),
+                        None => (Some(0), None),
+                    },
+                    Some((off, None)) => (Some(*off), None),
+                    None => (source_tz, source_tz_name.clone()),
+                };
+                let utc_nanos = match out_offset {
                     Some(off) => result_nanos - (off as i128) * 1_000_000_000,
                     None => result_nanos,
                 };
                 Ok(Value::Property(Property::DateTime {
                     nanos: utc_nanos,
-                    tz_offset_secs: source_tz,
-                    tz_name: source_tz_name.clone(),
+                    tz_offset_secs: out_offset,
+                    tz_name: out_name,
                 }))
             }
         }
