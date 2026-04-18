@@ -2626,6 +2626,40 @@ fn apply_return_pipeline(
     skip: Option<Expr>,
     limit: Option<Expr>,
 ) -> Result<LogicalPlan> {
+    // Rewrite ORDER BY expressions that refer to an already-projected
+    // aggregate so they reference the output column instead of
+    // re-evaluating the aggregate in a post-aggregation (scalar)
+    // context. Built from the RETURN items' aliases/expressions, so
+    // `RETURN max(n.age) ORDER BY max(n.age)` sorts on the aggregate
+    // output rather than trying to call `max` as a scalar.
+    let order_by_rewritten: Vec<SortItem> = if !star {
+        let mut alias_map: Vec<(Expr, String)> = Vec::new();
+        for item in return_items {
+            if let Some(alias) = &item.alias {
+                alias_map.push((item.expr.clone(), alias.clone()));
+            }
+            if matches!(
+                &item.expr,
+                Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some()
+            ) {
+                let col = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| render_expr_key(&item.expr));
+                alias_map.push((item.expr.clone(), col));
+            }
+        }
+        order_by
+            .iter()
+            .map(|s| SortItem {
+                expr: rewrite_aggregate_refs(s.expr.clone(), &alias_map),
+                descending: s.descending,
+            })
+            .collect()
+    } else {
+        order_by.to_vec()
+    };
+
     if star {
         plan = LogicalPlan::Identity {
             input: Box::new(plan),
@@ -2660,10 +2694,10 @@ fn apply_return_pipeline(
         };
     }
 
-    if !order_by.is_empty() {
+    if !order_by_rewritten.is_empty() {
         plan = LogicalPlan::OrderBy {
             input: Box::new(plan),
-            sort_items: order_by.to_vec(),
+            sort_items: order_by_rewritten,
         };
     }
 
@@ -3092,6 +3126,62 @@ fn contains_aggregate(expr: &Expr) -> bool {
                     .unwrap_or(false)
         }
         _ => false,
+    }
+}
+
+/// Rewrite expressions that match an already-projected aggregate
+/// call so they reference the output column (by identifier) instead
+/// of re-evaluating the aggregate function. Used for ORDER BY items
+/// that repeat a RETURN aggregate — the post-aggregation pipeline
+/// runs in a scalar context where `max(...)` / `count(*)` aren't
+/// directly callable.
+fn rewrite_aggregate_refs(expr: Expr, map: &[(Expr, String)]) -> Expr {
+    for (candidate, alias) in map {
+        if &expr == candidate {
+            return Expr::Identifier(alias.clone());
+        }
+    }
+    match expr {
+        Expr::Not(inner) => Expr::Not(Box::new(rewrite_aggregate_refs(*inner, map))),
+        Expr::And(a, b) => Expr::And(
+            Box::new(rewrite_aggregate_refs(*a, map)),
+            Box::new(rewrite_aggregate_refs(*b, map)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(rewrite_aggregate_refs(*a, map)),
+            Box::new(rewrite_aggregate_refs(*b, map)),
+        ),
+        Expr::Xor(a, b) => Expr::Xor(
+            Box::new(rewrite_aggregate_refs(*a, map)),
+            Box::new(rewrite_aggregate_refs(*b, map)),
+        ),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op,
+            left: Box::new(rewrite_aggregate_refs(*left, map)),
+            right: Box::new(rewrite_aggregate_refs(*right, map)),
+        },
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op,
+            left: Box::new(rewrite_aggregate_refs(*left, map)),
+            right: Box::new(rewrite_aggregate_refs(*right, map)),
+        },
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op,
+            operand: Box::new(rewrite_aggregate_refs(*operand, map)),
+        },
+        Expr::IsNull { negated, inner } => Expr::IsNull {
+            negated,
+            inner: Box::new(rewrite_aggregate_refs(*inner, map)),
+        },
+        Expr::PropertyAccess { base, key } => Expr::PropertyAccess {
+            base: Box::new(rewrite_aggregate_refs(*base, map)),
+            key,
+        },
+        Expr::IndexAccess { base, index } => Expr::IndexAccess {
+            base: Box::new(rewrite_aggregate_refs(*base, map)),
+            index: Box::new(rewrite_aggregate_refs(*index, map)),
+        },
+        other => other,
     }
 }
 
