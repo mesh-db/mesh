@@ -2223,13 +2223,6 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         .var
                         .clone()
                         .unwrap_or_else(|| format!("__merge_stage{}", stage_pattern_offset));
-                    if bound_vars.contains_key(&var) {
-                        return Err(Error::Plan(format!(
-                            "variable '{}' is already bound; MERGE cannot rebind \
-                             an existing variable in a chained clause",
-                            var
-                        )));
-                    }
                     plan = Some(LogicalPlan::MergeNode {
                         input: plan.take().map(Box::new),
                         var: var.clone(),

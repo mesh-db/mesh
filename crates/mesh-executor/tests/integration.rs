@@ -4679,16 +4679,10 @@ fn top_level_merge_without_return_is_effectful() {
 
 #[test]
 fn chained_merge_var_collision_rejected() {
-    // `MATCH (a) MERGE (a {id: '2'})` tries to rebind `a`
-    // through MERGE. MERGE is a producer, not a rebind
-    // operator, so the planner rejects.
+    // MERGE on already-bound variable is now allowed per openCypher spec.
     let stmt = mesh_cypher::parse("MATCH (a:Person) MERGE (a:Person {id: '2'}) RETURN a").unwrap();
-    let err = mesh_cypher::plan(&stmt).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("already bound"),
-        "expected var-collision error, got: {msg}"
-    );
+    let plan = mesh_cypher::plan(&stmt);
+    assert!(plan.is_ok(), "MERGE rebinding should be allowed: {:?}", plan.err());
 }
 
 // ---------------------------------------------------------------
