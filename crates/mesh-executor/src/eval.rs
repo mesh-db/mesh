@@ -2534,42 +2534,41 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                     Value::Property(Property::Map(m)) => {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                        // Extract base date/datetime if provided
-                        let base_date = if let Some(Property::Date(d)) = m.get("date") {
-                            Some(epoch + chrono::Duration::days(*d as i64))
+                        // Extract base date and time-of-day from `date`, `datetime`, or `time` field
+                        let (base_date, base_tod_ns) = if let Some(Property::Date(d)) = m.get("date") {
+                            (Some(epoch + chrono::Duration::days(*d as i64)), 0i128)
                         } else if let Some(Property::DateTime(ns)) = m.get("datetime") {
                             let (secs, nsec) = nanos_to_secs_nanos(*ns);
-                            chrono::DateTime::from_timestamp(secs, nsec)
-                                .map(|dt| dt.naive_utc().date())
+                            let date = chrono::DateTime::from_timestamp(secs, nsec)
+                                .map(|dt| dt.naive_utc().date());
+                            let tod = ns.rem_euclid(86_400_000_000_000);
+                            (date, tod)
                         } else {
-                            None
+                            (None, 0i128)
                         };
+                        let has_base = base_date.is_some();
                         let base = base_date.unwrap_or(epoch);
-                        let hour = map_int(&m, "hour").unwrap_or(0);
-                        let minute = map_int(&m, "minute").unwrap_or(0);
-                        let second = map_int(&m, "second").unwrap_or(0);
-                        let nanos = map_int(&m, "nanosecond").unwrap_or(0);
-                        let days_since_epoch = if let Some(week) = map_int(&m, "week") {
-                            let year = map_int(&m, "year").unwrap_or_else(|| {
-                                base.iso_week().year() as i64
-                            });
-                            let dow = map_int(&m, "dayOfWeek").unwrap_or_else(|| {
-                                if base_date.is_some() {
-                                    base.weekday().num_days_from_monday() as i64 + 1
-                                } else {
-                                    1
-                                }
-                            });
-                            let target = iso_week_date(year, week, dow);
-                            target.signed_duration_since(epoch).num_days()
-                        } else {
-                            let year = map_int(&m, "year").unwrap_or(base.year() as i64);
-                            let month = map_int(&m, "month").unwrap_or(base.month() as i64);
-                            let day = map_int(&m, "day").unwrap_or(base.day() as i64);
-                            chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
-                                .map(|d| d.signed_duration_since(epoch).num_days())
-                                .unwrap_or(0)
-                        };
+
+                        // Build date part
+                        let target_date = build_date_from_map(&m, base, has_base);
+                        let days_since_epoch = target_date.signed_duration_since(epoch).num_days();
+
+                        // Time-of-day: use explicit fields or inherit from base
+                        let base_hour = (base_tod_ns / 3_600_000_000_000) as i64;
+                        let base_min = ((base_tod_ns % 3_600_000_000_000) / 60_000_000_000) as i64;
+                        let base_sec = ((base_tod_ns % 60_000_000_000) / 1_000_000_000) as i64;
+                        let base_ns = (base_tod_ns % 1_000_000_000) as i64;
+
+                        let has_explicit_time = m.contains_key("hour") || m.contains_key("minute")
+                            || m.contains_key("second") || m.contains_key("nanosecond")
+                            || m.contains_key("millisecond") || m.contains_key("microsecond");
+                        let hour = map_int(&m, "hour").unwrap_or(if has_explicit_time { 0 } else { base_hour });
+                        let minute = map_int(&m, "minute").unwrap_or(if has_explicit_time { 0 } else { base_min });
+                        let second = map_int(&m, "second").unwrap_or(if has_explicit_time { 0 } else { base_sec });
+                        let nanos = map_int(&m, "nanosecond")
+                            .or_else(|| map_int(&m, "millisecond").map(|ms| ms * 1_000_000))
+                            .or_else(|| map_int(&m, "microsecond").map(|us| us * 1_000))
+                            .unwrap_or(if has_explicit_time { 0 } else { base_ns });
                         let epoch_nanos: i128 = (days_since_epoch as i128) * 86_400_000_000_000
                             + (hour as i128) * 3_600_000_000_000
                             + (minute as i128) * 60_000_000_000
@@ -2601,42 +2600,21 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     }
                     Value::Property(Property::Map(m)) => {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                        // If a base date is provided, start from it
+                        // Extract base date from `date` or `datetime` field
                         let base_date = if let Some(Property::Date(d)) = m.get("date") {
                             Some(epoch + chrono::Duration::days(*d as i64))
+                        } else if let Some(Property::DateTime(ns)) = m.get("datetime") {
+                            let days = ns.div_euclid(86_400_000_000_000);
+                            i64::try_from(days).ok().map(|d|
+                                epoch + chrono::Duration::days(d))
                         } else {
                             None
                         };
                         let base_or_epoch = base_date.unwrap_or(epoch);
-                        // Week-based date construction
-                        if let Some(week) = map_int(&m, "week") {
-                            // For week-based dates, use ISO week year
-                            let year = map_int(&m, "year").unwrap_or_else(|| {
-                                base_or_epoch.iso_week().year() as i64
-                            });
-                            let dow = map_int(&m, "dayOfWeek").unwrap_or_else(|| {
-                                if base_date.is_some() {
-                                    base_or_epoch.weekday().num_days_from_monday() as i64 + 1
-                                } else {
-                                    1
-                                }
-                            });
-                            let target = iso_week_date(year, week, dow);
-                            let days = target.signed_duration_since(epoch).num_days();
-                            Ok(Value::Property(Property::Date(days as i32)))
-                        } else {
-                            let year = map_int(&m, "year")
-                                .unwrap_or(base_or_epoch.year() as i64);
-                            let month = map_int(&m, "month")
-                                .unwrap_or(base_or_epoch.month() as i64);
-                            let day = map_int(&m, "day")
-                                .unwrap_or(base_or_epoch.day() as i64);
-                            let days =
-                                chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
-                                    .map(|d| d.signed_duration_since(epoch).num_days())
-                                    .unwrap_or(0);
-                            Ok(Value::Property(Property::Date(days as i32)))
-                        }
+                        let has_base = base_date.is_some();
+                        let target = build_date_from_map(&m, base_or_epoch, has_base);
+                        let days = target.signed_duration_since(epoch).num_days();
+                        Ok(Value::Property(Property::Date(days as i32)))
                     }
                     // date(datetime_value) - extract date from datetime
                     Value::Property(Property::DateTime(ms)) => {
@@ -2887,6 +2865,69 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
 }
 
 /// Extract epoch milliseconds from a temporal value.
+/// Build a date from a map of components, supporting multiple ways:
+/// - year+month+day (default)
+/// - year+week (+ optional dayOfWeek)
+/// - year+ordinalDay
+/// - year+quarter+dayOfQuarter
+/// Uses `base` to default missing fields. If `has_base` is false,
+/// defaults to 1970-01-01.
+fn build_date_from_map(
+    m: &std::collections::HashMap<String, Property>,
+    base: chrono::NaiveDate,
+    has_base: bool,
+) -> chrono::NaiveDate {
+    // Week-based date construction takes priority
+    if let Some(week) = map_int(m, "week") {
+        let year = map_int(m, "year").unwrap_or_else(|| {
+            if has_base {
+                base.iso_week().year() as i64
+            } else {
+                1970
+            }
+        });
+        let dow = map_int(m, "dayOfWeek")
+            .or_else(|| map_int(m, "weekDay"))
+            .unwrap_or_else(|| {
+                if has_base {
+                    base.weekday().num_days_from_monday() as i64 + 1
+                } else {
+                    1 // Monday default for week-based dates without base
+                }
+            });
+        return iso_week_date(year, week, dow);
+    }
+    // Ordinal day construction
+    if let Some(ordinal) = map_int(m, "ordinalDay").or_else(|| map_int(m, "dayOfYear")) {
+        let year = map_int(m, "year").unwrap_or(base.year() as i64);
+        return chrono::NaiveDate::from_yo_opt(year as i32, ordinal as u32)
+            .unwrap_or(base);
+    }
+    // Quarter-based construction
+    if let Some(quarter) = map_int(m, "quarter") {
+        let year = map_int(m, "year").unwrap_or(base.year() as i64);
+        let month = ((quarter - 1) * 3 + 1) as u32;
+        let day = map_int(m, "dayOfQuarter")
+            .or_else(|| map_int(m, "day"))
+            .map(|d| d as u32)
+            .unwrap_or_else(|| {
+                // Preserve day-of-quarter from base if same month alignment
+                let base_q = (base.month() - 1) / 3 + 1;
+                if base_q == quarter as u32 {
+                    base.day()
+                } else {
+                    1
+                }
+            });
+        return chrono::NaiveDate::from_ymd_opt(year as i32, month, day).unwrap_or(base);
+    }
+    // Default: year + month + day
+    let year = map_int(m, "year").unwrap_or(base.year() as i64);
+    let month = map_int(m, "month").unwrap_or(base.month() as i64);
+    let day = map_int(m, "day").unwrap_or(base.day() as i64);
+    chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32).unwrap_or(base)
+}
+
 /// Compute an ISO week-based date.
 fn iso_week_date(year: i64, week: i64, dow: i64) -> chrono::NaiveDate {
     // ISO 8601: week 1 of a year contains January 4th.
