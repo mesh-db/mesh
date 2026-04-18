@@ -1334,6 +1334,184 @@ fn plan_unwind(stmt: &UnwindStmt) -> Result<LogicalPlan> {
     )
 }
 
+/// Walk a SET right-hand side and reject `Expr::Identifier` /
+/// `Expr::Property` references to variables that aren't in the
+/// current binding scope. openCypher raises `SyntaxError:
+/// UndefinedVariable` at compile time for `SET a.name = missing`
+/// and similar — we mirror that with a plan-time `Error::Plan`.
+/// Comprehension / reduce / list-predicate binders extend the
+/// scope for their own subtree so `[x IN xs | x]` doesn't trip
+/// the check. Subquery / pattern predicate bodies are skipped;
+/// they manage their own scope internally.
+fn check_set_expr_scope(expr: &Expr, bound: &HashMap<String, VarType>) -> Result<()> {
+    check_set_expr_scope_inner(expr, bound, &[])
+}
+
+fn check_set_expr_scope_inner(
+    expr: &Expr,
+    bound: &HashMap<String, VarType>,
+    locals: &[&str],
+) -> Result<()> {
+    let in_scope = |name: &str| bound.contains_key(name) || locals.iter().any(|l| *l == name);
+    match expr {
+        Expr::Identifier(name) => {
+            if !in_scope(name) {
+                return Err(Error::Plan(format!(
+                    "UndefinedVariable: variable `{name}` is not defined"
+                )));
+            }
+            Ok(())
+        }
+        Expr::Property { var, .. } => {
+            if !in_scope(var) {
+                return Err(Error::Plan(format!(
+                    "UndefinedVariable: variable `{var}` is not defined"
+                )));
+            }
+            Ok(())
+        }
+        Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
+        Expr::PropertyAccess { base, .. } => check_set_expr_scope_inner(base, bound, locals),
+        Expr::HasLabels { expr, .. } => check_set_expr_scope_inner(expr, bound, locals),
+        Expr::IndexAccess { base, index } => {
+            check_set_expr_scope_inner(base, bound, locals)?;
+            check_set_expr_scope_inner(index, bound, locals)
+        }
+        Expr::SliceAccess { base, start, end } => {
+            check_set_expr_scope_inner(base, bound, locals)?;
+            if let Some(s) = start {
+                check_set_expr_scope_inner(s, bound, locals)?;
+            }
+            if let Some(e) = end {
+                check_set_expr_scope_inner(e, bound, locals)?;
+            }
+            Ok(())
+        }
+        Expr::Not(e) => check_set_expr_scope_inner(e, bound, locals),
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            check_set_expr_scope_inner(a, bound, locals)?;
+            check_set_expr_scope_inner(b, bound, locals)
+        }
+        Expr::Compare { left, right, .. } => {
+            check_set_expr_scope_inner(left, bound, locals)?;
+            check_set_expr_scope_inner(right, bound, locals)
+        }
+        Expr::IsNull { inner, .. } => check_set_expr_scope_inner(inner, bound, locals),
+        Expr::InList { element, list } => {
+            check_set_expr_scope_inner(element, bound, locals)?;
+            check_set_expr_scope_inner(list, bound, locals)
+        }
+        Expr::Call { args, .. } => match args {
+            CallArgs::Star => Ok(()),
+            CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) => {
+                for e in es {
+                    check_set_expr_scope_inner(e, bound, locals)?;
+                }
+                Ok(())
+            }
+        },
+        Expr::List(items) => {
+            for e in items {
+                check_set_expr_scope_inner(e, bound, locals)?;
+            }
+            Ok(())
+        }
+        Expr::Map(entries) => {
+            for (_, e) in entries {
+                check_set_expr_scope_inner(e, bound, locals)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            if let Some(s) = scrutinee {
+                check_set_expr_scope_inner(s, bound, locals)?;
+            }
+            for (cond, result) in branches {
+                check_set_expr_scope_inner(cond, bound, locals)?;
+                check_set_expr_scope_inner(result, bound, locals)?;
+            }
+            if let Some(e) = else_expr {
+                check_set_expr_scope_inner(e, bound, locals)?;
+            }
+            Ok(())
+        }
+        Expr::ListComprehension {
+            var,
+            source,
+            predicate,
+            projection,
+        } => {
+            check_set_expr_scope_inner(source, bound, locals)?;
+            let mut next: Vec<&str> = locals.to_vec();
+            next.push(var);
+            if let Some(p) = predicate {
+                check_set_expr_scope_inner(p, bound, &next)?;
+            }
+            if let Some(p) = projection {
+                check_set_expr_scope_inner(p, bound, &next)?;
+            }
+            Ok(())
+        }
+        Expr::Reduce {
+            acc_var,
+            acc_init,
+            elem_var,
+            source,
+            body,
+        } => {
+            check_set_expr_scope_inner(acc_init, bound, locals)?;
+            check_set_expr_scope_inner(source, bound, locals)?;
+            let mut next: Vec<&str> = locals.to_vec();
+            next.push(acc_var);
+            next.push(elem_var);
+            check_set_expr_scope_inner(body, bound, &next)
+        }
+        Expr::ListPredicate {
+            var,
+            list,
+            predicate,
+            ..
+        } => {
+            check_set_expr_scope_inner(list, bound, locals)?;
+            let mut next: Vec<&str> = locals.to_vec();
+            next.push(var);
+            check_set_expr_scope_inner(predicate, bound, &next)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_set_expr_scope_inner(left, bound, locals)?;
+            check_set_expr_scope_inner(right, bound, locals)
+        }
+        Expr::UnaryOp { operand, .. } => check_set_expr_scope_inner(operand, bound, locals),
+        // Subquery / pattern predicate bodies manage their own scope; skip.
+        Expr::PatternExists(_) | Expr::ExistsSubquery { .. } | Expr::CountSubquery { .. } => {
+            Ok(())
+        }
+    }
+}
+
+fn check_set_assignments_scope(
+    assignments: &[SetAssignment],
+    bound: &HashMap<String, VarType>,
+) -> Result<()> {
+    for a in assignments {
+        match a {
+            SetAssignment::Property { value, .. } => check_set_expr_scope(value, bound)?,
+            SetAssignment::Replace { properties, .. }
+            | SetAssignment::Merge { properties, .. } => {
+                for (_, e) in properties {
+                    check_set_expr_scope(e, bound)?;
+                }
+            }
+            SetAssignment::Labels { .. } => {}
+        }
+    }
+    Ok(())
+}
+
 /// Lower an AST `SetItem` to an executor-side `SetAssignment`.
 /// Shared by every site that converts SET items into plan
 /// assignments — both top-level `MATCH ... SET` and the
@@ -2631,10 +2809,11 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 });
             }
             ReadingClause::Set(items) => {
-                let assignments = items
+                let assignments: Vec<SetAssignment> = items
                     .iter()
                     .map(set_item_to_assignment)
                     .collect();
+                check_set_assignments_scope(&assignments, &bound_vars)?;
                 let current = plan.take().ok_or_else(|| {
                     Error::Plan("SET requires a preceding clause".into())
                 })?;
@@ -2753,11 +2932,12 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         };
     }
     if !terminal.set_items.is_empty() {
-        let assignments = terminal
+        let assignments: Vec<SetAssignment> = terminal
             .set_items
             .iter()
             .map(set_item_to_assignment)
             .collect();
+        check_set_assignments_scope(&assignments, &bound_vars)?;
         plan = LogicalPlan::SetProperty {
             input: Box::new(plan),
             assignments,
