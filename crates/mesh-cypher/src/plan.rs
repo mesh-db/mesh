@@ -1751,13 +1751,42 @@ fn chain_hops(
     start_var: &str,
     pattern_idx: usize,
 ) -> Result<LogicalPlan> {
+    // Track already-bound node variables so repeat uses
+    // (`(n)-[r]->(n)`) become equality filters on the same
+    // binding rather than a fresh expansion.
+    let mut prior_node_vars: HashSet<String> = HashSet::new();
+    prior_node_vars.insert(start_var.to_string());
+    // Collect every edge variable along the chain so we can
+    // enforce relationship uniqueness: a single MATCH's
+    // relationships must all be distinct.
+    let mut chain_edge_vars: Vec<String> = Vec::new();
     let mut current_var = start_var.to_string();
     for (i, hop) in pattern.hops.iter().enumerate() {
-        let dst_var = hop
+        let declared_dst_var = hop
             .target
             .var
             .clone()
             .unwrap_or_else(|| format!("__p{}_a{}", pattern_idx, i + 1));
+        // When the target reuses a prior binding (`(n)-[r]->(n)`),
+        // expand into a synthetic name so EdgeExpand doesn't
+        // clobber the original — then add an equality filter so
+        // we only emit rows where the synthetic matches the prior
+        // binding by id.
+        let dst_is_reuse = prior_node_vars.contains(&declared_dst_var);
+        let dst_var = if dst_is_reuse {
+            format!("__p{}_rebind{}", pattern_idx, i + 1)
+        } else {
+            declared_dst_var.clone()
+        };
+        // Auto-generate an edge var when the pattern omitted one
+        // so uniqueness filters below can reference it. The
+        // executor ignores unused synthesised vars.
+        let expand_edge_var = Some(
+            hop.rel
+                .var
+                .clone()
+                .unwrap_or_else(|| format!("__p{}_e{}", pattern_idx, i + 1)),
+        );
         plan = if let Some(vl) = hop.rel.var_length {
             if vl.min > vl.max {
                 return Err(Error::Plan(format!(
@@ -1765,6 +1794,9 @@ fn chain_hops(
                     vl.min, vl.max
                 )));
             }
+            // Var-length expansion does its own binding, so keep
+            // the caller's edge_var (even if None) — uniqueness
+            // filtering below can't cross into the subpath.
             LogicalPlan::VarLengthExpand {
                 input: Box::new(plan),
                 src_var: current_var.clone(),
@@ -1787,7 +1819,7 @@ fn chain_hops(
             LogicalPlan::EdgeExpand {
                 input: Box::new(plan),
                 src_var: current_var.clone(),
-                edge_var: hop.rel.var.clone(),
+                edge_var: expand_edge_var.clone(),
                 dst_var: dst_var.clone(),
                 dst_labels: hop.target.labels.clone(),
                 edge_properties: hop.rel.properties.clone(),
@@ -1798,7 +1830,50 @@ fn chain_hops(
         // Lower the target node's pattern properties to a Filter
         // wrapping the expand for the same reason as the start node.
         plan = wrap_with_pattern_prop_filter(plan, &dst_var, &hop.target.properties);
-        current_var = dst_var;
+        // If the target reuses a prior binding, check the synthesised
+        // dst var equals the declared one by id, then drop the
+        // rename so downstream clauses still see `declared_dst_var`
+        // (the executor keeps both bindings, which is fine — the
+        // synthetic name is scoped to this hop).
+        if dst_is_reuse {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: Expr::Compare {
+                    op: CompareOp::Eq,
+                    left: Box::new(Expr::Identifier(dst_var.clone())),
+                    right: Box::new(Expr::Identifier(declared_dst_var.clone())),
+                },
+            };
+        }
+        // Relationship uniqueness: every previously-bound edge in
+        // this MATCH must be a different edge from the one we
+        // just traversed. Only applies to fixed-length hops (we
+        // don't have a synthetic edge var for var-length
+        // expansions).
+        if hop.rel.var_length.is_none() {
+            if let Some(this_edge) = expand_edge_var.as_ref() {
+                for prior_edge in &chain_edge_vars {
+                    plan = LogicalPlan::Filter {
+                        input: Box::new(plan),
+                        predicate: Expr::Compare {
+                            op: CompareOp::Ne,
+                            left: Box::new(Expr::Identifier(this_edge.clone())),
+                            right: Box::new(Expr::Identifier(prior_edge.clone())),
+                        },
+                    };
+                }
+                chain_edge_vars.push(this_edge.clone());
+            }
+        }
+        prior_node_vars.insert(declared_dst_var.clone());
+        // Continue the chain from the declared name if we didn't
+        // rename, or the rebind synthesis otherwise. Downstream
+        // hops should key off the declared form.
+        current_var = if dst_is_reuse {
+            declared_dst_var
+        } else {
+            dst_var
+        };
     }
     Ok(plan)
 }
