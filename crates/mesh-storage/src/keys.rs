@@ -128,8 +128,9 @@ pub(crate) fn encode_index_value(value: &Property) -> Option<Vec<u8>> {
         Property::Bool(b) => Some(vec![INDEX_VALUE_BOOL, u8::from(*b)]),
         Property::DateTime(nanos) => {
             // Big-endian epoch-nanos so lexicographic byte order
-            // matches temporal order.
-            let mut out = Vec::with_capacity(1 + 8);
+            // matches temporal order. Store as i128 to cover the
+            // full year 1..9999 range at nanosecond precision.
+            let mut out = Vec::with_capacity(1 + 16);
             out.push(INDEX_VALUE_DATETIME);
             out.extend_from_slice(&nanos.to_be_bytes());
             Some(out)

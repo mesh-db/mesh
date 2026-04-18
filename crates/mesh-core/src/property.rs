@@ -25,16 +25,12 @@ pub enum Property {
     Bool(bool),
     List(Vec<Property>),
     Map(HashMap<String, Property>),
-    /// UTC epoch **nanoseconds**. Full nanosecond precision for
-    /// openCypher temporal compliance. Optional timezone offset
-    /// in seconds (0 = UTC / no timezone). Maps to Bolt's
+    /// UTC epoch **nanoseconds**. Stored as `i128` so we can
+    /// represent the full openCypher temporal range (years 1 to
+    /// 9999) at nanosecond precision — `i64` nanoseconds only
+    /// cover roughly ±292 years from 1970. Maps to Bolt's
     /// `DateTime` (struct tag `0x49`) on the wire.
-    ///
-    /// When `tz_offset_secs` is `None`, the value represents a
-    /// `localdatetime` (no timezone). When `Some(0)`, it's UTC
-    /// (formatted with `Z`). When `Some(n)`, it carries the
-    /// explicit offset (formatted as `+HH:MM`).
-    DateTime(i64),
+    DateTime(i128),
     /// Days since the UNIX epoch (1970-01-01, UTC). `i32` gives
     /// ±5.9 million years of range — far more than any realistic
     /// calendar application. Maps to Bolt `Date` (struct tag

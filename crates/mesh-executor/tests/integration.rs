@@ -5746,7 +5746,7 @@ fn datetime_now_returns_recent_epoch_millis() {
     let before = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as i64;
+        .as_nanos() as i128;
     let rows = run(&store, "RETURN datetime() AS now");
     let got = match rows[0].get("now") {
         Some(Value::Property(Property::DateTime(ns))) => *ns,
@@ -5755,7 +5755,7 @@ fn datetime_now_returns_recent_epoch_millis() {
     let after = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as i64;
+        .as_nanos() as i128;
     assert!(
         got >= before && got <= after,
         "datetime() {got} out of range [{before}, {after}]"
@@ -5901,7 +5901,7 @@ fn datetime_ordering_works_in_where() {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos() as i64;
+                .as_nanos() as i128;
             assert!(ts < now);
         })
         .unwrap();

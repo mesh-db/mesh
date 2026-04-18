@@ -441,7 +441,7 @@ fn format_property(p: &Property) -> String {
             format!("{{{}}}", entries.join(", "))
         }
         Property::DateTime(epoch_nanos) => {
-            let secs = epoch_nanos / 1_000_000_000;
+            let secs = (epoch_nanos / 1_000_000_000) as i64;
             let nanos = (epoch_nanos % 1_000_000_000) as u32;
             if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
                 let naive = dt.naive_utc();

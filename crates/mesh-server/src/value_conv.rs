@@ -186,8 +186,10 @@ fn property_to_bolt(p: &Property) -> BoltValue {
 /// Encode a UTC epoch-nanos `DateTime` as a Bolt 4.4
 /// `LocalDateTime` struct. Splits the nanos into `(seconds,
 /// nanos)` — Bolt's `LocalDateTime` field layout.
-fn datetime_to_bolt(epoch_nanos: i64) -> BoltValue {
-    let seconds = epoch_nanos.div_euclid(1_000_000_000);
+fn datetime_to_bolt(epoch_nanos: i128) -> BoltValue {
+    // Bolt LocalDateTime struct carries seconds as i64; nanos as i32.
+    // Split via div/rem, then downcast — years 1..9999 fit in i64 seconds.
+    let seconds = (epoch_nanos.div_euclid(1_000_000_000)) as i64;
     let nanos = epoch_nanos.rem_euclid(1_000_000_000) as i32;
     BoltValue::Struct {
         tag: TAG_LOCAL_DATE_TIME,
@@ -373,19 +375,11 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
                     reason: "expected 2 fields",
                 });
             }
-            // Collapse (seconds, nanos) back into epoch millis.
-            // Truncates sub-millisecond precision — the Property
-            // type carries millis, so any finer resolution from
-            // the driver is dropped silently. Round toward zero
-            // so the result stays monotonic with the input.
-            let ms = seconds
-                .checked_mul(1000)
-                .and_then(|s_ms| s_ms.checked_add(nanos / 1_000_000))
-                .ok_or(ParamConversionError::MalformedTemporal {
-                    tag,
-                    reason: "datetime overflows i64 milliseconds",
-                })?;
-            Ok(Property::DateTime(ms))
+            // Combine (seconds, nanos) into epoch nanoseconds. i128
+            // has plenty of range for the Bolt DateTime wire format.
+            let epoch_nanos: i128 =
+                (seconds as i128) * 1_000_000_000 + (nanos as i128);
+            Ok(Property::DateTime(epoch_nanos))
         }
         TAG_DATE => {
             if fields.len() != 1 {
