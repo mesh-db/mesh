@@ -197,6 +197,53 @@ fn when_executing_control_query(world: &mut MeshWorld, step: &cucumber::gherkin:
 
 // --- Then steps ---
 
+/// Normalize node/path label lists into alphabetical order. openCypher
+/// treats labels as an unordered set, so `(:A:B:C)` and `(:C:B:A)`
+/// denote the same value — but our formatter preserves creation order
+/// while the TCK's expected strings may use any permutation. Sort
+/// label runs within node-literal parentheses so comparison ignores
+/// label ordering. Only touches `:Label` sequences immediately after
+/// an opening `(`; property maps and other colon uses are unaffected.
+fn normalize_labels(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        // Detect a label run starting with `(:`. Labels are
+        // [A-Za-z0-9_] separated by `:` (and optional spaces added
+        // by normalize_tck), terminated by ` {`, `)`, or end of
+        // input. Rewrite the run with labels sorted alphabetically.
+        if chars[i] == '(' && i + 1 < chars.len() && chars[i + 1] == ':' {
+            let mut j = i + 1;
+            while j < chars.len()
+                && chars[j] != ')'
+                && !(chars[j] == ' '
+                    && j + 1 < chars.len()
+                    && chars[j + 1] == '{')
+            {
+                j += 1;
+            }
+            let run: String = chars[i + 2..j].iter().collect();
+            let mut labels: Vec<String> = run
+                .split(':')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            labels.sort();
+            out.push('(');
+            for lab in &labels {
+                out.push(':');
+                out.push_str(lab);
+            }
+            i = j;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Normalize property formatting for comparison: ensure consistent
 /// whitespace around colons in `{key:val}` vs `{key: val}`.
 fn normalize_tck(s: &str) -> String {
@@ -256,7 +303,7 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
         .map(|row| {
             headers
                 .iter()
-                .map(|h| normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null))))
+                .map(|h| normalize_labels(&normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null)))))
                 .collect()
         })
         .collect();
@@ -264,7 +311,7 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
 
     let mut expected_sorted: Vec<Vec<String>> = expected_rows
         .iter()
-        .map(|row| row.iter().map(|s| normalize_tck(s)).collect())
+        .map(|row| row.iter().map(|s| normalize_labels(&normalize_tck(s))).collect())
         .collect();
     expected_sorted.sort();
 
@@ -292,14 +339,14 @@ fn then_result_in_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
         .map(|row| {
             headers
                 .iter()
-                .map(|h| normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null))))
+                .map(|h| normalize_labels(&normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null)))))
                 .collect()
         })
         .collect();
 
     let expected_normalized: Vec<Vec<String>> = expected_rows
         .iter()
-        .map(|row| row.iter().map(|s| normalize_tck(s)).collect())
+        .map(|row| row.iter().map(|s| normalize_labels(&normalize_tck(s))).collect())
         .collect();
 
     assert_eq!(
@@ -378,7 +425,21 @@ fn format_value(val: &Value) -> String {
                 parts.push(format_value(&Value::Node(node.clone())));
                 if i < edges.len() {
                     let e = &edges[i];
-                    parts.push(format!("-[:{}]->", e.edge_type));
+                    let props = format_props_inline(&e.properties);
+                    let rel_body = if props.is_empty() {
+                        format!(":{}", e.edge_type)
+                    } else {
+                        format!(":{} {props}", e.edge_type)
+                    };
+                    // Determine direction by comparing the edge's
+                    // source to the current node's id. If the edge
+                    // runs from current→next, render forward; else
+                    // render reversed.
+                    if e.source == node.id {
+                        parts.push(format!("-[{rel_body}]->"));
+                    } else {
+                        parts.push(format!("<-[{rel_body}]-"));
+                    }
                 }
             }
             format!("<{}>", parts.join(""))
