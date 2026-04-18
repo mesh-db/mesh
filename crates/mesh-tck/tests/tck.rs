@@ -550,6 +550,98 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
     );
 }
 
+/// TCK's `the result should be (ignoring element order for lists):`
+/// step is the row-unordered variant that also ignores the order of
+/// elements inside list-typed cells. `labels(n)` is the canonical
+/// example — Neo4j doesn't pin the list order.
+#[then("the result should be (ignoring element order for lists):")]
+fn then_result_ignoring_list_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
+    if let Some(err) = &world.error {
+        panic!("Expected results but got error: {err}");
+    }
+    let table = step.table.as_ref().expect("expected result table");
+    let headers: Vec<&str> = table.rows[0].iter().map(|s| s.trim()).collect();
+    let expected_rows: Vec<Vec<String>> = table.rows[1..]
+        .iter()
+        .map(|row| row.iter().map(|s| s.trim().to_string()).collect())
+        .collect();
+
+    assert_eq!(
+        world.results.len(),
+        expected_rows.len(),
+        "Row count mismatch: got {} rows, expected {}.\nActual: {:?}",
+        world.results.len(),
+        expected_rows.len(),
+        format_results(&world.results, &headers),
+    );
+
+    let canonicalise = |s: &str| -> String {
+        let normalized = normalize_map_keys(&normalize_labels(&normalize_tck(s)));
+        // Sort comma-separated contents inside any `[ ... ]` so two
+        // lists with the same elements compare equal regardless of
+        // order. Leaves nested maps (`{k: v}`) alone — the TCK uses
+        // `[...]` brackets exclusively for its list cells.
+        let bytes = normalized.as_bytes();
+        let mut out = String::with_capacity(normalized.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'[' {
+                let start = i;
+                let mut depth = 0i32;
+                let mut end = i;
+                while end < bytes.len() {
+                    match bytes[end] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                let inner = &normalized[start + 1..end.saturating_sub(1)];
+                let mut parts: Vec<&str> = inner.split(", ").collect();
+                parts.sort();
+                out.push('[');
+                out.push_str(&parts.join(", "));
+                out.push(']');
+                i = end;
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
+    };
+
+    let mut actual_strs: Vec<Vec<String>> = world
+        .results
+        .iter()
+        .map(|row| {
+            headers
+                .iter()
+                .map(|h| canonicalise(&format_value(row.get(*h).unwrap_or(&Value::Null))))
+                .collect()
+        })
+        .collect();
+    actual_strs.sort();
+
+    let mut expected_sorted: Vec<Vec<String>> = expected_rows
+        .iter()
+        .map(|row| row.iter().map(|s| canonicalise(s)).collect())
+        .collect();
+    expected_sorted.sort();
+
+    assert_eq!(
+        actual_strs, expected_sorted,
+        "Result mismatch (unordered, list-order-insensitive).\nActual:   {actual_strs:?}\nExpected: {expected_sorted:?}"
+    );
+}
+
 #[then("the result should be, in order:")]
 fn then_result_in_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
     if let Some(err) = &world.error {
@@ -606,7 +698,7 @@ fn then_side_effects(_world: &mut MeshWorld) {
     // Side-effect checking deferred
 }
 
-#[then(regex = r"^a \w+ should be raised at (?:compile|runtime) time: .+$")]
+#[then(regex = r"^a \w+ should be raised at (?:compile time|runtime): .+$")]
 fn then_error_raised(world: &mut MeshWorld) {
     assert!(
         world.error.is_some(),
