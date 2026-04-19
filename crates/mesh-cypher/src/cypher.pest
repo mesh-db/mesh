@@ -101,7 +101,7 @@ match_stmt = {
 // query can't start with OPTIONAL MATCH or WITH without
 // something to pull rows from first.
 reading_clause = {
-    match_clause | optional_match_clause | with_tail | merge_clause | unwind_clause | call_subquery | load_csv_clause
+    match_clause | optional_match_clause | with_tail | merge_clause | unwind_clause | call_subquery | call_procedure | load_csv_clause
 }
 
 load_csv_clause = {
@@ -109,6 +109,24 @@ load_csv_clause = {
 }
 
 call_subquery = { kw_call ~ "{" ~ union_query ~ "}" }
+
+// A procedure call, either standalone (`CALL ns.name[(args)] [YIELD ...]`)
+// or appearing mid-query as a reading clause. The grammar doesn't
+// distinguish between the two — the planner decides based on
+// whether the call is the entire query body or sits inside a
+// `match_stmt`.
+//
+// Ordering note: `call_subquery` (body `{`) is tried before this
+// rule inside `reading_clause` so subquery-style calls aren't
+// accidentally committed as procedure calls.
+call_procedure = { kw_call ~ procedure_name ~ procedure_args? ~ yield_clause? }
+procedure_name = { identifier ~ ("." ~ identifier)* }
+procedure_args = { "(" ~ procedure_arg_list? ~ ")" }
+procedure_arg_list = { expression ~ ("," ~ expression)* }
+yield_clause = { kw_yield ~ (yield_star | yield_items) }
+yield_star = { "*" }
+yield_items = { yield_item ~ ("," ~ yield_item)* }
+yield_item = { identifier ~ (kw_as ~ identifier)? }
 
 // `UNWIND expression AS alias` as a mid-query reading clause —
 // expands the current row stream by cross-joining each row with
@@ -522,6 +540,7 @@ kw_profile = @{ ^"profile" ~ !id_cont }
 kw_remove = _{ ^"remove" }
 kw_count = @{ ^"count" ~ !id_cont }
 kw_call = _{ ^"call" }
+kw_yield = @{ ^"yield" ~ !id_cont }
 kw_foreach = _{ ^"foreach" }
 kw_load = _{ ^"load" }
 kw_csv = @{ ^"csv" ~ !id_cont }

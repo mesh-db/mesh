@@ -148,6 +148,36 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         body: Box<LogicalPlan>,
     },
+    /// Invocation of a registered procedure — `CALL ns.name[(args)]
+    /// [YIELD cols]`. Distinct from [`LogicalPlan::CallSubquery`]
+    /// (which runs a Cypher query body), a procedure call pulls
+    /// rows from an external registry looked up by the executor at
+    /// run time.
+    ///
+    /// `input` is `None` for a standalone call (the entire query is
+    /// this CALL); `Some(_)` when the call is embedded mid-query,
+    /// in which case each upstream row cross-products with the
+    /// procedure's matching rows.
+    ///
+    /// `args` is `None` for the implicit-args form (`CALL ns.name`)
+    /// where argument values come from the per-query `$`-parameter
+    /// map. `Some(exprs)` carries the explicit argument expressions.
+    ///
+    /// `yield_spec` is `None` when no YIELD keyword appeared (valid
+    /// only standalone: projects every declared output column).
+    /// `Some(YieldSpec::Star)` is `YIELD *` (also standalone only).
+    /// `Some(YieldSpec::Items(...))` is the named projection form.
+    ///
+    /// `standalone` mirrors the parser's context detection so the
+    /// executor can cheaply reject constructs that are only legal
+    /// in one form or the other.
+    ProcedureCall {
+        input: Option<Box<LogicalPlan>>,
+        qualified_name: Vec<String>,
+        args: Option<Vec<Expr>>,
+        yield_spec: Option<crate::ast::YieldSpec>,
+        standalone: bool,
+    },
     LoadCsv {
         input: Option<Box<LogicalPlan>>,
         path_expr: Expr,
@@ -468,6 +498,13 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
         Statement::Explain(inner) | Statement::Profile(inner) => {
             return plan_with_context(inner, ctx)
         }
+        Statement::CallProcedure(pc) => LogicalPlan::ProcedureCall {
+            input: None,
+            qualified_name: pc.qualified_name.clone(),
+            args: pc.args.clone(),
+            yield_spec: pc.yield_spec.clone(),
+            standalone: true,
+        },
     };
     validate_pattern_predicates(&plan)?;
     Ok(plan)
@@ -646,6 +683,19 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             format_plan_inner(body, buf, depth + 2);
             buf.push_str(&format!("{indent}  input:\n"));
             format_plan_inner(input, buf, depth + 2);
+        }
+        LogicalPlan::ProcedureCall {
+            qualified_name,
+            input,
+            ..
+        } => {
+            buf.push_str(&format!(
+                "{indent}ProcedureCall({})\n",
+                qualified_name.join(".")
+            ));
+            if let Some(inp) = input {
+                format_plan_inner(inp, buf, depth + 1);
+            }
         }
         LogicalPlan::IndexSeek {
             var,
@@ -1001,6 +1051,17 @@ where
             Some(i) => walk_plan_exprs(i, visit),
             None => Ok(()),
         },
+        LogicalPlan::ProcedureCall { input, args, .. } => {
+            if let Some(exprs) = args {
+                for e in exprs {
+                    visit(e)?;
+                }
+            }
+            match input {
+                Some(i) => walk_plan_exprs(i, visit),
+                None => Ok(()),
+            }
+        }
         LogicalPlan::NodeScanAll { .. }
         | LogicalPlan::NodeScanByLabels { .. }
         | LogicalPlan::SeedRow
@@ -1225,7 +1286,8 @@ fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
         Statement::Create(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
-        | Statement::ShowIndexes => Err(Error::Plan(
+        | Statement::ShowIndexes
+        | Statement::CallProcedure(_) => Err(Error::Plan(
             "UNION branches must be read queries (MATCH / UNWIND / RETURN); \
              DDL and CREATE-only statements are not allowed"
                 .into(),
@@ -2630,14 +2692,22 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     None => LogicalPlan::SeedRow,
                 };
                 plan = Some(apply_with_clause(current, w)?);
-                // Register the WITH's projected aliases so a
-                // downstream MATCH can use them as rebind
-                // references (e.g. CALL { WITH a MATCH (a)-[...]-> }).
+                // A WITH clause introduces a fresh scope: only the
+                // projected aliases (or the wildcard `*` pass-through
+                // of all current bindings) survive into subsequent
+                // clauses. Recompute `bound_vars` from the WITH
+                // projection so later clauses can't see names that
+                // were only bound before this scope boundary.
+                let mut new_bound: HashMap<String, VarType> = HashMap::new();
+                if w.star {
+                    new_bound = bound_vars.clone();
+                }
                 for item in &w.items {
                     let alias = return_item_column_name(item);
                     let vtype = infer_expr_type(&item.expr, &bound_vars);
-                    bound_vars.insert(alias, vtype);
+                    new_bound.insert(alias, vtype);
                 }
+                bound_vars = new_bound;
             }
             ReadingClause::Merge(mc) => {
                 // Lower a MERGE clause. Dispatch on whether
@@ -2839,6 +2909,81 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 plan = Some(LogicalPlan::CallSubquery {
                     input: Box::new(current),
                     body: Box::new(body_plan),
+                });
+            }
+            ReadingClause::CallProcedure(pc) => {
+                // Embedded CALL — reaches this arm only when the
+                // enclosing MatchStmt has either more than one
+                // reading clause or a terminal_tail; the standalone
+                // variant is promoted to `Statement::CallProcedure`
+                // back in the parser.
+                if pc.args.is_none() {
+                    // Implicit-args form (`CALL ns.name`) isn't
+                    // allowed mid-query; openCypher rejects it with
+                    // InvalidArgumentPassingMode.
+                    return Err(Error::Plan(
+                        "in-query CALL requires explicit argument list".into(),
+                    ));
+                }
+                if let Some(crate::ast::YieldSpec::Star) = &pc.yield_spec {
+                    return Err(Error::Plan(
+                        "YIELD * is only allowed on standalone CALL".into(),
+                    ));
+                }
+                // Reject aggregate expressions passed as args — TCK
+                // Scenario 16 covers this. Aggregates aren't legal
+                // outside of an Aggregate operator (RETURN / WITH),
+                // and CALL args are evaluated per-row.
+                if let Some(exprs) = &pc.args {
+                    for e in exprs {
+                        if contains_aggregate(e) {
+                            return Err(Error::Plan(
+                                "aggregate functions are not allowed in CALL arguments"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                match &pc.yield_spec {
+                    Some(crate::ast::YieldSpec::Items(items)) => {
+                        for yi in items {
+                            let bind_name =
+                                yi.alias.as_ref().unwrap_or(&yi.column).clone();
+                            if bound_vars.contains_key(&bind_name) {
+                                return Err(Error::Plan(format!(
+                                    "variable '{bind_name}' already defined"
+                                )));
+                            }
+                            bound_vars.insert(bind_name, VarType::Scalar);
+                        }
+                    }
+                    Some(crate::ast::YieldSpec::Star) => {
+                        // Already rejected above.
+                    }
+                    None => {
+                        // No YIELD in an in-query CALL — the TCK
+                        // flags this as UndefinedVariable the moment
+                        // a later clause tries to reference an
+                        // output. We mark it as "unyieldable" so
+                        // the terminal tail's RETURN / WITH
+                        // scope-check raises at plan time instead of
+                        // silently projecting nulls.
+                        //
+                        // Since we don't know the procedure's
+                        // outputs here (registry lookup is an
+                        // executor concern), we can't selectively
+                        // allow `CALL test.doNothing()` — but we
+                        // also can't reject every YIELD-less
+                        // in-query CALL. Defer the check to the
+                        // executor, where the registry is in scope.
+                    }
+                }
+                plan = Some(LogicalPlan::ProcedureCall {
+                    input: plan.take().map(Box::new),
+                    qualified_name: pc.qualified_name.clone(),
+                    args: pc.args.clone(),
+                    yield_spec: pc.yield_spec.clone(),
+                    standalone: false,
                 });
             }
             ReadingClause::LoadCsv(lc) => {

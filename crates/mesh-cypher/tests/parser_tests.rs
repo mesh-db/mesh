@@ -1345,6 +1345,7 @@ fn three_match_stages_parse() {
             ReadingClause::Merge(_) => "G",
             ReadingClause::Unwind(_) => "U",
             ReadingClause::Call(_) => "C",
+            ReadingClause::CallProcedure(_) => "CP",
             ReadingClause::LoadCsv(_) => "L",
             ReadingClause::Create(_) => "CR",
             ReadingClause::Set(_) => "S",

@@ -1,5 +1,6 @@
 use crate::{
     error::{Error, Result},
+    procedures::ProcedureRegistry,
     reader::GraphReader,
     value::{ParamMap, Row, Value},
 };
@@ -23,6 +24,7 @@ pub(crate) struct EvalCtx<'a> {
     pub row: &'a Row,
     pub params: &'a ParamMap,
     pub reader: &'a dyn GraphReader,
+    pub procedures: &'a ProcedureRegistry,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -35,6 +37,7 @@ impl<'a> EvalCtx<'a> {
             row: new_row,
             params: self.params,
             reader: self.reader,
+            procedures: self.procedures,
         }
     }
 }
@@ -961,6 +964,7 @@ fn execute_subquery_body(body: &mesh_cypher::Statement, ctx: &EvalCtx) -> Result
         store: ctx.reader,
         writer: &noop,
         params: ctx.params,
+        procedures: ctx.procedures,
     };
     let mut count = 0i64;
     while op.next(&exec_ctx)?.is_some() {

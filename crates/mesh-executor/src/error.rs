@@ -49,6 +49,9 @@ pub enum Error {
 
     #[error("invalid regular expression: {0}")]
     InvalidRegex(String),
+
+    #[error("procedure error: {0}")]
+    Procedure(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

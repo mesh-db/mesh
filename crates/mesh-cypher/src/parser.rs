@@ -108,11 +108,42 @@ fn build_read_stmt(pair: Pair<Rule>) -> Result<Statement> {
         .next()
         .ok_or_else(|| Error::Parse("empty read_stmt".into()))?;
     match inner.as_rule() {
-        Rule::match_stmt => Ok(Statement::Match(build_match(inner)?)),
+        Rule::match_stmt => {
+            let m = build_match(inner)?;
+            // A `match_stmt` whose whole body is a single
+            // `CALL ns.name[(...)] [YIELD ...]` and no terminal is a
+            // *standalone* procedure call — Neo4j allows forms here
+            // (implicit args, `YIELD *`) that aren't legal in
+            // mid-query position. Promote to [`Statement::CallProcedure`]
+            // so the planner can tell the two contexts apart.
+            if m.clauses.len() == 1 && terminal_is_empty(&m.terminal) {
+                if let crate::ast::ReadingClause::CallProcedure(pc) = &m.clauses[0] {
+                    return Ok(Statement::CallProcedure(pc.clone()));
+                }
+            }
+            Ok(Statement::Match(m))
+        }
         Rule::unwind_stmt => Ok(Statement::Unwind(build_unwind(inner)?)),
         Rule::return_only_stmt => Ok(Statement::Return(build_return_only(inner)?)),
         r => Err(Error::Parse(format!("unexpected read_stmt child: {r:?}"))),
     }
+}
+
+/// Cheap check for "this match_stmt has no terminal tail". The
+/// grammar leaves `terminal` at its default when no `terminal_tail`
+/// was seen, so every field is empty / `None` / `false`.
+fn terminal_is_empty(t: &crate::ast::TerminalTail) -> bool {
+    t.return_items.is_empty()
+        && !t.star
+        && !t.distinct
+        && t.order_by.is_empty()
+        && t.skip.is_none()
+        && t.limit.is_none()
+        && t.set_items.is_empty()
+        && t.delete.is_none()
+        && t.create_patterns.is_empty()
+        && t.remove_items.is_empty()
+        && t.foreach.is_none()
 }
 
 /// Parse a bare `RETURN <items>` statement. The grammar wraps a
@@ -511,6 +542,10 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                         let stmt = build_union_query(body)?;
                         clauses.push(ReadingClause::Call(Box::new(stmt)));
                     }
+                    Rule::call_procedure => {
+                        let pc = build_procedure_call(inner)?;
+                        clauses.push(ReadingClause::CallProcedure(pc));
+                    }
                     r => {
                         return Err(Error::Parse(format!(
                             "unexpected rule inside reading_clause: {:?}",
@@ -581,6 +616,7 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
         | ReadingClause::Unwind(_)
         | ReadingClause::With(_)
         | ReadingClause::Call(_)
+        | ReadingClause::CallProcedure(_)
         | ReadingClause::LoadCsv(_)
         | ReadingClause::Create(_)
         | ReadingClause::OptionalMatch(_) => {}
@@ -592,6 +628,105 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
     }
 
     Ok(MatchStmt { clauses, terminal })
+}
+
+/// Parse a `call_procedure` pair — the `CALL ns.name[(args)] [YIELD
+/// ...]` syntax — into a [`ProcedureCall`] struct. Used both by the
+/// in-query reading-clause path and by the standalone-detection
+/// wrapper at the top of [`build_match`]: the grammar doesn't
+/// distinguish the two contexts, so the planner decides based on
+/// whether the enclosing `MatchStmt` is a single-clause, no-terminal
+/// envelope (standalone) or anything else (in-query).
+fn build_procedure_call(pair: Pair<Rule>) -> Result<crate::ast::ProcedureCall> {
+    debug_assert_eq!(pair.as_rule(), Rule::call_procedure);
+    let mut qualified_name: Vec<String> = Vec::new();
+    let mut args: Option<Vec<Expr>> = None;
+    let mut yield_spec: Option<crate::ast::YieldSpec> = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::procedure_name => {
+                for id in p.into_inner() {
+                    debug_assert_eq!(id.as_rule(), Rule::identifier);
+                    qualified_name.push(parse_ident(id.as_str()));
+                }
+            }
+            Rule::procedure_args => {
+                // `Some(vec![])` represents an explicit empty list
+                // (`CALL ns.name()`) — the implicit-args form
+                // (`CALL ns.name` with no parens) leaves `args`
+                // as `None`.
+                let mut list: Vec<Expr> = Vec::new();
+                for child in p.into_inner() {
+                    if child.as_rule() == Rule::procedure_arg_list {
+                        for e in child.into_inner() {
+                            if e.as_rule() == Rule::expression {
+                                list.push(build_expression(e)?);
+                            }
+                        }
+                    }
+                }
+                args = Some(list);
+            }
+            Rule::yield_clause => {
+                yield_spec = Some(build_yield_clause(p)?);
+            }
+            Rule::kw_call => {}
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in call_procedure: {r:?}"
+                )))
+            }
+        }
+    }
+    if qualified_name.is_empty() {
+        return Err(Error::Parse("CALL missing procedure name".into()));
+    }
+    Ok(crate::ast::ProcedureCall {
+        qualified_name,
+        args,
+        yield_spec,
+    })
+}
+
+fn build_yield_clause(pair: Pair<Rule>) -> Result<crate::ast::YieldSpec> {
+    debug_assert_eq!(pair.as_rule(), Rule::yield_clause);
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::yield_star => return Ok(crate::ast::YieldSpec::Star),
+            Rule::yield_items => {
+                let mut items: Vec<crate::ast::YieldItem> = Vec::new();
+                for yi in p.into_inner() {
+                    debug_assert_eq!(yi.as_rule(), Rule::yield_item);
+                    let mut column = String::new();
+                    let mut alias: Option<String> = None;
+                    let mut saw_as = false;
+                    for part in yi.into_inner() {
+                        match part.as_rule() {
+                            Rule::identifier => {
+                                let name = parse_ident(part.as_str());
+                                if column.is_empty() && !saw_as {
+                                    column = name;
+                                } else {
+                                    alias = Some(name);
+                                }
+                            }
+                            Rule::kw_as => saw_as = true,
+                            _ => {}
+                        }
+                    }
+                    items.push(crate::ast::YieldItem { column, alias });
+                }
+                return Ok(crate::ast::YieldSpec::Items(items));
+            }
+            Rule::kw_yield => {}
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rule in yield_clause: {r:?}"
+                )))
+            }
+        }
+    }
+    Err(Error::Parse("empty yield_clause".into()))
 }
 
 /// Parse a bare `match_clause` (`MATCH pattern_list [WHERE]`)

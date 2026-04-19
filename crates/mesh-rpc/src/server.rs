@@ -855,6 +855,7 @@ fn count_index_seeks(plan: &mesh_cypher::LogicalPlan) -> u64 {
         P::BindPath { input, .. } | P::ShortestPath { input, .. } => count_index_seeks(input),
         P::CreatePath { input, .. } => input.as_deref().map(count_index_seeks).unwrap_or(0),
         P::MergeNode { input, .. } => input.as_deref().map(count_index_seeks).unwrap_or(0),
+        P::ProcedureCall { input, .. } => input.as_deref().map(count_index_seeks).unwrap_or(0),
         P::NodeScanAll { .. }
         | P::NodeScanByLabels { .. }
         | P::Unwind { .. }

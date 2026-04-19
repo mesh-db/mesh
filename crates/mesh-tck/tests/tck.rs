@@ -1,8 +1,10 @@
-use chrono::Timelike;
 use cucumber::{given, then, when, World};
 use mesh_core::Property;
 use mesh_cypher::{parse, plan};
-use mesh_executor::{execute_with_reader, ParamMap, Row, Value};
+use mesh_executor::{
+    execute_with_reader_and_procs, ProcArgSpec, ProcOutSpec, ProcRow, ProcType, Procedure,
+    ProcedureRegistry, ParamMap, Row, Value,
+};
 use mesh_storage::RocksDbStorageEngine;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -14,6 +16,7 @@ struct MeshWorld {
     dir: TempDir,
     store: RocksDbStorageEngine,
     params: ParamMap,
+    procedures: ProcedureRegistry,
     results: Vec<Row>,
     error: Option<String>,
 }
@@ -35,6 +38,7 @@ impl MeshWorld {
             dir,
             store,
             params: ParamMap::new(),
+            procedures: ProcedureRegistry::new(),
             results: Vec::new(),
             error: None,
         }
@@ -66,11 +70,12 @@ impl MeshWorld {
                 return;
             }
         };
-        match execute_with_reader(
+        match execute_with_reader_and_procs(
             &p,
             &self.store as &dyn mesh_executor::GraphReader,
             &self.store as &dyn mesh_executor::GraphWriter,
             &self.params,
+            &self.procedures,
         ) {
             Ok(rows) => self.results = rows,
             Err(e) => self.error = Some(format!("RuntimeError: {e}")),
@@ -178,6 +183,148 @@ fn given_parameters(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
             }
         }
     }
+}
+
+/// Register a mock procedure for the current scenario. Matches TCK
+/// steps like:
+///
+/// ```text
+/// And there exists a procedure test.my.proc(name :: STRING?, id :: INTEGER?) :: (city :: STRING?, country_code :: INTEGER?):
+///   | name     | id | city   | country_code |
+///   | 'Stefan' | 1  | 'Berlin' | 49         |
+/// ```
+///
+/// The signature is parsed from the matched regex captures; the
+/// gherkin data table is walked row-by-row to build the
+/// [`ProcRow`] entries, keyed by the declared column names so the
+/// executor's `row_matches` logic can filter by input arguments
+/// and project output columns.
+#[given(regex = r"^there exists a procedure (.+)$")]
+fn given_procedure(
+    world: &mut MeshWorld,
+    step: &cucumber::gherkin::Step,
+    signature: String,
+) {
+    let (name, inputs_raw, outputs_raw) = match parse_proc_signature(&signature) {
+        Some(parts) => parts,
+        None => {
+            panic!("failed to parse procedure signature: {signature}");
+        }
+    };
+    let qualified_name: Vec<String> = name.split('.').map(|s| s.to_string()).collect();
+    let inputs = parse_proc_arg_list(&inputs_raw);
+    let outputs = parse_proc_out_list(&outputs_raw);
+    let all_col_names: Vec<String> = inputs
+        .iter()
+        .map(|a| a.name.clone())
+        .chain(outputs.iter().map(|o| o.name.clone()))
+        .collect();
+
+    let mut rows: Vec<ProcRow> = Vec::new();
+    if let Some(table) = &step.table {
+        // The first gherkin row is the header. We ignore the actual
+        // header text (the signature already gave us column names +
+        // order) and treat the rest as data. Skip rows whose every
+        // cell is empty — that's the sentinel `|` form used for
+        // "no-output, no-data" procedures.
+        let data_rows = table.rows.iter().skip(1);
+        for gherk_row in data_rows {
+            if gherk_row.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            let mut pr: ProcRow = HashMap::new();
+            for (i, col_name) in all_col_names.iter().enumerate() {
+                let raw = gherk_row.get(i).map(|s| s.trim()).unwrap_or("");
+                pr.insert(col_name.clone(), parse_tck_value(raw));
+            }
+            rows.push(pr);
+        }
+    }
+    world.procedures.register(Procedure {
+        qualified_name,
+        inputs,
+        outputs,
+        rows,
+    });
+}
+
+fn parse_proc_arg_list(s: &str) -> Vec<ProcArgSpec> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    trimmed
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (name, ty) = split_sig_entry(entry)?;
+            Some(ProcArgSpec {
+                name,
+                ty: ProcType::parse(&ty),
+            })
+        })
+        .collect()
+}
+
+fn parse_proc_out_list(s: &str) -> Vec<ProcOutSpec> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    trimmed
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (name, ty) = split_sig_entry(entry)?;
+            Some(ProcOutSpec {
+                name,
+                ty: ProcType::parse(&ty),
+            })
+        })
+        .collect()
+}
+
+/// Split a procedure-signature entry like `name :: STRING?` into
+/// `("name", "STRING?")`. Returns `None` for malformed entries.
+fn split_sig_entry(s: &str) -> Option<(String, String)> {
+    let idx = s.find("::")?;
+    let name = s[..idx].trim().to_string();
+    let ty = s[idx + 2..].trim().to_string();
+    if name.is_empty() || ty.is_empty() {
+        return None;
+    }
+    Some((name, ty))
+}
+
+/// Parse a procedure-signature string like
+/// `test.my.proc(name :: STRING?, id :: INTEGER?) :: (city :: STRING?)`
+/// (trailing `:` optional) into `(qualified_name, inputs, outputs)`.
+/// Written by hand rather than via `regex::Captures` because
+/// cucumber-rs's regex-step capture routing is easier to get wrong
+/// than a plain parse off the full suffix.
+fn parse_proc_signature(s: &str) -> Option<(String, String, String)> {
+    let s = s.trim().trim_end_matches(':').trim();
+    let open = s.find('(')?;
+    let name = s[..open].trim().to_string();
+    let rest = &s[open + 1..];
+    // Find the matching close paren for the first `(`. The procedure
+    // name + arg list never contains nested parens, so a naive scan
+    // is enough.
+    let close = rest.find(')')?;
+    let inputs = rest[..close].trim().to_string();
+    let tail = rest[close + 1..].trim();
+    // Expect `:: ( outputs )`
+    let tail = tail.strip_prefix("::")?.trim();
+    let tail = tail.strip_prefix('(')?;
+    let outer_close = tail.rfind(')')?;
+    let outputs = tail[..outer_close].trim().to_string();
+    Some((name, inputs, outputs))
 }
 
 // --- When steps ---

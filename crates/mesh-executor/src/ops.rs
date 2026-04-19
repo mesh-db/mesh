@@ -1,6 +1,7 @@
 use crate::{
     error::{Error, Result},
     eval::{compare_values, eval_expr, row_key, to_bool, value_key, values_equal, EvalCtx},
+    procedures::ProcedureRegistry,
     reader::GraphReader,
     value::{ParamMap, Row, Value},
     writer::GraphWriter,
@@ -9,7 +10,7 @@ use mesh_core::{Edge, EdgeId, Node, NodeId, Property};
 use mesh_cypher::{
     AggregateArg, AggregateFn, AggregateSpec, BinaryOp, CallArgs, CompareOp, CreateEdgeSpec,
     CreateNodeSpec, Direction, Expr, Literal, LogicalPlan, RemoveSpec, ReturnItem, SetAssignment,
-    SortItem, UnaryOp,
+    SortItem, UnaryOp, YieldSpec,
 };
 use mesh_storage::RocksDbStorageEngine;
 use std::cmp::Ordering;
@@ -23,6 +24,11 @@ pub struct ExecCtx<'a> {
     /// driver-supplied params on the Bolt path. Threaded into every
     /// `eval_expr` call so `Expr::Parameter("name")` resolves.
     pub params: &'a ParamMap,
+    /// Procedures known to this execution. Defaults to an empty
+    /// registry on call sites that don't care; the TCK harness and
+    /// any future server startup plug in a populated registry so
+    /// `CALL ns.name(...)` resolves.
+    pub procedures: &'a ProcedureRegistry,
 }
 
 pub(crate) struct NoOpWriter;
@@ -55,6 +61,7 @@ impl<'a> ExecCtx<'a> {
             row,
             params: self.params,
             reader: self.store,
+            procedures: self.procedures,
         }
     }
 }
@@ -123,6 +130,22 @@ pub fn execute_with_reader(
     writer: &dyn GraphWriter,
     params: &ParamMap,
 ) -> Result<Vec<Row>> {
+    let empty_procs = ProcedureRegistry::new();
+    execute_with_reader_and_procs(plan, reader, writer, params, &empty_procs)
+}
+
+/// Like [`execute_with_reader`] but with an explicit procedure
+/// registry in scope. Used by the TCK harness to mount mock
+/// procedures declared by `there exists a procedure ...` steps,
+/// and reserved for the server startup path once built-in
+/// procedures land.
+pub fn execute_with_reader_and_procs(
+    plan: &LogicalPlan,
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    params: &ParamMap,
+    procedures: &ProcedureRegistry,
+) -> Result<Vec<Row>> {
     // `datetime()`, `localtime()`, and friends cache "now" in a
     // thread-local so multiple calls inside the same statement see
     // the same instant. Clear it at the start of every execution so
@@ -141,6 +164,7 @@ pub fn execute_with_reader(
         store: reader,
         writer,
         params,
+        procedures,
     };
     let mut rows = Vec::new();
     while let Some(row) = op.next(&ctx)? {
@@ -303,6 +327,19 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
         LogicalPlan::CallSubquery { input, body } => {
             Box::new(CallSubqueryOp::new(child!(input), (**body).clone()))
         }
+        LogicalPlan::ProcedureCall {
+            input,
+            qualified_name,
+            args,
+            yield_spec,
+            standalone,
+        } => Box::new(ProcedureCallOp::new(
+            input.as_ref().map(|p| child!(p)),
+            qualified_name.clone(),
+            args.clone(),
+            yield_spec.clone(),
+            *standalone,
+        )),
         LogicalPlan::SeedRow => match seed {
             Some(r) => Box::new(SeededRowOp {
                 row: Some(r.clone()),
@@ -520,6 +557,7 @@ impl Operator for UnwindOp {
                 row: &empty,
                 params: ctx.params,
                 reader: ctx.store,
+                procedures: ctx.procedures,
             };
             let val = eval_expr(&self.expr, &ectx)?;
             self.items = Some(coerce_unwind_list(val)?);
@@ -587,6 +625,7 @@ impl Operator for UnwindChainOp {
                 row: &base,
                 params: ctx.params,
                 reader: ctx.store,
+                procedures: ctx.procedures,
             };
             let val = eval_expr(&self.expr, &ectx)?;
             self.items = coerce_unwind_list(val)?;
@@ -1364,6 +1403,298 @@ impl Operator for CallSubqueryOp {
             }
             self.pending = results;
             self.pending_idx = 0;
+        }
+    }
+}
+
+/// Runtime operator for `CALL ns.name[(args)] [YIELD ...]`.
+///
+/// Resolves the procedure against the [`ProcedureRegistry`] at
+/// `next()` time, validates arity / types / form (implicit args,
+/// `YIELD *`, in-query YIELD requirement), then scans the registered
+/// data-table for rows whose input cells match the call arguments.
+/// Each matching row is projected according to the YIELD spec and
+/// merged into the upstream row.
+///
+/// Two shapes are supported at once:
+/// * Standalone (`input = None`): the op is the full plan. It
+///   runs the procedure exactly once (against a synthetic empty row)
+///   and emits the matching rows directly.
+/// * In-query (`input = Some(...)`): for each upstream row, runs
+///   the procedure with args evaluated against that row and emits
+///   one merged row per match. Procedures with zero declared output
+///   columns act as a pass-through — the upstream row is forwarded
+///   unchanged, matching Neo4j's side-effect-only semantics.
+struct ProcedureCallOp {
+    input: Option<Box<dyn Operator>>,
+    qualified_name: Vec<String>,
+    args: Option<Vec<Expr>>,
+    yield_spec: Option<YieldSpec>,
+    standalone: bool,
+    buffered: Vec<Row>,
+    buffered_idx: usize,
+    // Only set for the standalone form, which drives itself off a
+    // synthetic seed row exactly once.
+    done: bool,
+}
+
+impl ProcedureCallOp {
+    fn new(
+        input: Option<Box<dyn Operator>>,
+        qualified_name: Vec<String>,
+        args: Option<Vec<Expr>>,
+        yield_spec: Option<YieldSpec>,
+        standalone: bool,
+    ) -> Self {
+        Self {
+            input,
+            qualified_name,
+            args,
+            yield_spec,
+            standalone,
+            buffered: Vec::new(),
+            buffered_idx: 0,
+            done: false,
+        }
+    }
+
+    /// Resolve the projection list `(source_column, output_alias)`
+    /// from the procedure signature and this op's yield spec. Also
+    /// validates the spec — unknown YIELD columns, duplicate
+    /// aliases, and `YIELD *` / no-YIELD in disallowed contexts all
+    /// surface as `Error::Procedure`.
+    fn resolve_projection(
+        &self,
+        proc: &crate::procedures::Procedure,
+    ) -> Result<Vec<(String, String)>> {
+        match &self.yield_spec {
+            None => {
+                if !self.standalone {
+                    // In-query CALL with no YIELD: legal only for
+                    // side-effect-only procedures (zero declared
+                    // outputs). A procedure with outputs but no
+                    // YIELD leaves those outputs unbound, so any
+                    // downstream RETURN that references them would
+                    // see `UndefinedVariable`; reject here so the
+                    // error surfaces instead of silently emitting
+                    // nulls.
+                    if proc.outputs.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    return Err(Error::Procedure(format!(
+                        "procedure '{}' has outputs but no YIELD clause",
+                        self.qualified_name.join(".")
+                    )));
+                }
+                Ok(proc
+                    .outputs
+                    .iter()
+                    .map(|o| (o.name.clone(), o.name.clone()))
+                    .collect())
+            }
+            Some(YieldSpec::Star) => {
+                if !self.standalone {
+                    return Err(Error::Procedure(
+                        "YIELD * is only allowed on standalone CALL".into(),
+                    ));
+                }
+                Ok(proc
+                    .outputs
+                    .iter()
+                    .map(|o| (o.name.clone(), o.name.clone()))
+                    .collect())
+            }
+            Some(YieldSpec::Items(items)) => {
+                let mut projection = Vec::with_capacity(items.len());
+                let mut seen_aliases: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for yi in items {
+                    if !proc.outputs.iter().any(|o| o.name == yi.column) {
+                        return Err(Error::Procedure(format!(
+                            "procedure '{}' has no output column '{}'",
+                            self.qualified_name.join("."),
+                            yi.column
+                        )));
+                    }
+                    let alias = yi.alias.clone().unwrap_or_else(|| yi.column.clone());
+                    if !seen_aliases.insert(alias.clone()) {
+                        return Err(Error::Procedure(format!(
+                            "variable '{alias}' already bound by YIELD"
+                        )));
+                    }
+                    projection.push((yi.column.clone(), alias));
+                }
+                Ok(projection)
+            }
+        }
+    }
+
+    /// Evaluate the call's argument list against `row`. For the
+    /// implicit-args form (`args = None`), each declared input
+    /// column's value comes from the per-query parameter map
+    /// (keyed by the input-column name). Returns the argument
+    /// values in declaration order. Raises `ProcedureError` on
+    /// arity mismatch, type mismatch, or missing parameter.
+    fn evaluate_args(
+        &self,
+        ctx: &ExecCtx,
+        row: &Row,
+        proc: &crate::procedures::Procedure,
+    ) -> Result<Vec<Value>> {
+        match &self.args {
+            Some(exprs) => {
+                if exprs.len() != proc.inputs.len() {
+                    return Err(Error::Procedure(format!(
+                        "procedure '{}' expects {} argument(s), got {}",
+                        self.qualified_name.join("."),
+                        proc.inputs.len(),
+                        exprs.len()
+                    )));
+                }
+                let eval_ctx = ctx.eval_ctx(row);
+                let mut values = Vec::with_capacity(exprs.len());
+                for (expr, spec) in exprs.iter().zip(proc.inputs.iter()) {
+                    let v = eval_expr(expr, &eval_ctx)?;
+                    if !spec.ty.accepts(&v) {
+                        return Err(Error::Procedure(format!(
+                            "argument '{}' has wrong type for procedure '{}'",
+                            spec.name,
+                            self.qualified_name.join(".")
+                        )));
+                    }
+                    values.push(coerce_arg(v, spec.ty));
+                }
+                Ok(values)
+            }
+            None => {
+                // Implicit-arg form only valid standalone.
+                if !self.standalone {
+                    return Err(Error::Procedure(
+                        "in-query CALL requires explicit argument list".into(),
+                    ));
+                }
+                let mut values = Vec::with_capacity(proc.inputs.len());
+                for spec in &proc.inputs {
+                    let v = ctx.params.get(&spec.name).cloned().ok_or_else(|| {
+                        Error::Procedure(format!(
+                            "missing parameter ${} for procedure '{}'",
+                            spec.name,
+                            self.qualified_name.join(".")
+                        ))
+                    })?;
+                    if !spec.ty.accepts(&v) {
+                        return Err(Error::Procedure(format!(
+                            "parameter '{}' has wrong type",
+                            spec.name
+                        )));
+                    }
+                    values.push(coerce_arg(v, spec.ty));
+                }
+                Ok(values)
+            }
+        }
+    }
+
+    /// Invoke the procedure once for `input_row` and emit zero or
+    /// more output rows into `out`. Handles the "zero-output-column
+    /// pass-through" case that keeps `MATCH (n) CALL test.doNothing()
+    /// RETURN n.name` from filtering the match rows.
+    fn invoke_once(
+        &self,
+        ctx: &ExecCtx,
+        input_row: &Row,
+        proc: &crate::procedures::Procedure,
+        projection: &[(String, String)],
+        out: &mut Vec<Row>,
+    ) -> Result<()> {
+        // Zero-output-column procedures are side-effect-only in
+        // the TCK; they either suppress rows entirely (standalone)
+        // or pass the input row through unchanged (in-query).
+        if proc.outputs.is_empty() {
+            if !self.standalone {
+                out.push(input_row.clone());
+            }
+            return Ok(());
+        }
+        let args = self.evaluate_args(ctx, input_row, proc)?;
+        for proc_row in &proc.rows {
+            if !proc.row_matches(proc_row, &args) {
+                continue;
+            }
+            let mut merged = if self.standalone {
+                Row::new()
+            } else {
+                input_row.clone()
+            };
+            for (src, alias) in projection {
+                let v = proc_row.get(src).cloned().unwrap_or(Value::Null);
+                merged.insert(alias.clone(), v);
+            }
+            out.push(merged);
+        }
+        Ok(())
+    }
+}
+
+/// Cast an int to a float when the declared type is `FLOAT`. Other
+/// declared types leave the value as-is (accept() has already
+/// gated on kind) so the comparison in `row_matches` sees a
+/// consistent shape.
+fn coerce_arg(v: Value, ty: crate::procedures::ProcType) -> Value {
+    use crate::procedures::ProcType;
+    if matches!(ty, ProcType::Float) {
+        if let Value::Property(Property::Int64(n)) = v {
+            return Value::Property(Property::Float64(n as f64));
+        }
+    }
+    v
+}
+
+impl Operator for ProcedureCallOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            if self.buffered_idx < self.buffered.len() {
+                let row = self.buffered[self.buffered_idx].clone();
+                self.buffered_idx += 1;
+                return Ok(Some(row));
+            }
+            self.buffered.clear();
+            self.buffered_idx = 0;
+
+            let proc = match ctx.procedures.get(&self.qualified_name) {
+                Some(p) => p,
+                None => {
+                    return Err(Error::Procedure(format!(
+                        "procedure '{}' not found",
+                        self.qualified_name.join(".")
+                    )));
+                }
+            };
+            let projection = self.resolve_projection(proc)?;
+
+            let input_row = match &mut self.input {
+                Some(inp) => match inp.next(ctx)? {
+                    Some(r) => r,
+                    None => return Ok(None),
+                },
+                None => {
+                    if self.done {
+                        return Ok(None);
+                    }
+                    self.done = true;
+                    Row::new()
+                }
+            };
+
+            let mut produced = Vec::new();
+            self.invoke_once(ctx, &input_row, proc, &projection, &mut produced)?;
+            if produced.is_empty() {
+                if self.input.is_some() {
+                    continue;
+                }
+                return Ok(None);
+            }
+            self.buffered = produced;
         }
     }
 }

@@ -30,6 +30,49 @@ pub enum Statement {
     /// `PROFILE <query>` — execute the query and return the plan
     /// annotated with row counts per operator.
     Profile(Box<Statement>),
+    /// Standalone procedure call: `CALL ns.name[(args)] [YIELD ...]`
+    /// with no surrounding reading clauses and no trailing RETURN.
+    /// Distinct from the in-query `ReadingClause::CallProcedure`
+    /// form so the planner can allow forms (implicit args, `YIELD *`)
+    /// that openCypher reserves for standalone calls.
+    CallProcedure(ProcedureCall),
+}
+
+/// A single `CALL ns.sub.name[(args)] [YIELD items|*]` invocation.
+/// Shared by both the standalone statement form and the in-query
+/// reading-clause form; the planner distinguishes by the enclosing
+/// context.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcedureCall {
+    /// Fully qualified name components, e.g. `["test", "my", "proc"]`.
+    /// The last entry is the procedure name; any preceding entries
+    /// are namespace segments.
+    pub qualified_name: Vec<String>,
+    /// Explicit argument list. `None` for implicit-args form
+    /// (`CALL ns.name` with no parens) — only valid on standalone
+    /// calls. `Some(vec![])` for an explicit empty list
+    /// (`CALL ns.name()`).
+    pub args: Option<Vec<Expr>>,
+    /// `YIELD` projection. `None` = no YIELD clause at all (valid
+    /// only on standalone calls — projects every declared output).
+    /// `Some(YieldSpec::Star)` = `YIELD *`. `Some(YieldSpec::Items(...))`
+    /// = named column list.
+    pub yield_spec: Option<YieldSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum YieldSpec {
+    Star,
+    Items(Vec<YieldItem>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct YieldItem {
+    /// Declared output column of the procedure being called.
+    pub column: String,
+    /// Optional `AS <alias>` rename. When absent the column's own
+    /// name is used as the row-key.
+    pub alias: Option<String>,
 }
 
 /// `query1 UNION [ALL] query2 [UNION [ALL] query3 ...]`. Each
@@ -130,6 +173,12 @@ pub enum ReadingClause {
     /// input row. Correlated subqueries import outer bindings via
     /// `WITH var1, var2` as the first clause inside the body.
     Call(Box<Statement>),
+    /// `CALL ns.name[(args)] YIELD cols` — mid-query invocation of
+    /// a registered procedure. Unlike the standalone
+    /// [`Statement::CallProcedure`] form, in-query calls require an
+    /// explicit args list and an explicit YIELD (no `YIELD *`) so
+    /// the row shape is known to subsequent clauses.
+    CallProcedure(ProcedureCall),
     /// Mid-query `CREATE pattern_list` — creates nodes/edges
     /// inline, allowing subsequent reading clauses to see them.
     Create(Vec<Pattern>),
