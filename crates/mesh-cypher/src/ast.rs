@@ -544,6 +544,18 @@ pub enum Expr {
     /// variable-length hops, no path variables, and the pattern
     /// must carry at least one hop.
     PatternExists(Pattern),
+    /// Pattern comprehension: `[(n)-[:T]->(m) [WHERE pred] |
+    /// projection]`. For each match of `pattern` in the graph
+    /// (anchored by outer-row bindings the same way
+    /// [`Expr::PatternExists`] is), evaluate `projection` with
+    /// the match's bindings in scope and collect into a list.
+    /// `predicate` is an optional WHERE applied before
+    /// projection. Inner bindings don't leak to the outer row.
+    PatternComprehension {
+        pattern: Pattern,
+        predicate: Option<Box<Expr>>,
+        projection: Box<Expr>,
+    },
     /// `EXISTS { MATCH pattern [WHERE expr] }` — Cypher 5
     /// subquery existence form. A strict superset of
     /// [`Expr::PatternExists`]: the WHERE clause can reference

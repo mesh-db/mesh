@@ -4337,6 +4337,14 @@ impl AggregateOp {
                             Value::Property(Property::Int64(i)) => i as f64,
                             _ => 0.0,
                         };
+                        // openCypher requires the percentile to
+                        // lie in [0.0, 1.0]; anything else is an
+                        // `ArgumentError: NumberOutOfRange`.
+                        if !(0.0..=1.0).contains(&p) || p.is_nan() {
+                            return Err(Error::Procedure(format!(
+                                "percentile out of range: {p}"
+                            )));
+                        }
                         match &mut entry.agg_states[i] {
                             AggState::PercentileDisc { percentile, .. }
                             | AggState::PercentileCont { percentile, .. } => {

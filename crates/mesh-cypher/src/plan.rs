@@ -1310,6 +1310,18 @@ where
         // shape is checked separately by the subquery
         // validation pass.
         Expr::ExistsSubquery { .. } | Expr::CountSubquery { .. } => Ok(()),
+        // Pattern comprehension: the pattern itself carries no
+        // sub-expressions the walker cares about (same rule as
+        // `PatternExists`), but the WHERE / projection are plain
+        // expressions and need to be visited so any pattern
+        // predicates, parameter uses, etc. inside them are
+        // validated.
+        Expr::PatternComprehension { predicate, projection, .. } => {
+            if let Some(p) = predicate {
+                walk_expr(p, visit)?;
+            }
+            walk_expr(projection, visit)
+        }
     }
 }
 
@@ -1747,6 +1759,37 @@ fn check_set_expr_scope_inner(
         // Subquery / pattern predicate bodies manage their own scope; skip.
         Expr::PatternExists(_) | Expr::ExistsSubquery { .. } | Expr::CountSubquery { .. } => {
             Ok(())
+        }
+        // Pattern comprehension binds the pattern's node / edge
+        // variables locally, so WHERE / projection see them on
+        // top of the outer scope. Skipping the pattern itself
+        // (same as PatternExists) — its property values are
+        // literal-only.
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            projection,
+        } => {
+            let mut local_names: Vec<String> = Vec::new();
+            if let Some(v) = &pattern.start.var {
+                local_names.push(v.clone());
+            }
+            for hop in &pattern.hops {
+                if let Some(v) = &hop.rel.var {
+                    local_names.push(v.clone());
+                }
+                if let Some(v) = &hop.target.var {
+                    local_names.push(v.clone());
+                }
+            }
+            let mut next: Vec<&str> = locals.to_vec();
+            for n in &local_names {
+                next.push(n.as_str());
+            }
+            if let Some(p) = predicate {
+                check_set_expr_scope_inner(p, bound, &next)?;
+            }
+            check_set_expr_scope_inner(projection, bound, &next)
         }
     }
 }
@@ -2958,6 +3001,7 @@ fn infer_expr_type(expr: &Expr, bound_vars: &HashMap<String, VarType>) -> VarTyp
         | Expr::ExistsSubquery { .. }
         | Expr::CountSubquery { .. }
         | Expr::ListComprehension { .. }
+        | Expr::PatternComprehension { .. }
         | Expr::Reduce { .. }
         | Expr::BinaryOp { .. }
         | Expr::UnaryOp { .. } => VarType::NonNode,

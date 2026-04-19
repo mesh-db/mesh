@@ -2152,6 +2152,50 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             Ok(Expr::Map(entries))
         }
         Rule::list_comp => build_list_comp(pair),
+        Rule::pattern_comprehension => {
+            let mut start: Option<crate::ast::NodePattern> = None;
+            let mut hops: Vec<crate::ast::Hop> = Vec::new();
+            let mut predicate: Option<Expr> = None;
+            let mut projection: Option<Expr> = None;
+            for p in pair.into_inner() {
+                match p.as_rule() {
+                    Rule::node_pattern => {
+                        start = Some(build_node_pattern(p)?);
+                    }
+                    Rule::hop => {
+                        hops.push(build_hop(p)?);
+                    }
+                    Rule::list_comp_where => {
+                        let inner = p
+                            .into_inner()
+                            .find(|e| e.as_rule() == Rule::expression)
+                            .ok_or_else(|| {
+                                Error::Parse("pattern comprehension WHERE missing expr".into())
+                            })?;
+                        predicate = Some(build_expression(inner)?);
+                    }
+                    Rule::expression => {
+                        projection = Some(build_expression(p)?);
+                    }
+                    Rule::kw_where => {}
+                    _ => {}
+                }
+            }
+            let start = start
+                .ok_or_else(|| Error::Parse("pattern comprehension missing start node".into()))?;
+            let projection = projection
+                .ok_or_else(|| Error::Parse("pattern comprehension missing projection".into()))?;
+            Ok(Expr::PatternComprehension {
+                pattern: Pattern {
+                    start,
+                    hops,
+                    path_var: None,
+                    shortest: None,
+                },
+                predicate: predicate.map(Box::new),
+                projection: Box::new(projection),
+            })
+        }
         Rule::reduce_expr => build_reduce_expr(pair),
         Rule::list_predicate => {
             let mut inner = pair.into_inner();

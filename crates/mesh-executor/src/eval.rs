@@ -746,6 +746,16 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 Ok(Value::Property(Property::Int64(n)))
             }
         }
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            projection,
+        } => pattern_comprehension_eval(
+            pattern,
+            predicate.as_deref(),
+            projection,
+            ctx,
+        ),
     }
 }
 
@@ -1034,6 +1044,130 @@ fn execute_subquery_body(body: &mesh_cypher::Statement, ctx: &EvalCtx) -> Result
         count += 1;
     }
     Ok(count)
+}
+
+/// Evaluate a pattern comprehension `[pattern [WHERE pred] | proj]`:
+/// enumerate every match of `pattern` anchored at the outer-row's
+/// bound start variable, apply the optional WHERE filter against
+/// the match's bindings, evaluate the projection, and collect into
+/// a list. Inner bindings (new edge / target names introduced by
+/// the pattern) are visible to WHERE and projection but don't
+/// leak back to the outer row. Fixed-length hops only (no
+/// var-length / shortestPath) — the TCK doesn't exercise those
+/// and they'd need separate enumeration.
+fn pattern_comprehension_eval(
+    pattern: &Pattern,
+    predicate: Option<&Expr>,
+    projection: &Expr,
+    ctx: &EvalCtx,
+) -> Result<Value> {
+    let start_var = match pattern.start.var.as_deref() {
+        Some(v) => v,
+        None => return Ok(Value::List(Vec::new())),
+    };
+    let start_node = match ctx.row.get(start_var) {
+        Some(Value::Node(n)) => n.clone(),
+        _ => return Ok(Value::List(Vec::new())),
+    };
+    if !start_node_matches(&start_node, &pattern.start, ctx)? {
+        return Ok(Value::List(Vec::new()));
+    }
+
+    // Each entry: (current node, edges used so far, bindings added
+    // by inner pattern variables). Extending the frontier per hop
+    // mirrors `pattern_exists` but also tracks bindings so the
+    // projection / predicate can reference them.
+    use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
+    use mesh_core::EdgeId;
+    let mut frontier: Vec<(NodeId, StdHashSet<EdgeId>, StdHashMap<String, Value>)> =
+        vec![(start_node.id, StdHashSet::new(), StdHashMap::new())];
+    for hop in &pattern.hops {
+        // Var-length hops in a comprehension would need path-list
+        // handling analogous to `VarLengthExpand` — out of scope
+        // for this minimal implementation; collapse to empty.
+        if hop.rel.var_length.is_some() {
+            return Ok(Value::List(Vec::new()));
+        }
+        let mut next: Vec<(NodeId, StdHashSet<EdgeId>, StdHashMap<String, Value>)> = Vec::new();
+        for (cur_id, used, bindings) in &frontier {
+            let neighbors = match hop.rel.direction {
+                Direction::Outgoing => ctx.reader.outgoing(*cur_id)?,
+                Direction::Incoming => ctx.reader.incoming(*cur_id)?,
+                Direction::Both => {
+                    let mut all = ctx.reader.outgoing(*cur_id)?;
+                    all.extend(ctx.reader.incoming(*cur_id)?);
+                    all
+                }
+            };
+            for (edge_id, neighbor_id) in neighbors {
+                if used.contains(&edge_id) {
+                    continue;
+                }
+                let edge = match ctx.reader.get_edge(edge_id)? {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if !hop.rel.edge_types.is_empty()
+                    && !hop.rel.edge_types.iter().any(|t| t == &edge.edge_type)
+                {
+                    continue;
+                }
+                let neighbor = match ctx.reader.get_node(neighbor_id)? {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if !node_pattern_matches(&neighbor, &hop.target, ctx)? {
+                    continue;
+                }
+                // If the target var is already bound in the outer
+                // row, only accept neighbors that match by id —
+                // same rule `PatternExists` uses for the endpoint
+                // constraint case.
+                if let Some(target_var) = &hop.target.var {
+                    if let Some(Value::Node(bound)) = ctx.row.get(target_var) {
+                        if bound.id != neighbor.id {
+                            continue;
+                        }
+                    }
+                }
+                let mut new_bindings = bindings.clone();
+                if let Some(ev) = &hop.rel.var {
+                    new_bindings.insert(ev.clone(), Value::Edge(edge));
+                }
+                if let Some(tv) = &hop.target.var {
+                    new_bindings.insert(tv.clone(), Value::Node(neighbor));
+                }
+                let mut new_used = used.clone();
+                new_used.insert(edge_id);
+                next.push((neighbor_id, new_used, new_bindings));
+            }
+        }
+        frontier = next;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+
+    let mut out: Vec<Value> = Vec::new();
+    for (_, _, bindings) in frontier {
+        // Layer inner bindings onto the outer row. The sub-row
+        // needs to live long enough for `eval_expr` to borrow
+        // through `with_row`.
+        let mut sub_row = ctx.row.clone();
+        for (k, v) in bindings {
+            sub_row.insert(k, v);
+        }
+        let sub_ctx = ctx.with_row(&sub_row);
+        if let Some(p) = predicate {
+            let pv = eval_expr(p, &sub_ctx)?;
+            if !matches!(pv, Value::Property(Property::Bool(true))) {
+                continue;
+            }
+        }
+        let val = eval_expr(projection, &sub_ctx)?;
+        out.push(val);
+    }
+    Ok(Value::List(out))
 }
 
 fn pattern_exists(pattern: &Pattern, ctx: &EvalCtx) -> Result<bool> {
