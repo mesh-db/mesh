@@ -328,6 +328,15 @@ pub enum SetItem {
         var: String,
         properties: Vec<(String, Expr)>,
     },
+    /// `SET x = y` / `SET x = $param` — copy another binding's
+    /// (or a parameter's) property map wholesale. `replace` is
+    /// true for the `=` form (clears existing properties first)
+    /// and false for the `+=` merge form.
+    ReplaceFromExpr {
+        var: String,
+        source: Expr,
+        replace: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

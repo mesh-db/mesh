@@ -362,6 +362,12 @@ pub enum LogicalPlan {
         /// and the newly-created edge is emitted in the src→dst
         /// direction (matching Neo4j's tie-breaking behavior).
         undirected: bool,
+        /// Inline edge property filter (`[r:T {year: 1988}]`) — an
+        /// existing edge matches only if all of these properties
+        /// equal the bound values. When the create branch fires,
+        /// the newly-synthesized edge is stamped with this map so
+        /// a later MATCH finds the same shape.
+        properties: Vec<(String, Expr)>,
         on_create: Vec<SetAssignment>,
         on_match: Vec<SetAssignment>,
     },
@@ -506,6 +512,15 @@ pub enum SetAssignment {
     Merge {
         var: String,
         properties: Vec<(String, Expr)>,
+    },
+    /// `SET x = y` (`replace = true`) / `SET x += y` (`replace = false`)
+    /// where `y` is a bound node/edge identifier or a parameter —
+    /// copies `y`'s properties onto `x`. Evaluated at runtime; the
+    /// executor extracts the property map from the value.
+    ReplaceFromExpr {
+        var: String,
+        source: Expr,
+        replace: bool,
     },
 }
 
@@ -1101,6 +1116,7 @@ where
                             visit(e)?;
                         }
                     }
+                    SetAssignment::ReplaceFromExpr { source, .. } => visit(source)?,
                     SetAssignment::Labels { .. } => {}
                 }
             }
@@ -1630,6 +1646,51 @@ fn check_set_expr_scope(expr: &Expr, bound: &HashMap<String, VarType>) -> Result
     check_set_expr_scope_inner(expr, bound, &[])
 }
 
+/// Scope-check the target-var and value-expression of a single
+/// `SetItem`. Used for MERGE's `ON CREATE` / `ON MATCH` clauses,
+/// where the usual set-tail scope check doesn't run (the items
+/// live on the MergeClause rather than as standalone clauses).
+fn check_set_item_scope(
+    item: &crate::ast::SetItem,
+    bound: &HashMap<String, VarType>,
+) -> Result<()> {
+    use crate::ast::SetItem;
+    let missing = |v: &str| {
+        Err(Error::Plan(format!(
+            "UndefinedVariable: variable `{v}` is not defined"
+        )))
+    };
+    match item {
+        SetItem::Property { var, value, .. } => {
+            if !bound.contains_key(var) {
+                return missing(var);
+            }
+            check_set_expr_scope(value, bound)
+        }
+        SetItem::Labels { var, .. } => {
+            if !bound.contains_key(var) {
+                return missing(var);
+            }
+            Ok(())
+        }
+        SetItem::Replace { var, properties } | SetItem::Merge { var, properties } => {
+            if !bound.contains_key(var) {
+                return missing(var);
+            }
+            for (_, expr) in properties {
+                check_set_expr_scope(expr, bound)?;
+            }
+            Ok(())
+        }
+        SetItem::ReplaceFromExpr { var, source, .. } => {
+            if !bound.contains_key(var) {
+                return missing(var);
+            }
+            check_set_expr_scope(source, bound)
+        }
+    }
+}
+
 /// Scope-check every property-value expression in `pattern` (its
 /// start node plus every hop's rel and target) against `bound`.
 /// Pattern-property values may be full expressions — including
@@ -1849,6 +1910,10 @@ fn check_set_assignments_scope(
                     check_set_expr_scope(e, bound)?;
                 }
             }
+            SetAssignment::ReplaceFromExpr { source, .. } => {
+                reject_pattern_predicate_in_projection(source, "SET right-hand side")?;
+                check_set_expr_scope(source, bound)?;
+            }
             SetAssignment::Labels { .. } => {}
         }
     }
@@ -1877,6 +1942,15 @@ fn set_item_to_assignment(item: &crate::ast::SetItem) -> SetAssignment {
         crate::ast::SetItem::Merge { var, properties } => SetAssignment::Merge {
             var: var.clone(),
             properties: properties.clone(),
+        },
+        crate::ast::SetItem::ReplaceFromExpr {
+            var,
+            source,
+            replace,
+        } => SetAssignment::ReplaceFromExpr {
+            var: var.clone(),
+            source: source.clone(),
+            replace: *replace,
         },
     }
 }
@@ -3382,6 +3456,102 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // None (MERGE is the first clause of the
                 // query), the merge runs top-level as a
                 // producer with `input = None`.
+
+                // openCypher rejects rebinding a variable with new
+                // predicates inside a MERGE — `MATCH (a) MERGE (a)`
+                // and `CREATE (a:Foo) MERGE (a)-[r:K]->(a:Bar)` both
+                // raise `VariableAlreadyBound`. Scan every node
+                // position in the pattern: if its var is already in
+                // `bound_vars` and this occurrence adds labels or
+                // properties, reject. The bare-rebind case (no hops,
+                // no labels, no properties) is also rejected — it has
+                // no side effect but the spec still forbids it.
+                {
+                    let start = &mc.pattern.start;
+                    if let Some(v) = &start.var {
+                        if bound_vars.contains_key(v)
+                            && (!start.labels.is_empty() || !start.properties.is_empty())
+                        {
+                            return Err(Error::Plan(format!(
+                                "VariableAlreadyBound: MERGE cannot impose new predicates on `{v}`"
+                            )));
+                        }
+                    }
+                    for hop in &mc.pattern.hops {
+                        if let Some(v) = &hop.target.var {
+                            if bound_vars.contains_key(v)
+                                && (!hop.target.labels.is_empty()
+                                    || !hop.target.properties.is_empty())
+                            {
+                                return Err(Error::Plan(format!(
+                                    "VariableAlreadyBound: MERGE cannot impose new predicates on `{v}`"
+                                )));
+                            }
+                        }
+                    }
+                    // Bare-node MERGE of an already-bound var is a
+                    // no-op that openCypher still flags.
+                    if mc.pattern.hops.is_empty() {
+                        if let Some(v) = &start.var {
+                            if bound_vars.contains_key(v)
+                                && start.labels.is_empty()
+                                && start.properties.is_empty()
+                            {
+                                return Err(Error::Plan(format!(
+                                    "VariableAlreadyBound: MERGE on already-bound `{v}`"
+                                )));
+                            }
+                        }
+                    }
+                }
+
+                // `MERGE (n {k: null})` is a semantic error —
+                // null can't participate in the equality match
+                // that backs MERGE, so openCypher rejects it
+                // (MergeReadOwnWrites). Catch top-level null
+                // literals in any pattern property value.
+                {
+                    let reject_null = |props: &[(String, Expr)]| -> Result<()> {
+                        for (_, v) in props {
+                            if matches!(v, Expr::Literal(Literal::Null)) {
+                                return Err(Error::Plan(
+                                    "MergeReadOwnWrites: null property in MERGE pattern".into(),
+                                ));
+                            }
+                        }
+                        Ok(())
+                    };
+                    reject_null(&mc.pattern.start.properties)?;
+                    for hop in &mc.pattern.hops {
+                        reject_null(&hop.rel.properties)?;
+                        reject_null(&hop.target.properties)?;
+                    }
+                }
+
+                // Scope-check every SET expression in ON CREATE /
+                // ON MATCH. The scope includes pre-existing bindings
+                // plus anything the MERGE pattern will bind. Without
+                // this, `MERGE (n) ON MATCH SET x.num = 1` silently
+                // plans (and then executes, mutating nothing useful)
+                // instead of raising UndefinedVariable.
+                {
+                    let mut merge_scope = bound_vars.clone();
+                    if let Some(v) = &mc.pattern.start.var {
+                        merge_scope.insert(v.clone(), VarType::Node);
+                    }
+                    for hop in &mc.pattern.hops {
+                        if let Some(v) = &hop.rel.var {
+                            merge_scope.insert(v.clone(), VarType::Edge);
+                        }
+                        if let Some(v) = &hop.target.var {
+                            merge_scope.insert(v.clone(), VarType::Node);
+                        }
+                    }
+                    for item in mc.on_create.iter().chain(mc.on_match.iter()) {
+                        check_set_item_scope(item, &merge_scope)?;
+                    }
+                }
+
                 let on_create = mc
                     .on_create
                     .iter()
@@ -3515,6 +3685,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             dst_var: merge_dst,
                             edge_type,
                             undirected: matches!(hop.rel.direction, Direction::Both),
+                            properties: hop.rel.properties.clone(),
                             on_create: on_create.clone(),
                             on_match: on_match.clone(),
                         });

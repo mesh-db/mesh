@@ -4696,13 +4696,15 @@ fn top_level_merge_without_return_is_effectful() {
 
 #[test]
 fn chained_merge_var_collision_rejected() {
-    // MERGE on already-bound variable is now allowed per openCypher spec.
+    // openCypher `VariableAlreadyBound`: MERGE can't impose new
+    // predicates (labels or properties) on a variable that's
+    // already bound by an earlier clause. TCK Merge1 scenario 15
+    // and Merge5 scenario 22 cover this same rule.
     let stmt = mesh_cypher::parse("MATCH (a:Person) MERGE (a:Person {id: '2'}) RETURN a").unwrap();
-    let plan = mesh_cypher::plan(&stmt);
+    let err = mesh_cypher::plan(&stmt).unwrap_err();
     assert!(
-        plan.is_ok(),
-        "MERGE rebinding should be allowed: {:?}",
-        plan.err()
+        matches!(&err, mesh_cypher::Error::Plan(msg) if msg.contains("VariableAlreadyBound")),
+        "expected VariableAlreadyBound, got {err:?}",
     );
 }
 

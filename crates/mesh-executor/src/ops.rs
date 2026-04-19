@@ -510,6 +510,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             dst_var,
             edge_type,
             undirected,
+            properties,
             on_create,
             on_match,
         } => Box::new(MergeEdgeOp::new(
@@ -519,6 +520,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             dst_var.clone(),
             edge_type.clone(),
             *undirected,
+            properties.clone(),
             on_create.clone(),
             on_match.clone(),
         )),
@@ -1099,6 +1101,25 @@ impl Operator for SetPropertyOp {
                                 var: var.clone(),
                                 props,
                             });
+                        }
+                        SetAssignment::ReplaceFromExpr {
+                            var,
+                            source,
+                            replace,
+                        } => {
+                            let v = eval_expr(source, &ctx.eval_ctx(&row))?;
+                            let props = extract_property_map(&v)?;
+                            if *replace {
+                                actions.push(Action::Replace {
+                                    var: var.clone(),
+                                    props,
+                                });
+                            } else {
+                                actions.push(Action::Merge {
+                                    var: var.clone(),
+                                    props,
+                                });
+                            }
                         }
                     }
                 }
@@ -1918,6 +1939,28 @@ impl Operator for ProcedureCallOp {
     }
 }
 
+/// Pull a property map out of a value. Supports node / edge
+/// (uses their live property map) and map values (parameter or
+/// map literal). Null propagates as an empty map — `SET x = null`
+/// is spec'd as a property clear / no-op and SET = <null-binding>
+/// (from an unmatched OPTIONAL MATCH) matches that shape.
+fn extract_property_map(v: &Value) -> Result<Vec<(String, Property)>> {
+    match v {
+        Value::Node(n) => Ok(n.properties.clone().into_iter().collect()),
+        Value::Edge(e) => Ok(e.properties.clone().into_iter().collect()),
+        Value::Map(pairs) => pairs
+            .iter()
+            .map(|(k, vv)| Ok((k.clone(), value_to_property(vv.clone())?)))
+            .collect(),
+        Value::Property(Property::Map(entries)) => Ok(entries
+            .iter()
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect()),
+        Value::Null | Value::Property(Property::Null) => Ok(Vec::new()),
+        _ => Err(Error::InvalidSetValue),
+    }
+}
+
 fn value_to_property(v: Value) -> Result<Property> {
     match v {
         Value::Property(Property::Map(_)) => Err(Error::InvalidSetValue),
@@ -2298,11 +2341,23 @@ struct MergeEdgeOp {
     dst_var: String,
     edge_type: String,
     undirected: bool,
+    /// Inline edge property filter from the MERGE pattern
+    /// (`[r:T {k: v}]`). Matched edges must satisfy every entry;
+    /// the create branch stamps them onto the new edge.
+    properties: Vec<(String, Expr)>,
     on_create: Vec<SetAssignment>,
     on_match: Vec<SetAssignment>,
+    /// Rows buffered from the current input row's MERGE result —
+    /// one per existing matched edge (or a single synthesized edge
+    /// if the create branch fired). Drained before the next
+    /// `input.next()` call so multi-match semantics stay correct:
+    /// `MATCH (a:A),(b:B) MERGE (a)-[r:T]->(b)` against two pre-
+    /// existing edges has to yield two rows, not one.
+    pending: std::collections::VecDeque<Row>,
 }
 
 impl MergeEdgeOp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         input: Box<dyn Operator>,
         edge_var: String,
@@ -2310,6 +2365,7 @@ impl MergeEdgeOp {
         dst_var: String,
         edge_type: String,
         undirected: bool,
+        properties: Vec<(String, Expr)>,
         on_create: Vec<SetAssignment>,
         on_match: Vec<SetAssignment>,
     ) -> Self {
@@ -2320,8 +2376,10 @@ impl MergeEdgeOp {
             dst_var,
             edge_type,
             undirected,
+            properties,
             on_create,
             on_match,
+            pending: std::collections::VecDeque::new(),
         }
     }
 }
@@ -2329,7 +2387,10 @@ impl MergeEdgeOp {
 impl Operator for MergeEdgeOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         loop {
-            let Some(mut row) = self.input.next(ctx)? else {
+            if let Some(row) = self.pending.pop_front() {
+                return Ok(Some(row));
+            }
+            let Some(row) = self.input.next(ctx)? else {
                 return Ok(None);
             };
             // Resolve src/dst. Both must be Value::Node — the
@@ -2345,100 +2406,138 @@ impl Operator for MergeEdgeOp {
                 _ => return Err(Error::UnboundVariable(self.dst_var.clone())),
             };
 
-            // Scan outgoing edges from src, looking for one
-            // that targets dst with the matching type. When the
-            // MERGE pattern is undirected, also scan incoming
-            // edges — the first match in either direction wins.
-            let mut matched_edge: Option<Edge> = None;
+            // Evaluate the inline edge property filter once per
+            // input row. These are AST expressions so they can
+            // reference outer bindings (`MERGE (a)-[r:T {k: a.v}]->(b)`).
+            let required_props: Vec<(String, Property)> = self
+                .properties
+                .iter()
+                .map(|(k, expr)| {
+                    let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
+                    Ok((k.clone(), value_to_property(v)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let edge_matches = |edge: &Edge| -> bool {
+                required_props.iter().all(|(k, want)| {
+                    edge.properties.get(k).map(|have| have == want).unwrap_or(false)
+                })
+            };
+
+            // Collect every edge of type `edge_type` from src to
+            // dst (and, for undirected patterns, dst to src) that
+            // also satisfies the inline property filter. If any
+            // exist we take the match branch and yield one row per
+            // match. If none exist we synthesize one and yield a
+            // single row from the create branch.
+            let mut matched: Vec<Edge> = Vec::new();
             for (edge_id, neighbor_id) in ctx.store.outgoing(src_node.id)? {
                 if neighbor_id != dst_node.id {
                     continue;
                 }
                 if let Some(edge) = ctx.store.get_edge(edge_id)? {
-                    if edge.edge_type == self.edge_type {
-                        matched_edge = Some(edge);
-                        break;
+                    if edge.edge_type == self.edge_type && edge_matches(&edge) {
+                        matched.push(edge);
                     }
                 }
             }
-            if matched_edge.is_none() && self.undirected {
+            if self.undirected {
                 for (edge_id, neighbor_id) in ctx.store.incoming(src_node.id)? {
                     if neighbor_id != dst_node.id {
                         continue;
                     }
                     if let Some(edge) = ctx.store.get_edge(edge_id)? {
-                        if edge.edge_type == self.edge_type {
-                            matched_edge = Some(edge);
-                            break;
+                        if edge.edge_type == self.edge_type && edge_matches(&edge) {
+                            matched.push(edge);
                         }
                     }
                 }
             }
 
-            let edge = if let Some(mut existing) = matched_edge {
-                // Match branch: apply ON MATCH SET (if any)
-                // and persist if we touched anything.
-                if !self.on_match.is_empty() {
-                    apply_merge_edge_actions(&mut existing, &self.on_match, &self.edge_var, ctx)?;
-                    ctx.writer.put_edge(&existing)?;
-                }
-                existing
-            } else {
-                // Create branch: synthesize a new edge, apply
-                // ON CREATE SET, persist.
+            if matched.is_empty() {
                 let mut new_edge = Edge::new(&self.edge_type, src_node.id, dst_node.id);
-                apply_merge_edge_actions(&mut new_edge, &self.on_create, &self.edge_var, ctx)?;
+                for (k, p) in &required_props {
+                    new_edge.properties.insert(k.clone(), p.clone());
+                }
+                let mut row_out = row.clone();
+                apply_merge_edge_actions(
+                    &mut new_edge,
+                    &self.on_create,
+                    &self.edge_var,
+                    ctx,
+                    &mut row_out,
+                )?;
                 ctx.writer.put_edge(&new_edge)?;
-                new_edge
-            };
-
-            row.insert(self.edge_var.clone(), Value::Edge(edge));
-            return Ok(Some(row));
+                row_out.insert(self.edge_var.clone(), Value::Edge(new_edge));
+                self.pending.push_back(row_out);
+            } else {
+                for mut existing in matched {
+                    let mut row_out = row.clone();
+                    if !self.on_match.is_empty() {
+                        apply_merge_edge_actions(
+                            &mut existing,
+                            &self.on_match,
+                            &self.edge_var,
+                            ctx,
+                            &mut row_out,
+                        )?;
+                        ctx.writer.put_edge(&existing)?;
+                    }
+                    row_out.insert(self.edge_var.clone(), Value::Edge(existing));
+                    self.pending.push_back(row_out);
+                }
+            }
         }
     }
 }
 
 /// Edge-side counterpart of [`apply_merge_actions`]. Evaluates
-/// each `SetAssignment` against a temporary row carrying the
-/// current edge, mutates the edge in place, and returns. Only
-/// property assignments are meaningful on edges (edges have no
-/// labels in Mesh's model); a Labels assignment against an
-/// edge-bound variable surfaces as `Error::UnboundVariable`
-/// via the mismatched-var check below.
+/// each `SetAssignment` against the outer `row` (augmented with
+/// the current edge binding) and mutates either the edge itself
+/// or a non-edge target node from the outer row. MERGE's ON
+/// CREATE / ON MATCH clauses are scoped against the whole input
+/// row, so `MERGE (a)-[:T]->(b) ON CREATE SET b.k = 1` has to
+/// reach outside the edge-local binding. Non-edge mutations
+/// are persisted via `ctx.writer.put_node` so the change is
+/// visible to later clauses.
 fn apply_merge_edge_actions(
     edge: &mut Edge,
     actions: &[SetAssignment],
     var: &str,
     exec_ctx: &ExecCtx,
+    outer: &mut Row,
 ) -> Result<()> {
     if actions.is_empty() {
         return Ok(());
     }
-    let mut row = Row::new();
-    row.insert(var.to_string(), Value::Edge(edge.clone()));
+    // Edge binding is live in `outer` while we evaluate — RHS can
+    // reference both the edge and any sibling node binding.
+    outer.insert(var.to_string(), Value::Edge(edge.clone()));
     for action in actions {
-        let sub_ctx = exec_ctx.eval_ctx(&row);
         match action {
             SetAssignment::Property {
                 var: target,
                 key,
                 value,
             } => {
-                if target != var {
-                    return Err(Error::UnboundVariable(target.clone()));
-                }
+                let sub_ctx = exec_ctx.eval_ctx(outer);
                 let evaluated = eval_expr(value, &sub_ctx)?;
                 let prop = value_to_property(evaluated)?;
-                edge.properties.insert(key.clone(), prop);
-                row.insert(var.to_string(), Value::Edge(edge.clone()));
+                if target == var {
+                    if matches!(prop, Property::Null) {
+                        edge.properties.remove(key);
+                    } else {
+                        edge.properties.insert(key.clone(), prop);
+                    }
+                    outer.insert(var.to_string(), Value::Edge(edge.clone()));
+                } else {
+                    apply_set_prop_to_outer(outer, exec_ctx, target, key, prop)?;
+                }
             }
             SetAssignment::Merge {
                 var: target,
                 properties,
             } => {
-                if target != var {
-                    return Err(Error::UnboundVariable(target.clone()));
-                }
+                let sub_ctx = exec_ctx.eval_ctx(outer);
                 let resolved: Vec<(String, Property)> = properties
                     .iter()
                     .map(|(k, expr)| {
@@ -2446,18 +2545,20 @@ fn apply_merge_edge_actions(
                         Ok((k.clone(), value_to_property(v)?))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                for (k, p) in resolved {
-                    edge.properties.insert(k, p);
+                if target == var {
+                    for (k, p) in resolved {
+                        edge.properties.insert(k, p);
+                    }
+                    outer.insert(var.to_string(), Value::Edge(edge.clone()));
+                } else {
+                    apply_set_map_to_outer(outer, exec_ctx, target, resolved, false)?;
                 }
-                row.insert(var.to_string(), Value::Edge(edge.clone()));
             }
             SetAssignment::Replace {
                 var: target,
                 properties,
             } => {
-                if target != var {
-                    return Err(Error::UnboundVariable(target.clone()));
-                }
+                let sub_ctx = exec_ctx.eval_ctx(outer);
                 let resolved: Vec<(String, Property)> = properties
                     .iter()
                     .map(|(k, expr)| {
@@ -2465,19 +2566,153 @@ fn apply_merge_edge_actions(
                         Ok((k.clone(), value_to_property(v)?))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                edge.properties.clear();
-                for (k, p) in resolved {
-                    edge.properties.insert(k, p);
+                if target == var {
+                    edge.properties.clear();
+                    for (k, p) in resolved {
+                        edge.properties.insert(k, p);
+                    }
+                    outer.insert(var.to_string(), Value::Edge(edge.clone()));
+                } else {
+                    apply_set_map_to_outer(outer, exec_ctx, target, resolved, true)?;
                 }
-                row.insert(var.to_string(), Value::Edge(edge.clone()));
             }
-            // Labels on edges don't exist — reject explicitly.
-            SetAssignment::Labels { var: target, .. } => {
-                return Err(Error::UnboundVariable(target.clone()));
+            SetAssignment::Labels {
+                var: target,
+                labels,
+            } => {
+                if target == var {
+                    // Edges don't carry labels.
+                    return Err(Error::UnboundVariable(target.clone()));
+                }
+                apply_set_labels_to_outer(outer, exec_ctx, target, labels)?;
+            }
+            SetAssignment::ReplaceFromExpr {
+                var: target,
+                source,
+                replace,
+            } => {
+                let sub_ctx = exec_ctx.eval_ctx(outer);
+                let v = eval_expr(source, &sub_ctx)?;
+                let props = extract_property_map(&v)?;
+                if target == var {
+                    if *replace {
+                        edge.properties.clear();
+                    }
+                    for (k, p) in props {
+                        edge.properties.insert(k, p);
+                    }
+                    outer.insert(var.to_string(), Value::Edge(edge.clone()));
+                } else {
+                    apply_set_map_to_outer(outer, exec_ctx, target, props, *replace)?;
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Apply a single `SET target.key = prop` to a node or edge bound
+/// in the outer row. Used by MERGE's ON CREATE / ON MATCH when
+/// the target isn't the merge edge itself (the common case being
+/// `MERGE (a)-[:R]->(b) ON CREATE SET b.k = v`).
+fn apply_set_prop_to_outer(
+    outer: &mut Row,
+    exec_ctx: &ExecCtx,
+    target: &str,
+    key: &str,
+    prop: Property,
+) -> Result<()> {
+    match outer.get_mut(target) {
+        Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
+            // SET on a null target (typically an unmatched OPTIONAL
+            // MATCH binding) is a silent no-op in openCypher.
+            return Ok(());
+        }
+        Some(Value::Node(n)) => {
+            if matches!(prop, Property::Null) {
+                n.properties.remove(key);
+            } else {
+                n.properties.insert(key.to_string(), prop);
+            }
+            exec_ctx.writer.put_node(n)?;
+        }
+        Some(Value::Edge(e)) => {
+            if matches!(prop, Property::Null) {
+                e.properties.remove(key);
+            } else {
+                e.properties.insert(key.to_string(), prop);
+            }
+            exec_ctx.writer.put_edge(e)?;
+        }
+        _ => return Err(Error::UnboundVariable(target.to_string())),
+    }
+    Ok(())
+}
+
+/// Apply a property-map assignment (`SET target = {..}` when
+/// `replace`, or `SET target += {..}` when not) to a node or
+/// edge bound in the outer row.
+fn apply_set_map_to_outer(
+    outer: &mut Row,
+    exec_ctx: &ExecCtx,
+    target: &str,
+    props: Vec<(String, Property)>,
+    replace: bool,
+) -> Result<()> {
+    match outer.get_mut(target) {
+        Some(Value::Null) | Some(Value::Property(Property::Null)) | None => Ok(()),
+        Some(Value::Node(n)) => {
+            if replace {
+                n.properties.clear();
+            }
+            for (k, p) in props {
+                if replace || !matches!(p, Property::Null) {
+                    n.properties.insert(k, p);
+                } else {
+                    n.properties.remove(&k);
+                }
+            }
+            exec_ctx.writer.put_node(n)?;
+            Ok(())
+        }
+        Some(Value::Edge(e)) => {
+            if replace {
+                e.properties.clear();
+            }
+            for (k, p) in props {
+                if replace || !matches!(p, Property::Null) {
+                    e.properties.insert(k, p);
+                } else {
+                    e.properties.remove(&k);
+                }
+            }
+            exec_ctx.writer.put_edge(e)?;
+            Ok(())
+        }
+        _ => Err(Error::UnboundVariable(target.to_string())),
+    }
+}
+
+/// Apply a labels assignment to a node bound in the outer row.
+fn apply_set_labels_to_outer(
+    outer: &mut Row,
+    exec_ctx: &ExecCtx,
+    target: &str,
+    labels: &[String],
+) -> Result<()> {
+    match outer.get_mut(target) {
+        Some(Value::Null) | Some(Value::Property(Property::Null)) | None => Ok(()),
+        Some(Value::Node(n)) => {
+            for label in labels {
+                if !n.labels.contains(label) {
+                    n.labels.push(label.clone());
+                }
+            }
+            exec_ctx.writer.put_node(n)?;
+            Ok(())
+        }
+        _ => Err(Error::UnboundVariable(target.to_string())),
+    }
 }
 
 /// `ON MATCH`) to `node` in place. Mirrors the `SetPropertyOp`
@@ -2567,6 +2802,24 @@ fn apply_merge_actions(
                     })
                     .collect::<Result<Vec<_>>>()?;
                 for (k, p) in resolved {
+                    node.properties.insert(k, p);
+                }
+                row.insert(var.to_string(), Value::Node(node.clone()));
+            }
+            SetAssignment::ReplaceFromExpr {
+                var: target,
+                source,
+                replace,
+            } => {
+                if target != var {
+                    return Err(Error::UnboundVariable(target.clone()));
+                }
+                let v = eval_expr(source, &sub_ctx)?;
+                let props = extract_property_map(&v)?;
+                if *replace {
+                    node.properties.clear();
+                }
+                for (k, p) in props {
                     node.properties.insert(k, p);
                 }
                 row.insert(var.to_string(), Value::Node(node.clone()));

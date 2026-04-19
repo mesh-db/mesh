@@ -1568,11 +1568,26 @@ fn build_set_item(pair: Pair<Rule>) -> Result<SetItem> {
                 .ok_or_else(|| Error::Parse("set merge missing var".into()))?
                 .as_str()
                 .to_string();
-            let props_pair = inner
+            let rhs = inner
                 .next()
-                .ok_or_else(|| Error::Parse("set merge missing props".into()))?;
-            let properties = build_properties(props_pair)?;
-            Ok(SetItem::Merge { var, properties })
+                .ok_or_else(|| Error::Parse("set merge missing rhs".into()))?;
+            match rhs.as_rule() {
+                Rule::properties => Ok(SetItem::Merge {
+                    var,
+                    properties: build_properties(rhs)?,
+                }),
+                Rule::identifier => Ok(SetItem::ReplaceFromExpr {
+                    var,
+                    source: Expr::Identifier(parse_ident(rhs.as_str())),
+                    replace: false,
+                }),
+                Rule::parameter => Ok(SetItem::ReplaceFromExpr {
+                    var,
+                    source: Expr::Parameter(parameter_name(rhs)),
+                    replace: false,
+                }),
+                r => Err(Error::Parse(format!("unexpected set merge rhs: {:?}", r))),
+            }
         }
         Rule::set_replace_item => {
             let mut inner = pair.into_inner();
@@ -1581,11 +1596,26 @@ fn build_set_item(pair: Pair<Rule>) -> Result<SetItem> {
                 .ok_or_else(|| Error::Parse("set replace missing var".into()))?
                 .as_str()
                 .to_string();
-            let props_pair = inner
+            let rhs = inner
                 .next()
-                .ok_or_else(|| Error::Parse("set replace missing props".into()))?;
-            let properties = build_properties(props_pair)?;
-            Ok(SetItem::Replace { var, properties })
+                .ok_or_else(|| Error::Parse("set replace missing rhs".into()))?;
+            match rhs.as_rule() {
+                Rule::properties => Ok(SetItem::Replace {
+                    var,
+                    properties: build_properties(rhs)?,
+                }),
+                Rule::identifier => Ok(SetItem::ReplaceFromExpr {
+                    var,
+                    source: Expr::Identifier(parse_ident(rhs.as_str())),
+                    replace: true,
+                }),
+                Rule::parameter => Ok(SetItem::ReplaceFromExpr {
+                    var,
+                    source: Expr::Parameter(parameter_name(rhs)),
+                    replace: true,
+                }),
+                r => Err(Error::Parse(format!("unexpected set replace rhs: {:?}", r))),
+            }
         }
         r => Err(Error::Parse(format!("unexpected set item rule: {:?}", r))),
     }

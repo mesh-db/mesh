@@ -215,8 +215,14 @@ set_label_item = { identifier ~ label_spec+ }
 // requires the expression to resolve to a node or edge at runtime.
 set_prop_item = { (set_paren_lhs | property_access) ~ "=" ~ expression }
 set_paren_lhs = { "(" ~ expression ~ ")" ~ "." ~ identifier }
-set_merge_item = { identifier ~ "+=" ~ properties }
-set_replace_item = { identifier ~ "=" ~ properties }
+// `SET x += <rhs>` / `SET x = <rhs>` where rhs is either a map
+// literal (`{k: v, ...}`), a bound node/edge identifier (copies
+// its properties — TCK Merge6/Merge7 scenario 4+6), or a
+// parameter (a map-valued $param). Grammar-level alternation so
+// the planner can distinguish without re-walking a generic
+// expression tree.
+set_merge_item = { identifier ~ "+=" ~ (properties | parameter | identifier) }
+set_replace_item = { identifier ~ "=" ~ (properties | parameter | identifier) }
 
 remove_tail = { kw_remove ~ remove_items }
 remove_items = { remove_item ~ ("," ~ remove_item)* }
