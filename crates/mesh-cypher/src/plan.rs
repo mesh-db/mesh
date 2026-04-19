@@ -137,6 +137,16 @@ pub enum LogicalPlan {
         /// direction and that the walk ends at the terminal node;
         /// a mismatched chain or wrong terminal yields no rows.
         bound_edge_list_var: Option<String>,
+        /// Row variables whose bound edges (or edge lists) must
+        /// be excluded from the walk — enforces openCypher's
+        /// relationship-uniqueness rule across hops in the same
+        /// MATCH pattern. Each listed var can hold a single
+        /// `Value::Edge` (e.g. a prior fixed hop's synthesised
+        /// edge var or an outer-scope bound edge) or a
+        /// `List<Edge>` (a prior var-length hop's emitted list).
+        /// The DFS skips any edge whose id appears in the union
+        /// of those bindings.
+        excluded_edge_vars: Vec<String>,
         /// When `true`, the expansion behaves as a per-input-row
         /// left-join: if no path of length `[min_hops, max_hops]`
         /// exists, the input row is forwarded once with `edge_var`
@@ -2303,6 +2313,21 @@ fn chain_hops_with_bound(
     external_bound_edges: &HashSet<String>,
     external_bound_edge_lists: &HashSet<String>,
 ) -> Result<LogicalPlan> {
+    // Pre-collect every hop's effective edge variable — declared
+    // if named, synthesised if not — so each var-length hop can
+    // exclude the others' edges and enforce relationship uniqueness
+    // across the whole pattern (not just within the fixed-hop
+    // chain). Synthesised names here match the formulas used
+    // inside the loop below.
+    let hop_edge_var_names: Vec<String> = (0..pattern.hops.len())
+        .map(|i| {
+            pattern.hops[i]
+                .rel
+                .var
+                .clone()
+                .unwrap_or_else(|| format!("__p{}_e{}", pattern_idx, i + 1))
+        })
+        .collect();
     // Track already-bound node variables so repeat uses
     // (`(n)-[r]->(n)`) become equality filters on the same
     // binding rather than a fresh expansion.
@@ -2364,6 +2389,33 @@ fn chain_hops_with_bound(
                     None
                 }
             });
+            // Relationship uniqueness across the whole pattern:
+            // exclude every other hop's edge variable and every
+            // outer-scope edge (bound_edges + bound_edge_lists)
+            // from this var-length walk. Replay-mode hops are
+            // self-consistent — the list they're replaying is the
+            // pre-bound truth — so skip the exclusion there.
+            let excluded_edge_vars: Vec<String> = if bound_edge_list_var.is_some() {
+                Vec::new()
+            } else {
+                let mut out: Vec<String> = Vec::new();
+                for (j, name) in hop_edge_var_names.iter().enumerate() {
+                    if j != i {
+                        out.push(name.clone());
+                    }
+                }
+                for e in external_bound_edges {
+                    if !out.contains(e) {
+                        out.push(e.clone());
+                    }
+                }
+                for el in external_bound_edge_lists {
+                    if !out.contains(el) {
+                        out.push(el.clone());
+                    }
+                }
+                out
+            };
             LogicalPlan::VarLengthExpand {
                 input: Box::new(plan),
                 src_var: current_var.clone(),
@@ -2385,6 +2437,7 @@ fn chain_hops_with_bound(
                 optional: false,
                 dst_constraint_var: None,
                 bound_edge_list_var,
+                excluded_edge_vars,
             }
         } else {
             // If the hop reuses an edge variable that was bound in
@@ -3972,6 +4025,7 @@ fn apply_optional_match(
                     optional: true,
                     dst_constraint_var: vl_constraint,
                     bound_edge_list_var: None,
+                    excluded_edge_vars: Vec::new(),
                 };
             } else {
                 // When the target is already bound, push the

@@ -444,6 +444,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             optional,
             dst_constraint_var,
             bound_edge_list_var,
+            excluded_edge_vars,
         } => Box::new(VarLengthExpandOp::new(
             child!(input),
             src_var.clone(),
@@ -459,6 +460,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             *optional,
             dst_constraint_var.clone(),
             bound_edge_list_var.clone(),
+            excluded_edge_vars.clone(),
         )),
         LogicalPlan::Filter { input, predicate } => {
             Box::new(FilterOp::new(child!(input), predicate.clone()))
@@ -2948,6 +2950,14 @@ struct VarLengthExpandOp {
     /// already bound at this row variable instead of doing DFS.
     /// Used by openCypher's "walk a pre-bound edge list" form.
     bound_edge_list_var: Option<String>,
+    /// Row variables whose bound edges (or edge lists) must not
+    /// appear in the walked path — enforces openCypher's
+    /// relationship-uniqueness rule across hops within the same
+    /// MATCH pattern. Each entry resolves against the current row
+    /// (falling through to outer-scope rows) at run time; the
+    /// union of every referenced edge id becomes the DFS
+    /// exclusion set.
+    excluded_edge_vars: Vec<String>,
     current_row: Option<Row>,
     pending_paths: Vec<Vec<Edge>>,
     pending_node_paths: Vec<Vec<NodeId>>,
@@ -2972,6 +2982,7 @@ impl VarLengthExpandOp {
         optional: bool,
         dst_constraint_var: Option<String>,
         bound_edge_list_var: Option<String>,
+        excluded_edge_vars: Vec<String>,
     ) -> Self {
         Self {
             input,
@@ -2988,6 +2999,7 @@ impl VarLengthExpandOp {
             optional,
             dst_constraint_var,
             bound_edge_list_var,
+            excluded_edge_vars,
             current_row: None,
             pending_paths: Vec::new(),
             pending_node_paths: Vec::new(),
@@ -3007,7 +3019,28 @@ impl VarLengthExpandOp {
         let mut targets: Vec<NodeId> = Vec::new();
         let mut edge_buf: Vec<Edge> = Vec::new();
         let mut node_buf: Vec<NodeId> = vec![start];
+        // Seed `used` with edges from outer-scope bindings the
+        // pattern flags as exclusions (e.g. the other hops'
+        // edge / edge-list vars). A fresh walk can't revisit an
+        // edge that's already bound as a relationship variable
+        // elsewhere in the MATCH — that's openCypher's
+        // relationship-uniqueness rule.
         let mut used: HashSet<EdgeId> = HashSet::new();
+        for var in &self.excluded_edge_vars {
+            match ctx.lookup_binding(input_row, var) {
+                Some(Value::Edge(e)) => {
+                    used.insert(e.id);
+                }
+                Some(Value::List(items)) => {
+                    for item in items {
+                        if let Value::Edge(e) = item {
+                            used.insert(e.id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         // Evaluate edge-property expected values once per input row
         // — they may reference row bindings or `$`-parameters, but
         // don't vary per walked edge.
