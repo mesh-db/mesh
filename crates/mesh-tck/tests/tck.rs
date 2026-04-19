@@ -845,7 +845,7 @@ fn then_side_effects(_world: &mut MeshWorld) {
     // Side-effect checking deferred
 }
 
-#[then(regex = r"^a \w+ should be raised at (?:compile time|runtime): .+$")]
+#[then(regex = r"^an? \w+ should be raised at (?:compile time|runtime|any time): .+$")]
 fn then_error_raised(world: &mut MeshWorld) {
     assert!(
         world.error.is_some(),

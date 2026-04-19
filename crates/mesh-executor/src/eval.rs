@@ -110,7 +110,13 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 Value::Property(Property::Duration(ref dur)) => {
                     Ok(duration_accessor(dur, key))
                 }
-                _ => Ok(Value::Null),
+                // Accessing a property on something that isn't a
+                // container (map, node, edge, temporal) is a type
+                // error — openCypher raises `InvalidArgumentType`
+                // rather than silently returning null, so an
+                // accidental `123.num` is caught instead of
+                // producing phantom nulls.
+                _ => Err(Error::TypeMismatch),
             }
         }
         Expr::PropertyAccess { base, key } => {
@@ -160,7 +166,9 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 Value::Property(Property::Duration(ref dur)) => {
                     Ok(duration_accessor(dur, key))
                 }
-                _ => Ok(Value::Null),
+                // Same rule as `Expr::Property` above — `.key` on a
+                // non-container is a type error, not null.
+                _ => Err(Error::TypeMismatch),
             }
         }
         Expr::IndexAccess { base, index } => {
@@ -2626,7 +2634,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         "keys" => {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
-                Value::Null => Ok(Value::Null),
+                Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                 Value::Node(n) => {
                     let mut keys: Vec<String> = n.properties.keys().cloned().collect();
                     keys.sort();
@@ -2638,6 +2646,15 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 }
                 Value::Edge(e) => {
                     let mut keys: Vec<String> = e.properties.keys().cloned().collect();
+                    keys.sort();
+                    Ok(Value::List(
+                        keys.into_iter()
+                            .map(|k| Value::Property(Property::String(k)))
+                            .collect(),
+                    ))
+                }
+                Value::Property(Property::Map(m)) => {
+                    let mut keys: Vec<String> = m.keys().cloned().collect();
                     keys.sort();
                     Ok(Value::List(
                         keys.into_iter()

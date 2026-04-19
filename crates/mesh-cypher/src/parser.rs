@@ -1982,12 +1982,13 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                     .ok_or_else(|| Error::Parse("empty postfix_chain".into()))?;
                 match inner_rule.as_rule() {
                     Rule::property_chain => {
-                        let key = inner_rule
-                            .into_inner()
-                            .find(|p| p.as_rule() == Rule::identifier)
-                            .ok_or_else(|| Error::Parse("property_chain missing key".into()))?
-                            .as_str()
-                            .to_string();
+                        let key = parse_ident(
+                            inner_rule
+                                .into_inner()
+                                .find(|p| p.as_rule() == Rule::identifier)
+                                .ok_or_else(|| Error::Parse("property_chain missing key".into()))?
+                                .as_str(),
+                        );
                         expr = Expr::PropertyAccess {
                             base: Box::new(expr),
                             key,
@@ -2107,16 +2108,18 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
         }
         Rule::property_access => {
             let mut inner = pair.into_inner();
-            let var = inner
-                .next()
-                .ok_or_else(|| Error::Parse("property var".into()))?
-                .as_str()
-                .to_string();
-            let key = inner
-                .next()
-                .ok_or_else(|| Error::Parse("property key".into()))?
-                .as_str()
-                .to_string();
+            let var = parse_ident(
+                inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("property var".into()))?
+                    .as_str(),
+            );
+            let key = parse_ident(
+                inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("property key".into()))?
+                    .as_str(),
+            );
             Ok(Expr::Property { var, key })
         }
         Rule::identifier => Ok(Expr::Identifier(parse_ident(pair.as_str()))),
