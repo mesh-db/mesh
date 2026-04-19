@@ -4529,6 +4529,37 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
         reject_pattern_predicate_in_projection(&item.expr, "WITH projection")?;
     }
 
+    // openCypher requires every WITH projection item that is not
+    // a bare variable to have an explicit alias
+    // (`NoExpressionAlias`). `WITH a, count(*)` fails — the
+    // aggregate has no visible name downstream.
+    if !w.star {
+        for item in &w.items {
+            if item.alias.is_none() && !matches!(item.expr, Expr::Identifier(_)) {
+                return Err(Error::Plan(
+                    "WITH projection item must have an AS alias".into(),
+                ));
+            }
+        }
+    }
+
+    // Duplicate output-column names across WITH items are a
+    // `ColumnNameConflict`. Same rule the RETURN pipeline uses.
+    if !w.star {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in &w.items {
+            let name = item
+                .alias
+                .clone()
+                .unwrap_or_else(|| render_expr_key(&item.expr));
+            if !seen.insert(name.clone()) {
+                return Err(Error::Plan(format!(
+                    "WITH has multiple columns with the same name `{name}`"
+                )));
+            }
+        }
+    }
+
     let has_aggregates = !w.star
         && w.items.iter().any(|it| contains_aggregate(&it.expr));
 
