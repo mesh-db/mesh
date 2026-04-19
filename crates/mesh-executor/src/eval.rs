@@ -1622,22 +1622,6 @@ fn nanos_to_secs_nanos(epoch_nanos: i128) -> (i64, u32) {
     (secs, nsec)
 }
 
-/// Parse an ISO 8601 / RFC 3339 datetime string into UTC epoch
-/// milliseconds. Accepts a few common forms:
-///
-/// - `2025-01-01T00:00:00Z` — RFC 3339 with explicit UTC
-/// - `2025-01-01T00:00:00+05:00` — RFC 3339 with offset
-/// - `2025-01-01T00:00:00` — ISO 8601 naive, treated as UTC
-/// - `2025-01-01T00:00:00.123` — with fractional seconds
-/// - `2025-01-01 00:00:00` — space instead of `T` (common relaxation)
-///
-/// Anything else is rejected with a clean parse error. Sub-
-/// millisecond precision is truncated toward zero since our
-/// on-the-wire DateTime is millis-resolution.
-fn parse_datetime(s: &str) -> Result<i128> {
-    parse_datetime_with_tz(s).map(|(ns, _, _)| ns)
-}
-
 /// Parse a datetime string, returning `(utc_nanos, tz_offset_secs,
 /// tz_name)`. The offset is `None` for naive inputs; the name is
 /// set when the string carried an `[IANA/Region]` suffix.
@@ -3978,7 +3962,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             // day fractions all boil down to this — into whole days
             // plus a sub-day nanosecond remainder that we'll
             // collapse back to days at the end.
-            let mut push_days_f = |total_days: f64, days: &mut i64, sub_day_nanos: &mut i128| {
+            let push_days_f = |total_days: f64, days: &mut i64, sub_day_nanos: &mut i128| {
                 let whole = total_days.trunc() as i64;
                 *days = days.wrapping_add(whole);
                 let frac = total_days - whole as f64;
@@ -4979,15 +4963,6 @@ fn days_in_month_big(year: i64, month: u32) -> u32 {
         4 | 6 | 9 | 11 => 30,
         2 if leap => 29,
         _ => 28,
-    }
-}
-
-fn temporal_to_nanos(v: &Value) -> Result<i128> {
-    match v {
-        Value::Property(Property::DateTime { nanos: ns, .. })
-        | Value::Property(Property::LocalDateTime(ns)) => Ok(*ns),
-        Value::Property(Property::Date(days)) => Ok(*days as i128 * 86_400_000_000_000),
-        _ => Err(Error::TypeMismatch),
     }
 }
 
