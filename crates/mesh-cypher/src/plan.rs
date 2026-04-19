@@ -1862,6 +1862,39 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
     if stmt.return_items.is_empty() && !stmt.star {
         Ok(plan)
     } else {
+        // Build scope from CREATE-introduced vars so return
+        // validators (unknown function, size-on-path, undefined
+        // variable) match the `plan_match` terminal RETURN path.
+        let mut return_scope: HashMap<String, VarType> = HashMap::new();
+        for pattern in &stmt.patterns {
+            if let Some(var) = &pattern.start.var {
+                return_scope.insert(var.clone(), VarType::Node);
+            }
+            for hop in &pattern.hops {
+                if let Some(var) = &hop.rel.var {
+                    return_scope.insert(var.clone(), VarType::Edge);
+                }
+                if let Some(var) = &hop.target.var {
+                    return_scope.insert(var.clone(), VarType::Node);
+                }
+            }
+        }
+
+        if stmt.star && return_scope.is_empty() {
+            return Err(Error::Plan(
+                "RETURN * has no variables in scope".into(),
+            ));
+        }
+        for item in &stmt.return_items {
+            reject_size_on_path(&item.expr, &return_scope)?;
+        }
+        for item in &stmt.return_items {
+            reject_unknown_functions(&item.expr)?;
+        }
+        for item in &stmt.return_items {
+            check_set_expr_scope(&item.expr, &return_scope)?;
+        }
+
         apply_return_pipeline(
             plan,
             &stmt.return_items,
@@ -3579,6 +3612,11 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         bound_vars.insert(v.clone(), VarType::Node);
                     }
                 }
+                for e in &edges {
+                    if let Some(v) = &e.var {
+                        bound_vars.insert(v.clone(), VarType::Edge);
+                    }
+                }
                 plan = Some(LogicalPlan::CreatePath {
                     input: plan.take().map(Box::new),
                     nodes,
@@ -3803,6 +3841,40 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         )
     });
 
+    // Scope visible to RETURN: MATCH-derived bindings plus any
+    // variables introduced by the terminal-tail's CREATE
+    // patterns (`CREATE (a)-[r:T]->(b) RETURN r`). CREATE runs
+    // before RETURN at execution time, so the vars are in scope
+    // by the time the projection fires.
+    let mut return_scope: HashMap<String, VarType> = bound_vars.clone();
+    for pattern in &terminal.create_patterns {
+        if let Some(var) = &pattern.start.var {
+            return_scope.insert(var.clone(), VarType::Node);
+        }
+        if let Some(pv) = &pattern.path_var {
+            return_scope.insert(pv.clone(), VarType::Path);
+        }
+        for hop in &pattern.hops {
+            if let Some(var) = &hop.rel.var {
+                return_scope.insert(var.clone(), VarType::Edge);
+            }
+            if let Some(var) = &hop.target.var {
+                return_scope.insert(var.clone(), VarType::Node);
+            }
+        }
+    }
+
+    if terminal.star {
+        // `RETURN *` demands at least one variable in scope —
+        // openCypher calls out `NoVariablesInScope` explicitly.
+        // Anonymous MATCH patterns (`MATCH ()`) don't introduce
+        // any, and silently returning empty masks the mistake.
+        if return_scope.is_empty() {
+            return Err(Error::Plan(
+                "RETURN * has no variables in scope".into(),
+            ));
+        }
+    }
     if terminal.star || !terminal.return_items.is_empty() {
         // `size()` is for strings and lists only — calling it on
         // a Path is an openCypher `InvalidArgumentType`. Catch
@@ -3810,7 +3882,21 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         // identifier at plan time (runtime would only see a raw
         // Value::Path without the original variable role).
         for item in &terminal.return_items {
-            reject_size_on_path(&item.expr, &bound_vars)?;
+            reject_size_on_path(&item.expr, &return_scope)?;
+        }
+        for item in &terminal.return_items {
+            reject_unknown_functions(&item.expr)?;
+        }
+        // Every identifier referenced in a RETURN item must be
+        // in scope. Without this check, `MATCH () RETURN foo`
+        // against an empty graph silently returns zero rows
+        // because the pipeline never evaluates `foo`, where
+        // openCypher mandates a compile-time
+        // `UndefinedVariable`. `check_set_expr_scope` already
+        // walks with local-binder awareness (list comp / reduce
+        // / pattern comp), so reuse it.
+        for item in &terminal.return_items {
+            check_set_expr_scope(&item.expr, &return_scope)?;
         }
         plan = apply_return_pipeline(
             plan,
@@ -3841,6 +3927,26 @@ fn apply_return_pipeline(
 ) -> Result<LogicalPlan> {
     for item in return_items {
         reject_pattern_predicate_in_projection(&item.expr, "RETURN projection")?;
+    }
+    // Duplicate output-column names — explicit `AS` aliases or
+    // bare variable references — are a `ColumnNameConflict` in
+    // openCypher. Flag the first repeat so a typo like
+    // `RETURN 1 AS a, 2 AS a` fails at compile time instead of
+    // silently keeping whichever the HashMap-backed Row decided
+    // to retain.
+    {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in return_items {
+            let name = item
+                .alias
+                .clone()
+                .unwrap_or_else(|| render_expr_key(&item.expr));
+            if !seen.insert(name.clone()) {
+                return Err(Error::Plan(format!(
+                    "RETURN has multiple columns with the same name `{name}`"
+                )));
+            }
+        }
     }
     for s in order_by {
         reject_pattern_predicate_in_projection(&s.expr, "ORDER BY")?;
@@ -4528,10 +4634,16 @@ fn classify_return_items(
                         extra_arg,
                     });
                 }
+                // Preserve the user-visible column name: if the
+                // item already had `AS <name>` use that, otherwise
+                // default to the source expression's canonical
+                // rendering (`count(a) + 3`), not a synthetic
+                // `__nested_agg_N`. The synthetic names are only
+                // for the lifted aggregate aliases upstream.
                 let alias = item
                     .alias
                     .clone()
-                    .unwrap_or_else(|| format!("__nested_agg_{}", idx));
+                    .unwrap_or_else(|| render_expr_key(&item.expr));
                 post_items.push(ReturnItem {
                     expr: rewritten,
                     alias: Some(alias),
@@ -4754,6 +4866,102 @@ fn extract_nested_aggregates(
             labels: labels.clone(),
         },
         other => other.clone(),
+    }
+}
+
+/// Returns true when `name` (case-insensitive) is a built-in
+/// scalar function recognised by the executor's `call_scalar`
+/// dispatcher — kept in sync with that function. Used by the
+/// RETURN scope validator to flag `RETURN foo(a)` as an
+/// `UnknownFunction` at compile time when the graph happens to
+/// be empty and the pipeline would otherwise finish without
+/// ever reaching a runtime error.
+fn is_known_scalar_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "size"
+            | "length"
+            | "nodes"
+            | "relationships"
+            | "labels"
+            | "keys"
+            | "type"
+            | "id"
+            | "elementid"
+            | "startnode"
+            | "endnode"
+            | "properties"
+            | "exists"
+            | "tolower"
+            | "toupper"
+            | "tostring"
+            | "tointeger"
+            | "toboolean"
+            | "tofloat"
+            | "coalesce"
+            | "substring"
+            | "left"
+            | "right"
+            | "trim"
+            | "ltrim"
+            | "rtrim"
+            | "replace"
+            | "split"
+            | "range"
+            | "head"
+            | "last"
+            | "tail"
+            | "reverse"
+            | "abs"
+            | "ceil"
+            | "floor"
+            | "round"
+            | "sqrt"
+            | "sign"
+            | "pi"
+            | "e"
+            | "exp"
+            | "log"
+            | "ln"
+            | "log10"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "cot"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "atan2"
+            | "degrees"
+            | "radians"
+            | "rand"
+            | "date"
+            | "datetime"
+            | "localdatetime"
+            | "time"
+            | "localtime"
+            | "timestamp"
+            | "duration"
+    )
+}
+
+/// Walk each RETURN item's expression and flag any function
+/// call whose name isn't an aggregate or a known scalar. Empty
+/// graphs would otherwise skip the runtime dispatcher entirely
+/// and return no rows, hiding the `UnknownFunction` error.
+fn reject_unknown_functions(expr: &Expr) -> Result<()> {
+    let mut err: Option<Error> = None;
+    walk_expr(expr, &mut |e| {
+        if let Expr::Call { name, .. } = e {
+            if aggregate_fn_from_name(name).is_none() && !is_known_scalar_function(name) {
+                err = Some(Error::Plan(format!("unknown function `{name}`")));
+            }
+        }
+        Ok(())
+    })?;
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
