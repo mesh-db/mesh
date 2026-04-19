@@ -750,7 +750,7 @@ impl CreatePathOp {
                     // treats `{k: null}` as "no such property," so
                     // `keys(n)` and `n.k IS NOT NULL` both skip it.
                     for (k, expr) in properties {
-                        let value = eval_expr(expr, &ctx.eval_ctx(row))?;
+                        let value = eval_expr(expr, &ctx.eval_ctx(&out))?;
                         let prop = value_to_property(value)?;
                         if matches!(prop, Property::Null) {
                             continue;
@@ -764,7 +764,7 @@ impl CreatePathOp {
                     }
                 }
                 CreateNodeSpec::Reference(name) => {
-                    let id = match row.get(name) {
+                    let id = match out.get(name) {
                         Some(Value::Node(n)) => n.id,
                         _ => return Err(Error::UnboundVariable(name.clone())),
                     };
@@ -777,7 +777,7 @@ impl CreatePathOp {
             let dst = node_ids[spec.dst_idx];
             let mut edge = Edge::new(spec.edge_type.clone(), src, dst);
             for (k, expr) in &spec.properties {
-                let value = eval_expr(expr, &ctx.eval_ctx(row))?;
+                let value = eval_expr(expr, &ctx.eval_ctx(&out))?;
                 let prop = value_to_property(value)?;
                 if matches!(prop, Property::Null) {
                     continue;

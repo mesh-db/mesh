@@ -1853,28 +1853,25 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
     let no_bindings: HashMap<String, VarType> = HashMap::new();
 
     // Every identifier referenced in a property expression must
-    // be in scope (i.e. introduced by this CREATE's patterns),
-    // else openCypher raises `UndefinedVariable` at compile time.
+    // be in scope (i.e. introduced by an earlier pattern in this
+    // CREATE), else openCypher raises `UndefinedVariable` at
+    // compile time. Vars accumulate left-to-right across
+    // patterns so `CREATE (a {..}), (:B {num: a.id})` sees `a`.
+    let mut scope_for_props: HashMap<String, VarType> = HashMap::new();
     for pattern in &stmt.patterns {
-        let scope_for_props = {
-            let mut s: HashMap<String, VarType> = HashMap::new();
-            if let Some(v) = &pattern.start.var {
-                s.insert(v.clone(), VarType::Node);
-            }
-            for hop in &pattern.hops {
-                if let Some(v) = &hop.rel.var {
-                    s.insert(v.clone(), VarType::Edge);
-                }
-                if let Some(v) = &hop.target.var {
-                    s.insert(v.clone(), VarType::Node);
-                }
-            }
-            s
-        };
         for (_, expr) in &pattern.start.properties {
             check_set_expr_scope(expr, &scope_for_props)?;
         }
+        if let Some(v) = &pattern.start.var {
+            scope_for_props.insert(v.clone(), VarType::Node);
+        }
         for hop in &pattern.hops {
+            if let Some(v) = &hop.rel.var {
+                scope_for_props.insert(v.clone(), VarType::Edge);
+            }
+            if let Some(v) = &hop.target.var {
+                scope_for_props.insert(v.clone(), VarType::Node);
+            }
             for (_, expr) in &hop.rel.properties {
                 check_set_expr_scope(expr, &scope_for_props)?;
             }
@@ -3620,6 +3617,15 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // edge with no extra decoration) are still allowed
                 // because that's the canonical way to attach new
                 // edges to an existing node.
+                // Every identifier referenced in a CREATE
+                // property expression must be in scope, else
+                // openCypher raises `UndefinedVariable` at
+                // compile time. Walk left-to-right across
+                // patterns and pattern elements so a value
+                // references only earlier elements:
+                // `CREATE (a {..}), (:B {k: a.id})` is OK,
+                // `CREATE (:B {k: a.id}), (a {..})` is not.
+                let mut scope_for_props = bound_vars.clone();
                 for pattern in patterns {
                     if let Some(var) = &pattern.start.var {
                         if bound_vars.contains_key(var)
@@ -3646,30 +3652,19 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             }
                         }
                     }
-                    // Every identifier referenced in a CREATE
-                    // property expression must be in scope, else
-                    // openCypher raises `UndefinedVariable` at
-                    // compile time. The check_set_expr_scope
-                    // helper already walks nested binders.
-                    let scope_for_props = {
-                        let mut s = bound_vars.clone();
-                        if let Some(v) = &pattern.start.var {
-                            s.insert(v.clone(), VarType::Node);
-                        }
-                        for hop in &pattern.hops {
-                            if let Some(v) = &hop.rel.var {
-                                s.insert(v.clone(), VarType::Edge);
-                            }
-                            if let Some(v) = &hop.target.var {
-                                s.insert(v.clone(), VarType::Node);
-                            }
-                        }
-                        s
-                    };
                     for (_, expr) in &pattern.start.properties {
                         check_set_expr_scope(expr, &scope_for_props)?;
                     }
+                    if let Some(v) = &pattern.start.var {
+                        scope_for_props.insert(v.clone(), VarType::Node);
+                    }
                     for hop in &pattern.hops {
+                        if let Some(v) = &hop.rel.var {
+                            scope_for_props.insert(v.clone(), VarType::Edge);
+                        }
+                        if let Some(v) = &hop.target.var {
+                            scope_for_props.insert(v.clone(), VarType::Node);
+                        }
                         for (_, expr) in &hop.rel.properties {
                             check_set_expr_scope(expr, &scope_for_props)?;
                         }
