@@ -1,4 +1,11 @@
-# Mesh
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo.png" alt="Mesh" width="1280"/>
+  </picture>
+</p>
+
+# MeshDB
 
 A distributed, Cypher-compliant graph database written in Rust.
 

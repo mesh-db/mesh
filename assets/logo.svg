@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 96" role="img" aria-label="MeshDB">
+  <defs>
+    <linearGradient id="meshGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#4F46E5"/>
+      <stop offset="100%" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Mesh mark: center node with 6 surrounding nodes, connected as a graph -->
+  <g transform="translate(48 48)">
+    <!-- Edges: center to each outer node, plus outer ring -->
+    <g stroke="url(#meshGrad)" stroke-width="2.5" stroke-linecap="round" fill="none">
+      <!-- spokes -->
+      <line x1="0" y1="0" x2="0" y2="-30"/>
+      <line x1="0" y1="0" x2="26" y2="-15"/>
+      <line x1="0" y1="0" x2="26" y2="15"/>
+      <line x1="0" y1="0" x2="0" y2="30"/>
+      <line x1="0" y1="0" x2="-26" y2="15"/>
+      <line x1="0" y1="0" x2="-26" y2="-15"/>
+      <!-- ring -->
+      <line x1="0" y1="-30" x2="26" y2="-15"/>
+      <line x1="26" y1="-15" x2="26" y2="15"/>
+      <line x1="26" y1="15" x2="0" y2="30"/>
+      <line x1="0" y1="30" x2="-26" y2="15"/>
+      <line x1="-26" y1="15" x2="-26" y2="-15"/>
+      <line x1="-26" y1="-15" x2="0" y2="-30"/>
+    </g>
+
+    <!-- Outer nodes -->
+    <g fill="url(#meshGrad)">
+      <circle cx="0"   cy="-30" r="4.5"/>
+      <circle cx="26"  cy="-15" r="4.5"/>
+      <circle cx="26"  cy="15"  r="4.5"/>
+      <circle cx="0"   cy="30"  r="4.5"/>
+      <circle cx="-26" cy="15"  r="4.5"/>
+      <circle cx="-26" cy="-15" r="4.5"/>
+    </g>
+
+    <!-- Center node (highlighted) -->
+    <circle cx="0" cy="0" r="7" fill="#0F172A"/>
+    <circle cx="0" cy="0" r="7" fill="url(#meshGrad)" opacity="0.9"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="104" y="60"
+        font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="40"
+        font-weight="700"
+        letter-spacing="-1.2"
+        fill="#0F172A">Mesh<tspan fill="url(#meshGrad)">DB</tspan></text>
+</svg>
