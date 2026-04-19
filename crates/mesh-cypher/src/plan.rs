@@ -3425,23 +3425,51 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
     // with its defining expression — so the pre-WITH vars stay in
     // scope. Aggregating WITH keeps the filter after so HAVING-style
     // predicates on aggregate results work correctly.
+    let alias_map: std::collections::HashMap<String, Expr> = w
+        .items
+        .iter()
+        .filter_map(|it| it.alias.as_ref().map(|a| (a.clone(), it.expr.clone())))
+        .collect();
+
     let (pre_filter, post_filter) = match (&w.where_clause, has_aggregates, w.star) {
         (Some(pred), false, false) => {
-            let alias_map: std::collections::HashMap<String, Expr> = w
-                .items
-                .iter()
-                .filter_map(|it| it.alias.as_ref().map(|a| (a.clone(), it.expr.clone())))
-                .collect();
             (Some(substitute_aliases(pred.clone(), &alias_map)), None)
         }
         (Some(pred), _, _) => (None, Some(pred.clone())),
         (None, _, _) => (None, None),
     };
 
+    // ORDER BY on WITH sees pre-projection variables too: sort by
+    // `a.name` after `WITH a.name AS name` is legal. For
+    // non-aggregating WITH we can satisfy that by pushing the sort
+    // *before* the projection, substituting alias references so
+    // they map back onto the pre-projection bindings they stand
+    // for. Aggregating WITH leaves ORDER BY after the aggregate so
+    // it can still reach the aggregate result columns; the
+    // explicit `a.name → name` back-substitution for that case
+    // happens further below.
+    let pre_order_by: Vec<SortItem> = if !has_aggregates && !w.star {
+        w.order_by
+            .iter()
+            .map(|s| SortItem {
+                expr: substitute_aliases(s.expr.clone(), &alias_map),
+                descending: s.descending,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     if let Some(predicate) = pre_filter {
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate,
+        };
+    }
+    if !pre_order_by.is_empty() {
+        plan = LogicalPlan::OrderBy {
+            input: Box::new(plan),
+            sort_items: pre_order_by,
         };
     }
 
@@ -3485,10 +3513,32 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
         };
     }
 
-    if !w.order_by.is_empty() {
+    // ORDER BY on an aggregating WITH goes here (after the aggregate
+    // output is materialized). For non-aggregating WITH we already
+    // emitted the sort before the projection above, so this branch
+    // only applies when `has_aggregates` or `star`. Aggregating
+    // WITH still accepts ORDER BY expressions that reference the
+    // pre-WITH variables whose values are carried through via an
+    // alias — e.g. `WITH a.name AS name, count(*) AS cnt ORDER BY
+    // a.name` — so back-substitute any sub-expression that equals
+    // an alias definition with an `Identifier(alias)`.
+    if !w.order_by.is_empty() && (has_aggregates || w.star) {
+        let back_map: Vec<(Expr, String)> = w
+            .items
+            .iter()
+            .filter_map(|it| it.alias.as_ref().map(|a| (it.expr.clone(), a.clone())))
+            .collect();
+        let rewritten: Vec<SortItem> = w
+            .order_by
+            .iter()
+            .map(|s| SortItem {
+                expr: rewrite_aggregate_refs(s.expr.clone(), &back_map),
+                descending: s.descending,
+            })
+            .collect();
         plan = LogicalPlan::OrderBy {
             input: Box::new(plan),
-            sort_items: w.order_by.clone(),
+            sort_items: rewritten,
         };
     }
     if let Some(n) = &w.skip {
