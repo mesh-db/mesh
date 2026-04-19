@@ -4034,21 +4034,20 @@ fn apply_return_pipeline(
     // `RETURN max(n.age) ORDER BY max(n.age)` sorts on the aggregate
     // output rather than trying to call `max` as a scalar.
     let order_by_rewritten: Vec<SortItem> = if !star {
+        // After Aggregate, the row only has columns for the
+        // projected items — raw bindings like `n` are gone.
+        // Rewrite ORDER BY expressions that match a RETURN item
+        // into references to the projected column so
+        // `RETURN n.num, count(*) ORDER BY n.num` can sort on
+        // the projected `n.num` column instead of dereferencing
+        // `n` on a squashed row.
         let mut alias_map: Vec<(Expr, String)> = Vec::new();
         for item in return_items {
-            if let Some(alias) = &item.alias {
-                alias_map.push((item.expr.clone(), alias.clone()));
-            }
-            if matches!(
-                &item.expr,
-                Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some()
-            ) {
-                let col = item
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| render_expr_key(&item.expr));
-                alias_map.push((item.expr.clone(), col));
-            }
+            let col = item
+                .alias
+                .clone()
+                .unwrap_or_else(|| render_expr_key(&item.expr));
+            alias_map.push((item.expr.clone(), col));
         }
         order_by
             .iter()
