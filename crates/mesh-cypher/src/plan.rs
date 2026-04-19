@@ -127,6 +127,16 @@ pub enum LogicalPlan {
         min_hops: u64,
         max_hops: u64,
         path_var: Option<String>,
+        /// When set, the expansion reads the edge sequence from the
+        /// list already bound at this row variable rather than
+        /// enumerating paths from the graph. Supports openCypher's
+        /// "walk a pre-bound edge list" form:
+        ///   `WITH [r1, r2] AS rs MATCH (first)-[rs*]->(second)`
+        /// where `rs` is expected to be a `List<Edge>`. The op
+        /// verifies each edge connects correctly in the requested
+        /// direction and that the walk ends at the terminal node;
+        /// a mismatched chain or wrong terminal yields no rows.
+        bound_edge_list_var: Option<String>,
         /// When `true`, the expansion behaves as a per-input-row
         /// left-join: if no path of length `[min_hops, max_hops]`
         /// exists, the input row is forwarded once with `edge_var`
@@ -1960,6 +1970,7 @@ fn plan_pattern_with_bound_edges(
         pattern_idx,
         &HashSet::new(),
         external_bound_edges,
+        &HashSet::new(),
     )?;
     Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
@@ -2059,6 +2070,7 @@ fn plan_pattern_from_bound(
     // (`(a)-[:A]->(b), (b)-[:B]->(a)`) constrain to the same node.
     let mut external_bound: HashSet<String> = HashSet::new();
     let mut external_bound_edges: HashSet<String> = HashSet::new();
+    let mut external_bound_edge_lists: HashSet<String> = HashSet::new();
     for (k, v) in bound_vars {
         match v {
             VarType::Node | VarType::Scalar => {
@@ -2066,6 +2078,15 @@ fn plan_pattern_from_bound(
             }
             VarType::Edge => {
                 external_bound_edges.insert(k.clone());
+            }
+            // `NonNode` is what `infer_expr_type` stamps on a WITH
+            // projection of a list literal (and similar non-graph
+            // expressions). That's exactly the shape a pre-bound
+            // edge list arrives in, so thread those names into the
+            // edge-list replay path. The executor verifies the
+            // list's element types at runtime.
+            VarType::NonNode => {
+                external_bound_edge_lists.insert(k.clone());
             }
             _ => {}
         }
@@ -2077,6 +2098,7 @@ fn plan_pattern_from_bound(
         pattern_idx,
         &external_bound,
         &external_bound_edges,
+        &external_bound_edge_lists,
     )?;
     Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
@@ -2255,11 +2277,13 @@ fn wrap_with_bind_path(
 /// wrapping `Filter` via [`wrap_with_pattern_prop_filter`],
 /// matching the pre-rebind behavior of `plan_pattern`.
 ///
-/// `external_bound_nodes` / `external_bound_edges` carry the
-/// already-bound variables from the outer scope so multi-pattern
-/// MATCH clauses and cross-stage rebinds hoist reuse into
-/// equality filters / edge-id constraints instead of rebinding
-/// and clobbering the outer value.
+/// `external_bound_nodes` / `external_bound_edges` /
+/// `external_bound_edge_lists` carry the already-bound variables
+/// from the outer scope so multi-pattern MATCH clauses and
+/// cross-stage rebinds hoist reuse into the appropriate constraint
+/// (equality filter for nodes, edge-id check for edges, replay of
+/// a pre-bound list for var-length) instead of rebinding and
+/// clobbering the outer value.
 fn chain_hops_with_bound(
     mut plan: LogicalPlan,
     pattern: &Pattern,
@@ -2267,6 +2291,7 @@ fn chain_hops_with_bound(
     pattern_idx: usize,
     external_bound_nodes: &HashSet<String>,
     external_bound_edges: &HashSet<String>,
+    external_bound_edge_lists: &HashSet<String>,
 ) -> Result<LogicalPlan> {
     // Track already-bound node variables so repeat uses
     // (`(n)-[r]->(n)`) become equality filters on the same
@@ -2314,6 +2339,21 @@ fn chain_hops_with_bound(
             // Var-length expansion does its own binding, so keep
             // the caller's edge_var (even if None) — uniqueness
             // filtering below can't cross into the subpath.
+            // When the hop reuses a var that was already bound in a
+            // prior clause with a non-graph-element shape (e.g.
+            // `WITH [r1, r2] AS rs MATCH (first)-[rs*]->(second)`),
+            // treat the var-length as a *replay* of that pre-bound
+            // edge list rather than a fresh DFS. The executor
+            // verifies each element is an edge and the walk stays
+            // connected; no rows are emitted if the list can't be
+            // followed in the required direction.
+            let bound_edge_list_var = hop.rel.var.as_ref().and_then(|v| {
+                if external_bound_edge_lists.contains(v) {
+                    Some(v.clone())
+                } else {
+                    None
+                }
+            });
             LogicalPlan::VarLengthExpand {
                 input: Box::new(plan),
                 src_var: current_var.clone(),
@@ -2334,6 +2374,7 @@ fn chain_hops_with_bound(
                 },
                 optional: false,
                 dst_constraint_var: None,
+                bound_edge_list_var,
             }
         } else {
             // If the hop reuses an edge variable that was bound in
@@ -2689,6 +2730,19 @@ fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarTy
     }
     for hop in &pattern.hops {
         if let Some(var) = &hop.rel.var {
+            // Var-length rel vars that reuse an outer `NonNode`
+            // binding are the edge-list replay form
+            // (`WITH [r1, r2] AS rs MATCH (a)-[rs*]->(b)`). Leave
+            // the outer type in place; the executor pulls the
+            // list out of the row at runtime. The inline check in
+            // `plan_match` already validated that *cross-scope*
+            // transition; this path just preserves it so a later
+            // same-pattern reuse still conflicts.
+            if hop.rel.var_length.is_some()
+                && matches!(out.get(var), Some(VarType::NonNode))
+            {
+                continue;
+            }
             check_var_type_conflict_allow_scalar(var, VarType::Edge, out)?;
             out.insert(var.clone(), VarType::Edge);
         }
@@ -2836,6 +2890,10 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         // re-referenced if the type matches. Only
                         // reject actual type conflicts.
                         if let Some(&existing_type) = bound_vars.get(var) {
+                            let is_var_length_edge = pattern.hops.iter().any(|h| {
+                                h.rel.var.as_deref() == Some(var.as_str())
+                                    && h.rel.var_length.is_some()
+                            });
                             let new_type = if start_var_name == Some(var.as_str()) {
                                 VarType::Node
                             } else if pattern
@@ -2854,9 +2912,17 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             // nodes). Allow any pattern role to
                             // bind over a Scalar — the executor
                             // checks the actual runtime value.
-                            if existing_type != new_type
-                                && existing_type != VarType::Scalar
-                            {
+                            //
+                            // Var-length edge vars also accept a
+                            // `NonNode` existing binding, because
+                            // the replay form (`MATCH (a)-[rs*]->(b)`
+                            // with `rs = [e1, e2]`) treats the
+                            // list-typed outer value as the walk.
+                            let allow_existing = existing_type == new_type
+                                || existing_type == VarType::Scalar
+                                || (is_var_length_edge
+                                    && matches!(existing_type, VarType::NonNode));
+                            if !allow_existing {
                                 return Err(Error::Plan(format!(
                                     "variable '{}' already defined with a different type",
                                     var
@@ -3874,6 +3940,7 @@ fn apply_optional_match(
                     path_var: vl_path_var,
                     optional: true,
                     dst_constraint_var: vl_constraint,
+                    bound_edge_list_var: None,
                 };
             } else {
                 // When the target is already bound, push the

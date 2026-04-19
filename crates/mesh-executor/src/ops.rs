@@ -417,6 +417,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             path_var,
             optional,
             dst_constraint_var,
+            bound_edge_list_var,
         } => Box::new(VarLengthExpandOp::new(
             child!(input),
             src_var.clone(),
@@ -431,6 +432,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             path_var.clone(),
             *optional,
             dst_constraint_var.clone(),
+            bound_edge_list_var.clone(),
         )),
         LogicalPlan::Filter { input, predicate } => {
             Box::new(FilterOp::new(child!(input), predicate.clone()))
@@ -2898,6 +2900,10 @@ struct VarLengthExpandOp {
     /// the bound target triggers the null-fallback instead of
     /// silently dropping.
     dst_constraint_var: Option<String>,
+    /// Replay mode: read the walked edge sequence from the list
+    /// already bound at this row variable instead of doing DFS.
+    /// Used by openCypher's "walk a pre-bound edge list" form.
+    bound_edge_list_var: Option<String>,
     current_row: Option<Row>,
     pending_paths: Vec<Vec<Edge>>,
     pending_node_paths: Vec<Vec<NodeId>>,
@@ -2921,6 +2927,7 @@ impl VarLengthExpandOp {
         path_var: Option<String>,
         optional: bool,
         dst_constraint_var: Option<String>,
+        bound_edge_list_var: Option<String>,
     ) -> Self {
         Self {
             input,
@@ -2936,6 +2943,7 @@ impl VarLengthExpandOp {
             path_var,
             optional,
             dst_constraint_var,
+            bound_edge_list_var,
             current_row: None,
             pending_paths: Vec::new(),
             pending_node_paths: Vec::new(),
@@ -3081,6 +3089,92 @@ impl VarLengthExpandOp {
     }
 }
 
+/// Replay the edge sequence stored at `list_var` in `row` as a
+/// var-length walk starting from `src_id`. Returns `(paths,
+/// node_paths, targets)` in the same shape `enumerate` produces
+/// — either one entry when the list reads as a valid connected
+/// walk in `direction`, or empty when it doesn't.
+///
+/// Validation per step:
+/// * the list element is a `Value::Edge`,
+/// * the edge's optional type filter matches `edge_types`,
+/// * the edge actually touches the current node and proceeds to
+///   the other endpoint in the requested direction (undirected
+///   accepts either).
+///
+/// A null / missing / non-list value, a null source, or any
+/// failed step all produce an empty result — which, when the
+/// caller is in optional mode, triggers the left-join null
+/// fallback.
+fn replay_edge_list(
+    ctx: &ExecCtx,
+    row: &Row,
+    list_var: &str,
+    src_id: Option<NodeId>,
+    direction: Direction,
+    edge_types: &[String],
+) -> Result<(Vec<Vec<Edge>>, Vec<Vec<NodeId>>, Vec<NodeId>)> {
+    let start = match src_id {
+        Some(id) => id,
+        None => return Ok((Vec::new(), Vec::new(), Vec::new())),
+    };
+    let list = match row.get(list_var) {
+        Some(Value::List(items)) => items.clone(),
+        Some(Value::Property(mesh_core::Property::List(items))) => items
+            .iter()
+            .cloned()
+            .map(Value::Property)
+            .collect::<Vec<_>>(),
+        _ => return Ok((Vec::new(), Vec::new(), Vec::new())),
+    };
+    let mut edge_buf: Vec<Edge> = Vec::with_capacity(list.len());
+    let mut node_buf: Vec<NodeId> = Vec::with_capacity(list.len() + 1);
+    node_buf.push(start);
+    let mut current = start;
+    for item in list {
+        let edge = match item {
+            Value::Edge(e) => e,
+            _ => return Ok((Vec::new(), Vec::new(), Vec::new())),
+        };
+        if !edge_types.is_empty() && !edge_types.iter().any(|t| t == &edge.edge_type) {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let next_node = match direction {
+            Direction::Outgoing => {
+                if edge.source != current {
+                    return Ok((Vec::new(), Vec::new(), Vec::new()));
+                }
+                edge.target
+            }
+            Direction::Incoming => {
+                if edge.target != current {
+                    return Ok((Vec::new(), Vec::new(), Vec::new()));
+                }
+                edge.source
+            }
+            Direction::Both => {
+                if edge.source == current {
+                    edge.target
+                } else if edge.target == current {
+                    edge.source
+                } else {
+                    return Ok((Vec::new(), Vec::new(), Vec::new()));
+                }
+            }
+        };
+        // The stored edge shape should still exist in the graph;
+        // a missing node mid-walk means the snapshot shifted and
+        // the list is no longer valid.
+        if ctx.store.get_node(next_node)?.is_none() {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        edge_buf.push(edge);
+        node_buf.push(next_node);
+        current = next_node;
+    }
+    Ok((vec![edge_buf], vec![node_buf], vec![current]))
+}
+
 impl Operator for VarLengthExpandOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         loop {
@@ -3136,9 +3230,29 @@ impl Operator for VarLengthExpandOp {
                         | Some(Value::Property(mesh_core::Property::Null)) => None,
                         _ => return Err(Error::UnboundVariable(self.src_var.clone())),
                     };
-                    let (mut paths, mut node_paths, mut targets) = match src_id {
-                        Some(id) => self.enumerate(ctx, id, &row)?,
-                        None => (Vec::new(), Vec::new(), Vec::new()),
+                    // Replay path: when the hop names an already-
+                    // bound edge list (`MATCH (a)-[rs*]->(b)` with
+                    // `rs = [r1, r2]` from an earlier WITH), skip
+                    // DFS entirely and verify the listed edges
+                    // form a connected walk from `src_id` in the
+                    // required direction. Produces at most one
+                    // path — the exact list that was supplied.
+                    let (mut paths, mut node_paths, mut targets) = if let Some(list_var) =
+                        &self.bound_edge_list_var
+                    {
+                        replay_edge_list(
+                            ctx,
+                            &row,
+                            list_var,
+                            src_id,
+                            self.direction,
+                            &self.edge_types,
+                        )?
+                    } else {
+                        match src_id {
+                            Some(id) => self.enumerate(ctx, id, &row)?,
+                            None => (Vec::new(), Vec::new(), Vec::new()),
+                        }
                     };
                     // Bound-endpoint constraint: drop paths whose
                     // terminal node doesn't match the node already
