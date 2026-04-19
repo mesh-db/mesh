@@ -17,6 +17,9 @@ pub enum Error {
     #[error("type mismatch in comparison")]
     TypeMismatch,
 
+    #[error("DeletedEntityAccess: {0}")]
+    DeletedEntityAccess(String),
+
     #[error("cannot access property on non-node/edge value")]
     NotNodeOrEdge,
 

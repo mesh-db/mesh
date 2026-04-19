@@ -820,19 +820,28 @@ fn match_create_with_return_yields_linked_pair() {
 }
 
 #[test]
-fn match_detach_delete_with_return_sees_pre_delete_row() {
+fn match_detach_delete_then_property_access_is_deleted_entity_access() {
+    // openCypher Return2 [15]: property access on a node DELETEd
+    // earlier in the same query raises DeletedEntityAccess at
+    // runtime rather than reading off the pre-delete snapshot.
+    // (`DETACH DELETE n RETURN n.name` had to produce the snapshot
+    // before tombstones existed; now it errors, matching the TCK.)
     let (store, _d) = open_store();
     run(
         &store,
         "CREATE (n:Person {name: 'Ada'})-[:KNOWS]->(m:Person {name: 'Alan'})",
     );
 
-    let rows = run(
-        &store,
+    let stmt = mesh_cypher::parse(
         "MATCH (n:Person) WHERE n.name = 'Ada' DETACH DELETE n RETURN n.name AS name",
+    )
+    .unwrap();
+    let plan = mesh_cypher::plan(&stmt).unwrap();
+    let err = mesh_executor::execute(&plan, &store).unwrap_err();
+    assert!(
+        matches!(err, mesh_executor::Error::DeletedEntityAccess(_)),
+        "expected DeletedEntityAccess, got {err:?}",
     );
-    assert_eq!(rows.len(), 1);
-    assert_eq!(str_prop(&rows[0], "name"), "Ada");
 
     // Verify Ada and her edge are actually gone.
     let after = run(&store, "MATCH (n:Person) WHERE n.name = 'Ada' RETURN n");

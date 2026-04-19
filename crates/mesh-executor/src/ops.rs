@@ -13,8 +13,20 @@ use mesh_cypher::{
     SortItem, UnaryOp, YieldSpec,
 };
 use mesh_storage::RocksDbStorageEngine;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+
+/// Shared tombstone set for nodes / edges that have been DELETEd
+/// earlier in the current query. Property / label / type / keys /
+/// id accesses consult this set and raise `DeletedEntityAccess`
+/// so `MATCH (n) DELETE n RETURN n.num` surfaces the error at
+/// runtime instead of reading off a stale clone.
+#[derive(Default)]
+pub struct Tombstones {
+    pub nodes: RefCell<HashSet<mesh_core::NodeId>>,
+    pub edges: RefCell<HashSet<mesh_core::EdgeId>>,
+}
 
 pub struct ExecCtx<'a> {
     pub store: &'a dyn GraphReader,
@@ -37,6 +49,10 @@ pub struct ExecCtx<'a> {
     /// variables the right-side scan didn't bind directly. Empty
     /// at the top level.
     pub outer_rows: &'a [&'a Row],
+    /// Tombstones for entities deleted earlier in the same query.
+    /// Shared by reference so DeleteOp can insert and downstream
+    /// eval can check.
+    pub tombstones: &'a Tombstones,
 }
 
 pub(crate) struct NoOpWriter;
@@ -71,6 +87,7 @@ impl<'a> ExecCtx<'a> {
             reader: self.store,
             procedures: self.procedures,
             outer_rows: self.outer_rows,
+            tombstones: self.tombstones,
         }
     }
 
@@ -186,12 +203,14 @@ pub fn execute_with_reader_and_procs(
     }
     let suppress_output = is_write_only_plan(plan);
     let mut op = build_op(plan);
+    let tombstones = Tombstones::default();
     let ctx = ExecCtx {
         store: reader,
         writer,
         params,
         procedures,
         outer_rows: &[],
+        tombstones: &tombstones,
     };
     let mut rows = Vec::new();
     while let Some(row) = op.next(&ctx)? {
@@ -613,6 +632,7 @@ impl Operator for UnwindOp {
                 reader: ctx.store,
                 procedures: ctx.procedures,
                 outer_rows: ctx.outer_rows,
+                tombstones: ctx.tombstones,
             };
             let val = eval_expr(&self.expr, &ectx)?;
             self.items = Some(coerce_unwind_list(val)?);
@@ -682,6 +702,7 @@ impl Operator for UnwindChainOp {
                 reader: ctx.store,
                 procedures: ctx.procedures,
                 outer_rows: ctx.outer_rows,
+                tombstones: ctx.tombstones,
             };
             let val = eval_expr(&self.expr, &ectx)?;
             self.items = coerce_unwind_list(val)?;
@@ -876,6 +897,7 @@ impl Operator for CartesianProductOp {
                 params: ctx.params,
                 procedures: ctx.procedures,
                 outer_rows: &stacked,
+                tombstones: ctx.tombstones,
             };
             match right_op.next(&inner_ctx)? {
                 Some(right_row) => {
@@ -961,6 +983,7 @@ impl DeleteOp {
         for eid in &edge_ids {
             if seen_edges.insert(*eid) {
                 ctx.writer.delete_edge(*eid)?;
+                ctx.tombstones.edges.borrow_mut().insert(*eid);
             }
         }
         for nid in &node_ids {
@@ -968,6 +991,16 @@ impl DeleteOp {
                 continue;
             }
             if self.detach {
+                // DETACH DELETE also removes every attached edge;
+                // tombstone them too so a later projection over a
+                // formerly-attached edge clone also raises rather
+                // than reading stale properties.
+                for (eid, _) in ctx.store.outgoing(*nid)? {
+                    ctx.tombstones.edges.borrow_mut().insert(eid);
+                }
+                for (eid, _) in ctx.store.incoming(*nid)? {
+                    ctx.tombstones.edges.borrow_mut().insert(eid);
+                }
                 ctx.writer.detach_delete_node(*nid)?;
             } else {
                 let out = ctx.store.outgoing(*nid)?;
@@ -981,6 +1014,7 @@ impl DeleteOp {
                 }
                 ctx.writer.detach_delete_node(*nid)?;
             }
+            ctx.tombstones.nodes.borrow_mut().insert(*nid);
         }
         Ok(())
     }
@@ -1625,6 +1659,7 @@ impl Operator for OptionalApplyOp {
                 params: ctx.params,
                 procedures: ctx.procedures,
                 outer_rows: &stacked,
+                tombstones: ctx.tombstones,
             };
             let mut results = Vec::new();
             while let Some(body_row) = body_op.next(&inner_ctx)? {

@@ -4916,6 +4916,162 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
     Ok(plan)
 }
 
+/// openCypher's `AmbiguousAggregationExpression` rule: in a
+/// projection item that contains (but isn't itself) an aggregate,
+/// every bare identifier / property reference outside the aggregate
+/// subtrees must correspond to another top-level return item.
+/// That's what lets `RETURN me.age, me.age + count(you.age)` work
+/// while rejecting `RETURN me.age + count(you.age)` (me.age is
+/// dangling) and `RETURN me.age + you.age, me.age + you.age + count(*)`
+/// (the compound-as-group-key isn't legal even though it's
+/// structurally returned — the leaves `me.age` / `you.age` themselves
+/// aren't top-level items).
+fn check_ambiguous_aggregation(items: &[ReturnItem]) -> Result<()> {
+    // Group-key candidates: top-level return items that don't
+    // contain an aggregate anywhere. These are the only items
+    // an aggregate-containing sibling may reference by name.
+    // `count(*)` alone is an aggregate — excluded. `me.age +
+    // count(*)` contains an aggregate — also excluded (it's
+    // not a legal thing to reference from another aggregate-
+    // containing item).
+    let top_level_refs: Vec<&Expr> = items
+        .iter()
+        .filter(|it| !contains_aggregate(&it.expr))
+        .map(|it| &it.expr)
+        .collect();
+    for item in items {
+        // Only items that contain (but aren't themselves) an
+        // aggregate need checking — a standalone `count(*)` is
+        // fine, and a pure non-aggregate is the group key itself.
+        let top_is_agg = matches!(
+            &item.expr,
+            Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some()
+        );
+        if top_is_agg || !contains_aggregate(&item.expr) {
+            continue;
+        }
+        verify_non_agg_refs(&item.expr, &top_level_refs)?;
+    }
+    Ok(())
+}
+
+/// Walk `expr`, skipping aggregate subtrees entirely, and fail if
+/// we find a bare `Identifier` / `Property` leaf that doesn't equal
+/// any of `top_level_refs`. Intermediate operator nodes just recurse
+/// into their children without any check of their own — the rule is
+/// leaf-level.
+fn verify_non_agg_refs(expr: &Expr, top_level_refs: &[&Expr]) -> Result<()> {
+    // Aggregate subtrees are opaque placeholders. Don't descend.
+    if let Expr::Call { name, .. } = expr {
+        if aggregate_fn_from_name(name).is_some() {
+            return Ok(());
+        }
+    }
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
+        // Only leaf references can match a top-level item — per
+        // openCypher, compound expressions must not appear next to
+        // aggregates even if the same compound is itself a return
+        // item (that's what makes scenario 21 a SyntaxError). So we
+        // check the leaves here and keep recursing through compound
+        // shapes below without a matching shortcut.
+        Expr::Identifier(_) | Expr::Property { .. } => {
+            if top_level_refs.iter().any(|t| *t == expr) {
+                Ok(())
+            } else {
+                Err(Error::Plan(format!(
+                    "AmbiguousAggregationExpression: `{}` appears outside an aggregate but isn't a top-level return item",
+                    render_expr_key(expr)
+                )))
+            }
+        }
+        Expr::PropertyAccess { base, .. } => verify_non_agg_refs(base, top_level_refs),
+        Expr::HasLabels { expr, .. } => verify_non_agg_refs(expr, top_level_refs),
+        Expr::IndexAccess { base, index } => {
+            verify_non_agg_refs(base, top_level_refs)?;
+            verify_non_agg_refs(index, top_level_refs)
+        }
+        Expr::SliceAccess { base, start, end } => {
+            verify_non_agg_refs(base, top_level_refs)?;
+            if let Some(s) = start {
+                verify_non_agg_refs(s, top_level_refs)?;
+            }
+            if let Some(e) = end {
+                verify_non_agg_refs(e, top_level_refs)?;
+            }
+            Ok(())
+        }
+        Expr::Not(e) => verify_non_agg_refs(e, top_level_refs),
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            verify_non_agg_refs(a, top_level_refs)?;
+            verify_non_agg_refs(b, top_level_refs)
+        }
+        Expr::Compare { left, right, .. } => {
+            verify_non_agg_refs(left, top_level_refs)?;
+            verify_non_agg_refs(right, top_level_refs)
+        }
+        Expr::IsNull { inner, .. } => verify_non_agg_refs(inner, top_level_refs),
+        Expr::BinaryOp { left, right, .. } => {
+            verify_non_agg_refs(left, top_level_refs)?;
+            verify_non_agg_refs(right, top_level_refs)
+        }
+        Expr::UnaryOp { operand, .. } => verify_non_agg_refs(operand, top_level_refs),
+        Expr::InList { element, list } => {
+            verify_non_agg_refs(element, top_level_refs)?;
+            verify_non_agg_refs(list, top_level_refs)
+        }
+        Expr::List(items) => {
+            for it in items {
+                verify_non_agg_refs(it, top_level_refs)?;
+            }
+            Ok(())
+        }
+        Expr::Map(entries) => {
+            for (_, v) in entries {
+                verify_non_agg_refs(v, top_level_refs)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            if let Some(s) = scrutinee {
+                verify_non_agg_refs(s, top_level_refs)?;
+            }
+            for (cond, then) in branches {
+                verify_non_agg_refs(cond, top_level_refs)?;
+                verify_non_agg_refs(then, top_level_refs)?;
+            }
+            if let Some(e) = else_expr {
+                verify_non_agg_refs(e, top_level_refs)?;
+            }
+            Ok(())
+        }
+        // Non-aggregate function calls recurse through their args.
+        Expr::Call { args, .. } => match args {
+            CallArgs::Star => Ok(()),
+            CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) => {
+                for e in es {
+                    verify_non_agg_refs(e, top_level_refs)?;
+                }
+                Ok(())
+            }
+        },
+        // Subqueries, comprehensions, list predicates, reduce,
+        // pattern exists/predicate — these introduce their own
+        // scopes; don't descend for the purposes of this check.
+        Expr::ExistsSubquery { .. }
+        | Expr::CountSubquery { .. }
+        | Expr::PatternExists(_)
+        | Expr::PatternComprehension { .. }
+        | Expr::ListComprehension { .. }
+        | Expr::ListPredicate { .. }
+        | Expr::Reduce { .. } => Ok(()),
+    }
+}
+
 fn classify_return_items(
     items: &[ReturnItem],
 ) -> Result<(Vec<ReturnItem>, Vec<AggregateSpec>, Vec<ReturnItem>)> {
@@ -4928,6 +5084,7 @@ fn classify_return_items(
     for item in items {
         reject_aggregate_inside_nested_scope(&item.expr)?;
     }
+    check_ambiguous_aggregation(items)?;
     let mut group_keys: Vec<ReturnItem> = Vec::new();
     let mut aggregates: Vec<AggregateSpec> = Vec::new();
     let mut post_items: Vec<ReturnItem> = Vec::new();

@@ -31,6 +31,12 @@ pub(crate) struct EvalCtx<'a> {
     /// so a WHERE inside an OPTIONAL MATCH body can still see
     /// variables the inner scan didn't itself bind.
     pub outer_rows: &'a [&'a Row],
+    /// Tombstones recording nodes / edges that have been DELETEd
+    /// earlier in this query. Property / label / type accessors
+    /// check this set so `MATCH (n) DELETE n RETURN n.num` raises
+    /// `DeletedEntityAccess` at runtime instead of returning the
+    /// pre-deletion snapshot value.
+    pub tombstones: &'a crate::ops::Tombstones,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -45,6 +51,7 @@ impl<'a> EvalCtx<'a> {
             reader: self.reader,
             procedures: self.procedures,
             outer_rows: self.outer_rows,
+            tombstones: self.tombstones,
         }
     }
 
@@ -104,6 +111,27 @@ fn value_to_scalar_property(v: Value) -> Result<Property> {
     }
 }
 
+/// Raise `DeletedEntityAccess` if the node was deleted earlier in
+/// this query. Called from every property / label / keys /
+/// properties / type access that dereferences a Node or Edge value.
+fn check_not_deleted_node(ctx: &EvalCtx, id: mesh_core::NodeId) -> Result<()> {
+    if ctx.tombstones.nodes.borrow().contains(&id) {
+        return Err(Error::DeletedEntityAccess(format!(
+            "node with id {id} was deleted earlier in this query"
+        )));
+    }
+    Ok(())
+}
+
+fn check_not_deleted_edge(ctx: &EvalCtx, id: mesh_core::EdgeId) -> Result<()> {
+    if ctx.tombstones.edges.borrow().contains(&id) {
+        return Err(Error::DeletedEntityAccess(format!(
+            "relationship with id {id} was deleted earlier in this query"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
         Expr::Literal(lit) => Ok(literal_to_value(lit)),
@@ -121,18 +149,24 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 .lookup(var)
                 .ok_or_else(|| Error::UnboundVariable(var.clone()))?;
             match bound {
-                Value::Node(n) => Ok(n
-                    .properties
-                    .get(key)
-                    .cloned()
-                    .map(Value::Property)
-                    .unwrap_or(Value::Null)),
-                Value::Edge(e) => Ok(e
-                    .properties
-                    .get(key)
-                    .cloned()
-                    .map(Value::Property)
-                    .unwrap_or(Value::Null)),
+                Value::Node(n) => {
+                    check_not_deleted_node(ctx, n.id)?;
+                    Ok(n
+                        .properties
+                        .get(key)
+                        .cloned()
+                        .map(Value::Property)
+                        .unwrap_or(Value::Null))
+                }
+                Value::Edge(e) => {
+                    check_not_deleted_edge(ctx, e.id)?;
+                    Ok(e
+                        .properties
+                        .get(key)
+                        .cloned()
+                        .map(Value::Property)
+                        .unwrap_or(Value::Null))
+                }
                 // Null-propagate property access so OPTIONAL MATCH
                 // patterns like `f.name` return Null when `f`
                 // itself is Null (i.e. the optional pattern
@@ -181,18 +215,24 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::PropertyAccess { base, key } => {
             let v = eval_expr(base, ctx)?;
             match v {
-                Value::Node(n) => Ok(n
-                    .properties
-                    .get(key)
-                    .cloned()
-                    .map(Value::Property)
-                    .unwrap_or(Value::Null)),
-                Value::Edge(e) => Ok(e
-                    .properties
-                    .get(key)
-                    .cloned()
-                    .map(Value::Property)
-                    .unwrap_or(Value::Null)),
+                Value::Node(n) => {
+                    check_not_deleted_node(ctx, n.id)?;
+                    Ok(n
+                        .properties
+                        .get(key)
+                        .cloned()
+                        .map(Value::Property)
+                        .unwrap_or(Value::Null))
+                }
+                Value::Edge(e) => {
+                    check_not_deleted_edge(ctx, e.id)?;
+                    Ok(e
+                        .properties
+                        .get(key)
+                        .cloned()
+                        .map(Value::Property)
+                        .unwrap_or(Value::Null))
+                }
                 Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                 Value::Property(Property::Map(m)) => Ok(m
                     .get(key)
@@ -1045,12 +1085,14 @@ fn execute_subquery_body(body: &mesh_cypher::Statement, ctx: &EvalCtx) -> Result
     // or bare match), it emits the outer row.
     let mut op = crate::ops::build_op_inner(&plan, Some(ctx.row));
     let noop = crate::ops::NoOpWriter;
+    let tombstones = crate::ops::Tombstones::default();
     let exec_ctx = crate::ops::ExecCtx {
         store: ctx.reader,
         writer: &noop,
         params: ctx.params,
         procedures: ctx.procedures,
         outer_rows: &[],
+        tombstones: &tombstones,
     };
     let mut count = 0i64;
     while op.next(&exec_ctx)?.is_some() {
@@ -2851,12 +2893,15 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
-                Value::Node(n) => Ok(Value::List(
-                    n.labels
-                        .into_iter()
-                        .map(|l| Value::Property(Property::String(l)))
-                        .collect(),
-                )),
+                Value::Node(n) => {
+                    check_not_deleted_node(ctx, n.id)?;
+                    Ok(Value::List(
+                        n.labels
+                            .into_iter()
+                            .map(|l| Value::Property(Property::String(l)))
+                            .collect(),
+                    ))
+                }
                 _ => Err(Error::TypeMismatch),
             }
         }
@@ -2865,6 +2910,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             match v {
                 Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
                 Value::Node(n) => {
+                    check_not_deleted_node(ctx, n.id)?;
                     let mut keys: Vec<String> = n.properties.keys().cloned().collect();
                     keys.sort();
                     Ok(Value::List(
@@ -2874,6 +2920,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                     ))
                 }
                 Value::Edge(e) => {
+                    check_not_deleted_edge(ctx, e.id)?;
                     let mut keys: Vec<String> = e.properties.keys().cloned().collect();
                     keys.sort();
                     Ok(Value::List(
@@ -2895,6 +2942,11 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             }
         }
         "type" => {
+            // `type(r)` on a deleted relationship is explicitly
+            // safe (openCypher Return2 [14]) — the relationship
+            // type is part of the edge's identity, not its
+            // mutable state. So we don't check the tombstone here
+            // even though properties / labels / keys do.
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
@@ -2937,8 +2989,14 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
-                Value::Node(n) => Ok(Value::Property(Property::Map(n.properties))),
-                Value::Edge(e) => Ok(Value::Property(Property::Map(e.properties))),
+                Value::Node(n) => {
+                    check_not_deleted_node(ctx, n.id)?;
+                    Ok(Value::Property(Property::Map(n.properties)))
+                }
+                Value::Edge(e) => {
+                    check_not_deleted_edge(ctx, e.id)?;
+                    Ok(Value::Property(Property::Map(e.properties)))
+                }
                 Value::Property(Property::Map(m)) => Ok(Value::Property(Property::Map(m))),
                 _ => Err(Error::TypeMismatch),
             }
