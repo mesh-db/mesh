@@ -526,6 +526,15 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     None => Value::Null,
                 });
             }
+            // Lists compared element-by-element may encounter nulls
+            // in the common prefix, where the ordering is unknown
+            // and openCypher wants the whole comparison to be null.
+            // `compare()` returns a bool so the Tri state is lost —
+            // do the three-valued list order separately and fall
+            // through for every other shape.
+            if let Some(res) = ordered_list_compare(*op, &vl, &vr) {
+                return Ok(res);
+            }
             match compare(*op, &vl, &vr) {
                 Ok(b) => Ok(Value::Property(Property::Bool(b))),
                 Err(Error::TypeMismatch) => match op {
@@ -1068,7 +1077,22 @@ fn execute_subquery_body(body: &mesh_cypher::Statement, ctx: &EvalCtx) -> Result
         }
         other => other.clone(),
     };
-    let plan = mesh_cypher::plan(&body).map_err(|e| Error::Unsupported(e.to_string()))?;
+    // Plan the body with the outer row's bindings propagated as
+    // enclosing scope so correlated references — e.g. `MATCH (n)`
+    // inside `exists { ... }` where `n` is an outer variable —
+    // lower as rebinds against the SeedRow producer instead of
+    // fresh label-wide scans.
+    let mut planner_ctx = mesh_cypher::PlannerContext::default();
+    for (name, value) in ctx.row.iter() {
+        let kind = match value {
+            Value::Node(_) => mesh_cypher::OuterBindingKind::Node,
+            Value::Edge(_) => mesh_cypher::OuterBindingKind::Edge,
+            _ => mesh_cypher::OuterBindingKind::Scalar,
+        };
+        planner_ctx.outer_bindings.push((name.clone(), kind));
+    }
+    let plan = mesh_cypher::plan_with_context(&body, &planner_ctx)
+        .map_err(|e| Error::Unsupported(e.to_string()))?;
 
     // Wrap the plan so the outer row's bindings are available.
     // Insert a SeedRow → CartesianProduct with the planned body
@@ -5737,18 +5761,28 @@ pub(crate) fn compare_values(a: &Value, b: &Value) -> Ordering {
     }
 }
 
+/// f64 comparison that gives NaN a deterministic sort position —
+/// greater than every finite number and +/-infinity, equal to
+/// another NaN. Matches the openCypher ASC order where NaN sits
+/// between finite numbers and null, so DESC surfaces NaN right
+/// after null (TCK ReturnOrderBy1 [12]).
+fn nan_aware_f64_cmp(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
+}
+
 fn compare_props(a: &Property, b: &Property) -> Ordering {
     match (a, b) {
         (Property::Int64(a), Property::Int64(b)) => a.cmp(b),
         (Property::String(a), Property::String(b)) => a.cmp(b),
         (Property::Bool(a), Property::Bool(b)) => a.cmp(b),
-        (Property::Float64(a), Property::Float64(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        (Property::Int64(a), Property::Float64(b)) => {
-            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
-        (Property::Float64(a), Property::Int64(b)) => {
-            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
-        }
+        (Property::Float64(a), Property::Float64(b)) => nan_aware_f64_cmp(*a, *b),
+        (Property::Int64(a), Property::Float64(b)) => nan_aware_f64_cmp(*a as f64, *b),
+        (Property::Float64(a), Property::Int64(b)) => nan_aware_f64_cmp(*a, *b as f64),
         // Temporal ordering: DateTime by epoch millis, Date by
         // day count. Duration has no total order in general (3
         // months vs 90 days depends on the reference date) so it
@@ -6042,6 +6076,68 @@ pub(crate) fn equal_three_valued(a: &Value, b: &Value) -> Option<bool> {
     }
 }
 
+/// Three-valued list ordering for `<`, `<=`, `>`, `>=`. Returns
+/// `Some(Value)` when both operands are lists (either `Value::List`
+/// or `Property::List`); falls through to `None` so scalar
+/// operands go down the regular `compare()` path. Element-by-
+/// element walk: equal elements advance, a determined order on
+/// a pair seals the answer, a null-involved pair makes the entire
+/// comparison `null` because the ordering can't be resolved.
+fn ordered_list_compare(op: CompareOp, l: &Value, r: &Value) -> Option<Value> {
+    if !matches!(op, CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge) {
+        return None;
+    }
+    fn as_list(v: &Value) -> Option<Vec<Value>> {
+        match v {
+            Value::List(items) => Some(items.clone()),
+            Value::Property(Property::List(props)) => {
+                Some(props.iter().cloned().map(Value::Property).collect())
+            }
+            _ => None,
+        }
+    }
+    let la = as_list(l)?;
+    let lb = as_list(r)?;
+    for (a, b) in la.iter().zip(lb.iter()) {
+        match equal_three_valued(a, b) {
+            Some(true) => continue,
+            Some(false) => {
+                // Elements differ and both are non-null — delegate
+                // to scalar compare for the ordering.
+                let lt = match compare(CompareOp::Lt, a, b) {
+                    Ok(b) => b,
+                    Err(_) => return Some(Value::Null),
+                };
+                let ord = if lt {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+                return Some(Value::Property(Property::Bool(match op {
+                    CompareOp::Lt => ord == Ordering::Less,
+                    CompareOp::Le => ord != Ordering::Greater,
+                    CompareOp::Gt => ord == Ordering::Greater,
+                    CompareOp::Ge => ord != Ordering::Less,
+                    _ => unreachable!(),
+                })));
+            }
+            None => {
+                // At least one side is null — ordering undefined.
+                return Some(Value::Null);
+            }
+        }
+    }
+    // All common-prefix elements equal: fall back to length order.
+    let ord = la.len().cmp(&lb.len());
+    Some(Value::Property(Property::Bool(match op {
+        CompareOp::Lt => ord == Ordering::Less,
+        CompareOp::Le => ord != Ordering::Greater,
+        CompareOp::Gt => ord == Ordering::Greater,
+        CompareOp::Ge => ord != Ordering::Less,
+        _ => unreachable!(),
+    })))
+}
+
 fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
     if matches!(l, Value::Null | Value::Property(Property::Null))
         || matches!(r, Value::Null | Value::Property(Property::Null))
@@ -6186,10 +6282,60 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
             _ => return Err(Error::UnsupportedComparison),
         });
     }
+    // Path equality is direction-agnostic per openCypher: two
+    // paths are equal if they traverse the same edges with the
+    // same endpoints, even when one was built outgoing and the
+    // other incoming. Match the edge-id sequence either forward
+    // or reversed, and check that the node sequences line up
+    // in the same orientation.
+    if let (
+        Value::Path {
+            nodes: na,
+            edges: ea,
+        },
+        Value::Path {
+            nodes: nb,
+            edges: eb,
+        },
+    ) = (l, r)
+    {
+        let ids_a: Vec<_> = ea.iter().map(|e| e.id).collect();
+        let ids_b: Vec<_> = eb.iter().map(|e| e.id).collect();
+        let node_ids_a: Vec<_> = na.iter().map(|n| n.id).collect();
+        let node_ids_b: Vec<_> = nb.iter().map(|n| n.id).collect();
+        let node_ids_b_rev: Vec<_> = node_ids_b.iter().rev().copied().collect();
+        let ids_b_rev: Vec<_> = ids_b.iter().rev().copied().collect();
+        let eq = (ids_a == ids_b && node_ids_a == node_ids_b)
+            || (ids_a == ids_b_rev && node_ids_a == node_ids_b_rev);
+        return Ok(match op {
+            CompareOp::Eq => eq,
+            CompareOp::Ne => !eq,
+            _ => return Err(Error::UnsupportedComparison),
+        });
+    }
     let (lp, rp) = match (l, r) {
         (Value::Property(lp), Value::Property(rp)) => (lp, rp),
         _ => return Err(Error::TypeMismatch),
     };
+    // Numeric ordering with NaN on either side: all four ordering
+    // operators (<, <=, >, >=) return false per openCypher
+    // (Comparison2 [5]). Equality already went through
+    // `equal_three_valued` upstream, so we never hit = / <> here.
+    let a_f = match lp {
+        Property::Float64(a) => Some(*a),
+        Property::Int64(a) => Some(*a as f64),
+        _ => None,
+    };
+    let b_f = match rp {
+        Property::Float64(b) => Some(*b),
+        Property::Int64(b) => Some(*b as f64),
+        _ => None,
+    };
+    if let (Some(a), Some(b)) = (a_f, b_f) {
+        if a.is_nan() || b.is_nan() {
+            return Ok(false);
+        }
+    }
     let ord = match (lp, rp) {
         (Property::Int64(a), Property::Int64(b)) => a.cmp(b),
         (Property::String(a), Property::String(b)) => a.cmp(b),

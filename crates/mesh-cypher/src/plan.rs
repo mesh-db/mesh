@@ -37,6 +37,20 @@ pub struct PlannerContext {
     /// a HashMap because N is small (single digits in practice) and
     /// iterating a Vec is faster than hashing for that size.
     pub indexes: Vec<(String, String)>,
+    /// Variables bound in an enclosing query scope. Populated when
+    /// planning the body of an `exists { ... }` / `count { ... }`
+    /// subquery so that a first-clause `MATCH (n)-->(m)` where `n`
+    /// references the outer row gets lowered as a re-bind (no
+    /// fresh scan) rather than a fresh label-wide scan that
+    /// ignores the correlation. Each entry is `(name, kind)`.
+    pub outer_bindings: Vec<(String, OuterBindingKind)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OuterBindingKind {
+    Node,
+    Edge,
+    Scalar,
 }
 
 impl PlannerContext {
@@ -948,11 +962,54 @@ fn validate_pattern_predicates(plan: &LogicalPlan) -> Result<()> {
             if let Expr::PatternExists(pattern) = e {
                 validate_pattern_predicate(pattern)?;
             }
-            // ExistsSubquery/CountSubquery bodies are validated
-            // when planned at execution time.
+            if let Expr::ExistsSubquery { body } | Expr::CountSubquery { body } = e {
+                validate_subquery_body_is_read_only(body)?;
+            }
             Ok(())
         })
     })
+}
+
+/// openCypher `InvalidClauseComposition`: the body of an
+/// `exists { ... }` / `count { ... }` subquery may only read from
+/// the graph — SET / CREATE / DELETE / REMOVE / MERGE / FOREACH
+/// are forbidden. Walks the body statement's clauses and terminal
+/// tail and rejects any mutation it finds.
+fn validate_subquery_body_is_read_only(body: &Statement) -> Result<()> {
+    let match_stmt = match body {
+        Statement::Match(m) => m,
+        // Non-match bodies (Unwind, Return, Union, etc.) can't
+        // carry writes at the grammar level — nothing to check.
+        _ => return Ok(()),
+    };
+    for c in &match_stmt.clauses {
+        use crate::ast::ReadingClause;
+        match c {
+            ReadingClause::Create(_)
+            | ReadingClause::Set(_)
+            | ReadingClause::Delete(_)
+            | ReadingClause::Remove(_)
+            | ReadingClause::Foreach(_)
+            | ReadingClause::Merge(_) => {
+                return Err(Error::Plan(
+                    "InvalidClauseComposition: updating clauses are not allowed inside an exists / count subquery".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let t = &match_stmt.terminal;
+    if !t.create_patterns.is_empty()
+        || !t.set_items.is_empty()
+        || !t.remove_items.is_empty()
+        || t.delete.is_some()
+        || t.foreach.is_some()
+    {
+        return Err(Error::Plan(
+            "InvalidClauseComposition: updating clauses are not allowed inside an exists / count subquery".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_pattern_predicate(pattern: &Pattern) -> Result<()> {
@@ -3207,6 +3264,26 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     // against every earlier stage.
     let mut plan: Option<LogicalPlan> = None;
     let mut bound_vars: HashMap<String, VarType> = HashMap::new();
+    // Seed with any enclosing-scope bindings the caller passed
+    // through PlannerContext. Only used today for correlated
+    // exists/count subqueries, but the wiring is general enough
+    // to support any nested-plan lowering that needs outer
+    // variables in scope. When the caller supplies outer bindings
+    // we also plant a `SeedRow` as the plan's producer so the
+    // first MATCH on a pre-bound variable can lower as a rebind
+    // (no fresh scan) — the executor wires the outer row into
+    // `SeedRow` via `build_op_inner`'s `seed` parameter.
+    for (name, kind) in &ctx.outer_bindings {
+        let vt = match kind {
+            OuterBindingKind::Node => VarType::Node,
+            OuterBindingKind::Edge => VarType::Edge,
+            OuterBindingKind::Scalar => VarType::Scalar,
+        };
+        bound_vars.insert(name.clone(), vt);
+    }
+    if !ctx.outer_bindings.is_empty() {
+        plan = Some(LogicalPlan::SeedRow);
+    }
     let mut stage_pattern_offset: usize = 0;
 
     for clause in &stmt.clauses {
@@ -4284,6 +4361,56 @@ fn apply_return_pipeline(
         classify_return_items(return_items)?
     };
     let has_aggregates = !aggregates.is_empty();
+
+    // InvalidAggregation: a non-aggregating RETURN can't grow an
+    // aggregate out of its ORDER BY — there's no group-by scope for
+    // the aggregate to fold over. `MATCH (n) RETURN n.num1 ORDER BY
+    // max(n.num2)` is the canonical TCK example.
+    if !has_aggregates && !star {
+        for s in order_by {
+            if contains_aggregate(&s.expr) {
+                return Err(Error::Plan(
+                    "InvalidAggregation: ORDER BY on a non-aggregating RETURN cannot reference an aggregate".into(),
+                ));
+            }
+        }
+    }
+
+    // AmbiguousAggregationExpression: when the RETURN is aggregating
+    // and ORDER BY contains (but isn't itself) an aggregate, the
+    // same leaf-level rule as RETURN items applies — non-aggregate
+    // parts must be simple references to a projected item or its
+    // alias. Catches `RETURN me.age + you.age, count(*) AS cnt
+    // ORDER BY me.age + you.age + count(*)`.
+    if has_aggregates {
+        let sort_items_as_return: Vec<ReturnItem> = order_by
+            .iter()
+            .map(|s| ReturnItem {
+                expr: s.expr.clone(),
+                alias: None,
+                raw_text: None,
+            })
+            .collect();
+        let mut top_refs: Vec<ReturnItem> = return_items
+            .iter()
+            .filter(|it| !contains_aggregate(&it.expr))
+            .cloned()
+            .collect();
+        for it in return_items {
+            if let Some(alias) = &it.alias {
+                top_refs.push(ReturnItem {
+                    expr: Expr::Identifier(alias.clone()),
+                    alias: None,
+                    raw_text: None,
+                });
+            }
+        }
+        let scope: Vec<ReturnItem> = top_refs
+            .into_iter()
+            .chain(sort_items_as_return.iter().cloned())
+            .collect();
+        check_ambiguous_aggregation(&scope)?;
+    }
 
     // openCypher lets ORDER BY reference either projected
     // columns (`RETURN n.num AS x ORDER BY x`) or pre-RETURN

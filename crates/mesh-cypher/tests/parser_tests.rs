@@ -1072,6 +1072,7 @@ fn create_index_rejects_missing_label() {
 fn ctx_with_index(label: &str, prop: &str) -> PlannerContext {
     PlannerContext {
         indexes: vec![(label.into(), prop.into())],
+        outer_bindings: Vec::new(),
     }
 }
 
