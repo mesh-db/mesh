@@ -1912,20 +1912,30 @@ fn plan_pattern(
     pattern_idx: usize,
     ctx: &PlannerContext,
 ) -> Result<LogicalPlan> {
-    plan_pattern_with_bound_edges(pattern, pattern_idx, ctx, &HashSet::new())
+    plan_pattern_with_bound_edges(
+        pattern,
+        pattern_idx,
+        ctx,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
 }
 
-/// Same as [`plan_pattern`] but honours a set of edge variables
-/// already bound in an outer clause — each hop that reuses such a
-/// variable lowers with an edge constraint so the fresh scan
-/// treats it as an existence check on the outer edge rather than
-/// rebinding it. Lets patterns like
-/// `MATCH ()-[r:EDGE]-() MATCH (n)-[r]-(m)` reuse `r` correctly.
+/// Same as [`plan_pattern`] but honours sets of edge / edge-list
+/// variables already bound in an outer clause. Each hop that
+/// reuses such a variable lowers with the appropriate constraint
+/// (id-equality for edges, list replay for var-length) so a
+/// fresh scan treats it as an existence / replay check on the
+/// outer binding rather than rebinding it. Lets patterns like
+/// `MATCH ()-[r:EDGE]-() MATCH (n)-[r]-(m)` reuse `r`, and
+/// `WITH [r1, r2] AS rs MATCH (first)-[rs*]->(second)` walk the
+/// pre-bound list.
 fn plan_pattern_with_bound_edges(
     pattern: &Pattern,
     pattern_idx: usize,
     ctx: &PlannerContext,
     external_bound_edges: &HashSet<String>,
+    external_bound_edge_lists: &HashSet<String>,
 ) -> Result<LogicalPlan> {
     if pattern.shortest.is_some() {
         return Err(Error::Plan(
@@ -1970,7 +1980,7 @@ fn plan_pattern_with_bound_edges(
         pattern_idx,
         &HashSet::new(),
         external_bound_edges,
-        &HashSet::new(),
+        external_bound_edge_lists,
     )?;
     Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
@@ -2957,16 +2967,37 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             .expect("is_rebind implies an earlier clause populated the plan");
                         Some(plan_pattern_from_bound(current, pattern, pattern_offset, &bound_vars)?)
                     } else {
-                        // Fresh-scan patterns don't see the current
-                        // plan's row bindings at runtime (the plan
-                        // tree lowers them as a right-side
-                        // `CartesianProduct` with an independent
-                        // scan), so we can't usefully push outer
-                        // edge constraints into the hop operators
-                        // here. Reusing an outer edge variable in a
-                        // fresh pattern is handled — if at all — by
-                        // a post-filter further downstream.
-                        let rhs = plan_pattern(pattern, pattern_offset, ctx)?;
+                        // Fresh-scan patterns lower as the right
+                        // side of a `CartesianProduct`. Expand
+                        // operators on that side can still reach
+                        // outer-scope bindings via
+                        // `CartesianProductOp`'s outer_rows stack,
+                        // so plumb outer-bound edge / edge-list
+                        // variables as constraints here. Reusing
+                        // `r` across clauses (`MATCH ()-[r]-()
+                        // MATCH (n)-[r]-(m)`) becomes an edge-id
+                        // check; reusing `rs` as a pre-bound edge
+                        // list becomes a list replay.
+                        let mut outer_edges: HashSet<String> = HashSet::new();
+                        let mut outer_edge_lists: HashSet<String> = HashSet::new();
+                        for (k, v) in &bound_vars {
+                            match v {
+                                VarType::Edge => {
+                                    outer_edges.insert(k.clone());
+                                }
+                                VarType::NonNode => {
+                                    outer_edge_lists.insert(k.clone());
+                                }
+                                _ => {}
+                            }
+                        }
+                        let rhs = plan_pattern_with_bound_edges(
+                            pattern,
+                            pattern_offset,
+                            ctx,
+                            &outer_edges,
+                            &outer_edge_lists,
+                        )?;
                         Some(match plan.take() {
                             None => rhs,
                             Some(lhs) => LogicalPlan::CartesianProduct {

@@ -973,6 +973,7 @@ fn execute_subquery_body(body: &mesh_cypher::Statement, ctx: &EvalCtx) -> Result
         writer: &noop,
         params: ctx.params,
         procedures: ctx.procedures,
+        outer_rows: &[],
     };
     let mut count = 0i64;
     while op.next(&exec_ctx)?.is_some() {

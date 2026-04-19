@@ -29,6 +29,14 @@ pub struct ExecCtx<'a> {
     /// any future server startup plug in a populated registry so
     /// `CALL ns.name(...)` resolves.
     pub procedures: &'a ProcedureRegistry,
+    /// Outer-scope rows contributed by enclosing operators. The
+    /// innermost slot (first entry) is the nearest outer. Set by
+    /// [`CartesianProductOp`] when running its right side so that
+    /// operators inside — typically `EdgeExpandOp` /
+    /// `VarLengthExpandOp` constraint lookups — can resolve
+    /// variables the right-side scan didn't bind directly. Empty
+    /// at the top level.
+    pub outer_rows: &'a [&'a Row],
 }
 
 pub(crate) struct NoOpWriter;
@@ -63,6 +71,23 @@ impl<'a> ExecCtx<'a> {
             reader: self.store,
             procedures: self.procedures,
         }
+    }
+
+    /// Look up a variable in `row` first, then in each outer-scope
+    /// row in order. Returns the nearest match. Used for constraint
+    /// lookups inside right-side operators of a `CartesianProduct`
+    /// so a fresh scan that references an outer binding
+    /// (`MATCH ()-[r]-() MATCH (n)-[r]-(m)`) can still resolve it.
+    pub(crate) fn lookup_binding<'r>(&'r self, row: &'r Row, name: &str) -> Option<&'r Value> {
+        if let Some(v) = row.get(name) {
+            return Some(v);
+        }
+        for outer in self.outer_rows {
+            if let Some(v) = outer.get(name) {
+                return Some(v);
+            }
+        }
+        None
     }
 }
 
@@ -165,6 +190,7 @@ pub fn execute_with_reader_and_procs(
         writer,
         params,
         procedures,
+        outer_rows: &[],
     };
     let mut rows = Vec::new();
     while let Some(row) = op.next(&ctx)? {
@@ -820,9 +846,24 @@ impl Operator for CartesianProductOp {
                 }
             }
             let right_op = self.right_op.as_mut().expect("right_op set");
-            match right_op.next(ctx)? {
+            // Expose the current left row to right-side operators
+            // via a shadow context so constraint lookups (for
+            // bound edges / bound edge lists) can find vars that
+            // the right-side scan itself doesn't bind.
+            let left_ref = self.left_row.as_ref().unwrap();
+            let mut stacked: Vec<&Row> = Vec::with_capacity(ctx.outer_rows.len() + 1);
+            stacked.push(left_ref);
+            stacked.extend_from_slice(ctx.outer_rows);
+            let inner_ctx = ExecCtx {
+                store: ctx.store,
+                writer: ctx.writer,
+                params: ctx.params,
+                procedures: ctx.procedures,
+                outer_rows: &stacked,
+            };
+            match right_op.next(&inner_ctx)? {
                 Some(right_row) => {
-                    let mut combined = self.left_row.as_ref().unwrap().clone();
+                    let mut combined = left_ref.clone();
                     for (k, v) in right_row {
                         combined.insert(k, v);
                     }
@@ -2498,15 +2539,18 @@ impl Operator for EdgeExpandOp {
                     continue;
                 }
                 // Pre-bound edge constraint: only accept the edge
-                // whose id matches the row-bound value. Non-edge /
-                // null bindings trigger no matches at all — the
+                // whose id matches the row-bound value. Falls
+                // through to outer scopes so a fresh right-side
+                // scan of a CartesianProduct can still see the
+                // bound edge from the left side. Non-edge / null
+                // bindings trigger no matches at all — the
                 // expansion yields nothing for that input row.
                 if let Some(constraint_var) = &self.edge_constraint_var {
                     let base = self
                         .current_row
                         .as_ref()
                         .expect("pending edges without source row");
-                    let expected = match base.get(constraint_var) {
+                    let expected = match ctx.lookup_binding(base, constraint_var) {
                         Some(Value::Edge(e)) => Some(e.id),
                         _ => None,
                     };
@@ -2698,15 +2742,15 @@ impl Operator for OptionalEdgeExpandOp {
                 }
                 // Pre-bound edge constraint: only the specific
                 // edge whose id matches the row-bound value
-                // counts as a match. Typical use is OPT MATCH
-                // patterns that reuse an edge variable from an
-                // earlier clause.
+                // counts as a match. Falls through to outer
+                // scopes so the constraint works for fresh
+                // scans on the right side of a CartesianProduct.
                 if let Some(constraint_var) = &self.edge_constraint_var {
                     let base = self
                         .current_row
                         .as_ref()
                         .expect("pending without source row");
-                    let expected = match base.get(constraint_var) {
+                    let expected = match ctx.lookup_binding(base, constraint_var) {
                         Some(Value::Edge(e)) => Some(e.id),
                         _ => None,
                     };
@@ -3118,7 +3162,7 @@ fn replay_edge_list(
         Some(id) => id,
         None => return Ok((Vec::new(), Vec::new(), Vec::new())),
     };
-    let list = match row.get(list_var) {
+    let list = match ctx.lookup_binding(row, list_var) {
         Some(Value::List(items)) => items.clone(),
         Some(Value::Property(mesh_core::Property::List(items))) => items
             .iter()
