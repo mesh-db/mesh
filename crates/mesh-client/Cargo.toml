@@ -1,0 +1,37 @@
+[package]
+name = "mesh-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TUI client for Bolt-compatible graph databases (Mesh, Neo4j) and FalkorDB"
+
+[[bin]]
+name = "mesh-client"
+path = "src/main.rs"
+
+[dependencies]
+mesh-bolt = { path = "../mesh-bolt" }
+
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = "0.7"
+
+tokio = { workspace = true }
+futures = "0.3"
+async-trait = "0.1"
+
+redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+
+serde = { workspace = true }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
