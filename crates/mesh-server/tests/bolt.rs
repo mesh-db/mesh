@@ -621,15 +621,23 @@ async fn bolt_unbound_parameter_surfaces_as_failure() {
 }
 
 #[tokio::test]
-async fn bolt_rejects_bolt_5_only_clients() {
+async fn bolt_rejects_unsupported_version_clients() {
+    // Server-side handshake test: a client that only offers a version
+    // outside the supported range (currently 4.4 through 5.4) gets
+    // 00000000 back and the connection closed. Uses Bolt 6.0 as a
+    // stand-in for "not yet implemented" — the in-crate handshake
+    // test in mesh-bolt covers the protocol logic; this exercises
+    // the server wiring end-to-end over TCP.
     let (addr, _dir) = spawn_bolt_server().await;
     let mut sock = TcpStream::connect(&addr).await.unwrap();
-    let preferences = [version_bytes(5, 0, 0), [0; 4], [0; 4], [0; 4]];
+    let preferences = [version_bytes(6, 0, 0), [0; 4], [0; 4], [0; 4]];
     let err = perform_client_handshake(&mut sock, &preferences)
         .await
         .unwrap_err();
-    // Server wrote 00000000 and closed; client surfaces NoCompatibleVersion.
-    matches!(err, mesh_bolt::BoltError::NoCompatibleVersion(_));
+    assert!(
+        matches!(err, mesh_bolt::BoltError::NoCompatibleVersion(_)),
+        "expected NoCompatibleVersion, got {err:?}",
+    );
 }
 
 // ---------------------------------------------------------------------------

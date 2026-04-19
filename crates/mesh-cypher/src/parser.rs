@@ -1693,7 +1693,57 @@ fn build_return_items(pair: Pair<Rule>) -> Result<(Vec<ReturnItem>, bool)> {
     Ok((items, false))
 }
 
+/// Strip operator-precedence wrapper rules whose only role at this
+/// position is to nest into the next-higher-binding level. A wrapper
+/// is "pass-through" when it has exactly one inner pair and that pair
+/// isn't an operator marker — i.e. no `kw_or` / `op_add` / etc. shows
+/// up at this level. See `build_expression`'s opening comment for why
+/// this matters.
+fn peel_passthrough(mut pair: Pair<Rule>) -> Pair<Rule> {
+    loop {
+        let peelable = matches!(
+            pair.as_rule(),
+            Rule::expression
+                | Rule::base_primary
+                | Rule::or_expr
+                | Rule::xor_expr
+                | Rule::and_expr
+                | Rule::not_expr
+                | Rule::comparison
+                | Rule::compound
+                | Rule::add_expr
+                | Rule::mul_expr
+                | Rule::pow_expr
+                | Rule::unary_expr
+                | Rule::primary
+        );
+        if !peelable {
+            return pair;
+        }
+        let mut inner = pair.clone().into_inner();
+        let Some(first) = inner.next() else {
+            return pair;
+        };
+        if inner.next().is_some() {
+            return pair;
+        }
+        if matches!(first.as_rule(), Rule::kw_not | Rule::op_neg) {
+            return pair;
+        }
+        pair = first;
+    }
+}
+
 fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
+    // The grammar's precedence chain (`expression → or_expr → xor_expr →
+    // ... → unary_expr → primary → base_primary`) inserts ~13 wrapper
+    // layers between an `expression` rule and its underlying leaf. Each
+    // layer used to recurse through `build_expression`, which in debug
+    // builds blew past the default 2 MB test thread stack on inputs as
+    // small as `MATCH (n) RETURN size(n)`. Peel the wrappers iteratively
+    // for the (very common) case where they carry no operator at this
+    // level so the main `match` lands on the meaningful rule directly.
+    let pair = peel_passthrough(pair);
     match pair.as_rule() {
         Rule::expression => build_expression(
             pair.into_inner()

@@ -266,12 +266,8 @@ fn path_with_repeated_node_dedupes_in_wire() {
 // than watching an end-to-end test fail with an obscure error.
 
 #[test]
-fn datetime_emits_local_date_time_tag() {
-    let input = Property::DateTime {
-        nanos: 1_735_689_600_000,
-        tz_offset_secs: Some(0),
-        tz_name: None,
-    };
+fn local_datetime_emits_local_date_time_tag() {
+    let input = Property::LocalDateTime(1_735_689_600_000);
     let mut row = Row::new();
     row.insert("v".into(), Value::Property(input));
     let bolt = row_to_bolt_fields(&row, &["v".to_string()]);
