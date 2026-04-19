@@ -368,6 +368,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             edge_properties,
             edge_types,
             direction,
+            edge_constraint_var,
         } => Box::new(EdgeExpandOp::new(
             child!(input),
             src_var.clone(),
@@ -377,6 +378,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             edge_properties.clone(),
             edge_types.clone(),
             *direction,
+            edge_constraint_var.clone(),
         )),
         LogicalPlan::OptionalEdgeExpand {
             input,
@@ -388,6 +390,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             edge_types,
             direction,
             dst_constraint_var,
+            edge_constraint_var,
         } => Box::new(OptionalEdgeExpandOp::new(
             child!(input),
             src_var.clone(),
@@ -398,6 +401,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             edge_types.clone(),
             *direction,
             dst_constraint_var.clone(),
+            edge_constraint_var.clone(),
         )),
         LogicalPlan::VarLengthExpand {
             input,
@@ -2434,12 +2438,19 @@ struct EdgeExpandOp {
     edge_properties: Vec<(String, Expr)>,
     edge_types: Vec<String>,
     direction: Direction,
+    /// When set, only the specific edge whose id matches the
+    /// row-bound value counts as a match. Used by fresh-scan
+    /// MATCH patterns that reuse an edge variable from a prior
+    /// clause so the new hop stays an existence check instead of
+    /// rebinding and clobbering the outer edge.
+    edge_constraint_var: Option<String>,
     current_row: Option<Row>,
     pending: Vec<(EdgeId, NodeId)>,
     pending_idx: usize,
 }
 
 impl EdgeExpandOp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         input: Box<dyn Operator>,
         src_var: String,
@@ -2449,6 +2460,7 @@ impl EdgeExpandOp {
         edge_properties: Vec<(String, Expr)>,
         edge_types: Vec<String>,
         direction: Direction,
+        edge_constraint_var: Option<String>,
     ) -> Self {
         Self {
             input,
@@ -2459,6 +2471,7 @@ impl EdgeExpandOp {
             edge_properties,
             edge_types,
             direction,
+            edge_constraint_var,
             current_row: None,
             pending: Vec::new(),
             pending_idx: 0,
@@ -2481,6 +2494,25 @@ impl Operator for EdgeExpandOp {
                     && !self.edge_types.iter().any(|t| t == &edge.edge_type)
                 {
                     continue;
+                }
+                // Pre-bound edge constraint: only accept the edge
+                // whose id matches the row-bound value. Non-edge /
+                // null bindings trigger no matches at all — the
+                // expansion yields nothing for that input row.
+                if let Some(constraint_var) = &self.edge_constraint_var {
+                    let base = self
+                        .current_row
+                        .as_ref()
+                        .expect("pending edges without source row");
+                    let expected = match base.get(constraint_var) {
+                        Some(Value::Edge(e)) => Some(e.id),
+                        _ => None,
+                    };
+                    match expected {
+                        Some(id) if id != edge.id => continue,
+                        None => continue,
+                        _ => {}
+                    }
                 }
                 // Inline edge property filter: every (key, value)
                 // must match the traversed edge's property of the
@@ -2602,6 +2634,11 @@ struct OptionalEdgeExpandOp {
     /// fail the constraint then triggers the same null-fallback
     /// as having no edges at all.
     dst_constraint_var: Option<String>,
+    /// When set, the expansion only considers the single edge
+    /// whose id matches the edge already bound at this row
+    /// variable — used when the OPTIONAL MATCH pattern reuses
+    /// an edge variable from a prior clause.
+    edge_constraint_var: Option<String>,
     current_row: Option<Row>,
     pending: Vec<(EdgeId, NodeId)>,
     pending_idx: usize,
@@ -2620,6 +2657,7 @@ impl OptionalEdgeExpandOp {
         edge_types: Vec<String>,
         direction: Direction,
         dst_constraint_var: Option<String>,
+        edge_constraint_var: Option<String>,
     ) -> Self {
         Self {
             input,
@@ -2631,6 +2669,7 @@ impl OptionalEdgeExpandOp {
             edge_types,
             direction,
             dst_constraint_var,
+            edge_constraint_var,
             current_row: None,
             pending: Vec::new(),
             pending_idx: 0,
@@ -2654,6 +2693,26 @@ impl Operator for OptionalEdgeExpandOp {
                     && !self.edge_types.iter().any(|t| t == &edge.edge_type)
                 {
                     continue;
+                }
+                // Pre-bound edge constraint: only the specific
+                // edge whose id matches the row-bound value
+                // counts as a match. Typical use is OPT MATCH
+                // patterns that reuse an edge variable from an
+                // earlier clause.
+                if let Some(constraint_var) = &self.edge_constraint_var {
+                    let base = self
+                        .current_row
+                        .as_ref()
+                        .expect("pending without source row");
+                    let expected = match base.get(constraint_var) {
+                        Some(Value::Edge(e)) => Some(e.id),
+                        _ => None,
+                    };
+                    match expected {
+                        Some(id) if id != edge.id => continue,
+                        None => continue,
+                        _ => {}
+                    }
                 }
 
                 let neighbor = match ctx.store.get_node(neighbor_id)? {
@@ -2728,13 +2787,33 @@ impl Operator for OptionalEdgeExpandOp {
             // Pending drained for the current row. If nothing was
             // yielded, emit the left-join fallback: preserve the
             // input row with the optional variables set to Null.
+            //
+            // Exception: when an edge / dst constraint names a
+            // variable that was pre-bound in the input row, the
+            // fallback must NOT clobber that variable — the
+            // constraint turns the expansion into an existence
+            // check and the outer value should survive through.
             if let Some(base) = self.current_row.take() {
                 if !self.yielded_for_current {
                     let mut out = base;
                     if let Some(ev) = &self.edge_var {
-                        out.insert(ev.clone(), Value::Null);
+                        let preserve = self
+                            .edge_constraint_var
+                            .as_ref()
+                            .map(|c| c == ev)
+                            .unwrap_or(false);
+                        if !preserve {
+                            out.insert(ev.clone(), Value::Null);
+                        }
                     }
-                    out.insert(self.dst_var.clone(), Value::Null);
+                    let preserve_dst = self
+                        .dst_constraint_var
+                        .as_ref()
+                        .map(|c| c == &self.dst_var)
+                        .unwrap_or(false);
+                    if !preserve_dst {
+                        out.insert(self.dst_var.clone(), Value::Null);
+                    }
                     self.yielded_for_current = true;
                     return Ok(Some(out));
                 }

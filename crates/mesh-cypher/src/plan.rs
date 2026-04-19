@@ -68,6 +68,13 @@ pub enum LogicalPlan {
         edge_properties: Vec<(String, Expr)>,
         edge_types: Vec<String>,
         direction: Direction,
+        /// Optional pre-bound edge constraint. Set when the hop's
+        /// edge variable was already bound in a prior clause — the
+        /// expansion then only matches that exact edge by id,
+        /// turning the hop into an existence check on the outer
+        /// edge rather than a fresh scan that would clobber the
+        /// binding.
+        edge_constraint_var: Option<String>,
     },
     /// Left-join expand. Behaves like `EdgeExpand` for input
     /// rows that have at least one matching neighbor, but for
@@ -95,6 +102,13 @@ pub enum LogicalPlan {
         /// OPTIONAL MATCH when both endpoints are already bound
         /// (`MATCH (a), (b) OPTIONAL MATCH (a)-[r]->(b)`).
         dst_constraint_var: Option<String>,
+        /// Optional pre-bound edge constraint. When set, only the
+        /// edge whose id matches the edge bound at this row
+        /// variable is considered a match — used for patterns like
+        /// `OPTIONAL MATCH (a1)<-[r]-(b2)` where `r` came from an
+        /// outer MATCH and the OPT should succeed iff the same
+        /// edge would also be visitable in the reversed direction.
+        edge_constraint_var: Option<String>,
     },
     VarLengthExpand {
         input: Box<LogicalPlan>,
@@ -1888,6 +1902,21 @@ fn plan_pattern(
     pattern_idx: usize,
     ctx: &PlannerContext,
 ) -> Result<LogicalPlan> {
+    plan_pattern_with_bound_edges(pattern, pattern_idx, ctx, &HashSet::new())
+}
+
+/// Same as [`plan_pattern`] but honours a set of edge variables
+/// already bound in an outer clause — each hop that reuses such a
+/// variable lowers with an edge constraint so the fresh scan
+/// treats it as an existence check on the outer edge rather than
+/// rebinding it. Lets patterns like
+/// `MATCH ()-[r:EDGE]-() MATCH (n)-[r]-(m)` reuse `r` correctly.
+fn plan_pattern_with_bound_edges(
+    pattern: &Pattern,
+    pattern_idx: usize,
+    ctx: &PlannerContext,
+    external_bound_edges: &HashSet<String>,
+) -> Result<LogicalPlan> {
     if pattern.shortest.is_some() {
         return Err(Error::Plan(
             "shortestPath(...) requires both endpoints to be bound \
@@ -1924,7 +1953,14 @@ fn plan_pattern(
     // filter so the executor actually enforces them.
     plan = wrap_with_pattern_prop_filter(plan, &start_var, &remaining_props);
 
-    let plan = chain_hops(plan, &working, &start_var, pattern_idx)?;
+    let plan = chain_hops_with_bound(
+        plan,
+        &working,
+        &start_var,
+        pattern_idx,
+        &HashSet::new(),
+        external_bound_edges,
+    )?;
     Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
 
@@ -2022,12 +2058,26 @@ fn plan_pattern_from_bound(
     // MATCH clauses (`(a)-->(x), (b)-->(x)`) and cycle patterns
     // (`(a)-[:A]->(b), (b)-[:B]->(a)`) constrain to the same node.
     let mut external_bound: HashSet<String> = HashSet::new();
+    let mut external_bound_edges: HashSet<String> = HashSet::new();
     for (k, v) in bound_vars {
-        if matches!(v, VarType::Node | VarType::Scalar) {
-            external_bound.insert(k.clone());
+        match v {
+            VarType::Node | VarType::Scalar => {
+                external_bound.insert(k.clone());
+            }
+            VarType::Edge => {
+                external_bound_edges.insert(k.clone());
+            }
+            _ => {}
         }
     }
-    let plan = chain_hops_with_bound(plan, &working, &start_var, pattern_idx, &external_bound)?;
+    let plan = chain_hops_with_bound(
+        plan,
+        &working,
+        &start_var,
+        pattern_idx,
+        &external_bound,
+        &external_bound_edges,
+    )?;
     Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
 
@@ -2198,27 +2248,25 @@ fn wrap_with_bind_path(
 /// expand operators pull `src_var` out of the row, so
 /// "just-scanned" and "already in the row from a prior stage"
 /// are semantically identical.
-fn chain_hops(
-    mut plan: LogicalPlan,
-    pattern: &Pattern,
-    start_var: &str,
-    pattern_idx: usize,
-) -> Result<LogicalPlan> {
-    chain_hops_with_bound(plan, pattern, start_var, pattern_idx, &HashSet::new())
-}
-
-/// Same as [`chain_hops`] but also treats every variable in
-/// `external_bound_nodes` as an already-bound prior node — so
-/// patterns like `MATCH (a)-[:A]->(b), (b)-[:B]->(a)` hoist the
-/// cycle check into an equality filter instead of rebinding `a`.
-/// The caller passes the node-typed entries from the outer
-/// `bound_vars` map that exists *before* this pattern is lowered.
+/// Chain `EdgeExpand` / `VarLengthExpand` operators for every
+/// hop in `pattern`, starting from whatever plan `plan` is
+/// currently producing (with `start_var` bound in its output
+/// rows). Each hop's target pattern properties lower to a
+/// wrapping `Filter` via [`wrap_with_pattern_prop_filter`],
+/// matching the pre-rebind behavior of `plan_pattern`.
+///
+/// `external_bound_nodes` / `external_bound_edges` carry the
+/// already-bound variables from the outer scope so multi-pattern
+/// MATCH clauses and cross-stage rebinds hoist reuse into
+/// equality filters / edge-id constraints instead of rebinding
+/// and clobbering the outer value.
 fn chain_hops_with_bound(
     mut plan: LogicalPlan,
     pattern: &Pattern,
     start_var: &str,
     pattern_idx: usize,
     external_bound_nodes: &HashSet<String>,
+    external_bound_edges: &HashSet<String>,
 ) -> Result<LogicalPlan> {
     // Track already-bound node variables so repeat uses
     // (`(n)-[r]->(n)`) become equality filters on the same
@@ -2288,6 +2336,18 @@ fn chain_hops_with_bound(
                 dst_constraint_var: None,
             }
         } else {
+            // If the hop reuses an edge variable that was bound in
+            // a prior clause, constrain the expansion to that
+            // specific edge by id — matches how the planner
+            // already handles reused node variables as prior_node
+            // equality filters.
+            let edge_constraint_var = hop.rel.var.as_ref().and_then(|v| {
+                if external_bound_edges.contains(v) {
+                    Some(v.clone())
+                } else {
+                    None
+                }
+            });
             LogicalPlan::EdgeExpand {
                 input: Box::new(plan),
                 src_var: current_var.clone(),
@@ -2297,6 +2357,7 @@ fn chain_hops_with_bound(
                 edge_properties: hop.rel.properties.clone(),
                 edge_types: hop.rel.edge_types.clone(),
                 direction: hop.rel.direction,
+                edge_constraint_var,
             }
         };
         // Lower the target node's pattern properties to a Filter
@@ -2830,6 +2891,15 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             .expect("is_rebind implies an earlier clause populated the plan");
                         Some(plan_pattern_from_bound(current, pattern, pattern_offset, &bound_vars)?)
                     } else {
+                        // Fresh-scan patterns don't see the current
+                        // plan's row bindings at runtime (the plan
+                        // tree lowers them as a right-side
+                        // `CartesianProduct` with an independent
+                        // scan), so we can't usefully push outer
+                        // edge constraints into the hop operators
+                        // here. Reusing an outer edge variable in a
+                        // fresh pattern is handled — if at all — by
+                        // a post-filter further downstream.
                         let rhs = plan_pattern(pattern, pattern_offset, ctx)?;
                         Some(match plan.take() {
                             None => rhs,
@@ -3584,6 +3654,7 @@ fn apply_optional_match(
     bound_vars: &mut HashMap<String, VarType>,
     ctx: &PlannerContext,
 ) -> Result<LogicalPlan> {
+    let mut where_consumed = false;
     for pattern in &clause.patterns {
         if pattern.hops.is_empty() {
             // Bare-node OPTIONAL MATCH: scan for matching nodes.
@@ -3689,26 +3760,37 @@ fn apply_optional_match(
             }
         }
 
-        // Multi-hop patterns (or any hop chain longer than one)
-        // can't use per-hop OptionalEdgeExpand safely: each hop's
-        // null-fallback fires independently, leaking partial
-        // matches where only a prefix succeeded. Build the pattern
-        // as a non-optional chain seeded from the outer row, then
-        // wrap the whole thing in `OptionalApply` which runs the
-        // body per outer row and only emits the null fallback
-        // when the *whole* pattern matched zero rows.
-        if working.hops.len() > 1 {
+        // Multi-hop patterns, or anywhere the OPTIONAL clause has a
+        // WHERE, can't use per-hop OptionalEdgeExpand safely: each
+        // hop's null-fallback fires independently (leaking partial
+        // matches with only a prefix bound) and a downstream filter
+        // would also drop the fallback row (so an outer row whose
+        // only match fails the WHERE vanishes instead of producing
+        // the expected all-null left-join row). Build the whole
+        // pattern as a non-optional chain seeded from the outer row,
+        // fold the WHERE into the same sub-plan, and wrap in
+        // `OptionalApply` so the null fallback only fires when the
+        // *entire* pattern+WHERE produced zero rows for that input.
+        let use_apply = working.hops.len() > 1 || clause.where_clause.is_some();
+        if use_apply {
             // Seed the body with the outer row so the executor's
             // per-row apply operator replays it; `SeedRow` is
             // substituted for the actual row by `build_op_inner`'s
             // `seed` parameter.
             let body_seed: LogicalPlan = LogicalPlan::SeedRow;
-            let body = plan_pattern_from_bound(
+            let mut body = plan_pattern_from_bound(
                 body_seed,
                 &working,
                 0,
                 bound_vars,
             )?;
+            if let Some(predicate) = &clause.where_clause {
+                body = LogicalPlan::Filter {
+                    input: Box::new(body),
+                    predicate: predicate.clone(),
+                };
+                where_consumed = true;
+            }
             for hop in &working.hops {
                 if let Some(v) = &hop.rel.var {
                     bound_vars.insert(v.clone(), VarType::Edge);
@@ -3806,6 +3888,17 @@ fn apply_optional_match(
                 } else {
                     None
                 };
+                // If the edge variable was already bound in a
+                // prior clause (e.g. `WITH r ... OPTIONAL MATCH
+                // (a)<-[r]-(b)`), pass it as an edge constraint
+                // so only the pre-bound edge counts as a match.
+                let edge_constraint_var = hop.rel.var.as_ref().and_then(|v| {
+                    if bound_vars.contains_key(v) {
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                });
                 plan = LogicalPlan::OptionalEdgeExpand {
                     input: Box::new(plan),
                     src_var: current_var.clone(),
@@ -3816,6 +3909,7 @@ fn apply_optional_match(
                     edge_types: hop.rel.edge_types.clone(),
                     direction: hop.rel.direction,
                     dst_constraint_var: constraint_var,
+                    edge_constraint_var,
                 };
             }
 
@@ -3851,10 +3945,12 @@ fn apply_optional_match(
     }
 
     if let Some(predicate) = &clause.where_clause {
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate: predicate.clone(),
-        };
+        if !where_consumed {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: predicate.clone(),
+            };
+        }
     }
 
     Ok(plan)
