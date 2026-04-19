@@ -2016,6 +2016,16 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                         return Ok(Expr::Literal(Literal::Integer(n)));
                     }
                 }
+                // `-<float>` folds at parse time so callers see
+                // `Float(-3.14)` instead of `UnaryOp(Neg, Float(3.14))`
+                // — pattern-property values in particular compare
+                // structurally and the unary wrapper would mask the
+                // literal shape.
+                if let Some(lit) = peel_to_float_literal(&operand_pair) {
+                    if let Ok(f) = format!("-{}", lit).parse::<f64>() {
+                        return Ok(Expr::Literal(Literal::Float(f)));
+                    }
+                }
                 let operand = build_expression(operand_pair)?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Neg,
@@ -2672,10 +2682,20 @@ fn unescape_string(s: &str) -> Result<String> {
 /// Returns its source text if the chain is nothing but wrappers +
 /// integer, or `None` otherwise.
 fn peel_to_integer_literal(pair: &Pair<Rule>) -> Option<String> {
+    peel_to_numeric_literal(pair, Rule::integer)
+}
+
+fn peel_to_float_literal(pair: &Pair<Rule>) -> Option<String> {
+    peel_to_numeric_literal(pair, Rule::float)
+}
+
+fn peel_to_numeric_literal(pair: &Pair<Rule>, target: Rule) -> Option<String> {
     let mut current = pair.clone();
     loop {
+        if current.as_rule() == target {
+            return Some(current.as_str().to_string());
+        }
         match current.as_rule() {
-            Rule::integer => return Some(current.as_str().to_string()),
             Rule::literal
             | Rule::primary
             | Rule::base_primary

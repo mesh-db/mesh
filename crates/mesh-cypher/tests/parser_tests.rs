@@ -1015,10 +1015,18 @@ fn parameter_in_return_expression() {
 
 #[test]
 fn property_value_rejects_free_identifier() {
-    // Pattern property values are restricted to literal | parameter at
-    // the grammar level, so `(n {name: foo})` (foo as a free identifier)
-    // is a parse error rather than an "unbound variable" runtime error.
-    assert!(parse("MATCH (n {name: foo}) RETURN n").is_err());
+    // Pattern property values are full expressions so TCK shapes like
+    // `UNWIND r AS i CREATE (n {var: i})` can reference in-scope
+    // bindings. A bare identifier that isn't bound anywhere (like
+    // `foo` below) is caught at plan time as UndefinedVariable
+    // rather than silently compiling into a filter that matches
+    // zero rows.
+    let stmt = parse("MATCH (n {name: foo}) RETURN n").expect("parse");
+    let err = mesh_cypher::plan(&stmt).unwrap_err();
+    assert!(
+        matches!(&err, mesh_cypher::Error::Plan(msg) if msg.contains("foo")),
+        "expected UndefinedVariable plan error on `foo`, got {err:?}",
+    );
 }
 
 #[test]

@@ -274,15 +274,12 @@ node_pattern = { "(" ~ identifier? ~ label_spec* ~ properties? ~ ")" }
 label_spec = { ":" ~ identifier }
 properties = { "{" ~ (property_entry ~ ("," ~ property_entry)*)? ~ "}" }
 property_entry = { map_key ~ ":" ~ property_value }
-// Node-pattern property values are deliberately narrower than full
-// expressions: only literals or parameters are allowed. This statically
-// rejects things like `{name: m.y}` (free row references in pattern
-// properties) without needing a planner-side scope check. Routing
-// through `literal` directly (rather than `expression`) also gets us
-// `{x: -3.14}` as a single `Float(-3.14)` literal for free, since the
-// `float` rule already accepts a leading `-` and we no longer have to
-// chase it through `unary_expr`.
-property_value = { literal | parameter }
+// Node-pattern property values are full expressions — the TCK uses
+// in-scope bindings here (e.g. `UNWIND r AS i CREATE (n {var: i})`),
+// so we can't restrict at the grammar level. Unbound identifiers
+// fall out as a plan-time `UndefinedVariable` via the usual scope
+// check on pattern property expressions.
+property_value = { expression }
 
 return_items = { return_star | (return_item ~ ("," ~ return_item)*) }
 return_star = { "*" }

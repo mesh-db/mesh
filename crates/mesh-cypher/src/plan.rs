@@ -1630,6 +1630,31 @@ fn check_set_expr_scope(expr: &Expr, bound: &HashMap<String, VarType>) -> Result
     check_set_expr_scope_inner(expr, bound, &[])
 }
 
+/// Scope-check every property-value expression in `pattern` (its
+/// start node plus every hop's rel and target) against `bound`.
+/// Pattern-property values may be full expressions — including
+/// references to earlier bindings (`UNWIND r AS i CREATE (n {var: i})`)
+/// — so grammar-level restriction is off the table; this catches the
+/// unbound-identifier case at plan time instead of letting it flow
+/// into a filter predicate that silently matches zero rows.
+fn check_pattern_property_scope(
+    pattern: &crate::ast::Pattern,
+    bound: &HashMap<String, VarType>,
+) -> Result<()> {
+    for (_, expr) in &pattern.start.properties {
+        check_set_expr_scope(expr, bound)?;
+    }
+    for hop in &pattern.hops {
+        for (_, expr) in &hop.rel.properties {
+            check_set_expr_scope(expr, bound)?;
+        }
+        for (_, expr) in &hop.target.properties {
+            check_set_expr_scope(expr, bound)?;
+        }
+    }
+    Ok(())
+}
+
 fn check_set_expr_scope_inner(
     expr: &Expr,
     bound: &HashMap<String, VarType>,
@@ -3194,6 +3219,25 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             this_clause_vars.insert(var.clone());
                         }
                     }
+                }
+
+                // Pattern-property values are expressions, so a bare
+                // identifier like `{name: foo}` must resolve to a
+                // binding from an earlier clause or from this clause's
+                // own patterns. Catch the unbound case here rather
+                // than letting it flow into a `Filter` predicate that
+                // would silently return zero rows at runtime.
+                let scope_for_props: HashMap<String, VarType> = bound_vars
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .chain(
+                        this_clause_vars
+                            .iter()
+                            .map(|v| (v.clone(), VarType::Scalar)),
+                    )
+                    .collect();
+                for pattern in &m.patterns {
+                    check_pattern_property_scope(pattern, &scope_for_props)?;
                 }
 
                 // Lower each pattern. A pattern whose start var
