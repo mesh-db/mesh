@@ -798,6 +798,94 @@ fn validate_pattern_predicate(pattern: &Pattern) -> Result<()> {
     Ok(())
 }
 
+/// Every named variable inside a pattern predicate must already be
+/// bound in the outer row — pattern predicates can existentially
+/// quantify over anonymous positions (`(n)-[]->()`) but they can't
+/// *introduce* fresh named bindings. openCypher raises
+/// `SyntaxError: UndefinedVariable` at compile time for
+/// `WHERE (n)-[r]->(a)` when `r` / `a` weren't bound by an earlier
+/// clause. Walk every `PatternExists` the expression carries and
+/// check each named position (start, per-hop rel, per-hop target).
+fn validate_pattern_predicate_vars_bound(
+    expr: &Expr,
+    bound: &HashMap<String, VarType>,
+) -> Result<()> {
+    walk_expr(expr, &mut |e| {
+        if let Expr::PatternExists(pattern) = e {
+            check_pattern_vars_bound(pattern, bound)?;
+        }
+        Ok(())
+    })
+}
+
+fn check_pattern_vars_bound(
+    pattern: &Pattern,
+    bound: &HashMap<String, VarType>,
+) -> Result<()> {
+    if let Some(v) = &pattern.start.var {
+        if !bound.contains_key(v) {
+            return Err(Error::Plan(format!(
+                "UndefinedVariable: pattern predicate references unbound variable `{v}`"
+            )));
+        }
+    }
+    for hop in &pattern.hops {
+        if let Some(v) = &hop.rel.var {
+            if !bound.contains_key(v) {
+                return Err(Error::Plan(format!(
+                    "UndefinedVariable: pattern predicate references unbound variable `{v}`"
+                )));
+            }
+        }
+        if let Some(v) = &hop.target.var {
+            if !bound.contains_key(v) {
+                return Err(Error::Plan(format!(
+                    "UndefinedVariable: pattern predicate references unbound variable `{v}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `WHERE (n)` or `WHERE n` where `n` is a node / edge / path
+/// binding raises `SyntaxError: InvalidArgumentType` in openCypher
+/// — a WHERE predicate has to evaluate to a boolean, and a bare
+/// graph-element reference doesn't. Reject the narrow shape at
+/// plan time so we don't silently coerce and succeed.
+fn reject_non_boolean_where_predicate(
+    expr: &Expr,
+    bound: &HashMap<String, VarType>,
+) -> Result<()> {
+    if let Expr::Identifier(name) = expr {
+        if let Some(vtype) = bound.get(name) {
+            if matches!(vtype, VarType::Node | VarType::Edge | VarType::Path) {
+                return Err(Error::Plan(format!(
+                    "InvalidArgumentType: WHERE predicate `{name}` is a {vtype:?}, not a boolean"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pattern predicates (`(n)-[r]->(m)` as a boolean expression)
+/// are only legal inside WHERE clauses and EXISTS subqueries.
+/// RETURN / WITH projections, SET right-hand sides, ORDER BY
+/// keys and the like have to use a pattern comprehension
+/// (`[(n)-[r]->(m) | r]`) instead — using a bare pattern
+/// predicate there raises `SyntaxError: UnexpectedSyntax`.
+fn reject_pattern_predicate_in_projection(expr: &Expr, context: &str) -> Result<()> {
+    walk_expr(expr, &mut |e| {
+        if matches!(e, Expr::PatternExists(_)) {
+            return Err(Error::Plan(format!(
+                "UnexpectedSyntax: pattern predicate not allowed in {context}"
+            )));
+        }
+        Ok(())
+    })
+}
+
 /// Looser version of [`validate_pattern_predicate`] for
 /// `EXISTS { ... }` subqueries. Relaxes two restrictions that
 /// apply to pattern predicates but aren't required by EXISTS:
@@ -1499,10 +1587,14 @@ fn check_set_assignments_scope(
 ) -> Result<()> {
     for a in assignments {
         match a {
-            SetAssignment::Property { value, .. } => check_set_expr_scope(value, bound)?,
+            SetAssignment::Property { value, .. } => {
+                reject_pattern_predicate_in_projection(value, "SET right-hand side")?;
+                check_set_expr_scope(value, bound)?;
+            }
             SetAssignment::Replace { properties, .. }
             | SetAssignment::Merge { properties, .. } => {
                 for (_, e) in properties {
+                    reject_pattern_predicate_in_projection(e, "SET right-hand side")?;
                     check_set_expr_scope(e, bound)?;
                 }
             }
@@ -2509,6 +2601,9 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 stage_pattern_offset += m.patterns.len();
 
                 if let Some(predicate) = &m.where_clause {
+                    validate_pattern_predicate_vars_bound(predicate, &bound_vars)?;
+                    check_set_expr_scope(predicate, &bound_vars)?;
+                    reject_non_boolean_where_predicate(predicate, &bound_vars)?;
                     let current = plan.expect("MATCH populated plan above");
                     plan = Some(LogicalPlan::Filter {
                         input: Box::new(current),
@@ -3043,6 +3138,13 @@ fn apply_return_pipeline(
     skip: Option<Expr>,
     limit: Option<Expr>,
 ) -> Result<LogicalPlan> {
+    for item in return_items {
+        reject_pattern_predicate_in_projection(&item.expr, "RETURN projection")?;
+    }
+    for s in order_by {
+        reject_pattern_predicate_in_projection(&s.expr, "ORDER BY")?;
+    }
+
     // Rewrite ORDER BY expressions that refer to an already-projected
     // aggregate so they reference the output column instead of
     // re-evaluating the aggregate in a post-aggregation (scalar)
@@ -3296,6 +3398,10 @@ fn apply_optional_match(
 /// LIMIT. Downstream clauses (RETURN, another MATCH) then see
 /// only the names introduced by this WITH's items.
 fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Result<LogicalPlan> {
+    for item in &w.items {
+        reject_pattern_predicate_in_projection(&item.expr, "WITH projection")?;
+    }
+
     let has_aggregates = !w.star
         && w.items.iter().any(|it| contains_aggregate(&it.expr));
 
