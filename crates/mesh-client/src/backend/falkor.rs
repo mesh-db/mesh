@@ -49,7 +49,9 @@ impl GraphBackend for FalkorBackend {
     }
 
     async fn schema(&mut self) -> Result<Schema> {
-        let labels = single_column(self, "CALL db.labels()").await.unwrap_or_default();
+        let labels = single_column(self, "CALL db.labels()")
+            .await
+            .unwrap_or_default();
         let rels = single_column(self, "CALL db.relationshipTypes()")
             .await
             .unwrap_or_default();

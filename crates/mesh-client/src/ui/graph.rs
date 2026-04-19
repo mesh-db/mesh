@@ -51,10 +51,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .y_bounds([-50.0 + pan_y, 50.0 + pan_y])
         .paint(move |ctx| {
             for edge in &edges_for_canvas {
-                if let (Some(&(x1, y1)), Some(&(x2, y2))) = (
-                    positions.get(&edge.source),
-                    positions.get(&edge.target),
-                ) {
+                if let (Some(&(x1, y1)), Some(&(x2, y2))) =
+                    (positions.get(&edge.source), positions.get(&edge.target))
+                {
                     ctx.draw(&CLine {
                         x1,
                         y1,

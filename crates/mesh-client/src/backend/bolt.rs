@@ -65,9 +65,10 @@ impl BoltBackend {
 
         let auth_in_hello = !is_5_1_plus(version);
 
-        let mut hello_extra: Vec<(String, BoltValue)> = vec![
-            ("user_agent".into(), BoltValue::String("mesh-client/0.1".into())),
-        ];
+        let mut hello_extra: Vec<(String, BoltValue)> = vec![(
+            "user_agent".into(),
+            BoltValue::String("mesh-client/0.1".into()),
+        )];
         if auth_in_hello {
             push_auth(&mut hello_extra, profile);
         }
@@ -295,11 +296,7 @@ fn parse_bolt_uri(uri: &str) -> Result<ParsedUri> {
     };
 
     // Strip any trailing `/database` segment before splitting host:port.
-    let authority = rest
-        .trim_end_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or(rest);
+    let authority = rest.trim_end_matches('/').split('/').next().unwrap_or(rest);
     if authority.is_empty() {
         bail!("empty host in uri {uri}");
     }
@@ -426,11 +423,7 @@ fn summarize(metadata: &BoltValue, row_count: usize) -> String {
     parts.join(" · ")
 }
 
-fn from_bolt(
-    v: &BoltValue,
-    nodes: &mut Vec<GraphNode>,
-    edges: &mut Vec<GraphEdge>,
-) -> Value {
+fn from_bolt(v: &BoltValue, nodes: &mut Vec<GraphNode>, edges: &mut Vec<GraphEdge>) -> Value {
     match v {
         BoltValue::Null => Value::Null,
         BoltValue::Bool(b) => Value::Bool(*b),
@@ -438,12 +431,9 @@ fn from_bolt(
         BoltValue::Float(f) => Value::Float(*f),
         BoltValue::String(s) => Value::String(s.clone()),
         BoltValue::Bytes(b) => Value::String(format!("bytes[{}]", b.len())),
-        BoltValue::List(items) => Value::List(
-            items
-                .iter()
-                .map(|x| from_bolt(x, nodes, edges))
-                .collect(),
-        ),
+        BoltValue::List(items) => {
+            Value::List(items.iter().map(|x| from_bolt(x, nodes, edges)).collect())
+        }
         BoltValue::Map(entries) => {
             let m: BTreeMap<String, Value> = entries
                 .iter()

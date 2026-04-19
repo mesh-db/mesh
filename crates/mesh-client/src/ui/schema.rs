@@ -51,7 +51,14 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn render_list(f: &mut Frame, area: Rect, title: &str, items: &[String], color: Color, scroll: usize) {
+fn render_list(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    items: &[String],
+    color: Color,
+    scroll: usize,
+) {
     let items: Vec<ListItem> = items
         .iter()
         .skip(scroll)
@@ -62,6 +69,10 @@ fn render_list(f: &mut Frame, area: Rect, title: &str, items: &[String], color: 
             ]))
         })
         .collect();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title.to_string()));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_string()),
+    );
     f.render_widget(list, area);
 }

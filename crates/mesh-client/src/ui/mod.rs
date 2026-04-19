@@ -37,15 +37,11 @@ fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .map(|t| Line::from(t.title()))
         .collect();
     let header = Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    " mesh-client — {} [{}] ",
-                    app.profile_name,
-                    app.backend.label()
-                )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " mesh-client — {} [{}] ",
+            app.profile_name,
+            app.backend.label()
+        )))
         .select(app.tab.index())
         .style(Style::default().fg(Color::Gray))
         .highlight_style(
@@ -59,7 +55,9 @@ fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn draw_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let hint = match app.tab {
-        Tab::Repl => "F5 run · Alt+↑/↓ history · F6 / Esc switch pane · F1/F2/F3 tabs · F8 schema · F10 quit",
+        Tab::Repl => {
+            "F5 run · Alt+↑/↓ history · F6 / Esc switch pane · F1/F2/F3 tabs · F8 schema · F10 quit"
+        }
         Tab::Schema => "↑/↓ scroll · F8 refresh · F1/F2/F3 tabs · F10 quit",
         Tab::Graph => "h/j/k/l pan · Home center · F1/F2/F3 tabs · F10 quit",
     };

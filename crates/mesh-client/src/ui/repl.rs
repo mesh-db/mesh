@@ -78,14 +78,13 @@ fn draw_results(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     let header = Row::new(header_cells).style(Style::default().fg(Color::Yellow));
 
-    let visible = result
-        .rows
-        .iter()
-        .skip(app.result_scroll)
-        .map(|r| {
-            let cells: Vec<Cell> = r.iter().map(|v| Cell::from(truncate(v.render(), 80))).collect();
-            Row::new(cells)
-        });
+    let visible = result.rows.iter().skip(app.result_scroll).map(|r| {
+        let cells: Vec<Cell> = r
+            .iter()
+            .map(|v| Cell::from(truncate(v.render(), 80)))
+            .collect();
+        Row::new(cells)
+    });
 
     let col_count = result.columns.len().max(1);
     let widths: Vec<Constraint> = (0..col_count)
