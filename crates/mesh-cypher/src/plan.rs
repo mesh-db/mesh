@@ -5122,6 +5122,27 @@ fn reject_size_on_path(expr: &Expr, bound: &HashMap<String, VarType>) -> Result<
                     }
                 }
             }
+            // `length()` is defined for paths only; lists / strings
+            // use `size()` and scalars like nodes / edges have no
+            // length. openCypher raises `InvalidArgumentType`.
+            if name.eq_ignore_ascii_case("length") {
+                if let CallArgs::Exprs(es) = args {
+                    if es.len() == 1 {
+                        if let Expr::Identifier(n) = &es[0] {
+                            if matches!(
+                                bound.get(n),
+                                Some(VarType::Node | VarType::Edge)
+                            ) {
+                                err = Some(Error::Plan(
+                                    "length() is not defined for node or edge \
+                                     values; it applies to paths"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     })?;
