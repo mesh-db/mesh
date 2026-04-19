@@ -1591,6 +1591,7 @@ fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {
     let mut var = None;
     let mut labels = Vec::new();
     let mut properties = Vec::new();
+    let mut has_property_clause = false;
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -1602,7 +1603,10 @@ fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {
                     .ok_or_else(|| Error::Parse("empty label".into()))?;
                 labels.push(parse_ident(label_id.as_str()));
             }
-            Rule::properties => properties = build_properties(p)?,
+            Rule::properties => {
+                has_property_clause = true;
+                properties = build_properties(p)?;
+            }
             r => {
                 return Err(Error::Parse(format!(
                     "unexpected rule in node pattern: {:?}",
@@ -1616,6 +1620,7 @@ fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern> {
         var,
         labels,
         properties,
+        has_property_clause,
     })
 }
 

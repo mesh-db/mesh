@@ -743,9 +743,15 @@ impl CreatePathOp {
                     // per the grammar). Evaluate against the current row
                     // + params and convert to a stored Property via the
                     // existing helper, which rejects Node/Edge values.
+                    // Null-valued properties aren't stored — openCypher
+                    // treats `{k: null}` as "no such property," so
+                    // `keys(n)` and `n.k IS NOT NULL` both skip it.
                     for (k, expr) in properties {
                         let value = eval_expr(expr, &ctx.eval_ctx(row))?;
                         let prop = value_to_property(value)?;
+                        if matches!(prop, Property::Null) {
+                            continue;
+                        }
                         node.properties.insert(k.clone(), prop);
                     }
                     ctx.writer.put_node(&node)?;
@@ -770,6 +776,9 @@ impl CreatePathOp {
             for (k, expr) in &spec.properties {
                 let value = eval_expr(expr, &ctx.eval_ctx(row))?;
                 let prop = value_to_property(value)?;
+                if matches!(prop, Property::Null) {
+                    continue;
+                }
                 edge.properties.insert(k.clone(), prop);
             }
             ctx.writer.put_edge(&edge)?;

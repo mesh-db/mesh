@@ -414,6 +414,11 @@ pub struct NodePattern {
     /// `property_value` in cypher.pest), so every Expr here is either
     /// `Expr::Literal` or `Expr::Parameter`.
     pub properties: Vec<(String, Expr)>,
+    /// `true` when the source had a `{...}` map — even an empty `{}`.
+    /// Needed to distinguish `(n)` (bare reference to a bound node,
+    /// legal) from `(n {})` (re-declaration with empty property
+    /// clause, which openCypher calls `VariableAlreadyBound`).
+    pub has_property_clause: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

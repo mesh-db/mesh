@@ -1849,6 +1849,38 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
     let mut var_idx: HashMap<String, usize> = HashMap::new();
     let no_bindings: HashMap<String, VarType> = HashMap::new();
 
+    // Every identifier referenced in a property expression must
+    // be in scope (i.e. introduced by this CREATE's patterns),
+    // else openCypher raises `UndefinedVariable` at compile time.
+    for pattern in &stmt.patterns {
+        let scope_for_props = {
+            let mut s: HashMap<String, VarType> = HashMap::new();
+            if let Some(v) = &pattern.start.var {
+                s.insert(v.clone(), VarType::Node);
+            }
+            for hop in &pattern.hops {
+                if let Some(v) = &hop.rel.var {
+                    s.insert(v.clone(), VarType::Edge);
+                }
+                if let Some(v) = &hop.target.var {
+                    s.insert(v.clone(), VarType::Node);
+                }
+            }
+            s
+        };
+        for (_, expr) in &pattern.start.properties {
+            check_set_expr_scope(expr, &scope_for_props)?;
+        }
+        for hop in &pattern.hops {
+            for (_, expr) in &hop.rel.properties {
+                check_set_expr_scope(expr, &scope_for_props)?;
+            }
+            for (_, expr) in &hop.target.properties {
+                check_set_expr_scope(expr, &scope_for_props)?;
+            }
+        }
+    }
+
     for pattern in &stmt.patterns {
         build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &no_bindings)?;
     }
@@ -3236,6 +3268,18 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     validate_pattern_predicate_vars_bound(predicate, &bound_vars)?;
                     check_set_expr_scope(predicate, &bound_vars)?;
                     reject_non_boolean_where_predicate(predicate, &bound_vars)?;
+                    // WHERE can't contain aggregates — openCypher
+                    // raises `InvalidAggregation`. Grouping only
+                    // happens in projections (RETURN / WITH).
+                    if contains_aggregate(predicate) {
+                        return Err(Error::Plan(
+                            "aggregate functions are not allowed in WHERE".into(),
+                        ));
+                    }
+                    // Property access on a statically-known Path
+                    // variable is `InvalidArgumentType` —
+                    // properties belong to nodes and edges.
+                    reject_property_access_on_path(predicate, &bound_vars)?;
                     let current = plan.expect("MATCH populated plan above");
                     plan = Some(LogicalPlan::Filter {
                         input: Box::new(current),
@@ -3577,7 +3621,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     if let Some(var) = &pattern.start.var {
                         if bound_vars.contains_key(var)
                             && (!pattern.start.labels.is_empty()
-                                || !pattern.start.properties.is_empty()
+                                || pattern.start.has_property_clause
                                 || pattern.hops.is_empty())
                         {
                             return Err(Error::Plan(format!(
@@ -3590,13 +3634,44 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         if let Some(var) = &hop.target.var {
                             if bound_vars.contains_key(var)
                                 && (!hop.target.labels.is_empty()
-                                    || !hop.target.properties.is_empty())
+                                    || hop.target.has_property_clause)
                             {
                                 return Err(Error::Plan(format!(
                                     "variable '{}' already defined with a different type",
                                     var
                                 )));
                             }
+                        }
+                    }
+                    // Every identifier referenced in a CREATE
+                    // property expression must be in scope, else
+                    // openCypher raises `UndefinedVariable` at
+                    // compile time. The check_set_expr_scope
+                    // helper already walks nested binders.
+                    let scope_for_props = {
+                        let mut s = bound_vars.clone();
+                        if let Some(v) = &pattern.start.var {
+                            s.insert(v.clone(), VarType::Node);
+                        }
+                        for hop in &pattern.hops {
+                            if let Some(v) = &hop.rel.var {
+                                s.insert(v.clone(), VarType::Edge);
+                            }
+                            if let Some(v) = &hop.target.var {
+                                s.insert(v.clone(), VarType::Node);
+                            }
+                        }
+                        s
+                    };
+                    for (_, expr) in &pattern.start.properties {
+                        check_set_expr_scope(expr, &scope_for_props)?;
+                    }
+                    for hop in &pattern.hops {
+                        for (_, expr) in &hop.rel.properties {
+                            check_set_expr_scope(expr, &scope_for_props)?;
+                        }
+                        for (_, expr) in &hop.target.properties {
+                            check_set_expr_scope(expr, &scope_for_props)?;
                         }
                     }
                 }
@@ -4988,6 +5063,60 @@ fn reject_size_on_path(expr: &Expr, bound: &HashMap<String, VarType>) -> Result<
                     }
                 }
             }
+            // `type()` is defined for relationships only; calling
+            // it on a known node variable is a compile-time
+            // `InvalidArgumentType` in openCypher.
+            if name.eq_ignore_ascii_case("type") {
+                if let CallArgs::Exprs(es) = args {
+                    if es.len() == 1 {
+                        if let Expr::Identifier(n) = &es[0] {
+                            if matches!(bound.get(n), Some(VarType::Node)) {
+                                err = Some(Error::Plan(
+                                    "type() is not defined for node values; it applies \
+                                     to relationships"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Reject `path.key` / `path[idx]` on a known Path-typed
+/// variable — properties belong to nodes/edges and openCypher
+/// raises `InvalidArgumentType` at compile time.
+fn reject_property_access_on_path(
+    expr: &Expr,
+    bound: &HashMap<String, VarType>,
+) -> Result<()> {
+    let mut err: Option<Error> = None;
+    walk_expr(expr, &mut |e| {
+        match e {
+            Expr::Property { var, .. } => {
+                if matches!(bound.get(var), Some(VarType::Path)) {
+                    err = Some(Error::Plan(
+                        "property access is not defined on path values".into(),
+                    ));
+                }
+            }
+            Expr::PropertyAccess { base, .. } => {
+                if let Expr::Identifier(name) = base.as_ref() {
+                    if matches!(bound.get(name), Some(VarType::Path)) {
+                        err = Some(Error::Plan(
+                            "property access is not defined on path values".into(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     })?;
