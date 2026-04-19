@@ -4423,8 +4423,8 @@ enum AggState {
         total: f64,
         count: i64,
     },
-    Min(Option<Property>),
-    Max(Option<Property>),
+    Min(Option<Value>),
+    Max(Option<Value>),
     Collect(Vec<Value>),
     StDev {
         sum: f64,
@@ -4525,17 +4525,21 @@ impl AggState {
                 }
             }
             AggState::Min(slot) => {
+                // `min` / `max` ignore null inputs and operate
+                // over any `Value` (including lists, nodes etc.),
+                // not just scalar Properties. The ordering is
+                // `compare_values`: within a single type the
+                // natural order, across types the
+                // `type_order_value` rank.
                 let v = expr_arg_value(arg, ctx)?;
-                if let Value::Property(p) = v {
+                if matches!(v, Value::Null | Value::Property(Property::Null)) {
+                    // skip
+                } else {
                     match slot {
-                        None => *slot = Some(p),
+                        None => *slot = Some(v),
                         Some(cur) => {
-                            if compare_values(
-                                &Value::Property(p.clone()),
-                                &Value::Property(cur.clone()),
-                            ) == Ordering::Less
-                            {
-                                *cur = p;
+                            if compare_values(&v, cur) == Ordering::Less {
+                                *cur = v;
                             }
                         }
                     }
@@ -4543,16 +4547,14 @@ impl AggState {
             }
             AggState::Max(slot) => {
                 let v = expr_arg_value(arg, ctx)?;
-                if let Value::Property(p) = v {
+                if matches!(v, Value::Null | Value::Property(Property::Null)) {
+                    // skip
+                } else {
                     match slot {
-                        None => *slot = Some(p),
+                        None => *slot = Some(v),
                         Some(cur) => {
-                            if compare_values(
-                                &Value::Property(p.clone()),
-                                &Value::Property(cur.clone()),
-                            ) == Ordering::Greater
-                            {
-                                *cur = p;
+                            if compare_values(&v, cur) == Ordering::Greater {
+                                *cur = v;
                             }
                         }
                     }
@@ -4615,7 +4617,7 @@ impl AggState {
                 }
             }
             AggState::Min(slot) | AggState::Max(slot) => match slot {
-                Some(p) => Value::Property(p.clone()),
+                Some(v) => v.clone(),
                 None => Value::Null,
             },
             AggState::Collect(items) => Value::List(items.clone()),
