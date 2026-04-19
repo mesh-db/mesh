@@ -2930,7 +2930,27 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         }
         "tostring" => {
             let v = single_arg(name, arg_exprs, ctx)?;
-            Ok(value_to_string(v))
+            // openCypher restricts `toString` to scalar values —
+            // strings, numbers, booleans, temporals. Lists,
+            // maps, graph elements, and paths raise
+            // `InvalidArgumentValue` at runtime.
+            match &v {
+                Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                Value::Property(
+                    Property::String(_)
+                    | Property::Int64(_)
+                    | Property::Float64(_)
+                    | Property::Bool(_)
+                    | Property::Date(_)
+                    | Property::DateTime { .. }
+                    | Property::LocalDateTime(_)
+                    | Property::Time { .. }
+                    | Property::Duration(_),
+                ) => Ok(value_to_string(v)),
+                _ => Err(Error::InvalidArgumentValue(
+                    "toString() requires a scalar value".into(),
+                )),
+            }
         }
         "tointeger" => {
             let v = single_arg(name, arg_exprs, ctx)?;

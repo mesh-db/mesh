@@ -52,6 +52,9 @@ pub enum Error {
 
     #[error("procedure error: {0}")]
     Procedure(String),
+
+    #[error("invalid argument value: {0}")]
+    InvalidArgumentValue(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
