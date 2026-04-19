@@ -96,6 +96,40 @@ fn given_any_graph(world: &mut MeshWorld) {
     let _ = world;
 }
 
+/// Load one of the TCK's canonical named graphs (e.g.
+/// `binary-tree-2`) by reading and executing the matching
+/// `graphs/<name>/<name>.cypher` script. Lets
+/// `useCases/triadicSelection` scenarios run — they all open with
+/// `Given the binary-tree-2 graph` to set up the same tree
+/// topology before each query.
+#[given(regex = r"^the ([A-Za-z0-9][A-Za-z0-9_-]*) graph$")]
+fn given_named_graph(world: &mut MeshWorld, name: String) {
+    // `tests/tck.rs` runs with `crates/mesh-tck/` as CWD so the
+    // path is reachable via `../../tck/...` like `TCK_FEATURES`.
+    let path = format!(
+        "../../tck/opencypher/tck/graphs/{name}/{name}.cypher",
+        name = name
+    );
+    let script = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => panic!("Named graph fixture `{name}` not found at {path}: {e}"),
+    };
+    // The fixture is a single CREATE block separated by commas /
+    // semicolons. Split on `;` so multi-statement files work, and
+    // drop any trailing blanks.
+    for stmt in script.split(';') {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        world.error = None;
+        world.run_cypher(trimmed);
+        if let Some(err) = &world.error {
+            panic!("Named graph `{name}` setup failed: {err}");
+        }
+    }
+}
+
 #[given("having executed:")]
 fn given_having_executed(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
     let text = step.docstring.as_ref().expect("docstring").trim();
@@ -820,6 +854,91 @@ fn then_result_ignoring_list_order(world: &mut MeshWorld, step: &cucumber::gherk
         actual_strs, expected_sorted,
         "Result mismatch (unordered, list-order-insensitive).\nActual:   {actual_strs:?}\nExpected: {expected_sorted:?}"
     );
+}
+
+/// TCK's `the result should be, in order (ignoring element
+/// order for lists):` step — same row-ordered comparison as
+/// [`then_result_in_order`] but with per-cell list
+/// canonicalisation from
+/// [`then_result_ignoring_list_order`]. Only ReturnOrderBy2
+/// [12] uses this shape today (paths grouped by length where
+/// the intra-group path list isn't pinned).
+#[then("the result should be, in order (ignoring element order for lists):")]
+fn then_result_in_order_ignoring_list_order(
+    world: &mut MeshWorld,
+    step: &cucumber::gherkin::Step,
+) {
+    if let Some(err) = &world.error {
+        panic!("Expected results but got error: {err}");
+    }
+    let table = step.table.as_ref().expect("expected result table");
+    let headers: Vec<&str> = table.rows[0].iter().map(|s| s.trim()).collect();
+    let expected_rows: Vec<Vec<String>> = table.rows[1..]
+        .iter()
+        .map(|row| row.iter().map(|s| unescape_gherkin_cell(s.trim())).collect())
+        .collect();
+    let actual_strs: Vec<Vec<String>> = world
+        .results
+        .iter()
+        .map(|row| {
+            headers
+                .iter()
+                .map(|h| canonicalise_list_cells(&format_value(row.get(*h).unwrap_or(&Value::Null))))
+                .collect()
+        })
+        .collect();
+    let expected_normalized: Vec<Vec<String>> = expected_rows
+        .iter()
+        .map(|row| row.iter().map(|s| canonicalise_list_cells(s)).collect())
+        .collect();
+    assert_eq!(
+        actual_strs, expected_normalized,
+        "Result mismatch (ordered, list-order-insensitive).\nActual:   {actual_strs:?}\nExpected: {expected_normalized:?}"
+    );
+}
+
+/// Shared by both "ignoring element order for lists" Then
+/// handlers — normalises whitespace / labels / map keys then
+/// sorts the comma-separated elements inside every top-level
+/// `[ ... ]` bracket so two lists with the same elements
+/// compare equal regardless of order.
+fn canonicalise_list_cells(s: &str) -> String {
+    let normalized = normalize_map_keys(&normalize_labels(&normalize_tck(s)));
+    let bytes = normalized.as_bytes();
+    let mut out = String::with_capacity(normalized.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let start = i;
+            let mut depth = 0i32;
+            let mut end = i;
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
+            let inner = &normalized[start + 1..end.saturating_sub(1)];
+            let mut parts: Vec<&str> = inner.split(", ").collect();
+            parts.sort();
+            out.push('[');
+            out.push_str(&parts.join(", "));
+            out.push(']');
+            i = end;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 #[then("the result should be, in order:")]
