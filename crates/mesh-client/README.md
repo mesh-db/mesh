@@ -1,68 +1,81 @@
 # mesh-client
 
-A Rust TUI for graph databases. One binary, three tabs: a Cypher REPL, a schema
-browser, and an ASCII graph view of the nodes and edges in the last result.
+A terminal UI for Bolt-compatible graph databases and FalkorDB. One binary,
+three tabs — Cypher REPL, schema browser, and an ASCII graph view of the nodes
+and edges in the last result.
 
-Speaks Bolt 5.4 / 5.0 / 4.4 (against Mesh, Neo4j, or anything else on the
-wire) and Redis `GRAPH.QUERY` (against FalkorDB).
+Part of the [mesh](../../) workspace. Speaks Bolt 5.4 / 5.0 / 4.4 (against
+Mesh, Neo4j, or anything else on the wire) and Redis `GRAPH.QUERY` (against
+FalkorDB).
 
 ## Backends
 
-| Backend  | Protocol                    | Notes                                          |
-|----------|-----------------------------|------------------------------------------------|
-| Mesh     | Bolt (5.4 / 5.0 / 4.4)      | Uses the `mesh-bolt` crate directly.           |
-| Neo4j    | Bolt (5.4 / 5.0 / 4.4)      | Plaintext and TLS (`bolt+s://`, `neo4j+s://`). |
-| FalkorDB | Redis `GRAPH.QUERY`         | Verbose mode; best-effort node parsing.        |
+| Backend  | Protocol                 | Notes                                                                |
+|----------|--------------------------|----------------------------------------------------------------------|
+| Mesh     | Bolt 5.4 / 5.0 / 4.4     | Uses the in-workspace `mesh-bolt` crate directly.                    |
+| Neo4j    | Bolt 5.4 / 5.0 / 4.4     | Same wire code path as Mesh. HELLO→LOGON split handled for 5.1+.     |
+| FalkorDB | Redis `GRAPH.QUERY`      | Verbose mode; best-effort node/edge parsing.                         |
 
 ### URI schemes
 
-| Scheme          | Transport                                               |
-|-----------------|---------------------------------------------------------|
-| `bolt://`, `neo4j://`     | Plaintext TCP.                                |
-| `bolt+s://`, `neo4j+s://`   | TLS verified against the Mozilla root bundle (`webpki-roots`). |
-| `bolt+ssc://`, `neo4j+ssc://` | TLS, accepts any server cert — dev only.  |
+| Scheme                          | Transport                                                       |
+|---------------------------------|-----------------------------------------------------------------|
+| `bolt://`, `neo4j://`           | Plaintext TCP.                                                  |
+| `bolt+s://`, `neo4j+s://`       | TLS verified against the Mozilla root bundle (`webpki-roots`).  |
+| `bolt+ssc://`, `neo4j+ssc://`   | TLS, accepts any server cert — **dev / self-signed only**.      |
+| `redis://`                      | Plaintext Redis (FalkorDB).                                     |
+
+The `neo4j://` schemes are treated identically to `bolt://` — server-side
+routing isn't implemented, so connections go straight to the host/port in
+the URI. Default port is `7687` if omitted.
 
 ## Build
 
-This crate has a `path` dependency on `../mesh/crates/mesh-bolt`, so it expects
-to live next to the `mesh` repo:
+`mesh-client` is a member of the top-level `mesh` workspace, so the usual
+workspace commands work from the repo root:
 
-```
-mesh-db/
-├── mesh/          # the graph database
-└── mesh-client/   # this repo
+```sh
+cargo build -p mesh-client --release
 ```
 
-```
-cargo build --release
-```
+The binary lands at `target/release/mesh-client`.
 
 ## Run
 
-```
-cargo run --release -- --profile mesh-local
+```sh
+cargo run -p mesh-client --release -- --profile mesh-local
 ```
 
-Profiles come from `~/.config/mesh-client/config.toml`. If that file doesn't
-exist, three defaults are used: `mesh-local`, `neo4j-local`, `falkor-local`.
+On first launch with no `~/.config/mesh-client/config.toml`, three sensible
+defaults are seeded in-memory: `mesh-local`, `neo4j-local`, `falkor-local`.
+Write your own config (see below) to override.
 
-Write your own to override — see [Config](#config) below.
+Flags:
+
+| Flag                 | Purpose                                                           |
+|----------------------|-------------------------------------------------------------------|
+| `-p, --profile NAME` | Which profile to connect to. Defaults to the first in the config. |
+| `-c, --config PATH`  | Alternate config path. Defaults to `~/.config/mesh-client/config.toml`. |
 
 ## Keyboard shortcuts
 
-All terminal-safe (no Ctrl combos that iTerm / tmux steal).
+All terminal-safe — no Ctrl combos that iTerm / tmux / terminal multiplexers
+typically steal.
 
-| Key           | Action                                        |
-|---------------|-----------------------------------------------|
-| `F1` / `F2` / `F3` | REPL / Schema / Graph tabs              |
-| `F5`          | Run query                                     |
-| `F6`          | Toggle focus between editor and results       |
-| `F8`          | Refresh schema                                |
-| `F10`         | Quit                                          |
-| `Alt+↑` / `Alt+↓` | Cycle query history (in REPL editor)      |
-| `Esc`         | Drop from editor into results pane            |
-| `Enter` / `i` | From results, jump back into editor           |
-| `h` `j` `k` `l` | Pan the graph view                          |
+| Key                    | Action                                                |
+|------------------------|-------------------------------------------------------|
+| `F1` / `F2` / `F3`     | REPL / Schema / Graph tab                             |
+| `F5`                   | Run query (REPL tab)                                  |
+| `F6`                   | Toggle focus between editor and results (REPL tab)    |
+| `F8`                   | Refresh schema                                        |
+| `F10`                  | Quit                                                  |
+| `Alt+↑` / `Alt+↓`      | Cycle query history (REPL editor only)                |
+| `Esc`                  | From editor, drop into results pane                   |
+| `Enter` / `i`          | From results, jump back into editor                   |
+| `↑` `↓` `j` `k`        | Scroll results / schema                               |
+| `PgUp` / `PgDn`        | Page-scroll results                                   |
+| `Home`                 | Results/schema: top · Graph: recenter (0, 0)          |
+| `h` `j` `k` `l`        | Pan the graph view                                    |
 
 ## Config
 
@@ -85,49 +98,80 @@ password = "password"
 database = "neo4j"
 
 [[profiles]]
+name = "neo4j-tls"
+kind = "neo4j"
+uri = "bolt+s://graph.example.com:7687"
+username = "neo4j"
+password = "s3cret"
+
+[[profiles]]
 name = "falkor-local"
 kind = "falkor"
 uri = "redis://127.0.0.1:6379"
 graph = "my-graph"
 ```
 
+`username` / `password` are optional — leaving both off sends `scheme: none`
+on the Bolt HELLO/LOGON. `database` is forwarded on Neo4j connections;
+`graph` names the FalkorDB graph key.
+
 Pick a profile at startup with `--profile <name>`, or point at a different
 config with `--config <path>`.
 
 ## How the three tabs work together
 
-- **REPL (F1)** — write Cypher, run with F5. Results land in a table below.
-  Each successful query is pushed onto history (Alt+↑/↓ to recall).
+- **REPL (F1)** — write Cypher in the editor, run with F5. Results drop into
+  a paged table below. Each successful query is pushed onto the session's
+  history (Alt+↑/↓ to recall). The status line shows row count, `t_last`
+  from Bolt, and query type when the server returns them.
 - **Schema (F2)** — three columns: labels, relationship types, property keys.
-  Loaded on startup and refreshed with F8. Populated by running
-  `MATCH (n) UNWIND labels(n)...` etc., so it works against any
-  Cypher-speaking backend.
-- **Graph (F3)** — takes the nodes and edges from the last REPL result and
-  draws them on a ratatui canvas. Circular layout today (deterministic, pans
-  with hjkl); a force-directed layout would be a nice upgrade.
+  Loaded on startup, refreshed on demand with F8. Populated by running
+  `MATCH (n) UNWIND labels(n) AS l RETURN DISTINCT l` etc., so it works
+  against any Cypher-speaking backend without server-side introspection
+  APIs.
+- **Graph (F3)** — renders the nodes and edges of the last REPL result on
+  a ratatui canvas. Circular layout — deterministic so panning stays
+  stable; gets busy past ~30 nodes. Edges are drawn straight, labels
+  next to node circles.
 
 ## Layout
 
 ```
 src/
-├── main.rs              # entry, terminal setup, event loop
-├── app.rs               # App state, tabs, history, focus
-├── config.rs            # TOML connection profiles
+├── main.rs              # entry, terminal setup, event loop, key routing
+├── app.rs               # App state: tabs, focus, history, scroll offsets
+├── config.rs            # Serde-backed profile config, default-path lookup
 ├── backend/
-│   ├── mod.rs           # GraphBackend trait, Value / Node / Edge types
-│   ├── bolt.rs          # Bolt 4.4 + 5.x client on mesh-bolt
-│   └── falkor.rs        # redis::cmd("GRAPH.QUERY") + verbose-mode parsing
+│   ├── mod.rs           # GraphBackend trait, Value/Node/Edge/QueryResult types
+│   ├── bolt.rs          # Bolt 4.4/5.x client on mesh-bolt, with TLS
+│   └── falkor.rs        # redis::cmd("GRAPH.QUERY"), verbose-mode parsing
 └── ui/
     ├── mod.rs           # top-level layout, tab bar, status line
     ├── repl.rs          # query textarea + results table
     ├── schema.rs        # three-column list view
-    └── graph.rs         # canvas-based graph viewer
+    └── graph.rs         # canvas-based graph viewer with circular layout
 ```
+
+## Dependencies worth knowing about
+
+- **`mesh-bolt`** (intra-workspace) — the Bolt 5 client used for every
+  Bolt-compatible backend. Picks the newest version each side supports
+  via `perform_client_handshake`.
+- **`tokio-rustls`** + **`webpki-roots`** — TLS for `+s://` schemes. The
+  `+ssc://` variants swap in a no-op cert verifier for dev against
+  self-signed servers.
+- **`redis`** — the `tokio-comp` client used only by the FalkorDB backend.
+  Mesh / Neo4j don't pull it in at runtime.
+- **`ratatui`** + **`crossterm`** + **`tui-textarea`** — the TUI stack.
 
 ## Known limitations
 
-- **FalkorDB parser is verbose-mode only.** Compact mode would be faster and
-  give correct label/property-key resolution via `db.labels()` caches, but
-  verbose mode is simpler and good enough for reading small graphs.
-- **Graph layout is circular, not force-directed.** Stable and fast, but gets
-  busy past ~30 nodes.
+- **FalkorDB parser is verbose-mode only.** Compact mode would be faster
+  and give label/property-key resolution through the per-connection
+  `db.labels()` / `db.propertyKeys()` caches, but verbose mode is
+  simpler and adequate for reading small graphs.
+- **Graph layout is circular, not force-directed.** Stable and fast, but
+  gets visually busy past ~30 nodes. Good upgrade path for later.
+- **No server-side routing.** `neo4j://` URIs are treated as direct
+  connections — the client talks straight to the host/port in the URI
+  without consulting `ROUTE`. Fine for single-server setups.
