@@ -3864,10 +3864,11 @@ impl Operator for ProjectOp {
             Some(row) => {
                 let mut out = Row::new();
                 for (i, item) in self.items.iter().enumerate() {
-                    let name = item
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| default_name(&item.expr, i));
+                    let name = item.alias.clone().unwrap_or_else(|| {
+                        item.raw_text
+                            .clone()
+                            .unwrap_or_else(|| default_name(&item.expr, i))
+                    });
                     let value = eval_expr(&item.expr, &ctx.eval_ctx(&row))?;
                     out.insert(name, value);
                 }

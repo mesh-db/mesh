@@ -434,6 +434,16 @@ pub struct NodePattern {
 pub struct ReturnItem {
     pub expr: Expr,
     pub alias: Option<String>,
+    /// Verbatim source text of the expression, captured at parse
+    /// time. openCypher specifies that when a RETURN item has no
+    /// `AS alias`, the output column is named after the source
+    /// text exactly as the user typed it — whitespace, case, and
+    /// all. `count( * )` is a different column name than `count(*)`
+    /// per the TCK. Populated by the parser for return/with items
+    /// and consumed by projection-side column naming so rendered
+    /// headers round-trip. `None` when the item was synthesized
+    /// (e.g. mirrored from an AST rewrite without a source span).
+    pub raw_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

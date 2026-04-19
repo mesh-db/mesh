@@ -1441,6 +1441,9 @@ fn return_item_column_name(item: &ReturnItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
     }
+    if let Some(raw) = &item.raw_text {
+        return raw.clone();
+    }
     render_expr_key(&item.expr)
 }
 
@@ -4939,6 +4942,34 @@ fn classify_return_items(
                 unreachable!()
             };
             let func = aggregate_fn_from_name(name).unwrap();
+            // openCypher requires aggregate arguments to be
+            // deterministic — `count(rand())` is flagged as
+            // `NonConstantExpression` at compile time. The same
+            // rule covers `timestamp()` and any other side-effect
+            // or non-deterministic scalar, so check against a
+            // dedicated predicate rather than hard-coding `rand`.
+            let reject_nondet = |e: &Expr| -> Result<()> {
+                let mut err: Option<Error> = None;
+                walk_expr(e, &mut |inner| {
+                    if let Expr::Call { name, .. } = inner {
+                        if is_non_deterministic_function(name) {
+                            err = Some(Error::Plan(format!(
+                                "NonConstantExpression: `{name}()` is not allowed inside an aggregate argument"
+                            )));
+                        }
+                    }
+                    Ok(())
+                })?;
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                Ok(())
+            };
+            if let CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) = args {
+                for e in es {
+                    reject_nondet(e)?;
+                }
+            }
             let mut percentile_extra: Option<Expr> = None;
             let agg_arg = match args {
                 CallArgs::Star => {
@@ -4975,10 +5006,16 @@ fn classify_return_items(
                     )))
                 }
             };
-            let alias = item
-                .alias
-                .clone()
-                .unwrap_or_else(|| render_expr_key(&item.expr));
+            // Prefer verbatim source text for the output column —
+            // the TCK treats `count(*)` and `count( * )` as
+            // different column names. When no raw_text is available
+            // (synthesized items from AST rewrites) fall back to
+            // `render_expr_key`.
+            let alias = item.alias.clone().unwrap_or_else(|| {
+                item.raw_text
+                    .clone()
+                    .unwrap_or_else(|| render_expr_key(&item.expr))
+            });
             aggregates.push(AggregateSpec {
                 alias: alias.clone(),
                 function: func,
@@ -4997,6 +5034,7 @@ fn classify_return_items(
             post_items.push(ReturnItem {
                 expr: Expr::Identifier(alias),
                 alias: item.alias.clone(),
+                raw_text: item.raw_text.clone(),
             });
         } else {
             if contains_aggregate(&item.expr) {
@@ -5025,6 +5063,7 @@ fn classify_return_items(
                 post_items.push(ReturnItem {
                     expr: rewritten,
                     alias: Some(alias),
+                    raw_text: item.raw_text.clone(),
                 });
             } else {
                 group_keys.push(item.clone());
@@ -5038,6 +5077,7 @@ fn classify_return_items(
                             .unwrap_or_else(|| render_expr_key(&item.expr)),
                     ),
                     alias: item.alias.clone(),
+                    raw_text: item.raw_text.clone(),
                 });
             }
         }
@@ -5254,6 +5294,18 @@ fn extract_nested_aggregates(
 /// `UnknownFunction` at compile time when the graph happens to
 /// be empty and the pipeline would otherwise finish without
 /// ever reaching a runtime error.
+/// Scalar functions whose output depends on something other than
+/// their arguments — `rand()` returns a fresh value per call and
+/// `timestamp()` reads a clock. openCypher forbids them inside
+/// aggregate arguments because aggregation assumes a deterministic
+/// value to group or combine over.
+fn is_non_deterministic_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "rand" | "timestamp" | "randomuuid"
+    )
+}
+
 fn is_known_scalar_function(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),

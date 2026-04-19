@@ -77,6 +77,33 @@ fn value_contains_graph_element(v: &Value) -> bool {
     }
 }
 
+/// Convert a `Value` to a scalar-only `Property`, recursing through
+/// nested `Value::List` layers. Used by the `Expr::Map` evaluator
+/// after it's decided the map doesn't carry any graph elements
+/// (otherwise it would wrap in `Value::Map` instead). Nested list
+/// literals (`{name: [[x, y], [z]]}`) round-trip through here —
+/// without the recursion, the inner `Value::List` wrappers
+/// spuriously surfaced as TypeMismatch.
+fn value_to_scalar_property(v: Value) -> Result<Property> {
+    match v {
+        Value::Property(p) => Ok(p),
+        Value::Null => Ok(Property::Null),
+        Value::List(items) => {
+            let mut props = Vec::with_capacity(items.len());
+            for item in items {
+                props.push(value_to_scalar_property(item)?);
+            }
+            Ok(Property::List(props))
+        }
+        // `contains_graph` guard in the caller ensures none of
+        // these arrive here, but guard defensively rather than
+        // dropping a graph value.
+        Value::Node(_) | Value::Edge(_) | Value::Path { .. } | Value::Map(_) => {
+            Err(Error::TypeMismatch)
+        }
+    }
+}
+
 pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
         Expr::Literal(lit) => Ok(literal_to_value(lit)),
@@ -583,32 +610,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             }
             let mut out = std::collections::HashMap::with_capacity(evaluated.len());
             for (key, v) in evaluated {
-                let prop = match v {
-                    Value::Property(p) => p,
-                    Value::Null => Property::Null,
-                    Value::List(items) => {
-                        let mut props = Vec::with_capacity(items.len());
-                        for item in items {
-                            match item {
-                                Value::Property(p) => props.push(p),
-                                Value::Null => props.push(Property::Null),
-                                // Guarded by `contains_graph` above
-                                // — if we're here the list was
-                                // scalar-only. Still defensive:
-                                // fall back to TypeMismatch rather
-                                // than dropping a graph value.
-                                _ => return Err(Error::TypeMismatch),
-                            }
-                        }
-                        Property::List(props)
-                    }
-                    // Same guard — `contains_graph` is false here
-                    // so these shouldn't happen.
-                    Value::Node(_) | Value::Edge(_) | Value::Path { .. } | Value::Map(_) => {
-                        return Err(Error::TypeMismatch)
-                    }
-                };
-                out.insert(key, prop);
+                out.insert(key, value_to_scalar_property(v)?);
             }
             Ok(Value::Property(Property::Map(out)))
         }

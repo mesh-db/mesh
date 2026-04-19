@@ -1712,13 +1712,20 @@ fn build_return_items(pair: Pair<Rule>) -> Result<(Vec<ReturnItem>, bool)> {
         let mut inner = item_pair
             .into_inner()
             .filter(|p| p.as_rule() != Rule::kw_as);
-        let expr = build_expression(
-            inner
-                .next()
-                .ok_or_else(|| Error::Parse("return expr".into()))?,
-        )?;
+        let expr_pair = inner
+            .next()
+            .ok_or_else(|| Error::Parse("return expr".into()))?;
+        // Capture source text verbatim so the output column is
+        // named exactly as written (`count( * )` ≠ `count(*)` per
+        // the TCK). Trim outer whitespace but preserve inner.
+        let raw_text = Some(expr_pair.as_str().trim().to_string());
+        let expr = build_expression(expr_pair)?;
         let alias = inner.next().map(|p| parse_ident(p.as_str()));
-        items.push(ReturnItem { expr, alias });
+        items.push(ReturnItem {
+            expr,
+            alias,
+            raw_text,
+        });
     }
     Ok((items, false))
 }
