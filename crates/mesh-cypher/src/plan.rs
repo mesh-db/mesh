@@ -97,6 +97,14 @@ pub enum LogicalPlan {
         min_hops: u64,
         max_hops: u64,
         path_var: Option<String>,
+        /// When `true`, the expansion behaves as a per-input-row
+        /// left-join: if no path of length `[min_hops, max_hops]`
+        /// exists, the input row is forwarded once with `edge_var`
+        /// / `dst_var` / `path_var` bound to Null. Set by
+        /// `apply_optional_match` so `OPTIONAL MATCH p = (a)-[*]->(b)`
+        /// preserves the outer row when no path is found instead of
+        /// silently dropping it.
+        optional: bool,
     },
     Filter {
         input: Box<LogicalPlan>,
@@ -1878,6 +1886,40 @@ fn plan_pattern(
 /// deferred to keep the rebind path small and obviously correct.
 /// The dispatcher in `plan_match` checks these preconditions
 /// before calling here, so the function just asserts them.
+/// Swap the start and target of a single-hop pattern and flip
+/// the relationship direction so the walker proceeds from what
+/// was previously the target. Only changes `start`, the single
+/// hop's rel/target, and keeps everything else (labels,
+/// properties, edge var, path var) intact. Used when OPTIONAL
+/// MATCH's declared start is unbound but the target is already
+/// bound — starting from the bound side is the only way to
+/// preserve the caller's binding without cross-product
+/// clobbering.
+fn reverse_single_hop(pattern: &Pattern) -> Pattern {
+    debug_assert_eq!(pattern.hops.len(), 1);
+    let hop = &pattern.hops[0];
+    let new_start = hop.target.clone();
+    let new_target = pattern.start.clone();
+    let new_direction = match hop.rel.direction {
+        Direction::Outgoing => Direction::Incoming,
+        Direction::Incoming => Direction::Outgoing,
+        Direction::Both => Direction::Both,
+    };
+    let new_rel = crate::ast::RelPattern {
+        direction: new_direction,
+        ..hop.rel.clone()
+    };
+    Pattern {
+        start: new_start,
+        hops: vec![crate::ast::Hop {
+            rel: new_rel,
+            target: new_target,
+        }],
+        path_var: pattern.path_var.clone(),
+        shortest: pattern.shortest,
+    }
+}
+
 fn plan_pattern_from_bound(
     input: LogicalPlan,
     pattern: &Pattern,
@@ -2186,6 +2228,7 @@ fn chain_hops_with_bound(
                 } else {
                     None
                 },
+                optional: false,
             }
         } else {
             LogicalPlan::EdgeExpand {
@@ -2223,6 +2266,19 @@ fn chain_hops_with_bound(
         // don't have a synthetic edge var for var-length
         // expansions).
         if hop.rel.var_length.is_none() {
+            // User-declared edge var appearing in two hops is a
+            // `RelationshipUniquenessViolation` — Cypher forbids
+            // the same edge variable binding to two positions in
+            // one pattern. Raise a plan-time error instead of
+            // emitting an always-false `r != r` filter.
+            if let Some(declared) = hop.rel.var.as_ref() {
+                if chain_edge_vars.iter().any(|e| e == declared) {
+                    return Err(Error::Plan(format!(
+                        "relationship variable '{declared}' cannot be used twice \
+                         in the same pattern"
+                    )));
+                }
+            }
             if let Some(this_edge) = expand_edge_var.as_ref() {
                 for prior_edge in &chain_edge_vars {
                     plan = LogicalPlan::Filter {
@@ -2594,21 +2650,6 @@ fn infer_expr_type(expr: &Expr, bound_vars: &HashMap<String, VarType>) -> VarTyp
     }
 }
 
-fn check_var_type_conflict(
-    var: &str,
-    new_type: VarType,
-    bound_vars: &HashMap<String, VarType>,
-) -> Result<()> {
-    if let Some(&existing) = bound_vars.get(var) {
-        if existing != new_type {
-            return Err(Error::Plan(format!(
-                "variable '{}' already defined with a different type",
-                var
-            )));
-        }
-    }
-    Ok(())
-}
 
 fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     use crate::ast::ReadingClause;
@@ -3516,17 +3557,44 @@ fn apply_optional_match(
             .var
             .clone()
             .unwrap_or_else(|| format!("__opt_start_{}", bound_vars.len()));
+        // Special case: single-hop pattern with an unbound start
+        // but a bound target. Reverse the hop so the bound side
+        // becomes the starting point — otherwise the fresh-plan
+        // branch below would re-bind the target, clobbering the
+        // caller's value and losing the shared-endpoint
+        // constraint. Handled here rather than generally because
+        // multi-hop patterns with one bound-middle node need
+        // richer rewriting than the current pattern shape tracks.
+        let rewritten = if pattern.hops.len() == 1
+            && !bound_vars.contains_key(&start_var)
+            && pattern
+                .hops
+                .first()
+                .and_then(|h| h.target.var.as_ref())
+                .map(|v| bound_vars.contains_key(v))
+                .unwrap_or(false)
+        {
+            Some(reverse_single_hop(pattern))
+        } else {
+            None
+        };
+        let pattern_ref: &Pattern = rewritten.as_ref().unwrap_or(pattern);
+        let start_var = pattern_ref
+            .start
+            .var
+            .clone()
+            .unwrap_or_else(|| format!("__opt_start_{}", bound_vars.len()));
         if !bound_vars.contains_key(&start_var) {
             // Standalone OPTIONAL MATCH — the start var is not yet
             // bound. Plan it like a regular MATCH, then wrap with
             // CoalesceNullRow so the empty-result case emits a
             // single row with all pattern vars null-bound.
-            let fresh = plan_pattern(pattern, 0, ctx)?;
+            let fresh = plan_pattern(pattern_ref, 0, ctx)?;
             let mut pattern_vars: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            collect_pattern_vars(pattern, &mut pattern_vars);
+            collect_pattern_vars(pattern_ref, &mut pattern_vars);
             let null_vars: Vec<String> = pattern_vars.into_iter().collect();
-            collect_pattern_vars_typed(pattern, bound_vars)?;
+            collect_pattern_vars_typed(pattern_ref, bound_vars)?;
             plan = LogicalPlan::CoalesceNullRow {
                 input: Box::new(fresh),
                 null_vars,
@@ -3538,7 +3606,7 @@ fn apply_optional_match(
         // edge var and a target var so BindPath (below) can extract
         // the sequence from each row. Synthesise names when the
         // source pattern omitted them.
-        let mut working = pattern.clone();
+        let mut working = pattern_ref.clone();
         if working.path_var.is_some() {
             ensure_path_bindings(&mut working, bound_vars.len())?;
         }
@@ -3546,11 +3614,23 @@ fn apply_optional_match(
         let mut current_var = start_var;
 
         for (i, hop) in working.hops.iter().enumerate() {
-            let dst_var = hop
+            let declared_dst_var = hop
                 .target
                 .var
                 .clone()
                 .unwrap_or_else(|| format!("__opt_dst_{}_{}", bound_vars.len(), i));
+            // If the target var is already bound by an earlier
+            // clause, expand into a synthetic name and emit an
+            // equality filter so the traversal only keeps rows
+            // whose walked endpoint matches the existing binding
+            // — the same approach `plan_pattern_from_bound`
+            // takes for regular MATCH.
+            let dst_is_reuse = bound_vars.contains_key(&declared_dst_var);
+            let dst_var = if dst_is_reuse {
+                format!("__opt_rebind_{}_{}", bound_vars.len(), i)
+            } else {
+                declared_dst_var.clone()
+            };
 
             if let Some(vl) = hop.rel.var_length {
                 if vl.min > vl.max {
@@ -3570,6 +3650,7 @@ fn apply_optional_match(
                     min_hops: vl.min,
                     max_hops: vl.max,
                     path_var: None,
+                    optional: true,
                 };
             } else {
                 plan = LogicalPlan::OptionalEdgeExpand {
@@ -3583,12 +3664,39 @@ fn apply_optional_match(
                     direction: hop.rel.direction,
                 };
             }
+            if dst_is_reuse {
+                // When the expansion missed (OptionalEdgeExpand
+                // emitted a null-fallback row), keep that row —
+                // `(a = null) OR (a = b)` lets the left-join
+                // pass-through survive the equality check while
+                // still filtering mismatched real bindings.
+                plan = LogicalPlan::Filter {
+                    input: Box::new(plan),
+                    predicate: Expr::Or(
+                        Box::new(Expr::IsNull {
+                            negated: false,
+                            inner: Box::new(Expr::Identifier(dst_var.clone())),
+                        }),
+                        Box::new(Expr::Compare {
+                            op: CompareOp::Eq,
+                            left: Box::new(Expr::Identifier(dst_var.clone())),
+                            right: Box::new(Expr::Identifier(declared_dst_var.clone())),
+                        }),
+                    ),
+                };
+            }
 
-            bound_vars.insert(dst_var.clone(), VarType::Node);
+            if !dst_is_reuse {
+                bound_vars.insert(declared_dst_var.clone(), VarType::Node);
+            }
             if let Some(ev) = &hop.rel.var {
                 bound_vars.insert(ev.clone(), VarType::Edge);
             }
-            current_var = dst_var;
+            current_var = if dst_is_reuse {
+                declared_dst_var
+            } else {
+                dst_var
+            };
         }
 
         // Bind the path variable after all hops have run. BindPath

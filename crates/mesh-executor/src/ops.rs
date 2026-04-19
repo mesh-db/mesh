@@ -399,6 +399,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             min_hops,
             max_hops,
             path_var,
+            optional,
         } => Box::new(VarLengthExpandOp::new(
             child!(input),
             src_var.clone(),
@@ -410,6 +411,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             *min_hops,
             *max_hops,
             path_var.clone(),
+            *optional,
         )),
         LogicalPlan::Filter { input, predicate } => {
             Box::new(FilterOp::new(child!(input), predicate.clone()))
@@ -2691,6 +2693,12 @@ struct VarLengthExpandOp {
     min_hops: u64,
     max_hops: u64,
     path_var: Option<String>,
+    /// Per-row left-join mode: when `true`, an input row that
+    /// produces no matching paths still emits one row with the
+    /// expansion's output vars bound to Null. Set for
+    /// `OPTIONAL MATCH (a)-[*]->(b)` so the outer row survives
+    /// even when the path search is empty.
+    optional: bool,
     current_row: Option<Row>,
     pending_paths: Vec<Vec<Edge>>,
     pending_node_paths: Vec<Vec<NodeId>>,
@@ -2711,6 +2719,7 @@ impl VarLengthExpandOp {
         min_hops: u64,
         max_hops: u64,
         path_var: Option<String>,
+        optional: bool,
     ) -> Self {
         Self {
             input,
@@ -2723,6 +2732,7 @@ impl VarLengthExpandOp {
             min_hops,
             max_hops,
             path_var,
+            optional,
             current_row: None,
             pending_paths: Vec::new(),
             pending_node_paths: Vec::new(),
@@ -2874,15 +2884,35 @@ impl Operator for VarLengthExpandOp {
                 None => return Ok(None),
                 Some(row) => {
                     let src_id = match row.get(&self.src_var) {
-                        Some(Value::Node(n)) => n.id,
+                        Some(Value::Node(n)) => Some(n.id),
                         // Null source → no paths. Same
                         // null-propagating semantics as
-                        // `EdgeExpandOp`.
+                        // `EdgeExpandOp`. In optional mode we
+                        // still emit the left-join fallback;
+                        // otherwise we just skip.
                         Some(Value::Null)
-                        | Some(Value::Property(mesh_core::Property::Null)) => continue,
+                        | Some(Value::Property(mesh_core::Property::Null)) => None,
                         _ => return Err(Error::UnboundVariable(self.src_var.clone())),
                     };
-                    let (paths, node_paths, targets) = self.enumerate(ctx, src_id)?;
+                    let (paths, node_paths, targets) = match src_id {
+                        Some(id) => self.enumerate(ctx, id)?,
+                        None => (Vec::new(), Vec::new(), Vec::new()),
+                    };
+                    if paths.is_empty() && self.optional {
+                        // Left-join fallback: emit one row with
+                        // the expansion's output vars set to Null
+                        // so the outer OPTIONAL MATCH preserves
+                        // this input row.
+                        let mut out = row;
+                        if let Some(ev) = &self.edge_var {
+                            out.insert(ev.clone(), Value::Null);
+                        }
+                        out.insert(self.dst_var.clone(), Value::Null);
+                        if let Some(pv) = &self.path_var {
+                            out.insert(pv.clone(), Value::Null);
+                        }
+                        return Ok(Some(out));
+                    }
                     self.pending_paths = paths;
                     self.pending_node_paths = node_paths;
                     self.pending_targets = targets;
