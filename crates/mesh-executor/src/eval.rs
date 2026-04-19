@@ -276,14 +276,12 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             }
         }
         Expr::And(a, b) => {
-            // Three-valued AND: false AND anything = false,
-            // true AND x = x, null AND false = false, null AND x = null
+            // Three-valued AND: evaluate both sides (type-check each
+            // before applying the short-circuit) so that `false AND 123`
+            // still raises rather than quietly returning false.
             let va = to_bool_3v(&eval_expr(a, ctx)?)?;
-            if va == Some(false) {
-                return Ok(Value::Property(Property::Bool(false)));
-            }
             let vb = to_bool_3v(&eval_expr(b, ctx)?)?;
-            if vb == Some(false) {
+            if va == Some(false) || vb == Some(false) {
                 return Ok(Value::Property(Property::Bool(false)));
             }
             match (va, vb) {
@@ -292,14 +290,12 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             }
         }
         Expr::Or(a, b) => {
-            // Three-valued OR: true OR anything = true,
-            // false OR x = x, null OR true = true, null OR x = null
+            // Three-valued OR: same full-evaluation rule as AND so that
+            // `true OR 123` raises InvalidArgumentType instead of
+            // short-circuiting to true.
             let va = to_bool_3v(&eval_expr(a, ctx)?)?;
-            if va == Some(true) {
-                return Ok(Value::Property(Property::Bool(true)));
-            }
             let vb = to_bool_3v(&eval_expr(b, ctx)?)?;
-            if vb == Some(true) {
+            if va == Some(true) || vb == Some(true) {
                 return Ok(Value::Property(Property::Bool(true)));
             }
             match (va, vb) {
