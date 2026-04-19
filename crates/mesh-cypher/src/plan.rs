@@ -4714,7 +4714,7 @@ fn classify_return_items(
     let mut aggregates: Vec<AggregateSpec> = Vec::new();
     let mut post_items: Vec<ReturnItem> = Vec::new();
     let mut synth_idx = 0usize;
-    for (idx, item) in items.iter().enumerate() {
+    for item in items.iter() {
         let is_top_aggregate = matches!(
             &item.expr,
             Expr::Call { name, .. } if aggregate_fn_from_name(name).is_some()
