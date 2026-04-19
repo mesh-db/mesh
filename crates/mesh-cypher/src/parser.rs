@@ -2162,8 +2162,15 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             let mut hops: Vec<crate::ast::Hop> = Vec::new();
             let mut predicate: Option<Expr> = None;
             let mut projection: Option<Expr> = None;
+            let mut path_var: Option<String> = None;
             for p in pair.into_inner() {
                 match p.as_rule() {
+                    Rule::identifier => {
+                        // The only bare identifier inside a
+                        // pattern comprehension is the optional
+                        // path variable (`[p = (n)-->() | p]`).
+                        path_var = Some(parse_ident(p.as_str()));
+                    }
                     Rule::node_pattern => {
                         start = Some(build_node_pattern(p)?);
                     }
@@ -2194,7 +2201,7 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 pattern: Pattern {
                     start,
                     hops,
-                    path_var: None,
+                    path_var,
                     shortest: None,
                 },
                 predicate: predicate.map(Box::new),

@@ -1771,6 +1771,9 @@ fn check_set_expr_scope_inner(
             projection,
         } => {
             let mut local_names: Vec<String> = Vec::new();
+            if let Some(v) = &pattern.path_var {
+                local_names.push(v.clone());
+            }
             if let Some(v) = &pattern.start.var {
                 local_names.push(v.clone());
             }

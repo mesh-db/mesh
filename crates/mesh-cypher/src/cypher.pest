@@ -468,7 +468,7 @@ list_literal = { "[" ~ (expression ~ ("," ~ expression)*)? ~ "]" }
 // `list_literal` in the primary alternation so PEG ordered
 // choice tries the pattern shape first.
 pattern_comprehension = {
-    "[" ~ node_pattern ~ hop+ ~ list_comp_where? ~ "|" ~ expression ~ "]"
+    "[" ~ (identifier ~ "=")? ~ node_pattern ~ hop+ ~ list_comp_where? ~ "|" ~ expression ~ "]"
 }
 list_comp = {
     "[" ~ identifier ~ kw_in ~ expression ~

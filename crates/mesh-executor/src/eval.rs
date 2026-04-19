@@ -1074,13 +1074,26 @@ fn pattern_comprehension_eval(
     }
 
     // Each entry: (current node, edges used so far, bindings added
-    // by inner pattern variables). Extending the frontier per hop
-    // mirrors `pattern_exists` but also tracks bindings so the
-    // projection / predicate can reference them.
+    // by inner pattern variables, traversed nodes, traversed edges).
+    // The last two track path reconstruction so `[p = (n)-->() | p]`
+    // can bind `p` to a `Value::Path` and `length(p)` in WHERE /
+    // projection works.
     use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
     use mesh_core::EdgeId;
-    let mut frontier: Vec<(NodeId, StdHashSet<EdgeId>, StdHashMap<String, Value>)> =
-        vec![(start_node.id, StdHashSet::new(), StdHashMap::new())];
+    type FrontierEntry = (
+        NodeId,
+        StdHashSet<EdgeId>,
+        StdHashMap<String, Value>,
+        Vec<mesh_core::Node>,
+        Vec<mesh_core::Edge>,
+    );
+    let mut frontier: Vec<FrontierEntry> = vec![(
+        start_node.id,
+        StdHashSet::new(),
+        StdHashMap::new(),
+        vec![start_node.clone()],
+        Vec::new(),
+    )];
     for hop in &pattern.hops {
         // Var-length hops in a comprehension would need path-list
         // handling analogous to `VarLengthExpand` — out of scope
@@ -1088,8 +1101,8 @@ fn pattern_comprehension_eval(
         if hop.rel.var_length.is_some() {
             return Ok(Value::List(Vec::new()));
         }
-        let mut next: Vec<(NodeId, StdHashSet<EdgeId>, StdHashMap<String, Value>)> = Vec::new();
-        for (cur_id, used, bindings) in &frontier {
+        let mut next: Vec<FrontierEntry> = Vec::new();
+        for (cur_id, used, bindings, path_nodes, path_edges) in &frontier {
             let neighbors = match hop.rel.direction {
                 Direction::Outgoing => ctx.reader.outgoing(*cur_id)?,
                 Direction::Incoming => ctx.reader.incoming(*cur_id)?,
@@ -1132,14 +1145,18 @@ fn pattern_comprehension_eval(
                 }
                 let mut new_bindings = bindings.clone();
                 if let Some(ev) = &hop.rel.var {
-                    new_bindings.insert(ev.clone(), Value::Edge(edge));
+                    new_bindings.insert(ev.clone(), Value::Edge(edge.clone()));
                 }
                 if let Some(tv) = &hop.target.var {
-                    new_bindings.insert(tv.clone(), Value::Node(neighbor));
+                    new_bindings.insert(tv.clone(), Value::Node(neighbor.clone()));
                 }
                 let mut new_used = used.clone();
                 new_used.insert(edge_id);
-                next.push((neighbor_id, new_used, new_bindings));
+                let mut new_nodes = path_nodes.clone();
+                new_nodes.push(neighbor.clone());
+                let mut new_edges = path_edges.clone();
+                new_edges.push(edge);
+                next.push((neighbor_id, new_used, new_bindings, new_nodes, new_edges));
             }
         }
         frontier = next;
@@ -1149,13 +1166,22 @@ fn pattern_comprehension_eval(
     }
 
     let mut out: Vec<Value> = Vec::new();
-    for (_, _, bindings) in frontier {
+    for (_, _, bindings, path_nodes, path_edges) in frontier {
         // Layer inner bindings onto the outer row. The sub-row
         // needs to live long enough for `eval_expr` to borrow
         // through `with_row`.
         let mut sub_row = ctx.row.clone();
         for (k, v) in bindings {
             sub_row.insert(k, v);
+        }
+        if let Some(pv) = &pattern.path_var {
+            sub_row.insert(
+                pv.clone(),
+                Value::Path {
+                    nodes: path_nodes,
+                    edges: path_edges,
+                },
+            );
         }
         let sub_ctx = ctx.with_row(&sub_row);
         if let Some(p) = predicate {
