@@ -85,6 +85,16 @@ pub enum LogicalPlan {
         dst_properties: Vec<(String, Expr)>,
         edge_types: Vec<String>,
         direction: Direction,
+        /// Optional pre-bound endpoint constraint. When set, a
+        /// traversed edge is only considered a match if its target
+        /// node's id equals the node already bound at
+        /// `dst_constraint_var` in the current row. Keeps the
+        /// per-row null-fallback semantics intact — if no edge
+        /// satisfies the constraint, the input row is forwarded
+        /// with `edge_var` / `dst_var` bound to Null. Used by
+        /// OPTIONAL MATCH when both endpoints are already bound
+        /// (`MATCH (a), (b) OPTIONAL MATCH (a)-[r]->(b)`).
+        dst_constraint_var: Option<String>,
     },
     VarLengthExpand {
         input: Box<LogicalPlan>,
@@ -93,6 +103,12 @@ pub enum LogicalPlan {
         dst_var: String,
         dst_labels: Vec<String>,
         edge_types: Vec<String>,
+        /// Inline edge property filter (`[:T* {year: 1988}]`) —
+        /// every edge in the walked path must equal these
+        /// property values. Applied edge-by-edge during DFS so
+        /// paths whose members fail the check are pruned before
+        /// any row is emitted.
+        edge_properties: Vec<(String, Expr)>,
         direction: Direction,
         min_hops: u64,
         max_hops: u64,
@@ -105,6 +121,15 @@ pub enum LogicalPlan {
         /// preserves the outer row when no path is found instead of
         /// silently dropping it.
         optional: bool,
+        /// Optional pre-bound endpoint constraint. When set, only
+        /// paths whose terminal node matches the node bound at
+        /// this variable are considered a match. Lets OPTIONAL
+        /// MATCH with both endpoints bound (`(a)-[*]->(b)` with
+        /// `b` already bound) filter the expansion's targets
+        /// without having to rebind `b`; combined with `optional`,
+        /// paths that never reach the constrained target trigger
+        /// the null fallback.
+        dst_constraint_var: Option<String>,
     },
     Filter {
         input: Box<LogicalPlan>,
@@ -2218,6 +2243,7 @@ fn chain_hops_with_bound(
                 dst_var: dst_var.clone(),
                 dst_labels: hop.target.labels.clone(),
                 edge_types: hop.rel.edge_types.clone(),
+                edge_properties: hop.rel.properties.clone(),
                 direction: hop.rel.direction,
                 min_hops: vl.min,
                 max_hops: vl.max,
@@ -2229,6 +2255,7 @@ fn chain_hops_with_bound(
                     None
                 },
                 optional: false,
+                dst_constraint_var: None,
             }
         } else {
             LogicalPlan::EdgeExpand {
@@ -3639,6 +3666,28 @@ fn apply_optional_match(
                         vl.min, vl.max
                     )));
                 }
+                let vl_constraint = if dst_is_reuse {
+                    Some(declared_dst_var.clone())
+                } else {
+                    None
+                };
+                // For a single-hop var-length OPTIONAL MATCH with
+                // a declared path variable (`OPTIONAL MATCH p =
+                // (a)-[*]->(b)`), plumb the outer path_var
+                // directly into the op — `wrap_with_bind_path`
+                // short-circuits single-hop var-length patterns
+                // and would otherwise leave `p` unbound. Multi-hop
+                // patterns still synthesise a subpath name and
+                // let BindPath splice it.
+                let vl_path_var = if working.path_var.is_some()
+                    && working.hops.len() == 1
+                {
+                    working.path_var.clone()
+                } else if working.path_var.is_some() {
+                    Some(format!("__opt_subpath_{}_{}", bound_vars.len(), i))
+                } else {
+                    None
+                };
                 plan = LogicalPlan::VarLengthExpand {
                     input: Box::new(plan),
                     src_var: current_var.clone(),
@@ -3646,13 +3695,27 @@ fn apply_optional_match(
                     dst_var: dst_var.clone(),
                     dst_labels: hop.target.labels.clone(),
                     edge_types: hop.rel.edge_types.clone(),
+                    edge_properties: hop.rel.properties.clone(),
                     direction: hop.rel.direction,
                     min_hops: vl.min,
                     max_hops: vl.max,
-                    path_var: None,
+                    path_var: vl_path_var,
                     optional: true,
+                    dst_constraint_var: vl_constraint,
                 };
             } else {
+                // When the target is already bound, push the
+                // endpoint constraint into the op itself so that
+                // edges leading anywhere *other* than the bound
+                // target count as "no match" and trigger the
+                // per-row null-fallback — a post-filter can't do
+                // that because it runs after the fallback
+                // decision is made.
+                let constraint_var = if dst_is_reuse {
+                    Some(declared_dst_var.clone())
+                } else {
+                    None
+                };
                 plan = LogicalPlan::OptionalEdgeExpand {
                     input: Box::new(plan),
                     src_var: current_var.clone(),
@@ -3662,27 +3725,7 @@ fn apply_optional_match(
                     dst_properties: hop.target.properties.clone(),
                     edge_types: hop.rel.edge_types.clone(),
                     direction: hop.rel.direction,
-                };
-            }
-            if dst_is_reuse {
-                // When the expansion missed (OptionalEdgeExpand
-                // emitted a null-fallback row), keep that row —
-                // `(a = null) OR (a = b)` lets the left-join
-                // pass-through survive the equality check while
-                // still filtering mismatched real bindings.
-                plan = LogicalPlan::Filter {
-                    input: Box::new(plan),
-                    predicate: Expr::Or(
-                        Box::new(Expr::IsNull {
-                            negated: false,
-                            inner: Box::new(Expr::Identifier(dst_var.clone())),
-                        }),
-                        Box::new(Expr::Compare {
-                            op: CompareOp::Eq,
-                            left: Box::new(Expr::Identifier(dst_var.clone())),
-                            right: Box::new(Expr::Identifier(declared_dst_var.clone())),
-                        }),
-                    ),
+                    dst_constraint_var: constraint_var,
                 };
             }
 

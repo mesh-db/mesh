@@ -378,6 +378,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             dst_properties,
             edge_types,
             direction,
+            dst_constraint_var,
         } => Box::new(OptionalEdgeExpandOp::new(
             child!(input),
             src_var.clone(),
@@ -387,6 +388,7 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             dst_properties.clone(),
             edge_types.clone(),
             *direction,
+            dst_constraint_var.clone(),
         )),
         LogicalPlan::VarLengthExpand {
             input,
@@ -395,11 +397,13 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             dst_var,
             dst_labels,
             edge_types,
+            edge_properties,
             direction,
             min_hops,
             max_hops,
             path_var,
             optional,
+            dst_constraint_var,
         } => Box::new(VarLengthExpandOp::new(
             child!(input),
             src_var.clone(),
@@ -407,11 +411,13 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             dst_var.clone(),
             dst_labels.clone(),
             edge_types.clone(),
+            edge_properties.clone(),
             *direction,
             *min_hops,
             *max_hops,
             path_var.clone(),
             *optional,
+            dst_constraint_var.clone(),
         )),
         LogicalPlan::Filter { input, predicate } => {
             Box::new(FilterOp::new(child!(input), predicate.clone()))
@@ -2521,6 +2527,12 @@ struct OptionalEdgeExpandOp {
     dst_properties: Vec<(String, Expr)>,
     edge_types: Vec<String>,
     direction: Direction,
+    /// When set, edges whose target id differs from the node
+    /// bound at this variable in the current row are skipped
+    /// inside the expansion loop. A row whose outgoing edges all
+    /// fail the constraint then triggers the same null-fallback
+    /// as having no edges at all.
+    dst_constraint_var: Option<String>,
     current_row: Option<Row>,
     pending: Vec<(EdgeId, NodeId)>,
     pending_idx: usize,
@@ -2538,6 +2550,7 @@ impl OptionalEdgeExpandOp {
         dst_properties: Vec<(String, Expr)>,
         edge_types: Vec<String>,
         direction: Direction,
+        dst_constraint_var: Option<String>,
     ) -> Self {
         Self {
             input,
@@ -2548,6 +2561,7 @@ impl OptionalEdgeExpandOp {
             dst_properties,
             edge_types,
             direction,
+            dst_constraint_var,
             current_row: None,
             pending: Vec::new(),
             pending_idx: 0,
@@ -2579,6 +2593,30 @@ impl Operator for OptionalEdgeExpandOp {
                 };
                 if !has_all_labels(&neighbor, &self.dst_labels) {
                     continue;
+                }
+                // Bound-endpoint constraint: when the declared
+                // target is already bound in the row, only edges
+                // that lead to that exact node count as a match.
+                // Edges failing the constraint are silently
+                // skipped — if every candidate fails, the
+                // per-row left-join fallback below still fires.
+                if let Some(constraint_var) = &self.dst_constraint_var {
+                    let base = self
+                        .current_row
+                        .as_ref()
+                        .expect("pending without source row");
+                    let bound_id = match base.get(constraint_var) {
+                        Some(Value::Node(n)) => Some(n.id),
+                        Some(Value::Null)
+                        | Some(Value::Property(mesh_core::Property::Null))
+                        | None => None,
+                        _ => None,
+                    };
+                    match bound_id {
+                        Some(id) if id != neighbor.id => continue,
+                        None => continue,
+                        _ => {}
+                    }
                 }
                 if !self.dst_properties.is_empty() {
                     let base = self
@@ -2689,6 +2727,12 @@ struct VarLengthExpandOp {
     dst_var: String,
     dst_labels: Vec<String>,
     edge_types: Vec<String>,
+    /// Per-edge property filter — every edge along the walked
+    /// path must have these `(key, value)` pairs. Mirrors the
+    /// inline filter on `EdgeExpandOp`; applied during DFS so
+    /// failing edges prune the branch instead of generating
+    /// wrong-length results.
+    edge_properties: Vec<(String, Expr)>,
     direction: Direction,
     min_hops: u64,
     max_hops: u64,
@@ -2699,6 +2743,13 @@ struct VarLengthExpandOp {
     /// `OPTIONAL MATCH (a)-[*]->(b)` so the outer row survives
     /// even when the path search is empty.
     optional: bool,
+    /// When set, paths whose terminal node id differs from the
+    /// node bound at this variable in the current row are
+    /// filtered out before counting as a match. Combined with
+    /// `optional`, an input row whose candidate paths all miss
+    /// the bound target triggers the null-fallback instead of
+    /// silently dropping.
+    dst_constraint_var: Option<String>,
     current_row: Option<Row>,
     pending_paths: Vec<Vec<Edge>>,
     pending_node_paths: Vec<Vec<NodeId>>,
@@ -2715,11 +2766,13 @@ impl VarLengthExpandOp {
         dst_var: String,
         dst_labels: Vec<String>,
         edge_types: Vec<String>,
+        edge_properties: Vec<(String, Expr)>,
         direction: Direction,
         min_hops: u64,
         max_hops: u64,
         path_var: Option<String>,
         optional: bool,
+        dst_constraint_var: Option<String>,
     ) -> Self {
         Self {
             input,
@@ -2728,11 +2781,13 @@ impl VarLengthExpandOp {
             dst_var,
             dst_labels,
             edge_types,
+            edge_properties,
             direction,
             min_hops,
             max_hops,
             path_var,
             optional,
+            dst_constraint_var,
             current_row: None,
             pending_paths: Vec::new(),
             pending_node_paths: Vec::new(),
@@ -2745,6 +2800,7 @@ impl VarLengthExpandOp {
         &self,
         ctx: &ExecCtx,
         start: NodeId,
+        input_row: &Row,
     ) -> Result<(Vec<Vec<Edge>>, Vec<Vec<NodeId>>, Vec<NodeId>)> {
         let mut paths: Vec<Vec<Edge>> = Vec::new();
         let mut node_paths: Vec<Vec<NodeId>> = Vec::new();
@@ -2752,9 +2808,22 @@ impl VarLengthExpandOp {
         let mut edge_buf: Vec<Edge> = Vec::new();
         let mut node_buf: Vec<NodeId> = vec![start];
         let mut used: HashSet<EdgeId> = HashSet::new();
+        // Evaluate edge-property expected values once per input row
+        // — they may reference row bindings or `$`-parameters, but
+        // don't vary per walked edge.
+        let expected_edge_props: Vec<(String, Value)> = if self.edge_properties.is_empty() {
+            Vec::new()
+        } else {
+            let ectx = ctx.eval_ctx(input_row);
+            self.edge_properties
+                .iter()
+                .map(|(k, expr)| eval_expr(expr, &ectx).map(|v| (k.clone(), v)))
+                .collect::<Result<Vec<_>>>()?
+        };
         self.dfs(
             ctx,
             start,
+            &expected_edge_props,
             &mut edge_buf,
             &mut node_buf,
             &mut used,
@@ -2770,6 +2839,7 @@ impl VarLengthExpandOp {
         &self,
         ctx: &ExecCtx,
         current_node: NodeId,
+        expected_edge_props: &[(String, Value)],
         edge_buf: &mut Vec<Edge>,
         node_buf: &mut Vec<NodeId>,
         used: &mut HashSet<EdgeId>,
@@ -2817,12 +2887,36 @@ impl VarLengthExpandOp {
             {
                 continue;
             }
+            // Inline edge property filter: skip edges whose
+            // properties don't equal the expected values computed
+            // per input row. A missing property fails the check,
+            // matching `EdgeExpandOp`.
+            if !expected_edge_props.is_empty() {
+                let mut ok = true;
+                for (key, expected) in expected_edge_props {
+                    let actual = match edge.properties.get(key) {
+                        Some(v) => Value::Property(v.clone()),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    };
+                    if !values_equal(&actual, expected) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+            }
             used.insert(eid);
             edge_buf.push(edge);
             node_buf.push(neighbor_id);
             self.dfs(
                 ctx,
                 neighbor_id,
+                expected_edge_props,
                 edge_buf,
                 node_buf,
                 used,
@@ -2894,10 +2988,48 @@ impl Operator for VarLengthExpandOp {
                         | Some(Value::Property(mesh_core::Property::Null)) => None,
                         _ => return Err(Error::UnboundVariable(self.src_var.clone())),
                     };
-                    let (paths, node_paths, targets) = match src_id {
-                        Some(id) => self.enumerate(ctx, id)?,
+                    let (mut paths, mut node_paths, mut targets) = match src_id {
+                        Some(id) => self.enumerate(ctx, id, &row)?,
                         None => (Vec::new(), Vec::new(), Vec::new()),
                     };
+                    // Bound-endpoint constraint: drop paths whose
+                    // terminal node doesn't match the node already
+                    // bound at the constraint var. When combined
+                    // with `optional`, an input whose paths are
+                    // all filtered out still triggers the
+                    // null-fallback below.
+                    if let Some(constraint_var) = &self.dst_constraint_var {
+                        let target_id = match row.get(constraint_var) {
+                            Some(Value::Node(n)) => Some(n.id),
+                            _ => None,
+                        };
+                        match target_id {
+                            Some(id) => {
+                                let mut kept_paths = Vec::new();
+                                let mut kept_node_paths = Vec::new();
+                                let mut kept_targets = Vec::new();
+                                for ((p, np), t) in paths
+                                    .drain(..)
+                                    .zip(node_paths.drain(..))
+                                    .zip(targets.drain(..))
+                                {
+                                    if t == id {
+                                        kept_paths.push(p);
+                                        kept_node_paths.push(np);
+                                        kept_targets.push(t);
+                                    }
+                                }
+                                paths = kept_paths;
+                                node_paths = kept_node_paths;
+                                targets = kept_targets;
+                            }
+                            None => {
+                                paths.clear();
+                                node_paths.clear();
+                                targets.clear();
+                            }
+                        }
+                    }
                     if paths.is_empty() && self.optional {
                         // Left-join fallback: emit one row with
                         // the expansion's output vars set to Null
