@@ -616,6 +616,37 @@ fn format_iso_duration(d: &mesh_core::Duration) -> String {
     result
 }
 
+/// Undo the Gherkin table-cell escaping applied by openCypher TCK
+/// feature files: `\\` is a single literal backslash, `\|` is a
+/// literal pipe. Feature-file authors escape backslashes because
+/// `|` would otherwise split the cell and `\` itself becomes the
+/// escape char, so `\\` stands for one `\`. Literals6 scenario 5
+/// is the poster child — `'a\\\\bcn5t\'"\\\\//\\\\"\''` in the
+/// table means the string whose Cypher-display form is
+/// `'a\\bcn5t\'"\\//\\"\''`.
+fn unescape_gherkin_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('\\') => {
+                    out.push('\\');
+                    chars.next();
+                }
+                Some('|') => {
+                    out.push('|');
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn normalize_tck(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
@@ -655,7 +686,7 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
     let headers: Vec<&str> = table.rows[0].iter().map(|s| s.trim()).collect();
     let expected_rows: Vec<Vec<String>> = table.rows[1..]
         .iter()
-        .map(|row| row.iter().map(|s| s.trim().to_string()).collect())
+        .map(|row| row.iter().map(|s| unescape_gherkin_cell(s.trim())).collect())
         .collect();
 
     assert_eq!(
@@ -712,7 +743,7 @@ fn then_result_ignoring_list_order(world: &mut MeshWorld, step: &cucumber::gherk
     let headers: Vec<&str> = table.rows[0].iter().map(|s| s.trim()).collect();
     let expected_rows: Vec<Vec<String>> = table.rows[1..]
         .iter()
-        .map(|row| row.iter().map(|s| s.trim().to_string()).collect())
+        .map(|row| row.iter().map(|s| unescape_gherkin_cell(s.trim())).collect())
         .collect();
 
     assert_eq!(
@@ -800,7 +831,7 @@ fn then_result_in_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
     let headers: Vec<&str> = table.rows[0].iter().map(|s| s.trim()).collect();
     let expected_rows: Vec<Vec<String>> = table.rows[1..]
         .iter()
-        .map(|row| row.iter().map(|s| s.trim().to_string()).collect())
+        .map(|row| row.iter().map(|s| unescape_gherkin_cell(s.trim())).collect())
         .collect();
 
     let actual_strs: Vec<Vec<String>> = world

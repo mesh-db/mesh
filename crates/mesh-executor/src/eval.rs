@@ -1150,11 +1150,96 @@ fn pattern_comprehension_eval(
         Vec::new(),
     )];
     for hop in &pattern.hops {
-        // Var-length hops in a comprehension would need path-list
-        // handling analogous to `VarLengthExpand` — out of scope
-        // for this minimal implementation; collapse to empty.
-        if hop.rel.var_length.is_some() {
-            return Ok(Value::List(Vec::new()));
+        // Variable-length hop: iterate BFS from each current
+        // frontier entry for 1..=max depths, promoting entries
+        // at depths >= min to the next hop's frontier. Cap max
+        // at a safety limit so the default-unbounded `[*]` form
+        // doesn't loop forever on a cyclic graph. Edges already
+        // used earlier in the path (tracked per-entry) are
+        // skipped so every traversal stays simple.
+        if let Some(vl) = hop.rel.var_length {
+            const MAX_DEPTH_CAP: u64 = 32;
+            let max = vl.max.min(MAX_DEPTH_CAP);
+            let min = vl.min;
+            let mut next: Vec<FrontierEntry> = Vec::new();
+            // At min = 0 (`[*0..N]`) each entry trivially satisfies
+            // the lower bound right away — emit the current node.
+            if min == 0 {
+                for entry in &frontier {
+                    let (cur_id, _used, _bindings, path_nodes, _path_edges) = entry;
+                    if let Some(node) = path_nodes.last() {
+                        if node_pattern_matches(node, &hop.target, ctx)?
+                            && matches_bound_target(*cur_id, &hop.target, ctx)
+                        {
+                            next.push(entry.clone());
+                        }
+                    }
+                }
+            }
+            let mut level = frontier.clone();
+            for depth in 1..=max {
+                let mut next_level: Vec<FrontierEntry> = Vec::new();
+                for (cur_id, used, bindings, path_nodes, path_edges) in &level {
+                    let neighbors = match hop.rel.direction {
+                        Direction::Outgoing => ctx.reader.outgoing(*cur_id)?,
+                        Direction::Incoming => ctx.reader.incoming(*cur_id)?,
+                        Direction::Both => {
+                            let mut all = ctx.reader.outgoing(*cur_id)?;
+                            all.extend(ctx.reader.incoming(*cur_id)?);
+                            all
+                        }
+                    };
+                    for (edge_id, neighbor_id) in neighbors {
+                        if used.contains(&edge_id) {
+                            continue;
+                        }
+                        let edge = match ctx.reader.get_edge(edge_id)? {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        if !hop.rel.edge_types.is_empty()
+                            && !hop.rel.edge_types.iter().any(|t| t == &edge.edge_type)
+                        {
+                            continue;
+                        }
+                        let neighbor = match ctx.reader.get_node(neighbor_id)? {
+                            Some(n) => n,
+                            None => continue,
+                        };
+                        let mut new_used = used.clone();
+                        new_used.insert(edge_id);
+                        let mut new_nodes = path_nodes.clone();
+                        new_nodes.push(neighbor.clone());
+                        let mut new_edges = path_edges.clone();
+                        new_edges.push(edge.clone());
+                        next_level.push((
+                            neighbor_id,
+                            new_used,
+                            bindings.clone(),
+                            new_nodes,
+                            new_edges,
+                        ));
+                    }
+                }
+                level = next_level;
+                if depth >= min {
+                    for entry in &level {
+                        let (cur_id, _used, _bindings, path_nodes, _) = entry;
+                        if let Some(node) = path_nodes.last() {
+                            if node_pattern_matches(node, &hop.target, ctx)?
+                                && matches_bound_target(*cur_id, &hop.target, ctx)
+                            {
+                                next.push(entry.clone());
+                            }
+                        }
+                    }
+                }
+                if level.is_empty() {
+                    break;
+                }
+            }
+            frontier = next;
+            continue;
         }
         let mut next: Vec<FrontierEntry> = Vec::new();
         for (cur_id, used, bindings, path_nodes, path_edges) in &frontier {
@@ -1414,6 +1499,25 @@ fn vl_pred_dfs(
         used.remove(&edge_id);
     }
     Ok(())
+}
+
+/// If the hop's target node names a variable that's already bound
+/// in the outer row, reject neighbors whose id doesn't match the
+/// bound node's id. Used by the variable-length pattern-comp
+/// expander so `[p = (a)-[*]->(b) | p]` anchors to the bound `b`
+/// rather than accepting every reachable node.
+fn matches_bound_target(
+    candidate_id: mesh_core::NodeId,
+    target: &NodePattern,
+    ctx: &EvalCtx,
+) -> bool {
+    let Some(var) = target.var.as_deref() else {
+        return true;
+    };
+    match ctx.lookup(var) {
+        Some(Value::Node(n)) => n.id == candidate_id,
+        _ => true,
+    }
 }
 
 fn start_node_matches(

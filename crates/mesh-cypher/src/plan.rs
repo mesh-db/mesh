@@ -4779,6 +4779,49 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
         }
     }
 
+    // AmbiguousAggregationExpression: when ORDER BY on an aggregating
+    // WITH contains (but isn't itself) an aggregate, its non-aggregate
+    // sub-parts must be simple references to projected items — same
+    // rule classify_return_items enforces for RETURN items.
+    // `WITH me.age + you.age AS ages, count(*) AS cnt ORDER BY
+    // me.age + you.age + count(*)` fails because `me.age` / `you.age`
+    // aren't simple projections even though their compound is.
+    if has_aggregates {
+        let sort_items_as_return: Vec<ReturnItem> = w
+            .order_by
+            .iter()
+            .map(|s| ReturnItem {
+                expr: s.expr.clone(),
+                alias: None,
+                raw_text: None,
+            })
+            .collect();
+        // Treat the WITH projection as the "sibling" context the
+        // ORDER BY can reference: non-aggregate WITH items and their
+        // aliases (as bare identifiers) are both valid targets.
+        let mut top_refs: Vec<ReturnItem> = w
+            .items
+            .iter()
+            .filter(|it| !contains_aggregate(&it.expr))
+            .cloned()
+            .collect();
+        for it in &w.items {
+            if let Some(alias) = &it.alias {
+                top_refs.push(ReturnItem {
+                    expr: Expr::Identifier(alias.clone()),
+                    alias: None,
+                    raw_text: None,
+                });
+            }
+        }
+        // Classify ORDER BY items against that composite scope.
+        let scope: Vec<ReturnItem> = top_refs
+            .into_iter()
+            .chain(sort_items_as_return.iter().cloned())
+            .collect();
+        check_ambiguous_aggregation(&scope)?;
+    }
+
     // openCypher: `WHERE` attached to `WITH` can reference BOTH the
     // variables bound before the WITH and the aliases introduced by
     // it. When the projection is non-aggregating, push the filter
