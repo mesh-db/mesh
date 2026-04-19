@@ -2034,9 +2034,18 @@ fn pattern_predicate_in_boolean_and_tree_parses() {
 }
 
 #[test]
-fn pattern_predicate_with_var_length_plans_successfully() {
+fn pattern_predicate_with_var_length_rejects_new_target_var() {
+    // openCypher rejects pattern predicates that introduce fresh
+    // named variables; `b` is new here, so this has to fail with
+    // `UndefinedVariable` even though the pattern itself is
+    // variable-length. Anonymous targets (`(a)-[:KNOWS*1..3]->()`)
+    // still plan fine.
     let s = parse("MATCH (a:Person) WHERE (a)-[:KNOWS*1..3]->(b) RETURN a").unwrap();
-    plan(&s).expect("var-length in pattern predicate should plan");
+    let err = plan(&s).expect_err("new target var must be rejected");
+    assert!(
+        format!("{err}").contains("UndefinedVariable"),
+        "expected UndefinedVariable, got {err}"
+    );
 }
 
 #[test]

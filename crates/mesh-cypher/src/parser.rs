@@ -2265,16 +2265,23 @@ fn build_literal(pair: Pair<Rule>) -> Result<Literal> {
     match lit_pair.as_rule() {
         Rule::integer => Ok(Literal::Integer(parse_integer(lit_pair.as_str())?)),
         Rule::float => {
-            Ok(Literal::Float(lit_pair.as_str().parse().map_err(|_| {
-                Error::InvalidNumber(lit_pair.as_str().into())
-            })?))
+            let s = lit_pair.as_str();
+            let f: f64 = s
+                .parse()
+                .map_err(|_| Error::InvalidNumber(s.into()))?;
+            if !f.is_finite() {
+                return Err(Error::Parse(format!(
+                    "FloatingPointOverflow: float literal `{s}` overflows"
+                )));
+            }
+            Ok(Literal::Float(f))
         }
         Rule::string => {
             let inner = lit_pair
                 .into_inner()
                 .next()
                 .ok_or_else(|| Error::Parse("empty string literal".into()))?;
-            Ok(Literal::String(unescape_string(inner.as_str())))
+            Ok(Literal::String(unescape_string(inner.as_str())?))
         }
         Rule::boolean_lit => Ok(Literal::Boolean(
             lit_pair.as_str().eq_ignore_ascii_case("true"),
@@ -2359,7 +2366,7 @@ fn build_subquery_body(pair: Pair<Rule>) -> Result<Statement> {
     }
 }
 
-fn unescape_string(s: &str) -> String {
+fn unescape_string(s: &str) -> Result<String> {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -2373,6 +2380,31 @@ fn unescape_string(s: &str) -> String {
                 Some('t') => out.push('\t'),
                 Some('b') => out.push('\u{0008}'),
                 Some('f') => out.push('\u{000C}'),
+                Some('u') => {
+                    // `\uNNNN` — exactly four hex digits, decoded as a
+                    // Unicode scalar. Shorter sequences or non-hex
+                    // digits raise `InvalidUnicodeLiteral`.
+                    let mut hex = String::with_capacity(4);
+                    for _ in 0..4 {
+                        match chars.next() {
+                            Some(d) if d.is_ascii_hexdigit() => hex.push(d),
+                            _ => {
+                                return Err(Error::Parse(format!(
+                                    "InvalidUnicodeLiteral: `\\u` must be followed by 4 hex digits"
+                                )));
+                            }
+                        }
+                    }
+                    let code = u32::from_str_radix(&hex, 16).map_err(|_| {
+                        Error::Parse(format!("InvalidUnicodeLiteral: `\\u{hex}` is not valid hex"))
+                    })?;
+                    let ch = char::from_u32(code).ok_or_else(|| {
+                        Error::Parse(format!(
+                            "InvalidUnicodeLiteral: `\\u{hex}` is not a valid code point"
+                        ))
+                    })?;
+                    out.push(ch);
+                }
                 Some(other) => {
                     out.push('\\');
                     out.push(other);
@@ -2383,7 +2415,7 @@ fn unescape_string(s: &str) -> String {
             out.push(c);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Drill through trivial wrapper rules (`add_expr`, `mul_expr`,
