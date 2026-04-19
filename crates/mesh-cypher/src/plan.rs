@@ -2635,10 +2635,19 @@ fn chain_hops_with_bound(
         );
         plan = if let Some(vl) = hop.rel.var_length {
             if vl.min > vl.max {
-                return Err(Error::Plan(format!(
-                    "variable-length path min ({}) > max ({})",
-                    vl.min, vl.max
-                )));
+                // openCypher treats an inverted range (e.g.
+                // `[:R*2..1]`) as a match with zero results rather
+                // than a syntax error. Short-circuit the rest of
+                // the chain with an always-false filter so every
+                // row produced so far is dropped downstream. We
+                // still bind the declared dst/edge vars so a later
+                // clause that references them doesn't trip a
+                // scope check — the Filter guarantees no row
+                // actually carries values for them.
+                return Ok(LogicalPlan::Filter {
+                    input: Box::new(plan),
+                    predicate: Expr::Literal(Literal::Boolean(false)),
+                });
             }
             // Var-length expansion does its own binding, so keep
             // the caller's edge_var (even if None) — uniqueness

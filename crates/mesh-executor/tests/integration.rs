@@ -1400,13 +1400,16 @@ fn var_length_no_paths_for_isolated_source() {
 }
 
 #[test]
-fn var_length_invalid_range_rejected_at_plan_time() {
+fn var_length_inverted_range_yields_empty_results() {
+    // openCypher accepts an inverted range (min > max) and
+    // returns zero rows rather than failing at plan time (TCK
+    // Match5 scenarios 11/12/13). The planner short-circuits the
+    // hop to a Filter(false) so downstream operators see an
+    // empty stream.
     let (store, _d) = open_store();
-    let _ = &store;
-    let stmt = parse("MATCH (a)-[*5..2]->(b) RETURN b").unwrap();
-    let err = plan(&stmt).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("min"), "msg: {msg}");
+    run(&store, "CREATE (:A)-[:R]->(:A)");
+    let rows = run(&store, "MATCH (a)-[*5..2]->(b) RETURN b");
+    assert!(rows.is_empty(), "expected empty result, got {rows:?}");
 }
 
 #[test]
