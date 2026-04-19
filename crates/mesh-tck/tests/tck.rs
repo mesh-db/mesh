@@ -887,6 +887,15 @@ fn format_value(val: &Value) -> String {
             let inner: Vec<String> = items.iter().map(format_value).collect();
             format!("[{}]", inner.join(", "))
         }
+        Value::Map(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let entries: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{k}: {}", format_value(m.get(*k).unwrap())))
+                .collect();
+            format!("{{{}}}", entries.join(", "))
+        }
         Value::Path { nodes, edges } => {
             let mut parts = Vec::new();
             for (i, node) in nodes.iter().enumerate() {

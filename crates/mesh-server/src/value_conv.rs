@@ -57,6 +57,19 @@ fn value_to_bolt(value: &Value) -> BoltValue {
         Value::Null => BoltValue::Null,
         Value::Property(p) => property_to_bolt(p),
         Value::List(items) => BoltValue::List(items.iter().map(value_to_bolt).collect()),
+        Value::Map(m) => {
+            // Bolt map wire format: keys as strings + each value
+            // converted independently. `Value::Map` (graph-aware)
+            // and `Property::Map` (scalar-only) both produce the
+            // same `BoltValue::Map`; the wire protocol doesn't
+            // need to distinguish them.
+            let mut pairs: Vec<(String, BoltValue)> = m
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_bolt(v)))
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            BoltValue::Map(pairs)
+        }
         Value::Node(n) => node_to_bolt(n),
         Value::Edge(e) => edge_to_bolt(e),
         Value::Path { nodes, edges } => path_to_bolt(nodes, edges),

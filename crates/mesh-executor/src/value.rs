@@ -8,6 +8,15 @@ pub enum Value {
     Edge(Edge),
     Property(Property),
     List(Vec<Value>),
+    /// A Cypher map that can hold any `Value` — including graph
+    /// elements (`Node`, `Edge`, `Path`) which `Property::Map`
+    /// can't represent. Only constructed by `Expr::Map` when one
+    /// of the entries evaluates to a non-`Property` shape
+    /// (e.g. `{u: node_u}`). Purely-scalar map literals still
+    /// lower to `Value::Property(Property::Map(...))` so node /
+    /// edge property storage and the wire format stay
+    /// unchanged.
+    Map(std::collections::HashMap<String, Value>),
     /// A Cypher path — a materialized traversal produced by
     /// `MATCH p = (...)-[...]->(...)`. The invariant is
     /// `nodes.len() == edges.len() + 1`; a zero-hop path

@@ -5199,21 +5199,17 @@ fn map_literal_null_entry_survives_as_property_null() {
 }
 
 #[test]
-fn map_literal_rejects_node_values() {
+fn map_literal_wraps_node_values() {
+    // A map literal whose values include a Node / Edge / Path is
+    // a first-class Cypher value — `Value::Map` carries the full
+    // element — and downstream clauses can reach into it.
+    // Property::Map (scalar-only) is preserved for the common
+    // case where every value lowers to a stored Property.
     let (store, _d) = open_store();
     run(&store, "CREATE (:Person {name: 'Ada'})");
-    // `{p: a}` where a is a Node — v1 restriction: map values must
-    // be Properties, not Nodes. Evaluator returns TypeMismatch.
-    let (store2, _d2) = open_store();
-    run(&store2, "CREATE (:Person {name: 'Ada'})");
-    let plan =
-        mesh_cypher::plan(&mesh_cypher::parse("MATCH (a:Person) RETURN {p: a} AS m").unwrap())
-            .unwrap();
-    let err = mesh_executor::execute(&plan, &store2).unwrap_err();
-    assert!(
-        matches!(err, mesh_executor::Error::TypeMismatch),
-        "expected TypeMismatch, got {err:?}"
-    );
+    let rows = run(&store, "MATCH (a:Person) RETURN {p: a}.p.name AS n");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "Ada");
 }
 
 #[test]

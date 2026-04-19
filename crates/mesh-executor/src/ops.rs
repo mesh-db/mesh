@@ -886,6 +886,15 @@ struct DeleteOp {
     #[allow(dead_code)]
     vars: Vec<String>,
     exprs: Vec<Expr>,
+    /// Rows drained from `input` before any deletes have run.
+    /// Populated on first call to `next`. openCypher treats DELETE
+    /// as a batch mutation: the whole preceding row set is
+    /// materialised, then the mutations happen, then rows are
+    /// forwarded. Without buffering, `MATCH (a)-[r]-(b) DELETE r,
+    /// a, b RETURN count(*)` deletes the first row's nodes before
+    /// the pipelined scan reaches the second row.
+    buffered: Option<Vec<Row>>,
+    cursor: usize,
 }
 
 impl DeleteOp {
@@ -895,44 +904,103 @@ impl DeleteOp {
             detach,
             vars,
             exprs,
+            buffered: None,
+            cursor: 0,
         }
+    }
+
+    /// Gather every edge and node id referenced by the row's
+    /// DELETE expressions and run the delete in two phases —
+    /// edges first, then nodes. The two-phase ordering is what
+    /// lets `DELETE p1, p2` succeed when two paths share nodes
+    /// connected by each other's edges: by the time the node
+    /// phase runs, the in-batch edges are already gone. The
+    /// non-detach check probes the graph then filters out
+    /// any edge we just deleted, so the batch-level detachment
+    /// is counted as "no longer attached" rather than failing.
+    fn apply_deletes(
+        &self,
+        ctx: &ExecCtx,
+        row: &Row,
+        seen_edges: &mut HashSet<mesh_core::EdgeId>,
+        seen_nodes: &mut HashSet<mesh_core::NodeId>,
+    ) -> Result<()> {
+        let mut edge_ids: Vec<mesh_core::EdgeId> = Vec::new();
+        let mut node_ids: Vec<mesh_core::NodeId> = Vec::new();
+        for expr in &self.exprs {
+            let v = eval_expr(expr, &ctx.eval_ctx(row))?;
+            match v {
+                Value::Node(n) => node_ids.push(n.id),
+                Value::Edge(e) => edge_ids.push(e.id),
+                Value::Path { nodes, edges } => {
+                    for e in edges {
+                        edge_ids.push(e.id);
+                    }
+                    for n in nodes {
+                        node_ids.push(n.id);
+                    }
+                }
+                Value::Null | Value::Property(Property::Null) => continue,
+                _ => return Err(Error::TypeMismatch),
+            }
+        }
+        for eid in &edge_ids {
+            if seen_edges.insert(*eid) {
+                ctx.writer.delete_edge(*eid)?;
+            }
+        }
+        for nid in &node_ids {
+            if !seen_nodes.insert(*nid) {
+                continue;
+            }
+            if self.detach {
+                ctx.writer.detach_delete_node(*nid)?;
+            } else {
+                let out = ctx.store.outgoing(*nid)?;
+                let inc = ctx.store.incoming(*nid)?;
+                let still_attached = out
+                    .iter()
+                    .chain(inc.iter())
+                    .any(|(eid, _)| !seen_edges.contains(eid));
+                if still_attached {
+                    return Err(Error::CannotDeleteAttachedNode);
+                }
+                ctx.writer.detach_delete_node(*nid)?;
+            }
+        }
+        Ok(())
     }
 }
 
 impl Operator for DeleteOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        match self.input.next(ctx)? {
-            None => Ok(None),
-            Some(row) => {
-                for expr in &self.exprs {
-                    let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
-                    match v {
-                        Value::Node(n) => {
-                            if self.detach {
-                                ctx.writer.detach_delete_node(n.id)?;
-                            } else {
-                                let out = ctx.store.outgoing(n.id)?;
-                                let inc = ctx.store.incoming(n.id)?;
-                                if !out.is_empty() || !inc.is_empty() {
-                                    return Err(Error::CannotDeleteAttachedNode);
-                                }
-                                ctx.writer.detach_delete_node(n.id)?;
-                            }
-                        }
-                        Value::Edge(e) => {
-                            ctx.writer.delete_edge(e.id)?;
-                        }
-                        // openCypher: DELETE silently ignores null.
-                        // Common source: OPTIONAL MATCH with no match
-                        // binds the var to null and the subsequent
-                        // DELETE is a no-op.
-                        Value::Null | Value::Property(Property::Null) => continue,
-                        _ => return Err(Error::TypeMismatch),
-                    }
-                }
-                Ok(Some(row))
+        // First call: drain the input, run all deletes, then
+        // start forwarding rows. Buffering protects against the
+        // pipelined-scan-vs-mutation race: `MATCH (a)-[r]-(b)
+        // DELETE r, a, b RETURN count(*)` must observe every
+        // MATCH row before any node or edge disappears, otherwise
+        // the undirected expansion hits an already-deleted source
+        // on the second iteration.
+        if self.buffered.is_none() {
+            let mut rows: Vec<Row> = Vec::new();
+            while let Some(row) = self.input.next(ctx)? {
+                rows.push(row);
             }
+            let mut seen_edges: HashSet<mesh_core::EdgeId> = HashSet::new();
+            let mut seen_nodes: HashSet<mesh_core::NodeId> = HashSet::new();
+            for row in &rows {
+                self.apply_deletes(ctx, row, &mut seen_edges, &mut seen_nodes)?;
+            }
+            self.buffered = Some(rows);
+            self.cursor = 0;
         }
+        let rows = self.buffered.as_ref().unwrap();
+        if self.cursor < rows.len() {
+            let row = rows[self.cursor].clone();
+            self.cursor += 1;
+            return Ok(Some(row));
+        }
+        Ok(None)
     }
 }
 
@@ -1837,7 +1905,13 @@ fn value_to_property(v: Value) -> Result<Property> {
                 .collect::<Result<_>>()?;
             Ok(Property::List(props))
         }
-        Value::Node(_) | Value::Edge(_) | Value::Path { .. } => Err(Error::InvalidSetValue),
+        // Graph-aware `Value::Map` and graph elements can't be
+        // stored as node / edge property values; SET will reject
+        // them.
+        Value::Map(_)
+        | Value::Node(_)
+        | Value::Edge(_)
+        | Value::Path { .. } => Err(Error::InvalidSetValue),
     }
 }
 
@@ -1965,7 +2039,11 @@ impl Operator for IndexSeekOp {
             let property = match value {
                 Value::Property(p) => p,
                 Value::Null => Property::Null,
-                Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path { .. } => {
+                Value::Node(_)
+                | Value::Edge(_)
+                | Value::List(_)
+                | Value::Map(_)
+                | Value::Path { .. } => {
                     return Err(Error::InvalidSetValue);
                 }
             };

@@ -2826,6 +2826,98 @@ fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarTy
 /// strict check is kept for the CREATE / pattern-predicate
 /// scope-check paths that still want Node ≠ Edge to be hard
 /// errors.
+/// Top-level shape check for an expression supplied to `DELETE`.
+/// Only accepts shapes that can plausibly evaluate to a graph
+/// element (Node / Edge / Path) or Null at runtime — everything
+/// else produces an openCypher `InvalidArgumentType`. Also
+/// enforces the scope rule on identifiers: a DELETE reference
+/// to an unbound name is a compile-time `UndefinedVariable`.
+fn validate_delete_expr(
+    expr: &Expr,
+    bound_vars: &HashMap<String, VarType>,
+) -> Result<()> {
+    match expr {
+        // Identifier: must be bound. The type isn't checked here
+        // (a Scalar / NonNode binding might be wrong at runtime),
+        // but catching the unbound case is the common failure.
+        Expr::Identifier(name) => {
+            if !bound_vars.contains_key(name) {
+                return Err(Error::Plan(format!(
+                    "DELETE references undefined variable '{name}'"
+                )));
+            }
+        }
+        // Accessors that can land on graph-element values at
+        // runtime: property access (map.key), index / slice
+        // access (list[0], map[key]), parameters, CASE, calls
+        // (e.g. `head([n])`), and null literals.
+        Expr::Property { var, .. } => {
+            if !bound_vars.contains_key(var) {
+                return Err(Error::Plan(format!(
+                    "DELETE references undefined variable '{var}'"
+                )));
+            }
+        }
+        Expr::PropertyAccess { base, .. }
+        | Expr::IndexAccess { base, .. }
+        | Expr::SliceAccess { base, .. } => {
+            validate_delete_expr_identifiers(base, bound_vars)?;
+        }
+        Expr::Parameter(_) => {}
+        Expr::Case { .. } => {
+            // CASE branches might produce graph elements; identifier
+            // checks inside the branches happen at eval time.
+        }
+        Expr::Call { args, .. } => {
+            // Function result could be anything — leave the shape
+            // check to the executor, but still verify referenced
+            // identifiers are in scope.
+            match args {
+                CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) => {
+                    for e in es {
+                        validate_delete_expr_identifiers(e, bound_vars)?;
+                    }
+                }
+                CallArgs::Star => {}
+            }
+        }
+        Expr::Literal(Literal::Null) => {}
+        _ => {
+            return Err(Error::Plan(
+                "DELETE argument must be a node, edge, path, or null \
+                 (got a scalar expression)"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Walk a nested expression and validate every identifier is
+/// bound — used as a sub-routine by `validate_delete_expr` on
+/// argument sub-expressions where the result shape is
+/// unknowable at compile time but name resolution still matters.
+fn validate_delete_expr_identifiers(
+    expr: &Expr,
+    bound_vars: &HashMap<String, VarType>,
+) -> Result<()> {
+    let mut err: Option<Error> = None;
+    walk_expr(expr, &mut |e| {
+        if let Expr::Identifier(name) = e {
+            if !bound_vars.contains_key(name) {
+                err = Some(Error::Plan(format!(
+                    "DELETE references undefined variable '{name}'"
+                )));
+            }
+        }
+        Ok(())
+    })?;
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 fn check_var_type_conflict_allow_scalar(
     var: &str,
     new_type: VarType,
@@ -3464,6 +3556,17 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 });
             }
             ReadingClause::Delete(dc) => {
+                // Scope check: every identifier mentioned in a
+                // DELETE expression must be in scope. Catches
+                // `MATCH (a) DELETE x` at compile time instead of
+                // waiting for a runtime `UnboundVariable`.
+                // Additionally reject shapes whose result can
+                // never be a graph element (arithmetic, boolean
+                // ops, bare literals) — openCypher raises
+                // `InvalidArgumentType` for `DELETE 1 + 1`.
+                for expr in &dc.exprs {
+                    validate_delete_expr(expr, &bound_vars)?;
+                }
                 let current = plan.take().ok_or_else(|| {
                     Error::Plan("DELETE requires a preceding clause".into())
                 })?;

@@ -42,6 +42,18 @@ impl<'a> EvalCtx<'a> {
     }
 }
 
+/// Recursive check for whether a value contains a graph element
+/// (Node / Edge / Path / a Value::Map / a List thereof). Used by
+/// Expr::Map eval to decide between `Value::Map` (graph-aware)
+/// and `Property::Map` (scalar-only) wrappers.
+fn value_contains_graph_element(v: &Value) -> bool {
+    match v {
+        Value::Node(_) | Value::Edge(_) | Value::Path { .. } | Value::Map(_) => true,
+        Value::List(items) => items.iter().any(value_contains_graph_element),
+        _ => false,
+    }
+}
+
 pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
         Expr::Literal(lit) => Ok(literal_to_value(lit)),
@@ -84,6 +96,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     .cloned()
                     .map(Value::Property)
                     .unwrap_or(Value::Null)),
+                Value::Map(m) => Ok(m.get(key).cloned().unwrap_or(Value::Null)),
                 // Temporal property access for Expr::Property
                 Value::Property(Property::Date(days)) => {
                     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
@@ -140,6 +153,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     .cloned()
                     .map(Value::Property)
                     .unwrap_or(Value::Null)),
+                Value::Map(m) => Ok(m.get(key).cloned().unwrap_or(Value::Null)),
                 // Temporal property access
                 Value::Property(Property::Date(days)) => {
                     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
@@ -199,6 +213,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                         .cloned()
                         .map(Value::Property)
                         .unwrap_or(Value::Null)),
+                    Value::Map(m) => Ok(m.get(key).cloned().unwrap_or(Value::Null)),
                     _ => Ok(Value::Null),
                 };
             }
@@ -506,16 +521,32 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             Ok(Value::List(out))
         }
         Expr::Map(entries) => {
-            // Evaluate each entry value, unwrap to a Property, and
-            // stash in a HashMap. v1 restriction: map values must be
-            // Property (string, int, float, bool, list, map, null) —
-            // nested Nodes/Edges are rejected with TypeMismatch.
-            // Null values flow through as Property::Null rather than
-            // short-circuiting the whole map, matching how Neo4j
-            // returns `{name: null}` as a 1-key map.
-            let mut out = std::collections::HashMap::with_capacity(entries.len());
+            // First pass: collect evaluated values. If every entry
+            // lowers cleanly to a `Property`, keep the scalar-only
+            // `Property::Map` wrapper so node / edge property
+            // storage and wire format stay unchanged. If any entry
+            // is a graph element (Node, Edge, Path) or a list
+            // containing one, promote the whole map to
+            // `Value::Map` which carries full `Value` leaves.
+            let mut evaluated: Vec<(String, Value)> = Vec::with_capacity(entries.len());
+            let mut contains_graph = false;
             for (key, expr) in entries {
                 let v = eval_expr(expr, ctx)?;
+                if value_contains_graph_element(&v) {
+                    contains_graph = true;
+                }
+                evaluated.push((key.clone(), v));
+            }
+            if contains_graph {
+                let mut out: std::collections::HashMap<String, Value> =
+                    std::collections::HashMap::with_capacity(evaluated.len());
+                for (k, v) in evaluated {
+                    out.insert(k, v);
+                }
+                return Ok(Value::Map(out));
+            }
+            let mut out = std::collections::HashMap::with_capacity(evaluated.len());
+            for (key, v) in evaluated {
                 let prop = match v {
                     Value::Property(p) => p,
                     Value::Null => Property::Null,
@@ -525,20 +556,24 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                             match item {
                                 Value::Property(p) => props.push(p),
                                 Value::Null => props.push(Property::Null),
+                                // Guarded by `contains_graph` above
+                                // — if we're here the list was
+                                // scalar-only. Still defensive:
+                                // fall back to TypeMismatch rather
+                                // than dropping a graph value.
                                 _ => return Err(Error::TypeMismatch),
                             }
                         }
                         Property::List(props)
                     }
-                    // Nodes / Edges / Paths can't nest inside a
-                    // Property::Map in the current type model.
-                    // Cypher's real semantics allow this; revisit
-                    // if driver code actually needs it.
-                    Value::Node(_) | Value::Edge(_) | Value::Path { .. } => {
-                        return Err(Error::TypeMismatch)
-                    }
+                    // Same guard — `contains_graph` is false here
+                    // so these shouldn't happen.
+                    Value::Node(_)
+                    | Value::Edge(_)
+                    | Value::Path { .. }
+                    | Value::Map(_) => return Err(Error::TypeMismatch),
                 };
-                out.insert(key.clone(), prop);
+                out.insert(key, prop);
             }
             Ok(Value::Property(Property::Map(out)))
         }
@@ -5437,7 +5472,7 @@ fn type_order_prop(p: &Property) -> u8 {
 
 fn type_order_value(v: &Value) -> u8 {
     match v {
-        Value::Property(Property::Map(_)) => 1,
+        Value::Property(Property::Map(_)) | Value::Map(_) => 1,
         Value::Node(_) => 2,
         Value::Edge(_) => 3,
         Value::List(_) | Value::Property(Property::List(_)) => 4,
@@ -5522,6 +5557,19 @@ pub(crate) fn value_key(v: &Value) -> String {
                 out.push(',');
             }
             out.push(']');
+            out
+        }
+        Value::Map(m) => {
+            let mut keys: Vec<_> = m.keys().collect();
+            keys.sort();
+            let mut out = String::from("M:{");
+            for k in keys {
+                out.push_str(k);
+                out.push('=');
+                out.push_str(&value_key(&m[k]));
+                out.push(',');
+            }
+            out.push('}');
             out
         }
     }
