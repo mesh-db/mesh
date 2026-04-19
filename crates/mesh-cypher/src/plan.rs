@@ -2909,13 +2909,12 @@ fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarTy
             // `plan_match` already validated that *cross-scope*
             // transition; this path just preserves it so a later
             // same-pattern reuse still conflicts.
-            if hop.rel.var_length.is_some()
-                && matches!(out.get(var), Some(VarType::NonNode))
-            {
-                continue;
+            let is_edge_list_replay = hop.rel.var_length.is_some()
+                && matches!(out.get(var), Some(VarType::NonNode));
+            if !is_edge_list_replay {
+                check_var_type_conflict_allow_scalar(var, VarType::Edge, out)?;
+                out.insert(var.clone(), VarType::Edge);
             }
-            check_var_type_conflict_allow_scalar(var, VarType::Edge, out)?;
-            out.insert(var.clone(), VarType::Edge);
         }
         if let Some(var) = &hop.target.var {
             check_var_type_conflict_allow_scalar(var, VarType::Node, out)?;
