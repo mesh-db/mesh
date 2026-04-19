@@ -192,6 +192,25 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         body: Box<LogicalPlan>,
     },
+    /// Per-input-row left-join wrapper used by `apply_optional_match`
+    /// when the OPTIONAL MATCH body is a multi-hop pattern. Runs
+    /// `body` as a fresh sub-plan seeded with each outer row, then:
+    /// * if the body produces one or more rows, forwards each merged
+    ///   with the outer bindings (inner-join style, like
+    ///   `CallSubquery`);
+    /// * if the body produces zero rows, emits the outer row once
+    ///   with every variable in `null_vars` bound to `Value::Null`.
+    ///
+    /// Solves the "multi-hop OPTIONAL MATCH shouldn't null-fallback
+    /// per hop" problem: using per-hop OptionalEdgeExpand leaks
+    /// partial matches (b bound, c null) that openCypher forbids —
+    /// either the full pattern matches or the whole thing becomes
+    /// null.
+    OptionalApply {
+        input: Box<LogicalPlan>,
+        body: Box<LogicalPlan>,
+        null_vars: Vec<String>,
+    },
     /// Invocation of a registered procedure — `CALL ns.name[(args)]
     /// [YIELD cols]`. Distinct from [`LogicalPlan::CallSubquery`]
     /// (which runs a Cypher query body), a procedure call pulls
@@ -728,6 +747,16 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             buf.push_str(&format!("{indent}  input:\n"));
             format_plan_inner(input, buf, depth + 2);
         }
+        LogicalPlan::OptionalApply { input, body, null_vars } => {
+            buf.push_str(&format!(
+                "{indent}OptionalApply(nulls=[{}])\n",
+                null_vars.join(", ")
+            ));
+            buf.push_str(&format!("{indent}  body:\n"));
+            format_plan_inner(body, buf, depth + 2);
+            buf.push_str(&format!("{indent}  input:\n"));
+            format_plan_inner(input, buf, depth + 2);
+        }
         LogicalPlan::ProcedureCall {
             qualified_name,
             input,
@@ -1066,6 +1095,7 @@ where
         | LogicalPlan::MergeEdge { input, .. }
         | LogicalPlan::Foreach { input, .. }
         | LogicalPlan::CallSubquery { input, .. }
+        | LogicalPlan::OptionalApply { input, .. }
         | LogicalPlan::LoadCsv {
             input: Some(input), ..
         }
@@ -3636,6 +3666,66 @@ fn apply_optional_match(
         let mut working = pattern_ref.clone();
         if working.path_var.is_some() {
             ensure_path_bindings(&mut working, bound_vars.len())?;
+        }
+
+        // Collect every pattern-introduced variable up front —
+        // these are the ones a multi-hop failure needs to null out.
+        let mut new_pattern_vars: Vec<String> = Vec::new();
+        for hop in &working.hops {
+            if let Some(v) = &hop.rel.var {
+                if !bound_vars.contains_key(v) && !new_pattern_vars.contains(v) {
+                    new_pattern_vars.push(v.clone());
+                }
+            }
+            if let Some(v) = &hop.target.var {
+                if !bound_vars.contains_key(v) && !new_pattern_vars.contains(v) {
+                    new_pattern_vars.push(v.clone());
+                }
+            }
+        }
+        if let Some(pv) = &working.path_var {
+            if !bound_vars.contains_key(pv) && !new_pattern_vars.contains(pv) {
+                new_pattern_vars.push(pv.clone());
+            }
+        }
+
+        // Multi-hop patterns (or any hop chain longer than one)
+        // can't use per-hop OptionalEdgeExpand safely: each hop's
+        // null-fallback fires independently, leaking partial
+        // matches where only a prefix succeeded. Build the pattern
+        // as a non-optional chain seeded from the outer row, then
+        // wrap the whole thing in `OptionalApply` which runs the
+        // body per outer row and only emits the null fallback
+        // when the *whole* pattern matched zero rows.
+        if working.hops.len() > 1 {
+            // Seed the body with the outer row so the executor's
+            // per-row apply operator replays it; `SeedRow` is
+            // substituted for the actual row by `build_op_inner`'s
+            // `seed` parameter.
+            let body_seed: LogicalPlan = LogicalPlan::SeedRow;
+            let body = plan_pattern_from_bound(
+                body_seed,
+                &working,
+                0,
+                bound_vars,
+            )?;
+            for hop in &working.hops {
+                if let Some(v) = &hop.rel.var {
+                    bound_vars.insert(v.clone(), VarType::Edge);
+                }
+                if let Some(v) = &hop.target.var {
+                    bound_vars.insert(v.clone(), VarType::Node);
+                }
+            }
+            if let Some(pv) = &working.path_var {
+                bound_vars.insert(pv.clone(), VarType::Path);
+            }
+            plan = LogicalPlan::OptionalApply {
+                input: Box::new(plan),
+                body: Box::new(body),
+                null_vars: new_pattern_vars.clone(),
+            };
+            continue;
         }
 
         let mut current_var = start_var;

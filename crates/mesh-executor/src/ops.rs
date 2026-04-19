@@ -327,6 +327,15 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
         LogicalPlan::CallSubquery { input, body } => {
             Box::new(CallSubqueryOp::new(child!(input), (**body).clone()))
         }
+        LogicalPlan::OptionalApply {
+            input,
+            body,
+            null_vars,
+        } => Box::new(OptionalApplyOp::new(
+            child!(input),
+            (**body).clone(),
+            null_vars.clone(),
+        )),
         LogicalPlan::ProcedureCall {
             input,
             qualified_name,
@@ -1408,6 +1417,66 @@ impl Operator for CallSubqueryOp {
             }
             if results.is_empty() {
                 continue;
+            }
+            self.pending = results;
+            self.pending_idx = 0;
+        }
+    }
+}
+
+/// Per-input-row left-join driver (see
+/// `LogicalPlan::OptionalApply`). Replays `body_plan` once per
+/// outer row with the row as its seed; forwards all emitted rows
+/// merged with the outer bindings, and emits one null-fallback
+/// row (outer bindings plus `null_vars` bound to Null) only when
+/// the body produced zero rows for that input.
+struct OptionalApplyOp {
+    input: Box<dyn Operator>,
+    body_plan: LogicalPlan,
+    null_vars: Vec<String>,
+    pending: Vec<Row>,
+    pending_idx: usize,
+}
+
+impl OptionalApplyOp {
+    fn new(input: Box<dyn Operator>, body_plan: LogicalPlan, null_vars: Vec<String>) -> Self {
+        Self {
+            input,
+            body_plan,
+            null_vars,
+            pending: Vec::new(),
+            pending_idx: 0,
+        }
+    }
+}
+
+impl Operator for OptionalApplyOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        loop {
+            if self.pending_idx < self.pending.len() {
+                let row = self.pending[self.pending_idx].clone();
+                self.pending_idx += 1;
+                return Ok(Some(row));
+            }
+            let outer_row = match self.input.next(ctx)? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            let mut body_op = build_op_inner(&self.body_plan, Some(&outer_row));
+            let mut results = Vec::new();
+            while let Some(body_row) = body_op.next(ctx)? {
+                let mut merged = outer_row.clone();
+                for (k, v) in body_row {
+                    merged.insert(k, v);
+                }
+                results.push(merged);
+            }
+            if results.is_empty() {
+                let mut fallback = outer_row;
+                for v in &self.null_vars {
+                    fallback.insert(v.clone(), Value::Null);
+                }
+                return Ok(Some(fallback));
             }
             self.pending = results;
             self.pending_idx = 0;

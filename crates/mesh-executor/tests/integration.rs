@@ -2597,6 +2597,12 @@ fn optional_match_multi_hop_full_chain_matches() {
 
 #[test]
 fn optional_match_multi_hop_partial_chain_nulls_tail() {
+    // `OPTIONAL MATCH` has whole-pattern semantics: either every hop
+    // in the chain matches for a given outer row, or the entire
+    // pattern is treated as "no match" and the bindings introduced
+    // by the pattern all come out Null. A prefix like "KNOWS exists
+    // but no WORKS_AT follows" is NOT treated as a partial match —
+    // it's just a miss, and `f` / `c` both end up Null.
     let (store, _d) = open_store();
     run(&store, "CREATE (:Person {name: 'Ada'})");
     run(&store, "CREATE (:Person {name: 'Bob'})");
@@ -2608,11 +2614,14 @@ fn optional_match_multi_hop_partial_chain_nulls_tail() {
         &store,
         "MATCH (a:Person {name: 'Ada'}) \
          OPTIONAL MATCH (a)-[:KNOWS]->(f)-[:WORKS_AT]->(c) \
-         RETURN a.name AS a, f.name AS f, c IS NULL AS c_null",
+         RETURN a.name AS a, f IS NULL AS f_null, c IS NULL AS c_null",
     );
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "a"), "Ada");
-    assert_eq!(str_prop(&rows[0], "f"), "Bob");
+    match rows[0].get("f_null") {
+        Some(Value::Property(Property::Bool(b))) => assert!(b),
+        other => panic!("expected true, got: {other:?}"),
+    }
     match rows[0].get("c_null") {
         Some(Value::Property(Property::Bool(b))) => assert!(b),
         other => panic!("expected true, got: {other:?}"),
