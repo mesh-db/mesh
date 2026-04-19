@@ -55,3 +55,14 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets
+
+      - name: Run full openCypher TCK
+        # The default mesh-tck invocation above only runs Match1.feature
+        # (the smoke-test fixture). This step points TCK_FEATURES at the
+        # whole vendored feature directory so every scenario in the TCK
+        # gets exercised. Release mode keeps the run under a minute
+        # (debug-mode the pest-generated parser hits its ~2MB thread
+        # stack on deeper expressions).
+        env:
+          TCK_FEATURES: ${{ github.workspace }}/tck/opencypher/tck/features
+        run: cargo test --release -p mesh-tck --test tck

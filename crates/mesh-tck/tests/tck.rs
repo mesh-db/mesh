@@ -1345,15 +1345,22 @@ fn main() {
         "../../tck/opencypher/tck/features/clauses/match/Match1.feature".to_string()
     });
 
-    // Use a thread with a larger stack to handle deeply nested expressions
-    // (e.g. 20-deep nested list literals) without stack overflow.
+    // `run(...)` returns the `Cucumber` writer but doesn't
+    // propagate pass/fail into the process exit code. CI needs
+    // a non-zero exit when any scenario fails, so swap to
+    // `run_and_exit` which prints the summary and calls
+    // `std::process::exit(1)` on failure.
+    //
+    // Use a thread with a larger stack to handle deeply nested
+    // expressions (e.g. 20-deep nested list literals) without
+    // stack overflow.
     let builder = std::thread::Builder::new().stack_size(64 * 1024 * 1024);
     let handle = builder
         .spawn(move || {
             futures::executor::block_on(
                 MeshWorld::cucumber()
                     .max_concurrent_scenarios(1)
-                    .run(features),
+                    .run_and_exit(features),
             );
         })
         .expect("failed to spawn test thread");
