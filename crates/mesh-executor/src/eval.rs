@@ -339,11 +339,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 let mut scratch = ctx.row.clone();
                 scratch.insert(var.clone(), item.clone());
                 let sub_ctx = ctx.with_row(&scratch);
-                let v = match eval_expr(predicate, &sub_ctx) {
-                    Ok(v) => v,
-                    Err(Error::TypeMismatch) | Err(Error::NotBoolean) => Value::Null,
-                    Err(e) => return Err(e),
-                };
+                let v = eval_expr(predicate, &sub_ctx)?;
                 match to_bool_3v(&v).unwrap_or(None) {
                     Some(true) => {
                         true_count += 1;
@@ -661,11 +657,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::BinaryOp { op, left, right } => {
             let l = eval_expr(left, ctx)?;
             let r = eval_expr(right, ctx)?;
-            match eval_binary_op(*op, l, r) {
-                Ok(v) => Ok(v),
-                Err(Error::TypeMismatch) => Ok(Value::Null),
-                Err(e) => Err(e),
-            }
+            eval_binary_op(*op, l, r)
         }
         Expr::UnaryOp { op, operand } => {
             let v = eval_expr(operand, ctx)?;
