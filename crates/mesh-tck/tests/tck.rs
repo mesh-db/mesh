@@ -2,8 +2,8 @@ use cucumber::{given, then, when, World};
 use mesh_core::Property;
 use mesh_cypher::{parse, plan};
 use mesh_executor::{
-    execute_with_reader_and_procs, ProcArgSpec, ProcOutSpec, ProcRow, ProcType, Procedure,
-    ProcedureRegistry, ParamMap, Row, Value,
+    execute_with_reader_and_procs, ParamMap, ProcArgSpec, ProcOutSpec, ProcRow, ProcType,
+    Procedure, ProcedureRegistry, Row, Value,
 };
 use mesh_storage::RocksDbStorageEngine;
 use std::collections::HashMap;
@@ -200,11 +200,7 @@ fn given_parameters(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
 /// executor's `row_matches` logic can filter by input arguments
 /// and project output columns.
 #[given(regex = r"^there exists a procedure (.+)$")]
-fn given_procedure(
-    world: &mut MeshWorld,
-    step: &cucumber::gherkin::Step,
-    signature: String,
-) {
+fn given_procedure(world: &mut MeshWorld, step: &cucumber::gherkin::Step, signature: String) {
     let (name, inputs_raw, outputs_raw) = match parse_proc_signature(&signature) {
         Some(parts) => parts,
         None => {
@@ -364,9 +360,7 @@ fn normalize_labels(s: &str) -> String {
             let mut j = i + 1;
             while j < chars.len()
                 && chars[j] != ')'
-                && !(chars[j] == ' '
-                    && j + 1 < chars.len()
-                    && chars[j + 1] == '{')
+                && !(chars[j] == ' ' && j + 1 < chars.len() && chars[j + 1] == '{')
             {
                 j += 1;
             }
@@ -679,7 +673,11 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
         .map(|row| {
             headers
                 .iter()
-                .map(|h| normalize_map_keys(&normalize_labels(&normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null))))))
+                .map(|h| {
+                    normalize_map_keys(&normalize_labels(&normalize_tck(&format_value(
+                        row.get(*h).unwrap_or(&Value::Null),
+                    ))))
+                })
                 .collect()
         })
         .collect();
@@ -687,7 +685,11 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
 
     let mut expected_sorted: Vec<Vec<String>> = expected_rows
         .iter()
-        .map(|row| row.iter().map(|s| normalize_map_keys(&normalize_labels(&normalize_tck(s)))).collect())
+        .map(|row| {
+            row.iter()
+                .map(|s| normalize_map_keys(&normalize_labels(&normalize_tck(s))))
+                .collect()
+        })
         .collect();
     expected_sorted.sort();
 
@@ -807,14 +809,22 @@ fn then_result_in_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
         .map(|row| {
             headers
                 .iter()
-                .map(|h| normalize_map_keys(&normalize_labels(&normalize_tck(&format_value(row.get(*h).unwrap_or(&Value::Null))))))
+                .map(|h| {
+                    normalize_map_keys(&normalize_labels(&normalize_tck(&format_value(
+                        row.get(*h).unwrap_or(&Value::Null),
+                    ))))
+                })
                 .collect()
         })
         .collect();
 
     let expected_normalized: Vec<Vec<String>> = expected_rows
         .iter()
-        .map(|row| row.iter().map(|s| normalize_map_keys(&normalize_labels(&normalize_tck(s)))).collect())
+        .map(|row| {
+            row.iter()
+                .map(|s| normalize_map_keys(&normalize_labels(&normalize_tck(s))))
+                .collect()
+        })
         .collect();
 
     assert_eq!(
@@ -944,8 +954,7 @@ fn format_property(p: &Property) -> String {
                 let s = format!("{f}");
                 // Use scientific notation for very large or very small values
                 // but not for moderately small values like 0.00001
-                let needs_sci = (f.abs() >= 1e15
-                    || (f.abs() > 0.0 && f.abs() < 1e-15))
+                let needs_sci = (f.abs() >= 1e15 || (f.abs() > 0.0 && f.abs() < 1e-15))
                     && !s.contains('e')
                     && !s.contains('E');
                 if needs_sci {
@@ -1032,7 +1041,10 @@ fn format_property(p: &Property) -> String {
         Property::Duration(d) => {
             format!("'{}'", format_iso_duration(d))
         }
-        Property::Time { nanos, tz_offset_secs } => {
+        Property::Time {
+            nanos,
+            tz_offset_secs,
+        } => {
             let total_secs = nanos / 1_000_000_000;
             let h = total_secs / 3600;
             let m = (total_secs % 3600) / 60;

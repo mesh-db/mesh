@@ -141,9 +141,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     nanos,
                     tz_offset_secs,
                 }) => Ok(time_accessor(*nanos, *tz_offset_secs, key)),
-                Value::Property(Property::Duration(ref dur)) => {
-                    Ok(duration_accessor(dur, key))
-                }
+                Value::Property(Property::Duration(ref dur)) => Ok(duration_accessor(dur, key)),
                 // Accessing a property on something that isn't a
                 // container (map, node, edge, temporal) is a type
                 // error — openCypher raises `InvalidArgumentType`
@@ -198,9 +196,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     nanos,
                     tz_offset_secs,
                 }) => Ok(time_accessor(nanos, tz_offset_secs, key)),
-                Value::Property(Property::Duration(ref dur)) => {
-                    Ok(duration_accessor(dur, key))
-                }
+                Value::Property(Property::Duration(ref dur)) => Ok(duration_accessor(dur, key)),
                 // Same rule as `Expr::Property` above — `.key` on a
                 // non-container is a type error, not null.
                 _ => Err(Error::TypeMismatch),
@@ -608,10 +604,9 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     }
                     // Same guard — `contains_graph` is false here
                     // so these shouldn't happen.
-                    Value::Node(_)
-                    | Value::Edge(_)
-                    | Value::Path { .. }
-                    | Value::Map(_) => return Err(Error::TypeMismatch),
+                    Value::Node(_) | Value::Edge(_) | Value::Path { .. } | Value::Map(_) => {
+                        return Err(Error::TypeMismatch)
+                    }
                 };
                 out.insert(key, prop);
             }
@@ -771,12 +766,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             pattern,
             predicate,
             projection,
-        } => pattern_comprehension_eval(
-            pattern,
-            predicate.as_deref(),
-            projection,
-            ctx,
-        ),
+        } => pattern_comprehension_eval(pattern, predicate.as_deref(), projection, ctx),
     }
 }
 
@@ -1099,8 +1089,8 @@ fn pattern_comprehension_eval(
     // The last two track path reconstruction so `[p = (n)-->() | p]`
     // can bind `p` to a `Value::Path` and `length(p)` in WHERE /
     // projection works.
-    use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
     use mesh_core::EdgeId;
+    use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
     type FrontierEntry = (
         NodeId,
         StdHashSet<EdgeId>,
@@ -1672,11 +1662,14 @@ fn parse_datetime_with_tz(s: &str) -> Result<(i128, Option<i32>, Option<String>)
     // positions 4 and 7 (`YYYY-MM-DD`) must not be misread as an
     // offset, so look only past the `T` that separates date from time.
     let has_tz_marker = trimmed.ends_with('Z')
-        || trimmed.find('T').and_then(|t_idx| {
-            trimmed[t_idx..]
-                .rfind(|c: char| c == '+' || c == '-')
-                .map(|i| i > 0)
-        }).unwrap_or(false);
+        || trimmed
+            .find('T')
+            .and_then(|t_idx| {
+                trimmed[t_idx..]
+                    .rfind(|c: char| c == '+' || c == '-')
+                    .map(|i| i > 0)
+            })
+            .unwrap_or(false);
     let finalise = |nanos: i128, tz: Option<i32>| {
         if let Some(name) = tz_name.as_deref() {
             // If the string already carried an explicit offset (e.g.
@@ -2024,7 +2017,9 @@ fn parse_tz_name_local(s: &str, local_nanos: i128) -> Option<(i32, String)> {
     let secs = local_nanos.div_euclid(1_000_000_000) as i64;
     let nsec = local_nanos.rem_euclid(1_000_000_000) as u32;
     let naive = chrono::DateTime::from_timestamp(secs, nsec)?.naive_utc();
-    let resolved = tz.from_local_datetime(&naive).earliest()
+    let resolved = tz
+        .from_local_datetime(&naive)
+        .earliest()
         .or_else(|| tz.from_local_datetime(&naive).latest())?;
     let offset = resolved.offset().fix().local_minus_utc();
     Some((offset, tz.name().to_string()))
@@ -2158,14 +2153,28 @@ fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
     // `P12Y5M-14D` also contain `-`, so we need the stronger check.
     let is_calendar_form = {
         let segs: Vec<&str> = date_part.split('-').collect();
-        segs.len() == 3 && segs.iter().all(|s| !s.is_empty()
-            && s.chars().all(|c| c.is_ascii_digit()))
+        segs.len() == 3
+            && segs
+                .iter()
+                .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
     };
     if is_calendar_form {
         let mut d_iter = date_part.split('-');
-        let y = d_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
-        let mo = d_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
-        let d = d_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
+        let y = d_iter
+            .next()
+            .ok_or_else(bad)?
+            .parse::<i64>()
+            .map_err(|_| bad())?;
+        let mo = d_iter
+            .next()
+            .ok_or_else(bad)?
+            .parse::<i64>()
+            .map_err(|_| bad())?;
+        let d = d_iter
+            .next()
+            .ok_or_else(bad)?
+            .parse::<i64>()
+            .map_err(|_| bad())?;
         if d_iter.next().is_some() {
             return Err(bad());
         }
@@ -2175,8 +2184,16 @@ fn parse_iso_duration(s: &str) -> Result<mesh_core::Duration> {
         let mut nanos = 0_i32;
         if let Some(time) = time_part {
             let mut t_iter = time.split(':');
-            let hh = t_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
-            let mm = t_iter.next().ok_or_else(bad)?.parse::<i64>().map_err(|_| bad())?;
+            let hh = t_iter
+                .next()
+                .ok_or_else(bad)?
+                .parse::<i64>()
+                .map_err(|_| bad())?;
+            let mm = t_iter
+                .next()
+                .ok_or_else(bad)?
+                .parse::<i64>()
+                .map_err(|_| bad())?;
             let ss_raw = t_iter.next().ok_or_else(bad)?;
             if t_iter.next().is_some() {
                 return Err(bad());
@@ -2492,13 +2509,7 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
             tz_offset_secs: *tz,
             tz_name: name.clone(),
         }))),
-        (
-            BinaryOp::Sub,
-            DateTime {
-                nanos: a, ..
-            },
-            DateTime { nanos: b, .. },
-        )
+        (BinaryOp::Sub, DateTime { nanos: a, .. }, DateTime { nanos: b, .. })
         | (BinaryOp::Sub, LocalDateTime(a), LocalDateTime(b)) => {
             let diff_ns = a.wrapping_sub(*b);
             Some(Ok(Value::Property(Dur(mesh_core::Duration {
@@ -2509,10 +2520,11 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
             }))))
         }
         // LocalDateTime + Duration
-        (BinaryOp::Add, LocalDateTime(ns), Dur(d))
-        | (BinaryOp::Add, Dur(d), LocalDateTime(ns)) => Some(Ok(Value::Property(
-            LocalDateTime(datetime_add_duration(*ns, *d)),
-        ))),
+        (BinaryOp::Add, LocalDateTime(ns), Dur(d)) | (BinaryOp::Add, Dur(d), LocalDateTime(ns)) => {
+            Some(Ok(Value::Property(LocalDateTime(datetime_add_duration(
+                *ns, *d,
+            )))))
+        }
         (BinaryOp::Sub, LocalDateTime(ns), Dur(d)) => Some(Ok(Value::Property(LocalDateTime(
             datetime_add_duration(*ns, negate_duration(*d)),
         )))),
@@ -2606,7 +2618,10 @@ fn eval_temporal_binary_op(op: BinaryOp, left: &Value, right: &Value) -> Option<
             if *n == 0 {
                 return Some(Err(Error::DivideByZero));
             }
-            Some(Ok(Value::Property(Dur(scale_duration(*d, 1.0 / (*n as f64))))))
+            Some(Ok(Value::Property(Dur(scale_duration(
+                *d,
+                1.0 / (*n as f64),
+            )))))
         }
         (BinaryOp::Div, Dur(d), Property::Float64(n)) => {
             if *n == 0.0 {
@@ -2630,14 +2645,13 @@ fn scale_duration(d: mesh_core::Duration, factor: f64) -> mesh_core::Duration {
     // into days+sub-day seconds below.
     let scaled_months = d.months as f64 * factor;
     let whole_months = scaled_months.trunc() as i64;
-    let frac_month_ns = ((scaled_months - whole_months as f64) * SECS_PER_MONTH * 1e9)
-        .round() as i128;
+    let frac_month_ns =
+        ((scaled_months - whole_months as f64) * SECS_PER_MONTH * 1e9).round() as i128;
 
     // Scaled days: whole goes to `days`, fractional cascades too.
     let scaled_days = d.days as f64 * factor;
     let whole_days = scaled_days.trunc() as i64;
-    let frac_day_ns = ((scaled_days - whole_days as f64) * (DAY_SECS as f64) * 1e9)
-        .round() as i128;
+    let frac_day_ns = ((scaled_days - whole_days as f64) * (DAY_SECS as f64) * 1e9).round() as i128;
 
     // Sub-day: scale seconds+nanos independently so a nanosecond
     // that doesn't cleanly divide (1 * 0.5 = 0.5) gets truncated
@@ -2678,11 +2692,7 @@ fn scale_duration(d: mesh_core::Duration, factor: f64) -> mesh_core::Duration {
 /// Add a Duration to a Time value, wrapping mod 24h. Sub-day
 /// components only — month/day components are silently dropped
 /// because Time has no calendar.
-fn time_add_duration(
-    nanos: i64,
-    tz_offset_secs: Option<i32>,
-    d: mesh_core::Duration,
-) -> Property {
+fn time_add_duration(nanos: i64, tz_offset_secs: Option<i32>, d: mesh_core::Duration) -> Property {
     let nanos_per_day: i64 = 86_400_000_000_000;
     let tod = (d.seconds as i128) * 1_000_000_000 + (d.nanos as i128);
     let new_nanos = ((nanos as i128 + tod).rem_euclid(nanos_per_day as i128)) as i64;
@@ -2711,9 +2721,8 @@ fn datetime_add_duration(epoch_nanos: i128, d: mesh_core::Duration) -> i128 {
     // Apply days, seconds, nanos
     let final_date = after_months + chrono::Duration::days(d.days);
     let new_days = final_date.signed_duration_since(epoch).num_days() as i128;
-    let new_time_of_day = time_of_day_ns
-        + (d.seconds as i128).saturating_mul(1_000_000_000)
-        + (d.nanos as i128);
+    let new_time_of_day =
+        time_of_day_ns + (d.seconds as i128).saturating_mul(1_000_000_000) + (d.nanos as i128);
     new_days
         .saturating_mul(nanos_per_day)
         .saturating_add(new_time_of_day)
@@ -2738,8 +2747,7 @@ fn date_add_duration(days: i64, d: mesh_core::Duration) -> Result<Value> {
     // or more) still cascades. Matches Neo4j's date+duration rules.
     let seconds_day_carry = (d.seconds as i64) / 86_400;
     let new_date = add_months_to_date(base, d.months);
-    let final_date = new_date
-        + chrono::Duration::days(d.days.wrapping_add(seconds_day_carry));
+    let final_date = new_date + chrono::Duration::days(d.days.wrapping_add(seconds_day_carry));
     let new_days = final_date.signed_duration_since(epoch).num_days();
     Ok(Value::Property(Property::Date(new_days)))
 }
@@ -2755,8 +2763,7 @@ fn add_months_to_date(date: chrono::NaiveDate, months: i64) -> chrono::NaiveDate
     // Day clamping: Jan 31 + 1 month = Feb 28/29
     let days_in_new_month = days_in_month(new_year, new_month);
     let day = date.day().min(days_in_new_month);
-    chrono::NaiveDate::from_ymd_opt(new_year, new_month, day)
-        .unwrap_or(date)
+    chrono::NaiveDate::from_ymd_opt(new_year, new_month, day).unwrap_or(date)
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
@@ -3514,152 +3521,157 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 }
             };
             match arg_exprs.len() {
-            0 => Ok(wrap(now_epoch_nanos(), Some(0), None)),
-            1 => {
-                let v = eval_expr(&arg_exprs[0], ctx)?;
-                match v {
-                    Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
-                    Value::Property(Property::String(s)) => {
-                        let (ns, tz, tz_name) = parse_datetime_with_tz(&s)?;
-                        Ok(wrap(ns, tz, tz_name))
-                    }
-                    Value::Property(Property::Map(m)) => {
-                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                        // Extract base date and time-of-day from any temporal-typed value
-                        let (base_date, base_tod_ns) = extract_base_date_tod(&m, &epoch);
-                        let has_base = base_date.is_some();
-                        let base = base_date.unwrap_or(epoch);
+                0 => Ok(wrap(now_epoch_nanos(), Some(0), None)),
+                1 => {
+                    let v = eval_expr(&arg_exprs[0], ctx)?;
+                    match v {
+                        Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                        Value::Property(Property::String(s)) => {
+                            let (ns, tz, tz_name) = parse_datetime_with_tz(&s)?;
+                            Ok(wrap(ns, tz, tz_name))
+                        }
+                        Value::Property(Property::Map(m)) => {
+                            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                            // Extract base date and time-of-day from any temporal-typed value
+                            let (base_date, base_tod_ns) = extract_base_date_tod(&m, &epoch);
+                            let has_base = base_date.is_some();
+                            let base = base_date.unwrap_or(epoch);
 
-                        // Build date part
-                        let target_date = build_date_from_map(&m, base, has_base);
-                        let days_since_epoch = target_date.signed_duration_since(epoch).num_days();
+                            // Build date part
+                            let target_date = build_date_from_map(&m, base, has_base);
+                            let days_since_epoch =
+                                target_date.signed_duration_since(epoch).num_days();
 
-                        // Time-of-day: use explicit fields or inherit from base
-                        let base_hour = (base_tod_ns / 3_600_000_000_000) as i64;
-                        let base_min = ((base_tod_ns % 3_600_000_000_000) / 60_000_000_000) as i64;
-                        let base_sec = ((base_tod_ns % 60_000_000_000) / 1_000_000_000) as i64;
-                        let base_ns = (base_tod_ns % 1_000_000_000) as i64;
+                            // Time-of-day: use explicit fields or inherit from base
+                            let base_hour = (base_tod_ns / 3_600_000_000_000) as i64;
+                            let base_min =
+                                ((base_tod_ns % 3_600_000_000_000) / 60_000_000_000) as i64;
+                            let base_sec = ((base_tod_ns % 60_000_000_000) / 1_000_000_000) as i64;
+                            let base_ns = (base_tod_ns % 1_000_000_000) as i64;
 
-                        // Neo4j semantics: when a time-carrying base (datetime/time)
-                        // is given, missing time fields inherit from the base. When
-                        // no base is given, missing time fields default to 0.
-                        let has_time_base = m.contains_key("datetime")
-                            || m.contains_key("localdatetime")
-                            || m.contains_key("time");
-                        let default_tod = |base_val: i64| {
-                            if has_time_base {
-                                base_val
+                            // Neo4j semantics: when a time-carrying base (datetime/time)
+                            // is given, missing time fields inherit from the base. When
+                            // no base is given, missing time fields default to 0.
+                            let has_time_base = m.contains_key("datetime")
+                                || m.contains_key("localdatetime")
+                                || m.contains_key("time");
+                            let default_tod = |base_val: i64| {
+                                if has_time_base {
+                                    base_val
+                                } else {
+                                    0
+                                }
+                            };
+                            let hour =
+                                map_int(&m, "hour").unwrap_or_else(|| default_tod(base_hour));
+                            let minute =
+                                map_int(&m, "minute").unwrap_or_else(|| default_tod(base_min));
+                            let second =
+                                map_int(&m, "second").unwrap_or_else(|| default_tod(base_sec));
+                            // ms/us/ns combine: each is the appropriate order of
+                            // magnitude's contribution to sub-second nanoseconds.
+                            // Absent fields fall back to base. Present fields
+                            // add up.
+                            let has_any_sub = m.contains_key("millisecond")
+                                || m.contains_key("microsecond")
+                                || m.contains_key("nanosecond");
+                            let nanos = if has_any_sub {
+                                map_int(&m, "millisecond").unwrap_or(0) * 1_000_000
+                                    + map_int(&m, "microsecond").unwrap_or(0) * 1_000
+                                    + map_int(&m, "nanosecond").unwrap_or(0)
                             } else {
-                                0
-                            }
-                        };
-                        let hour = map_int(&m, "hour").unwrap_or_else(|| default_tod(base_hour));
-                        let minute = map_int(&m, "minute").unwrap_or_else(|| default_tod(base_min));
-                        let second = map_int(&m, "second").unwrap_or_else(|| default_tod(base_sec));
-                        // ms/us/ns combine: each is the appropriate order of
-                        // magnitude's contribution to sub-second nanoseconds.
-                        // Absent fields fall back to base. Present fields
-                        // add up.
-                        let has_any_sub = m.contains_key("millisecond")
-                            || m.contains_key("microsecond")
-                            || m.contains_key("nanosecond");
-                        let nanos = if has_any_sub {
-                            map_int(&m, "millisecond").unwrap_or(0) * 1_000_000
-                                + map_int(&m, "microsecond").unwrap_or(0) * 1_000
-                                + map_int(&m, "nanosecond").unwrap_or(0)
-                        } else {
-                            default_tod(base_ns)
-                        };
-                        let mut local_nanos: i128 = (days_since_epoch as i128) * 86_400_000_000_000
-                            + (hour as i128) * 3_600_000_000_000
-                            + (minute as i128) * 60_000_000_000
-                            + (second as i128) * 1_000_000_000
-                            + (nanos as i128);
-                        // Pull timezone from the map (string offset or
-                        // named region) or inherit from a base
-                        // datetime/time. For datetime() (not localdatetime())
-                        // we default to UTC when nothing else is specified.
-                        let (tz_offset, tz_name_opt) = if is_local {
-                            (None, None)
-                        } else {
-                            match extract_tz_spec(&m, Some(local_nanos)) {
-                                Some((off, name)) => (Some(off), name),
-                                None => (Some(0), None),
-                            }
-                        };
-                        // If we inherited a zone *name*, re-resolve
-                        // its offset against the new local wall-clock.
-                        // Without this, projecting a datetime from
-                        // Oct to March would keep the original Oct
-                        // offset (+01:00) rather than moving to the
-                        // DST-correct one (+02:00).
-                        let (tz_offset, tz_name_opt) = if let Some(name) = &tz_name_opt {
-                            match parse_tz_name_local(name, local_nanos) {
-                                Some((off, canonical)) => (Some(off), Some(canonical)),
-                                None => (tz_offset, tz_name_opt),
-                            }
-                        } else {
-                            (tz_offset, tz_name_opt)
-                        };
-                        // If the map *explicitly* supplied a timezone
-                        // alongside a zoned base value, we rotate the
-                        // wall-clock to the new zone — the same instant
-                        // gets a new local representation. (Without an
-                        // explicit override we just reuse the base's
-                        // tod, so nothing to rotate.)
-                        if !is_local && m.contains_key("timezone") {
-                            if let Some(base_off) = base_tz_offset(&m, local_nanos) {
-                                if let Some(new_off) = tz_offset {
-                                    let shift = (new_off - base_off) as i128 * 1_000_000_000;
-                                    local_nanos += shift;
+                                default_tod(base_ns)
+                            };
+                            let mut local_nanos: i128 = (days_since_epoch as i128)
+                                * 86_400_000_000_000
+                                + (hour as i128) * 3_600_000_000_000
+                                + (minute as i128) * 60_000_000_000
+                                + (second as i128) * 1_000_000_000
+                                + (nanos as i128);
+                            // Pull timezone from the map (string offset or
+                            // named region) or inherit from a base
+                            // datetime/time. For datetime() (not localdatetime())
+                            // we default to UTC when nothing else is specified.
+                            let (tz_offset, tz_name_opt) = if is_local {
+                                (None, None)
+                            } else {
+                                match extract_tz_spec(&m, Some(local_nanos)) {
+                                    Some((off, name)) => (Some(off), name),
+                                    None => (Some(0), None),
+                                }
+                            };
+                            // If we inherited a zone *name*, re-resolve
+                            // its offset against the new local wall-clock.
+                            // Without this, projecting a datetime from
+                            // Oct to March would keep the original Oct
+                            // offset (+01:00) rather than moving to the
+                            // DST-correct one (+02:00).
+                            let (tz_offset, tz_name_opt) = if let Some(name) = &tz_name_opt {
+                                match parse_tz_name_local(name, local_nanos) {
+                                    Some((off, canonical)) => (Some(off), Some(canonical)),
+                                    None => (tz_offset, tz_name_opt),
+                                }
+                            } else {
+                                (tz_offset, tz_name_opt)
+                            };
+                            // If the map *explicitly* supplied a timezone
+                            // alongside a zoned base value, we rotate the
+                            // wall-clock to the new zone — the same instant
+                            // gets a new local representation. (Without an
+                            // explicit override we just reuse the base's
+                            // tod, so nothing to rotate.)
+                            if !is_local && m.contains_key("timezone") {
+                                if let Some(base_off) = base_tz_offset(&m, local_nanos) {
+                                    if let Some(new_off) = tz_offset {
+                                        let shift = (new_off - base_off) as i128 * 1_000_000_000;
+                                        local_nanos += shift;
+                                    }
                                 }
                             }
-                        }
-                        // Time components in the map are *local* to the
-                        // given zone (Neo4j convention). Shift them back
-                        // to UTC so the stored `nanos` is always UTC.
-                        let epoch_nanos = match tz_offset {
-                            Some(offset) => local_nanos - (offset as i128) * 1_000_000_000,
-                            None => local_nanos,
-                        };
-                        Ok(wrap(epoch_nanos, tz_offset, tz_name_opt))
-                    }
-                    // datetime(other_temporal) — project from another
-                    // temporal. Date: promote to midnight of that day.
-                    // LocalDateTime: identity for localdatetime(),
-                    // wrapped with UTC for datetime().
-                    // DateTime: identity for datetime(), strip offset
-                    // for localdatetime().
-                    Value::Property(Property::Date(days)) => {
-                        let ns = (days as i128) * 86_400_000_000_000;
-                        Ok(wrap(ns, Some(0), None))
-                    }
-                    Value::Property(Property::LocalDateTime(ns)) => {
-                        Ok(wrap(ns, Some(0), None))
-                    }
-                    Value::Property(Property::DateTime {
-                        nanos,
-                        tz_offset_secs,
-                        tz_name,
-                    }) => {
-                        if is_local {
-                            // Strip to local wall-clock nanos.
-                            let local = match tz_offset_secs {
-                                Some(off) => nanos + (off as i128) * 1_000_000_000,
-                                None => nanos,
+                            // Time components in the map are *local* to the
+                            // given zone (Neo4j convention). Shift them back
+                            // to UTC so the stored `nanos` is always UTC.
+                            let epoch_nanos = match tz_offset {
+                                Some(offset) => local_nanos - (offset as i128) * 1_000_000_000,
+                                None => local_nanos,
                             };
-                            Ok(wrap(local, None, None))
-                        } else {
-                            Ok(wrap(nanos, tz_offset_secs.or(Some(0)), tz_name))
+                            Ok(wrap(epoch_nanos, tz_offset, tz_name_opt))
                         }
+                        // datetime(other_temporal) — project from another
+                        // temporal. Date: promote to midnight of that day.
+                        // LocalDateTime: identity for localdatetime(),
+                        // wrapped with UTC for datetime().
+                        // DateTime: identity for datetime(), strip offset
+                        // for localdatetime().
+                        Value::Property(Property::Date(days)) => {
+                            let ns = (days as i128) * 86_400_000_000_000;
+                            Ok(wrap(ns, Some(0), None))
+                        }
+                        Value::Property(Property::LocalDateTime(ns)) => Ok(wrap(ns, Some(0), None)),
+                        Value::Property(Property::DateTime {
+                            nanos,
+                            tz_offset_secs,
+                            tz_name,
+                        }) => {
+                            if is_local {
+                                // Strip to local wall-clock nanos.
+                                let local = match tz_offset_secs {
+                                    Some(off) => nanos + (off as i128) * 1_000_000_000,
+                                    None => nanos,
+                                };
+                                Ok(wrap(local, None, None))
+                            } else {
+                                Ok(wrap(nanos, tz_offset_secs.or(Some(0)), tz_name))
+                            }
+                        }
+                        _ => Err(Error::TypeMismatch),
                     }
-                    _ => Err(Error::TypeMismatch),
                 }
+                _ => Err(Error::UnknownScalarFunction(
+                    "datetime() takes zero or one argument".into(),
+                )),
             }
-            _ => Err(Error::UnknownScalarFunction(
-                "datetime() takes zero or one argument".into(),
-            )),
-        }},
+        }
         "date" => match arg_exprs.len() {
             0 => {
                 let days = now_epoch_nanos().div_euclid(86_400_000_000_000) as i64;
@@ -3717,205 +3729,207 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         "time" | "localtime" => {
             let is_tz = name == "time";
             match arg_exprs.len() {
-            0 => {
-                let time_nanos = (now_epoch_nanos() % 86_400_000_000_000) as i64;
-                Ok(Value::Property(Property::Time {
-                    nanos: time_nanos,
-                    tz_offset_secs: if is_tz { Some(0) } else { None },
-                }))
-            }
-            1 => {
-                let v = eval_expr(&arg_exprs[0], ctx)?;
-                match v {
-                    Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
-                    Value::Property(Property::Map(m)) => {
-                        // Extract base time-of-day from ANY temporal value under
-                        // any of the temporal-source keys (time, datetime,
-                        // localdatetime). TCK tests pass e.g. a LocalDateTime
-                        // value under the "time" key to mean "use this value's
-                        // time-of-day", so we can't assume the key name matches
-                        // the value type.
-                        let base_tod: i64 = {
-                            let mut tod = 0i64;
-                            for key in ["time", "datetime", "localdatetime"] {
-                                match m.get(key) {
-                                    Some(Property::Time { nanos, .. }) => {
-                                        tod = *nanos;
-                                        break;
-                                    }
-                                    Some(Property::DateTime {
-                                        nanos: ns,
-                                        tz_offset_secs,        tz_name: _,
-
-                                    }) => {
-                                        // DateTime's nanos are UTC; the
-                                        // "base time-of-day" we inherit
-                                        // is the *local* wall-clock tod.
-                                        let local = match tz_offset_secs {
-                                            Some(off) => {
-                                                *ns + (*off as i128) * 1_000_000_000
-                                            }
-                                            None => *ns,
-                                        };
-                                        tod = local.rem_euclid(86_400_000_000_000) as i64;
-                                        break;
-                                    }
-                                    Some(Property::LocalDateTime(ns)) => {
-                                        tod = ns.rem_euclid(86_400_000_000_000) as i64;
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            tod
-                        };
-                        let base_h = base_tod / 3_600_000_000_000;
-                        let base_min = (base_tod % 3_600_000_000_000) / 60_000_000_000;
-                        let base_sec = (base_tod % 60_000_000_000) / 1_000_000_000;
-                        let base_ns = base_tod % 1_000_000_000;
-
-                        let has_any_base = m.contains_key("time") || m.contains_key("datetime")
-                            || m.contains_key("localdatetime");
-                        let default_tod = |b: i64| if has_any_base { b } else { 0 };
-
-                        let hour = map_int(&m, "hour").unwrap_or_else(|| default_tod(base_h));
-                        let minute = map_int(&m, "minute").unwrap_or_else(|| default_tod(base_min));
-                        let second = map_int(&m, "second").unwrap_or_else(|| default_tod(base_sec));
-                        // ms/us/ns combine: each is the appropriate order of
-                        // magnitude's contribution to sub-second nanoseconds.
-                        // Absent fields fall back to base. Present fields
-                        // add up.
-                        let has_any_sub = m.contains_key("millisecond")
-                            || m.contains_key("microsecond")
-                            || m.contains_key("nanosecond");
-                        let nanos = if has_any_sub {
-                            map_int(&m, "millisecond").unwrap_or(0) * 1_000_000
-                                + map_int(&m, "microsecond").unwrap_or(0) * 1_000
-                                + map_int(&m, "nanosecond").unwrap_or(0)
-                        } else {
-                            default_tod(base_ns)
-                        };
-                        let time_nanos =
-                            hour * 3_600_000_000_000 + minute * 60_000_000_000
-                            + second * 1_000_000_000 + nanos;
-                        // Timezone: explicit `timezone:` in the map
-                        // wins. If absent, inherit from the base
-                        // temporal value (time() / datetime() under
-                        // any key). Otherwise default to UTC for
-                        // time(), or None for localtime().
-                        let tz_offset = if is_tz {
-                            extract_tz_offset(&m).or(Some(0))
-                        } else {
-                            None
-                        };
-                        // If the map supplies a timezone override
-                        // but carries a zoned base value, Neo4j
-                        // *rotates* the time to the new zone — the
-                        // wall-clock shifts by (new - old) offset so
-                        // the same instant is represented.
-                        let time_nanos = if is_tz {
-                            if let Some(Property::String(_)) = m.get("timezone") {
-                                let base_tz: Option<i32> = {
-                                    let mut tz = None;
-                                    for key in ["time", "datetime"] {
-                                        match m.get(key) {
-                                            Some(Property::Time {
-                                                tz_offset_secs: Some(o),
-                                                ..
-                                            }) => {
-                                                tz = Some(*o);
-                                                break;
-                                            }
-                                            Some(Property::DateTime {
-                                                tz_offset_secs: Some(o),
-                                                ..
-                                            }) => {
-                                                tz = Some(*o);
-                                                break;
-                                            }
-                                            _ => {}
+                0 => {
+                    let time_nanos = (now_epoch_nanos() % 86_400_000_000_000) as i64;
+                    Ok(Value::Property(Property::Time {
+                        nanos: time_nanos,
+                        tz_offset_secs: if is_tz { Some(0) } else { None },
+                    }))
+                }
+                1 => {
+                    let v = eval_expr(&arg_exprs[0], ctx)?;
+                    match v {
+                        Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                        Value::Property(Property::Map(m)) => {
+                            // Extract base time-of-day from ANY temporal value under
+                            // any of the temporal-source keys (time, datetime,
+                            // localdatetime). TCK tests pass e.g. a LocalDateTime
+                            // value under the "time" key to mean "use this value's
+                            // time-of-day", so we can't assume the key name matches
+                            // the value type.
+                            let base_tod: i64 = {
+                                let mut tod = 0i64;
+                                for key in ["time", "datetime", "localdatetime"] {
+                                    match m.get(key) {
+                                        Some(Property::Time { nanos, .. }) => {
+                                            tod = *nanos;
+                                            break;
                                         }
+                                        Some(Property::DateTime {
+                                            nanos: ns,
+                                            tz_offset_secs,
+                                            tz_name: _,
+                                        }) => {
+                                            // DateTime's nanos are UTC; the
+                                            // "base time-of-day" we inherit
+                                            // is the *local* wall-clock tod.
+                                            let local = match tz_offset_secs {
+                                                Some(off) => *ns + (*off as i128) * 1_000_000_000,
+                                                None => *ns,
+                                            };
+                                            tod = local.rem_euclid(86_400_000_000_000) as i64;
+                                            break;
+                                        }
+                                        Some(Property::LocalDateTime(ns)) => {
+                                            tod = ns.rem_euclid(86_400_000_000_000) as i64;
+                                            break;
+                                        }
+                                        _ => {}
                                     }
-                                    tz
-                                };
-                                match (base_tz, tz_offset) {
-                                    (Some(old), Some(new)) => {
-                                        let diff = (new - old) as i64;
-                                        let mut out =
-                                            time_nanos + diff * 1_000_000_000;
-                                        let day = 86_400_000_000_000_i64;
-                                        out = ((out % day) + day) % day;
-                                        out
+                                }
+                                tod
+                            };
+                            let base_h = base_tod / 3_600_000_000_000;
+                            let base_min = (base_tod % 3_600_000_000_000) / 60_000_000_000;
+                            let base_sec = (base_tod % 60_000_000_000) / 1_000_000_000;
+                            let base_ns = base_tod % 1_000_000_000;
+
+                            let has_any_base = m.contains_key("time")
+                                || m.contains_key("datetime")
+                                || m.contains_key("localdatetime");
+                            let default_tod = |b: i64| if has_any_base { b } else { 0 };
+
+                            let hour = map_int(&m, "hour").unwrap_or_else(|| default_tod(base_h));
+                            let minute =
+                                map_int(&m, "minute").unwrap_or_else(|| default_tod(base_min));
+                            let second =
+                                map_int(&m, "second").unwrap_or_else(|| default_tod(base_sec));
+                            // ms/us/ns combine: each is the appropriate order of
+                            // magnitude's contribution to sub-second nanoseconds.
+                            // Absent fields fall back to base. Present fields
+                            // add up.
+                            let has_any_sub = m.contains_key("millisecond")
+                                || m.contains_key("microsecond")
+                                || m.contains_key("nanosecond");
+                            let nanos = if has_any_sub {
+                                map_int(&m, "millisecond").unwrap_or(0) * 1_000_000
+                                    + map_int(&m, "microsecond").unwrap_or(0) * 1_000
+                                    + map_int(&m, "nanosecond").unwrap_or(0)
+                            } else {
+                                default_tod(base_ns)
+                            };
+                            let time_nanos = hour * 3_600_000_000_000
+                                + minute * 60_000_000_000
+                                + second * 1_000_000_000
+                                + nanos;
+                            // Timezone: explicit `timezone:` in the map
+                            // wins. If absent, inherit from the base
+                            // temporal value (time() / datetime() under
+                            // any key). Otherwise default to UTC for
+                            // time(), or None for localtime().
+                            let tz_offset = if is_tz {
+                                extract_tz_offset(&m).or(Some(0))
+                            } else {
+                                None
+                            };
+                            // If the map supplies a timezone override
+                            // but carries a zoned base value, Neo4j
+                            // *rotates* the time to the new zone — the
+                            // wall-clock shifts by (new - old) offset so
+                            // the same instant is represented.
+                            let time_nanos = if is_tz {
+                                if let Some(Property::String(_)) = m.get("timezone") {
+                                    let base_tz: Option<i32> = {
+                                        let mut tz = None;
+                                        for key in ["time", "datetime"] {
+                                            match m.get(key) {
+                                                Some(Property::Time {
+                                                    tz_offset_secs: Some(o),
+                                                    ..
+                                                }) => {
+                                                    tz = Some(*o);
+                                                    break;
+                                                }
+                                                Some(Property::DateTime {
+                                                    tz_offset_secs: Some(o),
+                                                    ..
+                                                }) => {
+                                                    tz = Some(*o);
+                                                    break;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        tz
+                                    };
+                                    match (base_tz, tz_offset) {
+                                        (Some(old), Some(new)) => {
+                                            let diff = (new - old) as i64;
+                                            let mut out = time_nanos + diff * 1_000_000_000;
+                                            let day = 86_400_000_000_000_i64;
+                                            out = ((out % day) + day) % day;
+                                            out
+                                        }
+                                        _ => time_nanos,
                                     }
-                                    _ => time_nanos,
+                                } else {
+                                    time_nanos
                                 }
                             } else {
                                 time_nanos
-                            }
-                        } else {
-                            time_nanos
-                        };
-                        Ok(Value::Property(Property::Time {
-                            nanos: time_nanos,
-                            tz_offset_secs: tz_offset,
-                        }))
-                    }
-                    Value::Property(Property::String(s)) => {
-                        let (time_nanos, tz) = parse_time_string_with_tz(&s)?;
-                        Ok(Value::Property(Property::Time {
-                            nanos: time_nanos,
-                            tz_offset_secs: if is_tz { Some(tz.unwrap_or(0)) } else { None },
-                        }))
-                    }
-                    // Project the time-of-day out of another temporal
-                    // value. For zoned sources (DateTime, zoned Time)
-                    // the nanos are UTC; shift by the offset so the
-                    // resulting local time of day matches the source's
-                    // local wall-clock.
-                    Value::Property(Property::Time {
-                        nanos,
-                        tz_offset_secs,
-                    }) => Ok(Value::Property(Property::Time {
-                        nanos,
-                        tz_offset_secs: if is_tz {
-                            Some(tz_offset_secs.unwrap_or(0))
-                        } else {
-                            None
-                        },
-                    })),
-                    Value::Property(Property::LocalDateTime(ns)) => {
-                        let tod = ns.rem_euclid(86_400_000_000_000) as i64;
-                        Ok(Value::Property(Property::Time {
-                            nanos: tod,
-                            tz_offset_secs: if is_tz { Some(0) } else { None },
-                        }))
-                    }
-                    Value::Property(Property::DateTime {
-                        nanos,
-                        tz_offset_secs,        tz_name: _,
-
-                    }) => {
-                        let local = match tz_offset_secs {
-                            Some(off) => nanos + (off as i128) * 1_000_000_000,
-                            None => nanos,
-                        };
-                        let tod = local.rem_euclid(86_400_000_000_000) as i64;
-                        Ok(Value::Property(Property::Time {
-                            nanos: tod,
+                            };
+                            Ok(Value::Property(Property::Time {
+                                nanos: time_nanos,
+                                tz_offset_secs: tz_offset,
+                            }))
+                        }
+                        Value::Property(Property::String(s)) => {
+                            let (time_nanos, tz) = parse_time_string_with_tz(&s)?;
+                            Ok(Value::Property(Property::Time {
+                                nanos: time_nanos,
+                                tz_offset_secs: if is_tz { Some(tz.unwrap_or(0)) } else { None },
+                            }))
+                        }
+                        // Project the time-of-day out of another temporal
+                        // value. For zoned sources (DateTime, zoned Time)
+                        // the nanos are UTC; shift by the offset so the
+                        // resulting local time of day matches the source's
+                        // local wall-clock.
+                        Value::Property(Property::Time {
+                            nanos,
+                            tz_offset_secs,
+                        }) => Ok(Value::Property(Property::Time {
+                            nanos,
                             tz_offset_secs: if is_tz {
                                 Some(tz_offset_secs.unwrap_or(0))
                             } else {
                                 None
                             },
-                        }))
+                        })),
+                        Value::Property(Property::LocalDateTime(ns)) => {
+                            let tod = ns.rem_euclid(86_400_000_000_000) as i64;
+                            Ok(Value::Property(Property::Time {
+                                nanos: tod,
+                                tz_offset_secs: if is_tz { Some(0) } else { None },
+                            }))
+                        }
+                        Value::Property(Property::DateTime {
+                            nanos,
+                            tz_offset_secs,
+                            tz_name: _,
+                        }) => {
+                            let local = match tz_offset_secs {
+                                Some(off) => nanos + (off as i128) * 1_000_000_000,
+                                None => nanos,
+                            };
+                            let tod = local.rem_euclid(86_400_000_000_000) as i64;
+                            Ok(Value::Property(Property::Time {
+                                nanos: tod,
+                                tz_offset_secs: if is_tz {
+                                    Some(tz_offset_secs.unwrap_or(0))
+                                } else {
+                                    None
+                                },
+                            }))
+                        }
+                        _ => Err(Error::TypeMismatch),
                     }
-                    _ => Err(Error::TypeMismatch),
                 }
+                _ => Err(Error::UnknownScalarFunction(
+                    "time() takes zero or one argument".into(),
+                )),
             }
-            _ => Err(Error::UnknownScalarFunction(
-                "time() takes zero or one argument".into(),
-            )),
-        }},
+        }
         "timestamp" => {
             if !arg_exprs.is_empty() {
                 return Err(Error::UnknownScalarFunction(
@@ -3964,9 +3978,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             // day fractions all boil down to this — into whole days
             // plus a sub-day nanosecond remainder that we'll
             // collapse back to days at the end.
-            let mut push_days_f = |total_days: f64,
-                                   days: &mut i64,
-                                   sub_day_nanos: &mut i128| {
+            let mut push_days_f = |total_days: f64, days: &mut i64, sub_day_nanos: &mut i128| {
                 let whole = total_days.trunc() as i64;
                 *days = days.wrapping_add(whole);
                 let frac = total_days - whole as f64;
@@ -4142,8 +4154,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             // When either side has no date (Time/LocalTime), collapse
             // to a time-only difference. Neo4j drops the calendar
             // component of the other side in this case.
-            let time_only = a_kind == TemporalKind::TimeOnly
-                || b_kind == TemporalKind::TimeOnly;
+            let time_only = a_kind == TemporalKind::TimeOnly || b_kind == TemporalKind::TimeOnly;
             let name_lc = name.to_ascii_lowercase();
             let duration = match name_lc.as_str() {
                 "duration.inmonths" => {
@@ -4307,8 +4318,11 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         }
 
         // Temporal truncation functions
-        "datetime.truncate" | "localdatetime.truncate" | "date.truncate"
-        | "time.truncate" | "localtime.truncate" => {
+        "datetime.truncate"
+        | "localdatetime.truncate"
+        | "date.truncate"
+        | "time.truncate"
+        | "localtime.truncate" => {
             if arg_exprs.is_empty() || arg_exprs.len() > 3 {
                 return Err(Error::UnknownScalarFunction(format!(
                     "{name}() expects 1-3 arguments, got {}",
@@ -4363,8 +4377,8 @@ fn extract_base_date(
             }
             Some(Property::DateTime {
                 nanos: ns,
-                tz_offset_secs,        tz_name: _,
-
+                tz_offset_secs,
+                tz_name: _,
             }) => {
                 // Use the *local* day for the base, matching the
                 // Neo4j behavior where date() / datetime() work in
@@ -4394,9 +4408,7 @@ fn extract_base_date(
 /// Extract a timezone offset (in seconds) from a datetime/time/localdatetime
 /// construction map. Looks at an explicit `timezone` string first, then
 /// any temporal-source value that carries an offset.
-fn extract_tz_offset(
-    m: &std::collections::HashMap<String, Property>,
-) -> Option<i32> {
+fn extract_tz_offset(m: &std::collections::HashMap<String, Property>) -> Option<i32> {
     extract_tz_spec(m, None).map(|(off, _)| off)
 }
 
@@ -4409,10 +4421,7 @@ fn extract_tz_offset(
 /// is a zoned DateTime with a named zone, we re-resolve the offset
 /// *at the pivot instant* rather than reusing the offset captured
 /// when the base was constructed — zones move across DST.
-fn base_tz_offset(
-    m: &std::collections::HashMap<String, Property>,
-    pivot: i128,
-) -> Option<i32> {
+fn base_tz_offset(m: &std::collections::HashMap<String, Property>, pivot: i128) -> Option<i32> {
     for key in ["datetime", "time"] {
         match m.get(key) {
             Some(Property::DateTime {
@@ -4505,8 +4514,8 @@ fn extract_base_date_tod(
             }
             Some(Property::DateTime {
                 nanos: ns,
-                tz_offset_secs,        tz_name: _,
-
+                tz_offset_secs,
+                tz_name: _,
             }) => {
                 // DateTime stores UTC nanos but the TCK feeds it into
                 // datetime()/date() maps expecting the *local* date
@@ -4588,8 +4597,7 @@ fn build_date_from_map(
     // Ordinal day construction
     if let Some(ordinal) = map_int(m, "ordinalDay").or_else(|| map_int(m, "dayOfYear")) {
         let year = map_int(m, "year").unwrap_or(base.year() as i64);
-        return chrono::NaiveDate::from_yo_opt(year as i32, ordinal as u32)
-            .unwrap_or(base);
+        return chrono::NaiveDate::from_yo_opt(year as i32, ordinal as u32).unwrap_or(base);
     }
     // Quarter-based construction
     if let Some(quarter) = map_int(m, "quarter") {
@@ -4769,8 +4777,8 @@ fn datetime_accessor(
     let date = epoch + chrono::Duration::days(days);
     // Calendar accessors land on the local date.
     match key {
-        "year" | "month" | "day" | "week" | "weekYear" | "dayOfWeek"
-        | "weekDay" | "dayOfYear" | "quarter" | "ordinalDay" | "dayOfQuarter" => {
+        "year" | "month" | "day" | "week" | "weekYear" | "dayOfWeek" | "weekDay" | "dayOfYear"
+        | "quarter" | "ordinalDay" | "dayOfQuarter" => {
             return temporal_date_prop(&date, key).unwrap_or(Value::Null);
         }
         _ => {}
@@ -4783,13 +4791,11 @@ fn datetime_accessor(
         "epochMillis" => {
             let utc_secs = utc_nanos.div_euclid(1_000_000_000) as i64;
             let utc_nsec = utc_nanos.rem_euclid(1_000_000_000) as i64;
-            Value::Property(Property::Int64(
-                utc_secs * 1000 + utc_nsec / 1_000_000,
-            ))
+            Value::Property(Property::Int64(utc_secs * 1000 + utc_nsec / 1_000_000))
         }
-        "epochSeconds" => Value::Property(Property::Int64(
-            utc_nanos.div_euclid(1_000_000_000) as i64,
-        )),
+        "epochSeconds" => {
+            Value::Property(Property::Int64(utc_nanos.div_euclid(1_000_000_000) as i64))
+        }
         // `timezone` reports the IANA name when one is on the value,
         // so `datetime({..., timezone: 'Europe/Stockholm'}).timezone`
         // round-trips. `offset` always reports the numeric `±HH:MM`
@@ -4834,13 +4840,9 @@ enum TemporalKind {
 /// Extract (date, local time-of-day nanos, optional tz offset secs, kind)
 /// from any temporal value. "Zoned" means the value carries an explicit
 /// offset (DateTime always, Time only when a zone was supplied).
-fn temporal_to_date_tod(
-    v: &Value,
-) -> Result<(i64, i128, Option<i32>, TemporalKind)> {
+fn temporal_to_date_tod(v: &Value) -> Result<(i64, i128, Option<i32>, TemporalKind)> {
     match v {
-        Value::Property(Property::Date(days)) => {
-            Ok((*days, 0, None, TemporalKind::HasDate))
-        }
+        Value::Property(Property::Date(days)) => Ok((*days, 0, None, TemporalKind::HasDate)),
         Value::Property(Property::DateTime {
             nanos: ns,
             tz_offset_secs,
@@ -4853,12 +4855,7 @@ fn temporal_to_date_tod(
             let days = local.div_euclid(86_400_000_000_000);
             let tod = local.rem_euclid(86_400_000_000_000);
             let days_i64 = i64::try_from(days).map_err(|_| Error::TypeMismatch)?;
-            Ok((
-                days_i64,
-                tod,
-                *tz_offset_secs,
-                TemporalKind::HasDate,
-            ))
+            Ok((days_i64, tod, *tz_offset_secs, TemporalKind::HasDate))
         }
         Value::Property(Property::LocalDateTime(ns)) => {
             let days = ns.div_euclid(86_400_000_000_000);
@@ -4866,12 +4863,10 @@ fn temporal_to_date_tod(
             let days_i64 = i64::try_from(days).map_err(|_| Error::TypeMismatch)?;
             Ok((days_i64, tod, None, TemporalKind::HasDate))
         }
-        Value::Property(Property::Time { nanos, tz_offset_secs }) => Ok((
-            0,
-            *nanos as i128,
-            *tz_offset_secs,
-            TemporalKind::TimeOnly,
-        )),
+        Value::Property(Property::Time {
+            nanos,
+            tz_offset_secs,
+        }) => Ok((0, *nanos as i128, *tz_offset_secs, TemporalKind::TimeOnly)),
         _ => Err(Error::TypeMismatch),
     }
 }
@@ -4895,12 +4890,7 @@ fn month_diff(a_days: i64, b_days: i64) -> i64 {
 
 /// Like `month_diff`, but also considers time-of-day when the two
 /// endpoints fall on the same day-of-month.
-fn month_diff_tod(
-    a_days: i64,
-    a_tod: i128,
-    b_days: i64,
-    b_tod: i128,
-) -> i64 {
+fn month_diff_tod(a_days: i64, a_tod: i128, b_days: i64, b_tod: i128) -> i64 {
     let mut diff = month_diff(a_days, b_days);
     if diff == 0 {
         return 0;
@@ -5017,14 +5007,13 @@ fn truncate_time_value(
             nanos,
             tz_offset_secs,
         }) => (*nanos as i128, *tz_offset_secs),
-        Value::Property(Property::LocalDateTime(ns)) => (
-            ns.rem_euclid(86_400_000_000_000),
-            None::<i32>,
-        ),
+        Value::Property(Property::LocalDateTime(ns)) => {
+            (ns.rem_euclid(86_400_000_000_000), None::<i32>)
+        }
         Value::Property(Property::DateTime {
             nanos,
-            tz_offset_secs,        tz_name: _,
-
+            tz_offset_secs,
+            tz_name: _,
         }) => {
             let local = match tz_offset_secs {
                 Some(off) => *nanos + (*off as i128) * 1_000_000_000,
@@ -5218,21 +5207,12 @@ fn truncate_temporal(
                     .and_hms_opt(0, 0, 0)
                     .unwrap(),
                 "day" => dt.date().and_hms_opt(0, 0, 0).unwrap(),
-                "hour" => {
-                    dt.date()
-                        .and_hms_opt(dt.hour(), 0, 0)
-                        .unwrap()
-                }
-                "minute" => {
-                    dt.date()
-                        .and_hms_opt(dt.hour(), dt.minute(), 0)
-                        .unwrap()
-                }
-                "second" => {
-                    dt.date()
-                        .and_hms_opt(dt.hour(), dt.minute(), dt.second())
-                        .unwrap()
-                }
+                "hour" => dt.date().and_hms_opt(dt.hour(), 0, 0).unwrap(),
+                "minute" => dt.date().and_hms_opt(dt.hour(), dt.minute(), 0).unwrap(),
+                "second" => dt
+                    .date()
+                    .and_hms_opt(dt.hour(), dt.minute(), dt.second())
+                    .unwrap(),
                 "millisecond" => {
                     // Drop sub-millisecond precision — floor the
                     // nanoseconds to the nearest 1e6.
@@ -5302,17 +5282,13 @@ fn truncate_temporal(
                         "millisecond" => {
                             nanosecond = nanosecond.wrapping_add((n as u32) * 1_000_000)
                         }
-                        "microsecond" => {
-                            nanosecond = nanosecond.wrapping_add((n as u32) * 1_000)
-                        }
+                        "microsecond" => nanosecond = nanosecond.wrapping_add((n as u32) * 1_000),
                         "dayOfWeek" | "weekDay" => {
                             // Adjust day based on weekday within week
-                            let current_dow =
-                                truncated.weekday().num_days_from_monday() as i64 + 1;
+                            let current_dow = truncated.weekday().num_days_from_monday() as i64 + 1;
                             let target_dow = n;
                             let delta = target_dow - current_dow;
-                            let new_date = truncated.date()
-                                + chrono::Duration::days(delta);
+                            let new_date = truncated.date() + chrono::Duration::days(delta);
                             year = new_date.year();
                             month = new_date.month();
                             day = new_date.day();
@@ -5326,11 +5302,10 @@ fn truncate_temporal(
             } else {
                 truncated
             };
-            let diff = truncated
-                .signed_duration_since(epoch.and_hms_opt(0, 0, 0).unwrap());
+            let diff = truncated.signed_duration_since(epoch.and_hms_opt(0, 0, 0).unwrap());
             // Use seconds + nanoseconds to build epoch nanos
-            let result_nanos: i128 = (diff.num_seconds() as i128) * 1_000_000_000
-                + (diff.subsec_nanos() as i128);
+            let result_nanos: i128 =
+                (diff.num_seconds() as i128) * 1_000_000_000 + (diff.subsec_nanos() as i128);
             if name.starts_with("date.") {
                 let days = diff.num_days();
                 Ok(Value::Property(Property::Date(days)))
@@ -5640,10 +5615,7 @@ fn compare_props(a: &Property, b: &Property) -> Ordering {
         // months vs 90 days depends on the reference date) so it
         // just compares equal — queries that need a deterministic
         // order over durations should project a specific field.
-        (
-            Property::DateTime { nanos: a, .. },
-            Property::DateTime { nanos: b, .. },
-        ) => a.cmp(b),
+        (Property::DateTime { nanos: a, .. }, Property::DateTime { nanos: b, .. }) => a.cmp(b),
         (Property::LocalDateTime(a), Property::LocalDateTime(b)) => a.cmp(b),
         (Property::Date(a), Property::Date(b)) => a.cmp(b),
         (
@@ -5666,8 +5638,7 @@ fn compare_props(a: &Property, b: &Property) -> Ordering {
         (Property::Duration(a), Property::Duration(b)) => {
             // No total order in general, but TCK expects equal
             // durations to compare equal. Use component-wise cmp.
-            (a.months, a.days, a.seconds, a.nanos)
-                .cmp(&(b.months, b.days, b.seconds, b.nanos))
+            (a.months, a.days, a.seconds, a.nanos).cmp(&(b.months, b.days, b.seconds, b.nanos))
         }
         // Cross-type ordering: use type precedence
         // Neo4j order: Map > List > String > Boolean > Number
@@ -5684,8 +5655,11 @@ fn type_order_prop(p: &Property) -> u8 {
         Property::String(_) => 6,
         Property::Bool(_) => 7,
         Property::Int64(_) | Property::Float64(_) => 8,
-        Property::Date(_) | Property::DateTime { .. } | Property::LocalDateTime(_)
-        | Property::Duration(_) | Property::Time { .. } => 9,
+        Property::Date(_)
+        | Property::DateTime { .. }
+        | Property::LocalDateTime(_)
+        | Property::Duration(_)
+        | Property::Time { .. } => 9,
         Property::Null => 10,
     }
 }
@@ -5701,8 +5675,11 @@ fn type_order_value(v: &Value) -> u8 {
         Value::Property(Property::Bool(_)) => 7,
         Value::Property(Property::Int64(_) | Property::Float64(_)) => 8,
         Value::Property(
-            Property::Date(_) | Property::DateTime { .. } | Property::LocalDateTime(_)
-            | Property::Duration(_) | Property::Time { .. },
+            Property::Date(_)
+            | Property::DateTime { .. }
+            | Property::LocalDateTime(_)
+            | Property::Duration(_)
+            | Property::Time { .. },
         ) => 9,
         Value::Null | Value::Property(Property::Null) => 10,
     }
@@ -5738,7 +5715,11 @@ pub(crate) fn value_key(v: &Value) -> String {
             out.push('}');
             out
         }
-        Value::Property(Property::DateTime { nanos, tz_offset_secs, tz_name }) => {
+        Value::Property(Property::DateTime {
+            nanos,
+            tz_offset_secs,
+            tz_name,
+        }) => {
             format!("dt:{},{:?},{:?}", nanos, tz_offset_secs, tz_name)
         }
         Value::Property(Property::LocalDateTime(ns)) => format!("ldt:{}", ns),
@@ -5746,7 +5727,10 @@ pub(crate) fn value_key(v: &Value) -> String {
         Value::Property(Property::Duration(d)) => {
             format!("dur:{},{},{},{}", d.months, d.days, d.seconds, d.nanos)
         }
-        Value::Property(Property::Time { nanos, tz_offset_secs }) => {
+        Value::Property(Property::Time {
+            nanos,
+            tz_offset_secs,
+        }) => {
             format!("t:{},{:?}", nanos, tz_offset_secs)
         }
         Value::Node(n) => format!("N:{}", n.id),
@@ -5862,16 +5846,24 @@ pub(crate) fn equal_three_valued(a: &Value, b: &Value) -> Option<bool> {
     // `Value::List` vs `Property::List`.
     let la = match a {
         Value::List(items) => Some(items.clone()),
-        Value::Property(Property::List(items)) => {
-            Some(items.iter().cloned().map(Value::Property).collect::<Vec<_>>())
-        }
+        Value::Property(Property::List(items)) => Some(
+            items
+                .iter()
+                .cloned()
+                .map(Value::Property)
+                .collect::<Vec<_>>(),
+        ),
         _ => None,
     };
     let lb = match b {
         Value::List(items) => Some(items.clone()),
-        Value::Property(Property::List(items)) => {
-            Some(items.iter().cloned().map(Value::Property).collect::<Vec<_>>())
-        }
+        Value::Property(Property::List(items)) => Some(
+            items
+                .iter()
+                .cloned()
+                .map(Value::Property)
+                .collect::<Vec<_>>(),
+        ),
         _ => None,
     };
     if let (Some(la), Some(lb)) = (la, lb) {
@@ -6076,10 +6068,7 @@ fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
         // orderings by their epoch-offset components. Duration
         // only supports equality because component ordering
         // isn't well-defined (months-vs-days).
-        (
-            Property::DateTime { nanos: a, .. },
-            Property::DateTime { nanos: b, .. },
-        ) => a.cmp(b),
+        (Property::DateTime { nanos: a, .. }, Property::DateTime { nanos: b, .. }) => a.cmp(b),
         (Property::LocalDateTime(a), Property::LocalDateTime(b)) => a.cmp(b),
         (Property::Date(a), Property::Date(b)) => a.cmp(b),
         (

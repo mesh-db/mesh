@@ -144,4 +144,3 @@ impl ProcedureRegistry {
         self.procs.get(&qualified_name.join("."))
     }
 }
-

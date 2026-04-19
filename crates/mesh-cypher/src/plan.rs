@@ -781,7 +781,11 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             buf.push_str(&format!("{indent}  input:\n"));
             format_plan_inner(input, buf, depth + 2);
         }
-        LogicalPlan::OptionalApply { input, body, null_vars } => {
+        LogicalPlan::OptionalApply {
+            input,
+            body,
+            null_vars,
+        } => {
             buf.push_str(&format!(
                 "{indent}OptionalApply(nulls=[{}])\n",
                 null_vars.join(", ")
@@ -975,10 +979,7 @@ fn validate_pattern_predicate_vars_bound(
     })
 }
 
-fn check_pattern_vars_bound(
-    pattern: &Pattern,
-    bound: &HashMap<String, VarType>,
-) -> Result<()> {
+fn check_pattern_vars_bound(pattern: &Pattern, bound: &HashMap<String, VarType>) -> Result<()> {
     if let Some(v) = &pattern.start.var {
         if !bound.contains_key(v) {
             return Err(Error::Plan(format!(
@@ -1010,10 +1011,7 @@ fn check_pattern_vars_bound(
 /// — a WHERE predicate has to evaluate to a boolean, and a bare
 /// graph-element reference doesn't. Reject the narrow shape at
 /// plan time so we don't silently coerce and succeed.
-fn reject_non_boolean_where_predicate(
-    expr: &Expr,
-    bound: &HashMap<String, VarType>,
-) -> Result<()> {
+fn reject_non_boolean_where_predicate(expr: &Expr, bound: &HashMap<String, VarType>) -> Result<()> {
     if let Expr::Identifier(name) = expr {
         if let Some(vtype) = bound.get(name) {
             if matches!(vtype, VarType::Node | VarType::Edge | VarType::Path) {
@@ -1316,7 +1314,11 @@ where
         // expressions and need to be visited so any pattern
         // predicates, parameter uses, etc. inside them are
         // validated.
-        Expr::PatternComprehension { predicate, projection, .. } => {
+        Expr::PatternComprehension {
+            predicate,
+            projection,
+            ..
+        } => {
             if let Some(p) = predicate {
                 walk_expr(p, visit)?;
             }
@@ -1453,7 +1455,10 @@ fn render_expr_key(expr: &Expr) -> String {
                     format!(
                         "{}{}",
                         prefix,
-                        es.iter().map(render_expr_key).collect::<Vec<_>>().join(", ")
+                        es.iter()
+                            .map(render_expr_key)
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )
                 }
             };
@@ -1468,7 +1473,11 @@ fn render_expr_key(expr: &Expr) -> String {
                 BinaryOp::Mod => " % ",
                 BinaryOp::Pow => " ^ ",
             };
-            format!("{}{op_str}{}", render_expr_key(left), render_expr_key(right))
+            format!(
+                "{}{op_str}{}",
+                render_expr_key(left),
+                render_expr_key(right)
+            )
         }
         Expr::UnaryOp { op, operand } => {
             let op_str = match op {
@@ -1497,7 +1506,11 @@ fn render_expr_key(expr: &Expr) -> String {
                 CompareOp::Contains => " CONTAINS ",
                 CompareOp::RegexMatch => " =~ ",
             };
-            format!("{}{op_str}{}", render_expr_key(left), render_expr_key(right))
+            format!(
+                "{}{op_str}{}",
+                render_expr_key(left),
+                render_expr_key(right)
+            )
         }
         Expr::List(items) => {
             let inner: Vec<String> = items.iter().map(render_expr_key).collect();
@@ -1757,9 +1770,7 @@ fn check_set_expr_scope_inner(
         }
         Expr::UnaryOp { operand, .. } => check_set_expr_scope_inner(operand, bound, locals),
         // Subquery / pattern predicate bodies manage their own scope; skip.
-        Expr::PatternExists(_) | Expr::ExistsSubquery { .. } | Expr::CountSubquery { .. } => {
-            Ok(())
-        }
+        Expr::PatternExists(_) | Expr::ExistsSubquery { .. } | Expr::CountSubquery { .. } => Ok(()),
         // Pattern comprehension binds the pattern's node / edge
         // variables locally, so WHERE / projection see them on
         // top of the outer scope. Skipping the pattern itself
@@ -1807,8 +1818,7 @@ fn check_set_assignments_scope(
                 reject_pattern_predicate_in_projection(value, "SET right-hand side")?;
                 check_set_expr_scope(value, bound)?;
             }
-            SetAssignment::Replace { properties, .. }
-            | SetAssignment::Merge { properties, .. } => {
+            SetAssignment::Replace { properties, .. } | SetAssignment::Merge { properties, .. } => {
                 for (_, e) in properties {
                     reject_pattern_predicate_in_projection(e, "SET right-hand side")?;
                     check_set_expr_scope(e, bound)?;
@@ -1913,9 +1923,7 @@ fn plan_create(stmt: &CreateStmt) -> Result<LogicalPlan> {
         }
 
         if stmt.star && return_scope.is_empty() {
-            return Err(Error::Plan(
-                "RETURN * has no variables in scope".into(),
-            ));
+            return Err(Error::Plan("RETURN * has no variables in scope".into()));
         }
         for item in &stmt.return_items {
             reject_size_on_path(&item.expr, &return_scope)?;
@@ -2030,13 +2038,7 @@ fn plan_pattern(
     pattern_idx: usize,
     ctx: &PlannerContext,
 ) -> Result<LogicalPlan> {
-    plan_pattern_with_bound_edges(
-        pattern,
-        pattern_idx,
-        ctx,
-        &HashSet::new(),
-        &HashSet::new(),
-    )
+    plan_pattern_with_bound_edges(pattern, pattern_idx, ctx, &HashSet::new(), &HashSet::new())
 }
 
 /// Same as [`plan_pattern`] but honours sets of edge / edge-list
@@ -2909,8 +2911,8 @@ fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarTy
             // `plan_match` already validated that *cross-scope*
             // transition; this path just preserves it so a later
             // same-pattern reuse still conflicts.
-            let is_edge_list_replay = hop.rel.var_length.is_some()
-                && matches!(out.get(var), Some(VarType::NonNode));
+            let is_edge_list_replay =
+                hop.rel.var_length.is_some() && matches!(out.get(var), Some(VarType::NonNode));
             if !is_edge_list_replay {
                 check_var_type_conflict_allow_scalar(var, VarType::Edge, out)?;
                 out.insert(var.clone(), VarType::Edge);
@@ -2939,10 +2941,7 @@ fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarTy
 /// else produces an openCypher `InvalidArgumentType`. Also
 /// enforces the scope rule on identifiers: a DELETE reference
 /// to an unbound name is a compile-time `UndefinedVariable`.
-fn validate_delete_expr(
-    expr: &Expr,
-    bound_vars: &HashMap<String, VarType>,
-) -> Result<()> {
+fn validate_delete_expr(expr: &Expr, bound_vars: &HashMap<String, VarType>) -> Result<()> {
     match expr {
         // Identifier: must be bound. The type isn't checked here
         // (a Scalar / NonNode binding might be wrong at runtime),
@@ -3085,7 +3084,6 @@ fn infer_expr_type(expr: &Expr, bound_vars: &HashMap<String, VarType>) -> VarTyp
     }
 }
 
-
 fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     use crate::ast::ReadingClause;
 
@@ -3218,7 +3216,12 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         let current = plan
                             .take()
                             .expect("is_rebind implies an earlier clause populated the plan");
-                        Some(plan_pattern_from_bound(current, pattern, pattern_offset, &bound_vars)?)
+                        Some(plan_pattern_from_bound(
+                            current,
+                            pattern,
+                            pattern_offset,
+                            &bound_vars,
+                        )?)
                     } else {
                         // Fresh-scan patterns lower as the right
                         // side of a `CartesianProduct`. Expand
@@ -3452,11 +3455,12 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                                 format!("__merge_e{}_{}", stage_pattern_offset, hi)
                             });
                         // For incoming edges, swap src and dst
-                        let (merge_src, merge_dst) = if matches!(hop.rel.direction, Direction::Incoming) {
-                            (dst_var.clone(), current_src.clone())
-                        } else {
-                            (current_src.clone(), dst_var.clone())
-                        };
+                        let (merge_src, merge_dst) =
+                            if matches!(hop.rel.direction, Direction::Incoming) {
+                                (dst_var.clone(), current_src.clone())
+                            } else {
+                                (current_src.clone(), dst_var.clone())
+                            };
                         let current = plan.take().ok_or_else(|| {
                             Error::Plan("MERGE on an edge pattern requires bound endpoints".into())
                         })?;
@@ -3551,8 +3555,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     for e in exprs {
                         if contains_aggregate(e) {
                             return Err(Error::Plan(
-                                "aggregate functions are not allowed in CALL arguments"
-                                    .into(),
+                                "aggregate functions are not allowed in CALL arguments".into(),
                             ));
                         }
                     }
@@ -3560,8 +3563,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 match &pc.yield_spec {
                     Some(crate::ast::YieldSpec::Items(items)) => {
                         for yi in items {
-                            let bind_name =
-                                yi.alias.as_ref().unwrap_or(&yi.column).clone();
+                            let bind_name = yi.alias.as_ref().unwrap_or(&yi.column).clone();
                             if bound_vars.contains_key(&bind_name) {
                                 return Err(Error::Plan(format!(
                                     "variable '{bind_name}' already defined"
@@ -3641,8 +3643,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     for hop in &pattern.hops {
                         if let Some(var) = &hop.target.var {
                             if bound_vars.contains_key(var)
-                                && (!hop.target.labels.is_empty()
-                                    || hop.target.has_property_clause)
+                                && (!hop.target.labels.is_empty() || hop.target.has_property_clause)
                             {
                                 return Err(Error::Plan(format!(
                                     "variable '{}' already defined with a different type",
@@ -3676,7 +3677,13 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 let mut edges: Vec<CreateEdgeSpec> = Vec::new();
                 let mut var_idx: HashMap<String, usize> = HashMap::new();
                 for pattern in patterns {
-                    build_create_pattern(pattern, &mut nodes, &mut edges, &mut var_idx, &bound_vars)?;
+                    build_create_pattern(
+                        pattern,
+                        &mut nodes,
+                        &mut edges,
+                        &mut var_idx,
+                        &bound_vars,
+                    )?;
                 }
                 // Register newly created variables as bound
                 for n in &nodes {
@@ -3696,14 +3703,12 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 });
             }
             ReadingClause::Set(items) => {
-                let assignments: Vec<SetAssignment> = items
-                    .iter()
-                    .map(set_item_to_assignment)
-                    .collect();
+                let assignments: Vec<SetAssignment> =
+                    items.iter().map(set_item_to_assignment).collect();
                 check_set_assignments_scope(&assignments, &bound_vars)?;
-                let current = plan.take().ok_or_else(|| {
-                    Error::Plan("SET requires a preceding clause".into())
-                })?;
+                let current = plan
+                    .take()
+                    .ok_or_else(|| Error::Plan("SET requires a preceding clause".into()))?;
                 plan = Some(LogicalPlan::SetProperty {
                     input: Box::new(current),
                     assignments,
@@ -3721,9 +3726,9 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 for expr in &dc.exprs {
                     validate_delete_expr(expr, &bound_vars)?;
                 }
-                let current = plan.take().ok_or_else(|| {
-                    Error::Plan("DELETE requires a preceding clause".into())
-                })?;
+                let current = plan
+                    .take()
+                    .ok_or_else(|| Error::Plan("DELETE requires a preceding clause".into()))?;
                 plan = Some(LogicalPlan::Delete {
                     input: Box::new(current),
                     detach: dc.detach,
@@ -3745,9 +3750,9 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         },
                     })
                     .collect();
-                let current = plan.take().ok_or_else(|| {
-                    Error::Plan("REMOVE requires a preceding clause".into())
-                })?;
+                let current = plan
+                    .take()
+                    .ok_or_else(|| Error::Plan("REMOVE requires a preceding clause".into()))?;
                 plan = Some(LogicalPlan::Remove {
                     input: Box::new(current),
                     items: specs,
@@ -3769,9 +3774,9 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         },
                     })
                     .collect();
-                let current = plan.take().ok_or_else(|| {
-                    Error::Plan("FOREACH requires a preceding clause".into())
-                })?;
+                let current = plan
+                    .take()
+                    .ok_or_else(|| Error::Plan("FOREACH requires a preceding clause".into()))?;
                 plan = Some(LogicalPlan::Foreach {
                     input: Box::new(current),
                     var: fe.var.clone(),
@@ -3942,9 +3947,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
         // Anonymous MATCH patterns (`MATCH ()`) don't introduce
         // any, and silently returning empty masks the mistake.
         if return_scope.is_empty() {
-            return Err(Error::Plan(
-                "RETURN * has no variables in scope".into(),
-            ));
+            return Err(Error::Plan("RETURN * has no variables in scope".into()));
         }
     }
     if terminal.star || !terminal.return_items.is_empty() {
@@ -4079,11 +4082,7 @@ fn apply_return_pipeline(
     } else {
         return_items
             .iter()
-            .map(|i| {
-                i.alias
-                    .clone()
-                    .unwrap_or_else(|| render_expr_key(&i.expr))
-            })
+            .map(|i| i.alias.clone().unwrap_or_else(|| render_expr_key(&i.expr)))
             .collect()
     };
     let order_before_project = !star
@@ -4332,12 +4331,7 @@ fn apply_optional_match(
             // substituted for the actual row by `build_op_inner`'s
             // `seed` parameter.
             let body_seed: LogicalPlan = LogicalPlan::SeedRow;
-            let mut body = plan_pattern_from_bound(
-                body_seed,
-                &working,
-                0,
-                bound_vars,
-            )?;
+            let mut body = plan_pattern_from_bound(body_seed, &working, 0, bound_vars)?;
             if let Some(predicate) = &clause.where_clause {
                 body = LogicalPlan::Filter {
                     input: Box::new(body),
@@ -4405,9 +4399,7 @@ fn apply_optional_match(
                 // and would otherwise leave `p` unbound. Multi-hop
                 // patterns still synthesise a subpath name and
                 // let BindPath splice it.
-                let vl_path_var = if working.path_var.is_some()
-                    && working.hops.len() == 1
-                {
+                let vl_path_var = if working.path_var.is_some() && working.hops.len() == 1 {
                     working.path_var.clone()
                 } else if working.path_var.is_some() {
                     Some(format!("__opt_subpath_{}_{}", bound_vars.len(), i))
@@ -4554,8 +4546,7 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
         }
     }
 
-    let has_aggregates = !w.star
-        && w.items.iter().any(|it| contains_aggregate(&it.expr));
+    let has_aggregates = !w.star && w.items.iter().any(|it| contains_aggregate(&it.expr));
 
     // InvalidAggregation: ORDER BY on a non-aggregating WITH can't
     // introduce aggregates — the projection defines the row set and
@@ -4584,9 +4575,7 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
         .collect();
 
     let (pre_filter, post_filter) = match (&w.where_clause, has_aggregates, w.star) {
-        (Some(pred), false, false) => {
-            (Some(substitute_aliases(pred.clone(), &alias_map)), None)
-        }
+        (Some(pred), false, false) => (Some(substitute_aliases(pred.clone(), &alias_map)), None),
         (Some(pred), _, _) => (None, Some(pred.clone())),
         (None, _, _) => (None, None),
     };
@@ -5187,10 +5176,7 @@ fn reject_size_on_path(expr: &Expr, bound: &HashMap<String, VarType>) -> Result<
                 if let CallArgs::Exprs(es) = args {
                     if es.len() == 1 {
                         if let Expr::Identifier(n) = &es[0] {
-                            if matches!(
-                                bound.get(n),
-                                Some(VarType::Node | VarType::Edge)
-                            ) {
+                            if matches!(bound.get(n), Some(VarType::Node | VarType::Edge)) {
                                 err = Some(Error::Plan(
                                     "length() is not defined for node or edge \
                                      values; it applies to paths"
@@ -5241,10 +5227,7 @@ fn all_refs_in(expr: &Expr, cols: &std::collections::HashSet<String>) -> bool {
 /// Reject `path.key` / `path[idx]` on a known Path-typed
 /// variable — properties belong to nodes/edges and openCypher
 /// raises `InvalidArgumentType` at compile time.
-fn reject_property_access_on_path(
-    expr: &Expr,
-    bound: &HashMap<String, VarType>,
-) -> Result<()> {
+fn reject_property_access_on_path(expr: &Expr, bound: &HashMap<String, VarType>) -> Result<()> {
     let mut err: Option<Error> = None;
     walk_expr(expr, &mut |e| {
         match e {
@@ -5304,7 +5287,9 @@ fn reject_aggregate_inside_nested_scope(expr: &Expr) -> Result<()> {
                 }
             }
         }
-        Expr::ListPredicate { list, predicate, .. } => {
+        Expr::ListPredicate {
+            list, predicate, ..
+        } => {
             reject_aggregate_inside_nested_scope(list)?;
             if contains_aggregate(predicate) {
                 return Err(Error::Plan(
@@ -5455,22 +5440,16 @@ fn contains_aggregate(expr: &Expr) -> bool {
                     .map(contains_aggregate)
                     .unwrap_or(false)
         }
-        Expr::ListPredicate { list, predicate, .. } => {
-            contains_aggregate(list) || contains_aggregate(predicate)
-        }
+        Expr::ListPredicate {
+            list, predicate, ..
+        } => contains_aggregate(list) || contains_aggregate(predicate),
         Expr::Reduce {
             acc_init,
             source,
             body,
             ..
-        } => {
-            contains_aggregate(acc_init)
-                || contains_aggregate(source)
-                || contains_aggregate(body)
-        }
-        Expr::InList { element, list } => {
-            contains_aggregate(element) || contains_aggregate(list)
-        }
+        } => contains_aggregate(acc_init) || contains_aggregate(source) || contains_aggregate(body),
+        Expr::InList { element, list } => contains_aggregate(element) || contains_aggregate(list),
         Expr::HasLabels { expr, .. } => contains_aggregate(expr),
         _ => false,
     }
@@ -5537,10 +5516,7 @@ fn rewrite_aggregate_refs(expr: Expr, map: &[(Expr, String)]) -> Expr {
 /// projection — the predicate may reference both pre-WITH variables
 /// and WITH aliases, so alias occurrences are rewritten to the
 /// expression that defines them (leaving pre-WITH vars untouched).
-fn substitute_aliases(
-    expr: Expr,
-    map: &std::collections::HashMap<String, Expr>,
-) -> Expr {
+fn substitute_aliases(expr: Expr, map: &std::collections::HashMap<String, Expr>) -> Expr {
     match expr {
         Expr::Identifier(ref name) => {
             if let Some(repl) = map.get(name) {
@@ -5615,9 +5591,9 @@ fn substitute_aliases(
             name,
             args: match args {
                 CallArgs::Star => CallArgs::Star,
-                CallArgs::Exprs(es) => CallArgs::Exprs(
-                    es.into_iter().map(|e| substitute_aliases(e, map)).collect(),
-                ),
+                CallArgs::Exprs(es) => {
+                    CallArgs::Exprs(es.into_iter().map(|e| substitute_aliases(e, map)).collect())
+                }
                 CallArgs::DistinctExprs(es) => CallArgs::DistinctExprs(
                     es.into_iter().map(|e| substitute_aliases(e, map)).collect(),
                 ),
@@ -5636,7 +5612,10 @@ fn substitute_aliases(
             else_expr: else_expr.map(|e| Box::new(substitute_aliases(*e, map))),
         },
         Expr::List(items) => Expr::List(
-            items.into_iter().map(|e| substitute_aliases(e, map)).collect(),
+            items
+                .into_iter()
+                .map(|e| substitute_aliases(e, map))
+                .collect(),
         ),
         Expr::Map(entries) => Expr::Map(
             entries

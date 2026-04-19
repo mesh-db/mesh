@@ -1994,7 +1994,11 @@ fn chained_unwind_rejects_alias_collision() {
     // UNWIND is now allowed to rebind existing variables per openCypher spec.
     let parsed = mesh_cypher::parse("MATCH (x) UNWIND [1, 2] AS x RETURN x").unwrap();
     let plan = mesh_cypher::plan(&parsed);
-    assert!(plan.is_ok(), "UNWIND rebinding should be allowed: {:?}", plan.err());
+    assert!(
+        plan.is_ok(),
+        "UNWIND rebinding should be allowed: {:?}",
+        plan.err()
+    );
 }
 
 #[test]
@@ -4691,7 +4695,11 @@ fn chained_merge_var_collision_rejected() {
     // MERGE on already-bound variable is now allowed per openCypher spec.
     let stmt = mesh_cypher::parse("MATCH (a:Person) MERGE (a:Person {id: '2'}) RETURN a").unwrap();
     let plan = mesh_cypher::plan(&stmt);
-    assert!(plan.is_ok(), "MERGE rebinding should be allowed: {:?}", plan.err());
+    assert!(
+        plan.is_ok(),
+        "MERGE rebinding should be allowed: {:?}",
+        plan.err()
+    );
 }
 
 // ---------------------------------------------------------------
@@ -4882,9 +4890,7 @@ fn cross_stage_rebind_both_vars_bound_plans() {
         "MATCH (a:Person), (b:Person) WITH a, b MATCH (a)-[:KNOWS]->(b) RETURN a, b",
     )
     .unwrap();
-    mesh_cypher::plan(&stmt).expect(
-        "cross-stage rebind with both vars bound should plan",
-    );
+    mesh_cypher::plan(&stmt).expect("cross-stage rebind with both vars bound should plan");
 }
 
 // ---------------------------------------------------------------

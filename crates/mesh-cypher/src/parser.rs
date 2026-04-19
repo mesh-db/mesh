@@ -1048,7 +1048,11 @@ fn build_delete_clause(pair: Pair<Rule>) -> Result<DeleteClause> {
             }
         }
     }
-    Ok(DeleteClause { detach, vars, exprs })
+    Ok(DeleteClause {
+        detach,
+        vars,
+        exprs,
+    })
 }
 
 /// Parse a `remove_tail` pair into [`RemoveItem`] entries.
@@ -2460,9 +2464,7 @@ fn build_literal(pair: Pair<Rule>) -> Result<Literal> {
         Rule::integer => Ok(Literal::Integer(parse_integer(lit_pair.as_str())?)),
         Rule::float => {
             let s = lit_pair.as_str();
-            let f: f64 = s
-                .parse()
-                .map_err(|_| Error::InvalidNumber(s.into()))?;
+            let f: f64 = s.parse().map_err(|_| Error::InvalidNumber(s.into()))?;
             if !f.is_finite() {
                 return Err(Error::Parse(format!(
                     "FloatingPointOverflow: float literal `{s}` overflows"
@@ -2590,7 +2592,9 @@ fn unescape_string(s: &str) -> Result<String> {
                         }
                     }
                     let code = u32::from_str_radix(&hex, 16).map_err(|_| {
-                        Error::Parse(format!("InvalidUnicodeLiteral: `\\u{hex}` is not valid hex"))
+                        Error::Parse(format!(
+                            "InvalidUnicodeLiteral: `\\u{hex}` is not valid hex"
+                        ))
                     })?;
                     let ch = char::from_u32(code).ok_or_else(|| {
                         Error::Parse(format!(
@@ -2655,10 +2659,15 @@ fn parse_integer(s: &str) -> Result<i64> {
         (false, s)
     };
     // Parse as u64 first to handle i64::MIN correctly (-2^63)
-    let uval = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X"))
+    let uval = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
     {
         u64::from_str_radix(hex, 16).map_err(|_| Error::InvalidNumber(s.to_string()))?
-    } else if let Some(oct) = digits.strip_prefix("0o").or_else(|| digits.strip_prefix("0O")) {
+    } else if let Some(oct) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
         u64::from_str_radix(oct, 8).map_err(|_| Error::InvalidNumber(s.to_string()))?
     } else {
         digits

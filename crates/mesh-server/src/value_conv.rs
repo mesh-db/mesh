@@ -178,7 +178,11 @@ fn property_to_bolt(p: &Property) -> BoltValue {
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             BoltValue::Map(pairs)
         }
-        Property::DateTime { nanos, tz_offset_secs, .. } => {
+        Property::DateTime {
+            nanos,
+            tz_offset_secs,
+            ..
+        } => {
             // Bolt 5 DateTime (tag 0x49): [seconds, nanos, tz_offset_secs].
             // The offset rides on the wire so drivers can reconstruct
             // the original presentation zone. We default to 0 ("Z")
@@ -201,7 +205,10 @@ fn property_to_bolt(p: &Property) -> BoltValue {
             fields: vec![BoltValue::Int(*days as i64)],
         },
         Property::Duration(d) => duration_to_bolt(*d),
-        Property::Time { nanos, tz_offset_secs } => {
+        Property::Time {
+            nanos,
+            tz_offset_secs,
+        } => {
             // Bolt LocalTime (tag 0x74): nanoseconds since midnight
             let tag = if tz_offset_secs.is_some() { 0x54 } else { 0x74 };
             let mut fields = vec![BoltValue::Int(*nanos)];
@@ -405,8 +412,7 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             }
             let seconds = temporal_int(fields, 0, tag, "LocalDateTime seconds")?;
             let nanos = temporal_int(fields, 1, tag, "LocalDateTime nanos")?;
-            let epoch_nanos: i128 =
-                (seconds as i128) * 1_000_000_000 + (nanos as i128);
+            let epoch_nanos: i128 = (seconds as i128) * 1_000_000_000 + (nanos as i128);
             Ok(Property::LocalDateTime(epoch_nanos))
         }
         mesh_bolt::TAG_DATE_TIME | mesh_bolt::TAG_DATE_TIME_LEGACY => {
@@ -424,8 +430,7 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             let seconds = temporal_int(fields, 0, tag, "DateTime seconds")?;
             let nanos = temporal_int(fields, 1, tag, "DateTime nanos")?;
             let tz_offset = temporal_int(fields, 2, tag, "DateTime tz_offset")?;
-            let epoch_nanos: i128 =
-                (seconds as i128) * 1_000_000_000 + (nanos as i128);
+            let epoch_nanos: i128 = (seconds as i128) * 1_000_000_000 + (nanos as i128);
             Ok(Property::DateTime {
                 nanos: epoch_nanos,
                 tz_offset_secs: Some(tz_offset as i32),
@@ -443,8 +448,7 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             }
             let seconds = temporal_int(fields, 0, tag, "DateTimeZoneId seconds")?;
             let nanos = temporal_int(fields, 1, tag, "DateTimeZoneId nanos")?;
-            let epoch_nanos: i128 =
-                (seconds as i128) * 1_000_000_000 + (nanos as i128);
+            let epoch_nanos: i128 = (seconds as i128) * 1_000_000_000 + (nanos as i128);
             Ok(Property::DateTime {
                 nanos: epoch_nanos,
                 tz_offset_secs: None,

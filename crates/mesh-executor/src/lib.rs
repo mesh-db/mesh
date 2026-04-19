@@ -11,9 +11,7 @@ pub use ops::{
     execute, execute_with_reader, execute_with_reader_and_procs, execute_with_writer, explain,
     profile,
 };
-pub use procedures::{
-    ProcArgSpec, ProcOutSpec, ProcRow, ProcType, Procedure, ProcedureRegistry,
-};
+pub use procedures::{ProcArgSpec, ProcOutSpec, ProcRow, ProcType, Procedure, ProcedureRegistry};
 pub use reader::{GraphReader, StorageReaderAdapter};
 pub use value::{ParamMap, Row, Value};
 pub use writer::{GraphWriter, StorageWriterAdapter};

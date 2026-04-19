@@ -146,8 +146,12 @@ pub(crate) fn encode_index_value(value: &Property) -> Option<Vec<u8>> {
         // on the reference date), so we refuse to index it — matches
         // how Neo4j treats `Duration` in schema indexes.
         Property::Duration(_) => None,
-        Property::Float64(_) | Property::List(_) | Property::Map(_) | Property::Null
-        | Property::Time { .. } | Property::LocalDateTime(_) => None,
+        Property::Float64(_)
+        | Property::List(_)
+        | Property::Map(_)
+        | Property::Null
+        | Property::Time { .. }
+        | Property::LocalDateTime(_) => None,
     }
 }
 

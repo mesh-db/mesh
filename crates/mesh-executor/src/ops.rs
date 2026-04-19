@@ -479,9 +479,9 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             aggregates.clone(),
         )),
         LogicalPlan::Identity { input } => Box::new(IdentityOp::new(child!(input))),
-        LogicalPlan::CoalesceNullRow { input, null_vars } => Box::new(
-            CoalesceNullRowOp::new(child!(input), null_vars.clone()),
-        ),
+        LogicalPlan::CoalesceNullRow { input, null_vars } => {
+            Box::new(CoalesceNullRowOp::new(child!(input), null_vars.clone()))
+        }
         LogicalPlan::Distinct { input } => Box::new(DistinctOp::new(child!(input))),
         LogicalPlan::OrderBy { input, sort_items } => {
             Box::new(OrderByOp::new(child!(input), sort_items.clone()))
@@ -1112,9 +1112,9 @@ impl Operator for SetPropertyOp {
                             // openCypher: SET on a null target (from
                             // OPTIONAL MATCH that didn't bind) is a
                             // silent no-op rather than an error.
-                            Some(Value::Null)
-                            | Some(Value::Property(Property::Null))
-                            | None => continue,
+                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
+                                continue
+                            }
                             // openCypher: SET a.key = null removes the
                             // property rather than storing a null value.
                             Some(Value::Node(n)) => {
@@ -1136,9 +1136,9 @@ impl Operator for SetPropertyOp {
                             _ => return Err(Error::UnboundVariable(var)),
                         },
                         Action::AddLabels { var, labels } => match row.get_mut(&var) {
-                            Some(Value::Null)
-                            | Some(Value::Property(Property::Null))
-                            | None => continue,
+                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
+                                continue
+                            }
                             Some(Value::Node(n)) => {
                                 for label in labels {
                                     if !n.labels.contains(&label) {
@@ -1150,9 +1150,9 @@ impl Operator for SetPropertyOp {
                             _ => return Err(Error::UnboundVariable(var)),
                         },
                         Action::Replace { var, props } => match row.get_mut(&var) {
-                            Some(Value::Null)
-                            | Some(Value::Property(Property::Null))
-                            | None => continue,
+                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
+                                continue
+                            }
                             Some(Value::Node(n)) => {
                                 n.properties.clear();
                                 for (k, v) in props {
@@ -1174,9 +1174,9 @@ impl Operator for SetPropertyOp {
                             _ => return Err(Error::UnboundVariable(var)),
                         },
                         Action::Merge { var, props } => match row.get_mut(&var) {
-                            Some(Value::Null)
-                            | Some(Value::Property(Property::Null))
-                            | None => continue,
+                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
+                                continue
+                            }
                             Some(Value::Node(n)) => {
                                 for (k, v) in props {
                                     if matches!(v, Property::Null) {
@@ -1243,9 +1243,9 @@ impl Operator for RemoveOp {
                         RemoveSpec::Property { var, key } => match row.get_mut(var) {
                             // Null target (from OPTIONAL MATCH) is a
                             // no-op, matching Neo4j's REMOVE semantics.
-                            Some(Value::Null)
-                            | Some(Value::Property(Property::Null))
-                            | None => continue,
+                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
+                                continue
+                            }
                             Some(Value::Node(n)) => {
                                 n.properties.remove(key);
                                 updated_nodes.insert(var.clone());
@@ -1257,9 +1257,9 @@ impl Operator for RemoveOp {
                             _ => return Err(Error::UnboundVariable(var.clone())),
                         },
                         RemoveSpec::Labels { var, labels } => match row.get_mut(var) {
-                            Some(Value::Null)
-                            | Some(Value::Property(Property::Null))
-                            | None => continue,
+                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
+                                continue
+                            }
                             Some(Value::Node(n)) => {
                                 n.labels.retain(|l| !labels.contains(l));
                                 updated_nodes.insert(var.clone());
@@ -1933,10 +1933,9 @@ fn value_to_property(v: Value) -> Result<Property> {
         // Graph-aware `Value::Map` and graph elements can't be
         // stored as node / edge property values; SET will reject
         // them.
-        Value::Map(_)
-        | Value::Node(_)
-        | Value::Edge(_)
-        | Value::Path { .. } => Err(Error::InvalidSetValue),
+        Value::Map(_) | Value::Node(_) | Value::Edge(_) | Value::Path { .. } => {
+            Err(Error::InvalidSetValue)
+        }
     }
 }
 
@@ -2724,8 +2723,9 @@ impl Operator for EdgeExpandOp {
                         // that matched nothing) drops the input
                         // row — `MATCH (a)-->(b)` against a null
                         // `a` is just empty, not an error.
-                        Some(Value::Null)
-                        | Some(Value::Property(mesh_core::Property::Null)) => continue,
+                        Some(Value::Null) | Some(Value::Property(mesh_core::Property::Null)) => {
+                            continue
+                        }
                         _ => return Err(Error::UnboundVariable(self.src_var.clone())),
                     };
                     self.pending = match self.direction {
@@ -3406,8 +3406,9 @@ impl Operator for VarLengthExpandOp {
                         // `EdgeExpandOp`. In optional mode we
                         // still emit the left-join fallback;
                         // otherwise we just skip.
-                        Some(Value::Null)
-                        | Some(Value::Property(mesh_core::Property::Null)) => None,
+                        Some(Value::Null) | Some(Value::Property(mesh_core::Property::Null)) => {
+                            None
+                        }
                         _ => return Err(Error::UnboundVariable(self.src_var.clone())),
                     };
                     // Replay path: when the hop names an already-
@@ -3417,23 +3418,22 @@ impl Operator for VarLengthExpandOp {
                     // form a connected walk from `src_id` in the
                     // required direction. Produces at most one
                     // path — the exact list that was supplied.
-                    let (mut paths, mut node_paths, mut targets) = if let Some(list_var) =
-                        &self.bound_edge_list_var
-                    {
-                        replay_edge_list(
-                            ctx,
-                            &row,
-                            list_var,
-                            src_id,
-                            self.direction,
-                            &self.edge_types,
-                        )?
-                    } else {
-                        match src_id {
-                            Some(id) => self.enumerate(ctx, id, &row)?,
-                            None => (Vec::new(), Vec::new(), Vec::new()),
-                        }
-                    };
+                    let (mut paths, mut node_paths, mut targets) =
+                        if let Some(list_var) = &self.bound_edge_list_var {
+                            replay_edge_list(
+                                ctx,
+                                &row,
+                                list_var,
+                                src_id,
+                                self.direction,
+                                &self.edge_types,
+                            )?
+                        } else {
+                            match src_id {
+                                Some(id) => self.enumerate(ctx, id, &row)?,
+                                None => (Vec::new(), Vec::new(), Vec::new()),
+                            }
+                        };
                     // Bound-endpoint constraint: drop paths whose
                     // terminal node doesn't match the node already
                     // bound at the constraint var. When combined
@@ -3637,7 +3637,10 @@ fn render_expr_name(expr: &Expr) -> Option<String> {
             // Match the source syntax's parenthesisation of a
             // bracketed base: `(list[1]).k` round-trips, while a
             // plain identifier base stays bare (`a.b`).
-            if matches!(base.as_ref(), Expr::IndexAccess { .. } | Expr::SliceAccess { .. }) {
+            if matches!(
+                base.as_ref(),
+                Expr::IndexAccess { .. } | Expr::SliceAccess { .. }
+            ) {
                 format!("({}).{key}", render_expr_name(base)?)
             } else {
                 format!("{}.{key}", render_expr_name(base)?)
@@ -3676,7 +3679,11 @@ fn render_expr_name(expr: &Expr) -> Option<String> {
                 BinaryOp::Mod => " % ",
                 BinaryOp::Pow => " ^ ",
             };
-            format!("{}{op_str}{}", render_expr_name(left)?, render_expr_name(right)?)
+            format!(
+                "{}{op_str}{}",
+                render_expr_name(left)?,
+                render_expr_name(right)?
+            )
         }
         Expr::UnaryOp { op, operand } => {
             let op_str = match op {
@@ -3705,7 +3712,11 @@ fn render_expr_name(expr: &Expr) -> Option<String> {
                 CompareOp::Contains => " CONTAINS ",
                 CompareOp::RegexMatch => " =~ ",
             };
-            format!("{}{op_str}{}", render_expr_name(left)?, render_expr_name(right)?)
+            format!(
+                "{}{op_str}{}",
+                render_expr_name(left)?,
+                render_expr_name(right)?
+            )
         }
         Expr::List(items) => {
             let inner: Vec<String> = items.iter().filter_map(render_expr_name).collect();
@@ -3725,7 +3736,11 @@ fn render_expr_name(expr: &Expr) -> Option<String> {
             format!("{}[{}]", render_expr_name(base)?, render_expr_name(index)?)
         }
         Expr::InList { element, list } => {
-            format!("{} IN {}", render_expr_name(element)?, render_expr_name(list)?)
+            format!(
+                "{} IN {}",
+                render_expr_name(element)?,
+                render_expr_name(list)?
+            )
         }
         Expr::HasLabels { expr, labels } => {
             let mut s = format!("({}", render_expr_name(expr)?);
@@ -4352,8 +4367,13 @@ impl AggregateOp {
                 if let Some(extra_expr) = &spec.extra_arg {
                     let need_resolve = matches!(
                         &entry.agg_states[i],
-                        AggState::PercentileDisc { percentile: None, .. }
-                            | AggState::PercentileCont { percentile: None, .. }
+                        AggState::PercentileDisc {
+                            percentile: None,
+                            ..
+                        } | AggState::PercentileCont {
+                            percentile: None,
+                            ..
+                        }
                     );
                     if need_resolve {
                         let pv = eval_expr(extra_expr, &ctx.eval_ctx(&row))?;
@@ -4366,9 +4386,7 @@ impl AggregateOp {
                         // lie in [0.0, 1.0]; anything else is an
                         // `ArgumentError: NumberOutOfRange`.
                         if !(0.0..=1.0).contains(&p) || p.is_nan() {
-                            return Err(Error::Procedure(format!(
-                                "percentile out of range: {p}"
-                            )));
+                            return Err(Error::Procedure(format!("percentile out of range: {p}")));
                         }
                         match &mut entry.agg_states[i] {
                             AggState::PercentileDisc { percentile, .. }
@@ -4591,8 +4609,7 @@ impl AggState {
                     items.push(v);
                 }
             }
-            AggState::PercentileDisc { items, .. }
-            | AggState::PercentileCont { items, .. } => {
+            AggState::PercentileDisc { items, .. } | AggState::PercentileCont { items, .. } => {
                 let v = expr_arg_value(arg, ctx)?;
                 if !matches!(v, Value::Null) {
                     items.push(v);

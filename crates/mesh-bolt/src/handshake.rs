@@ -47,8 +47,7 @@ pub const BOLT_5_3: [u8; 4] = version_bytes(5, 3, 0);
 pub const BOLT_5_4: [u8; 4] = version_bytes(5, 4, 0);
 
 /// All server-supported versions, in preference order (newest first).
-pub const SUPPORTED: &[[u8; 4]] =
-    &[BOLT_5_4, BOLT_5_3, BOLT_5_2, BOLT_5_1, BOLT_5_0, BOLT_4_4];
+pub const SUPPORTED: &[[u8; 4]] = &[BOLT_5_4, BOLT_5_3, BOLT_5_2, BOLT_5_1, BOLT_5_0, BOLT_4_4];
 
 /// Read the client's preamble + four version slots, decide which
 /// version to speak, and write the agreed version back. Returns the
