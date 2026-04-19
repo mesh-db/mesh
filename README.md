@@ -12,8 +12,8 @@ A distributed, Cypher-compliant graph database written in Rust.
 Mesh stores property graphs in RocksDB, parses and executes a useful subset
 of Cypher, and supports two wire protocols out of the box:
 
-- **Bolt 4.4**, so any Neo4j driver (Python, JS, Java, Go, .NET, cypher-shell)
-  can connect directly.
+- **Bolt 5** (5.0 – 5.4, with 4.4 still negotiated for older clients), so any
+  Neo4j driver (Python, JS, Java, Go, .NET, cypher-shell) can connect directly.
 - **gRPC** for service-to-service traffic and for the cluster's internal
   Raft / 2PC plumbing.
 
@@ -181,9 +181,10 @@ and `UNWIND $list` — the full driver-facing surface as of today.
 
 ### Wire protocols
 
-- **Bolt 4.4**: handshake, PackStream encoding, all standard message types
-  (HELLO, RUN, PULL, DISCARD, RESET, GOODBYE, BEGIN, COMMIT, ROLLBACK),
-  parameters, explicit transactions with atomic batch commit
+- **Bolt 5.0 – 5.4** (plus legacy 4.4): handshake, PackStream encoding, all
+  standard message types (HELLO, LOGON, LOGOFF, RUN, PULL, DISCARD, RESET,
+  GOODBYE, BEGIN, COMMIT, ROLLBACK, TELEMETRY), parameters, explicit
+  transactions with atomic batch commit
 - **gRPC** via tonic: `MeshQuery`, `MeshWrite`, `MeshRaft` services. See
   `crates/mesh-rpc/proto/mesh.proto`.
 
