@@ -3760,6 +3760,14 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     });
 
     if terminal.star || !terminal.return_items.is_empty() {
+        // `size()` is for strings and lists only — calling it on
+        // a Path is an openCypher `InvalidArgumentType`. Catch
+        // the common case where the argument is a known-Path
+        // identifier at plan time (runtime would only see a raw
+        // Value::Path without the original variable role).
+        for item in &terminal.return_items {
+            reject_size_on_path(&item.expr, &bound_vars)?;
+        }
         plan = apply_return_pipeline(
             plan,
             &terminal.return_items,
@@ -4380,6 +4388,15 @@ fn apply_with_clause(mut plan: LogicalPlan, w: &crate::ast::WithClause) -> Resul
 fn classify_return_items(
     items: &[ReturnItem],
 ) -> Result<(Vec<ReturnItem>, Vec<AggregateSpec>, Vec<ReturnItem>)> {
+    // openCypher forbids aggregate calls inside list
+    // comprehensions, list predicates, reduce, and similar
+    // scoping constructs — each introduces its own row
+    // iteration scope that has nothing to aggregate over.
+    // Catch them at plan time before the nested-aggregate
+    // extractor lifts them out.
+    for item in items {
+        reject_aggregate_inside_nested_scope(&item.expr)?;
+    }
     let mut group_keys: Vec<ReturnItem> = Vec::new();
     let mut aggregates: Vec<AggregateSpec> = Vec::new();
     let mut post_items: Vec<ReturnItem> = Vec::new();
@@ -4435,10 +4452,23 @@ fn classify_return_items(
                 .clone()
                 .unwrap_or_else(|| render_expr_key(&item.expr));
             aggregates.push(AggregateSpec {
-                alias,
+                alias: alias.clone(),
                 function: func,
                 arg: agg_arg,
                 extra_arg: percentile_extra,
+            });
+            // Keep the aggregate in `post_items` too, pointing
+            // at its own alias. Otherwise a RETURN / WITH that
+            // mixes a top-level aggregate with a nested-aggregate
+            // sibling would construct a Project over the Aggregate
+            // that only forwards the nested-aggregate's rewritten
+            // expr and drop the top-level aggregate's column.
+            // The Project stays a no-op-through when post_items
+            // ends up containing only identifiers — cheap and
+            // simpler than branching on "any nested".
+            post_items.push(ReturnItem {
+                expr: Expr::Identifier(alias),
+                alias: item.alias.clone(),
             });
         } else {
             if contains_aggregate(&item.expr) {
@@ -4464,8 +4494,30 @@ fn classify_return_items(
                 });
             } else {
                 group_keys.push(item.clone());
+                // Mirror non-aggregate group keys into post_items
+                // so the Project stays row-shape-complete when it
+                // has to run (because of sibling nested aggregates).
+                post_items.push(ReturnItem {
+                    expr: Expr::Identifier(
+                        item.alias
+                            .clone()
+                            .unwrap_or_else(|| render_expr_key(&item.expr)),
+                    ),
+                    alias: item.alias.clone(),
+                });
             }
         }
+    }
+    // If every item was a simple group key or top-level aggregate
+    // (no nested aggregates anywhere), collapse `post_items` back
+    // to empty so the existing "skip Project when nothing to
+    // rewrite" fast path still triggers. The identifiers we added
+    // would have been redundant there.
+    let has_real_rewrite = post_items
+        .iter()
+        .any(|it| !matches!(it.expr, Expr::Identifier(_)));
+    if !has_real_rewrite {
+        post_items.clear();
     }
     Ok((group_keys, aggregates, post_items))
 }
@@ -4603,8 +4655,219 @@ fn extract_nested_aggregates(
                 .as_deref()
                 .map(|e| Box::new(extract_nested_aggregates(e, out, idx))),
         },
+        // List / map / reduce sub-constructs also need to walk
+        // their sub-expressions: an aggregate nested inside
+        // `[x IN collect(r) WHERE ...]` must be lifted out so
+        // the RETURN's Aggregate operator sees it. Leaving these
+        // untouched would leave `collect` inside the list
+        // comprehension's source, which then errors at eval time
+        // as "not a scalar function".
+        Expr::ListComprehension {
+            var,
+            source,
+            predicate,
+            projection,
+        } => Expr::ListComprehension {
+            var: var.clone(),
+            source: Box::new(extract_nested_aggregates(source, out, idx)),
+            predicate: predicate
+                .as_deref()
+                .map(|p| Box::new(extract_nested_aggregates(p, out, idx))),
+            projection: projection
+                .as_deref()
+                .map(|p| Box::new(extract_nested_aggregates(p, out, idx))),
+        },
+        Expr::ListPredicate {
+            kind,
+            var,
+            list,
+            predicate,
+        } => Expr::ListPredicate {
+            kind: *kind,
+            var: var.clone(),
+            list: Box::new(extract_nested_aggregates(list, out, idx)),
+            predicate: Box::new(extract_nested_aggregates(predicate, out, idx)),
+        },
+        Expr::Reduce {
+            acc_var,
+            acc_init,
+            elem_var,
+            source,
+            body,
+        } => Expr::Reduce {
+            acc_var: acc_var.clone(),
+            acc_init: Box::new(extract_nested_aggregates(acc_init, out, idx)),
+            elem_var: elem_var.clone(),
+            source: Box::new(extract_nested_aggregates(source, out, idx)),
+            body: Box::new(extract_nested_aggregates(body, out, idx)),
+        },
+        Expr::InList { element, list } => Expr::InList {
+            element: Box::new(extract_nested_aggregates(element, out, idx)),
+            list: Box::new(extract_nested_aggregates(list, out, idx)),
+        },
+        Expr::HasLabels { expr, labels } => Expr::HasLabels {
+            expr: Box::new(extract_nested_aggregates(expr, out, idx)),
+            labels: labels.clone(),
+        },
         other => other.clone(),
     }
+}
+
+/// Walk `expr` and reject any `size(p)` where `p` is a
+/// statically-known Path-typed variable — openCypher raises
+/// `InvalidArgumentType` because `size()` is defined on
+/// strings and lists; path length is spelled `length()`.
+fn reject_size_on_path(expr: &Expr, bound: &HashMap<String, VarType>) -> Result<()> {
+    let mut err: Option<Error> = None;
+    walk_expr(expr, &mut |e| {
+        if let Expr::Call { name, args } = e {
+            if name.eq_ignore_ascii_case("size") {
+                if let CallArgs::Exprs(es) = args {
+                    if es.len() == 1 {
+                        if let Expr::Identifier(n) = &es[0] {
+                            if matches!(bound.get(n), Some(VarType::Path)) {
+                                err = Some(Error::Plan(
+                                    "size() is not defined for path values; use length() \
+                                     instead"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Reject aggregate calls that appear inside any scoping
+/// construct with its own row iteration scope (list
+/// comprehension, list predicate, reduce). openCypher flags
+/// these as `InvalidAggregation` — `[x IN xs | count(*)]`
+/// doesn't make sense because each iteration has only one row
+/// in scope.
+fn reject_aggregate_inside_nested_scope(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::ListComprehension {
+            source,
+            predicate,
+            projection,
+            ..
+        } => {
+            reject_aggregate_inside_nested_scope(source)?;
+            if let Some(p) = predicate {
+                if contains_aggregate(p) {
+                    return Err(Error::Plan(
+                        "aggregate functions are not allowed inside list comprehensions".into(),
+                    ));
+                }
+            }
+            if let Some(p) = projection {
+                if contains_aggregate(p) {
+                    return Err(Error::Plan(
+                        "aggregate functions are not allowed inside list comprehensions".into(),
+                    ));
+                }
+            }
+        }
+        Expr::ListPredicate { list, predicate, .. } => {
+            reject_aggregate_inside_nested_scope(list)?;
+            if contains_aggregate(predicate) {
+                return Err(Error::Plan(
+                    "aggregate functions are not allowed inside list predicates".into(),
+                ));
+            }
+        }
+        Expr::Reduce {
+            acc_init,
+            source,
+            body,
+            ..
+        } => {
+            reject_aggregate_inside_nested_scope(acc_init)?;
+            reject_aggregate_inside_nested_scope(source)?;
+            if contains_aggregate(body) {
+                return Err(Error::Plan(
+                    "aggregate functions are not allowed inside reduce".into(),
+                ));
+            }
+        }
+        Expr::Not(inner) | Expr::IsNull { inner, .. } | Expr::UnaryOp { operand: inner, .. } => {
+            reject_aggregate_inside_nested_scope(inner)?;
+        }
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            reject_aggregate_inside_nested_scope(a)?;
+            reject_aggregate_inside_nested_scope(b)?;
+        }
+        Expr::Compare { left, right, .. } | Expr::BinaryOp { left, right, .. } => {
+            reject_aggregate_inside_nested_scope(left)?;
+            reject_aggregate_inside_nested_scope(right)?;
+        }
+        Expr::PropertyAccess { base, .. } => {
+            reject_aggregate_inside_nested_scope(base)?;
+        }
+        Expr::IndexAccess { base, index } => {
+            reject_aggregate_inside_nested_scope(base)?;
+            reject_aggregate_inside_nested_scope(index)?;
+        }
+        Expr::SliceAccess { base, start, end } => {
+            reject_aggregate_inside_nested_scope(base)?;
+            if let Some(s) = start {
+                reject_aggregate_inside_nested_scope(s)?;
+            }
+            if let Some(e) = end {
+                reject_aggregate_inside_nested_scope(e)?;
+            }
+        }
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            if let Some(s) = scrutinee {
+                reject_aggregate_inside_nested_scope(s)?;
+            }
+            for (c, r) in branches {
+                reject_aggregate_inside_nested_scope(c)?;
+                reject_aggregate_inside_nested_scope(r)?;
+            }
+            if let Some(e) = else_expr {
+                reject_aggregate_inside_nested_scope(e)?;
+            }
+        }
+        Expr::List(items) => {
+            for it in items {
+                reject_aggregate_inside_nested_scope(it)?;
+            }
+        }
+        Expr::Map(entries) => {
+            for (_, v) in entries {
+                reject_aggregate_inside_nested_scope(v)?;
+            }
+        }
+        Expr::Call { args, .. } => match args {
+            CallArgs::Exprs(es) | CallArgs::DistinctExprs(es) => {
+                for e in es {
+                    reject_aggregate_inside_nested_scope(e)?;
+                }
+            }
+            CallArgs::Star => {}
+        },
+        Expr::InList { element, list } => {
+            reject_aggregate_inside_nested_scope(element)?;
+            reject_aggregate_inside_nested_scope(list)?;
+        }
+        Expr::HasLabels { expr, .. } => {
+            reject_aggregate_inside_nested_scope(expr)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn contains_aggregate(expr: &Expr) -> bool {
@@ -4663,6 +4926,23 @@ fn contains_aggregate(expr: &Expr) -> bool {
                     .map(contains_aggregate)
                     .unwrap_or(false)
         }
+        Expr::ListPredicate { list, predicate, .. } => {
+            contains_aggregate(list) || contains_aggregate(predicate)
+        }
+        Expr::Reduce {
+            acc_init,
+            source,
+            body,
+            ..
+        } => {
+            contains_aggregate(acc_init)
+                || contains_aggregate(source)
+                || contains_aggregate(body)
+        }
+        Expr::InList { element, list } => {
+            contains_aggregate(element) || contains_aggregate(list)
+        }
+        Expr::HasLabels { expr, .. } => contains_aggregate(expr),
         _ => false,
     }
 }

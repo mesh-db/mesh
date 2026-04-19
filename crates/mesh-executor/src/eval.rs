@@ -214,7 +214,10 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                         .map(Value::Property)
                         .unwrap_or(Value::Null)),
                     Value::Map(m) => Ok(m.get(key).cloned().unwrap_or(Value::Null)),
-                    _ => Ok(Value::Null),
+                    // String indexing is only valid on map-like
+                    // values; indexing a list / scalar with a
+                    // string is `InvalidArgumentType`.
+                    _ => Err(Error::TypeMismatch),
                 };
             }
             let items = match base_val {
@@ -429,6 +432,16 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             {
                 return Ok(Value::Null);
             }
+            // `=` / `<>` use three-valued equality so nested nulls
+            // bubble up (`[1, 2] = [null, 2]` → null). Ordering
+            // operators keep the existing compare() path.
+            if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+                return Ok(match equal_three_valued(&vl, &vr) {
+                    Some(true) => Value::Property(Property::Bool(matches!(op, CompareOp::Eq))),
+                    Some(false) => Value::Property(Property::Bool(matches!(op, CompareOp::Ne))),
+                    None => Value::Null,
+                });
+            }
             match compare(*op, &vl, &vr) {
                 Ok(b) => Ok(Value::Property(Property::Bool(b))),
                 Err(Error::TypeMismatch) => match op {
@@ -495,18 +508,24 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     Ok(Value::Null)
                 };
             }
-            // Three-valued IN: if element matches any item → true;
-            // if any item is null and no match found → null; otherwise false
-            let mut has_null = false;
+            // Three-valued IN: each item comparison is
+            // three-valued, so nested nulls in either the
+            // element or an item propagate to "indeterminate".
+            // A definite `true` anywhere collapses to true;
+            // all definite `false`s with no null collapses to
+            // false; any null with no prior true collapses to
+            // null.
+            let mut any_null = false;
             for item in &items {
-                if values_equal(&elem, item) {
-                    return Ok(Value::Property(Property::Bool(true)));
-                }
-                if matches!(item, Value::Null | Value::Property(Property::Null)) {
-                    has_null = true;
+                match equal_three_valued(&elem, item) {
+                    Some(true) => return Ok(Value::Property(Property::Bool(true))),
+                    Some(false) => continue,
+                    None => {
+                        any_null = true;
+                    }
                 }
             }
-            if has_null {
+            if any_null {
                 Ok(Value::Null)
             } else {
                 Ok(Value::Property(Property::Bool(false)))
@@ -5622,6 +5641,73 @@ fn to_bool_3v(v: &Value) -> Result<Option<bool>> {
 
 pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
     compare(CompareOp::Eq, a, b).unwrap_or(false)
+}
+
+/// Three-valued Cypher equality — returns `None` when either
+/// input is `null` or when any nested element on either side is
+/// null *and* the non-null parts haven't already proved the
+/// lists unequal. Used by `=` / `<>` between lists and by
+/// `IN` so `[1, 2] = [null, 2]` and `[null] IN [[null]]`
+/// correctly bubble up to `Value::Null` instead of being
+/// flattened to `false`.
+pub(crate) fn equal_three_valued(a: &Value, b: &Value) -> Option<bool> {
+    let a_null = matches!(a, Value::Null | Value::Property(Property::Null));
+    let b_null = matches!(b, Value::Null | Value::Property(Property::Null));
+    if a_null || b_null {
+        return None;
+    }
+    // Normalise both sides to `Vec<Value>` if they look like lists
+    // so the recursive comparison doesn't have to branch on
+    // `Value::List` vs `Property::List`.
+    let la = match a {
+        Value::List(items) => Some(items.clone()),
+        Value::Property(Property::List(items)) => {
+            Some(items.iter().cloned().map(Value::Property).collect::<Vec<_>>())
+        }
+        _ => None,
+    };
+    let lb = match b {
+        Value::List(items) => Some(items.clone()),
+        Value::Property(Property::List(items)) => {
+            Some(items.iter().cloned().map(Value::Property).collect::<Vec<_>>())
+        }
+        _ => None,
+    };
+    if let (Some(la), Some(lb)) = (la, lb) {
+        // Different lengths = definitely unequal, regardless of
+        // nulls — matches openCypher's "length-first" rule.
+        if la.len() != lb.len() {
+            return Some(false);
+        }
+        let mut any_null = false;
+        for (x, y) in la.iter().zip(lb.iter()) {
+            match equal_three_valued(x, y) {
+                Some(true) => continue,
+                Some(false) => return Some(false),
+                None => any_null = true,
+            }
+        }
+        return if any_null { None } else { Some(true) };
+    }
+    // One-side-is-list / other-isn't: no nulls to propagate, so
+    // the types simply don't compare as equal.
+    if matches!(a, Value::List(_) | Value::Property(Property::List(_)))
+        != matches!(b, Value::List(_) | Value::Property(Property::List(_)))
+    {
+        return Some(false);
+    }
+    // Everything else (maps, scalars, graph elements) defers to
+    // the existing `compare()` logic which already handles
+    // three-valued map equality (via `Err(UnsupportedComparison)`
+    // for "all common keys equal but some carry null"). Translate
+    // that Err path back into `None` so the caller treats it as
+    // null.
+    match compare(CompareOp::Eq, a, b) {
+        Ok(b) => Some(b),
+        Err(Error::UnsupportedComparison) => None,
+        Err(Error::TypeMismatch) => Some(false),
+        Err(_) => Some(false),
+    }
 }
 
 fn compare(op: CompareOp, l: &Value, r: &Value) -> Result<bool> {
