@@ -4060,14 +4060,56 @@ fn apply_return_pipeline(
         order_by.to_vec()
     };
 
+    let (group_keys, aggregates, post_items) = if star {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        classify_return_items(return_items)?
+    };
+    let has_aggregates = !aggregates.is_empty();
+
+    // openCypher lets ORDER BY reference either projected
+    // columns (`RETURN n.num AS x ORDER BY x`) or pre-RETURN
+    // bindings that weren't projected (`WITH n, 0 AS r RETURN n
+    // ORDER BY r`). We sort in the post-project position when
+    // every ORDER BY identifier resolves to a projected column,
+    // and in the pre-project position otherwise. DISTINCT and
+    // aggregation both collapse rows so they force the
+    // post-project path — any ORDER BY referencing a dropped
+    // binding in that case is already a user error the earlier
+    // scope check flagged.
+    let projected_cols: std::collections::HashSet<String> = if star {
+        std::collections::HashSet::new()
+    } else {
+        return_items
+            .iter()
+            .map(|i| {
+                i.alias
+                    .clone()
+                    .unwrap_or_else(|| render_expr_key(&i.expr))
+            })
+            .collect()
+    };
+    let order_before_project = !star
+        && !has_aggregates
+        && !distinct
+        && !order_by.is_empty()
+        && !order_by
+            .iter()
+            .all(|s| all_refs_in(&s.expr, &projected_cols));
+
+    if order_before_project {
+        plan = LogicalPlan::OrderBy {
+            input: Box::new(plan),
+            sort_items: order_by.to_vec(),
+        };
+    }
+
     if star {
         plan = LogicalPlan::Identity {
             input: Box::new(plan),
         };
     } else {
-        let (group_keys, aggregates, post_items) = classify_return_items(return_items)?;
-
-        plan = if !aggregates.is_empty() {
+        plan = if has_aggregates {
             let mut agg = LogicalPlan::Aggregate {
                 input: Box::new(plan),
                 group_keys,
@@ -4094,7 +4136,7 @@ fn apply_return_pipeline(
         };
     }
 
-    if !order_by_rewritten.is_empty() {
+    if !order_by_rewritten.is_empty() && !order_before_project {
         plan = LogicalPlan::OrderBy {
             input: Box::new(plan),
             sort_items: order_by_rewritten,
@@ -5087,6 +5129,34 @@ fn reject_size_on_path(expr: &Expr, bound: &HashMap<String, VarType>) -> Result<
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Walk `expr` and return `true` iff every referenced bare
+/// identifier / Property-base is in `cols`. Used by the ORDER
+/// BY placement decision: post-project sort is only valid when
+/// the sort expression doesn't reach past the projection to a
+/// dropped binding. Expressions that don't reference any
+/// variable (pure literals, aggregates over constants) return
+/// `true` vacuously.
+fn all_refs_in(expr: &Expr, cols: &std::collections::HashSet<String>) -> bool {
+    let mut all_in = true;
+    let _ = walk_expr(expr, &mut |e| {
+        match e {
+            Expr::Identifier(n) => {
+                if !cols.contains(n) {
+                    all_in = false;
+                }
+            }
+            Expr::Property { var, .. } => {
+                if !cols.contains(var) {
+                    all_in = false;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    all_in
 }
 
 /// Reject `path.key` / `path[idx]` on a known Path-typed
