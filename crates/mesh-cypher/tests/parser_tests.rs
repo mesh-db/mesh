@@ -57,18 +57,6 @@ fn all_create_patterns(m: &MatchStmt) -> Vec<&Pattern> {
     pats
 }
 
-/// Collect all REMOVE items from both inline clauses and terminal.
-fn all_remove_items(m: &MatchStmt) -> Vec<&RemoveItem> {
-    let mut items: Vec<&RemoveItem> = Vec::new();
-    for c in &m.clauses {
-        if let ReadingClause::Remove(ri) = c {
-            items.extend(ri.iter());
-        }
-    }
-    items.extend(m.terminal.remove_items.iter());
-    items
-}
-
 // --- test scaffolding for the clause-sequence MatchStmt ---
 //
 // These helpers pull the canonical "first MATCH clause" out
