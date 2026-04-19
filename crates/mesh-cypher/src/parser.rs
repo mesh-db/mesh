@@ -1375,7 +1375,7 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
     let direction = match inner.as_rule() {
         Rule::rel_right => Direction::Outgoing,
         Rule::rel_left => Direction::Incoming,
-        Rule::rel_both => Direction::Both,
+        Rule::rel_both | Rule::rel_both_arrows => Direction::Both,
         r => return Err(Error::Parse(format!("unexpected rel rule: {:?}", r))),
     };
 

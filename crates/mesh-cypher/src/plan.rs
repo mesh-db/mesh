@@ -11,7 +11,18 @@ enum VarType {
     Node,
     Edge,
     Path,
+    /// Opaque value whose runtime type the planner couldn't narrow
+    /// (function calls, parameters, CASE, property access...). A
+    /// downstream pattern is allowed to *refine* a Scalar binding
+    /// to Node/Edge/Path because at runtime it could genuinely be
+    /// that kind of value (`WITH head([n]) AS x MATCH (x)-->(y)`).
     Scalar,
+    /// Value whose literal form guarantees it can never be a graph
+    /// element (`WITH 123 AS n / MATCH (n)`). Distinct from
+    /// `Scalar` so the strict-check code path can flag
+    /// `VariableTypeConflict` statically without also rejecting
+    /// legitimate Scalar→Node refinement.
+    NonNode,
 }
 
 /// What the planner needs to know about the current store beyond the
@@ -1871,6 +1882,7 @@ fn plan_pattern_from_bound(
     input: LogicalPlan,
     pattern: &Pattern,
     pattern_idx: usize,
+    bound_vars: &HashMap<String, VarType>,
 ) -> Result<LogicalPlan> {
     // shortestPath wrapping is lowered to a dedicated operator
     // here because this is the only context where both
@@ -1906,7 +1918,19 @@ fn plan_pattern_from_bound(
     if !working.start.properties.is_empty() {
         plan = wrap_with_pattern_prop_filter(plan, &start_var, &working.start.properties);
     }
-    let plan = chain_hops(plan, &working, &start_var, pattern_idx)?;
+    // Any node (or scalar-but-could-be-a-node) variable from a
+    // prior clause is treated as a prior binding — subsequent hops
+    // that target it produce equality filters instead of fresh
+    // expansions, which makes shared endpoints in multi-pattern
+    // MATCH clauses (`(a)-->(x), (b)-->(x)`) and cycle patterns
+    // (`(a)-[:A]->(b), (b)-[:B]->(a)`) constrain to the same node.
+    let mut external_bound: HashSet<String> = HashSet::new();
+    for (k, v) in bound_vars {
+        if matches!(v, VarType::Node | VarType::Scalar) {
+            external_bound.insert(k.clone());
+        }
+    }
+    let plan = chain_hops_with_bound(plan, &working, &start_var, pattern_idx, &external_bound)?;
     Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
 
@@ -2083,10 +2107,26 @@ fn chain_hops(
     start_var: &str,
     pattern_idx: usize,
 ) -> Result<LogicalPlan> {
+    chain_hops_with_bound(plan, pattern, start_var, pattern_idx, &HashSet::new())
+}
+
+/// Same as [`chain_hops`] but also treats every variable in
+/// `external_bound_nodes` as an already-bound prior node — so
+/// patterns like `MATCH (a)-[:A]->(b), (b)-[:B]->(a)` hoist the
+/// cycle check into an equality filter instead of rebinding `a`.
+/// The caller passes the node-typed entries from the outer
+/// `bound_vars` map that exists *before* this pattern is lowered.
+fn chain_hops_with_bound(
+    mut plan: LogicalPlan,
+    pattern: &Pattern,
+    start_var: &str,
+    pattern_idx: usize,
+    external_bound_nodes: &HashSet<String>,
+) -> Result<LogicalPlan> {
     // Track already-bound node variables so repeat uses
     // (`(n)-[r]->(n)`) become equality filters on the same
     // binding rather than a fresh expansion.
-    let mut prior_node_vars: HashSet<String> = HashSet::new();
+    let mut prior_node_vars: HashSet<String> = external_bound_nodes.clone();
     prior_node_vars.insert(start_var.to_string());
     // Collect every edge variable along the chain so we can
     // enforce relationship uniqueness: a single MATCH's
@@ -2466,21 +2506,46 @@ fn collect_pattern_vars(pattern: &Pattern, out: &mut HashSet<String>) {
 
 fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarType>) -> Result<()> {
     if let Some(var) = &pattern.start.var {
-        check_var_type_conflict(var, VarType::Node, out)?;
+        check_var_type_conflict_allow_scalar(var, VarType::Node, out)?;
         out.insert(var.clone(), VarType::Node);
     }
     if let Some(pv) = &pattern.path_var {
-        check_var_type_conflict(pv, VarType::Path, out)?;
+        check_var_type_conflict_allow_scalar(pv, VarType::Path, out)?;
         out.insert(pv.clone(), VarType::Path);
     }
     for hop in &pattern.hops {
         if let Some(var) = &hop.rel.var {
-            check_var_type_conflict(var, VarType::Edge, out)?;
+            check_var_type_conflict_allow_scalar(var, VarType::Edge, out)?;
             out.insert(var.clone(), VarType::Edge);
         }
         if let Some(var) = &hop.target.var {
-            check_var_type_conflict(var, VarType::Node, out)?;
+            check_var_type_conflict_allow_scalar(var, VarType::Node, out)?;
             out.insert(var.clone(), VarType::Node);
+        }
+    }
+    Ok(())
+}
+
+/// Like [`check_var_type_conflict`] but tolerates a pre-existing
+/// `Scalar` binding. Used by `collect_pattern_vars_typed` to
+/// refine vars introduced by a WITH projection — e.g.
+/// `WITH coalesce(b, c) AS x` initially marks `x` as Scalar (the
+/// planner can't narrow a `Call`), then a subsequent
+/// `MATCH (x)-->(d)` should be allowed to pin `x` to Node. The
+/// strict check is kept for the CREATE / pattern-predicate
+/// scope-check paths that still want Node ≠ Edge to be hard
+/// errors.
+fn check_var_type_conflict_allow_scalar(
+    var: &str,
+    new_type: VarType,
+    bound_vars: &HashMap<String, VarType>,
+) -> Result<()> {
+    if let Some(&existing) = bound_vars.get(var) {
+        if existing != new_type && existing != VarType::Scalar {
+            return Err(Error::Plan(format!(
+                "variable '{}' already defined with a different type",
+                var
+            )));
         }
     }
     Ok(())
@@ -2489,21 +2554,14 @@ fn collect_pattern_vars_typed(pattern: &Pattern, out: &mut HashMap<String, VarTy
 fn infer_expr_type(expr: &Expr, bound_vars: &HashMap<String, VarType>) -> VarType {
     match expr {
         Expr::Identifier(name) => bound_vars.get(name).copied().unwrap_or(VarType::Node),
-        // An identifier that came from an earlier Node/Edge/Path
-        // binding produces the same type when projected verbatim.
-        // Everything else — literals, computed values, list /
-        // map literals, property access, function calls — is a
-        // scalar value that can't be re-used as a graph pattern
-        // var in a downstream MATCH.
+        // Literals / list+map constructors / arithmetic & boolean
+        // results are *definitively* not graph elements — marking
+        // them `NonNode` lets the scope check statically reject
+        // `WITH 123 AS n / MATCH (n)` while still allowing the
+        // broader Scalar→Node refinement for opaque values.
         Expr::Literal(_)
-        | Expr::Parameter(_)
         | Expr::List(_)
         | Expr::Map(_)
-        | Expr::Property { .. }
-        | Expr::PropertyAccess { .. }
-        | Expr::IndexAccess { .. }
-        | Expr::SliceAccess { .. }
-        | Expr::Case { .. }
         | Expr::Compare { .. }
         | Expr::And(_, _)
         | Expr::Or(_, _)
@@ -2512,11 +2570,27 @@ fn infer_expr_type(expr: &Expr, bound_vars: &HashMap<String, VarType>) -> VarTyp
         | Expr::IsNull { .. }
         | Expr::HasLabels { .. }
         | Expr::InList { .. }
+        | Expr::ListPredicate { .. }
+        | Expr::PatternExists(_)
+        | Expr::ExistsSubquery { .. }
+        | Expr::CountSubquery { .. }
         | Expr::ListComprehension { .. }
-        | Expr::Call { .. }
+        | Expr::Reduce { .. }
         | Expr::BinaryOp { .. }
-        | Expr::UnaryOp { .. } => VarType::Scalar,
-        _ => VarType::Node,
+        | Expr::UnaryOp { .. } => VarType::NonNode,
+        // Parameters, property access, function calls, CASE,
+        // index/slice access — could evaluate to anything at
+        // runtime (including a node via a user-defined function
+        // or `head([n])`), so stay as `Scalar` and let the
+        // relaxed scope check admit a later pattern's role
+        // refinement.
+        Expr::Parameter(_)
+        | Expr::Property { .. }
+        | Expr::PropertyAccess { .. }
+        | Expr::IndexAccess { .. }
+        | Expr::SliceAccess { .. }
+        | Expr::Case { .. }
+        | Expr::Call { .. } => VarType::Scalar,
     }
 }
 
@@ -2614,7 +2688,16 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                             } else {
                                 VarType::Node
                             };
-                            if existing_type != new_type {
+                            // `VarType::Scalar` is the planner's
+                            // catch-all when it couldn't statically
+                            // decide the type (e.g. WITH projecting
+                            // `coalesce(b, c)` where the inputs are
+                            // nodes). Allow any pattern role to
+                            // bind over a Scalar — the executor
+                            // checks the actual runtime value.
+                            if existing_type != new_type
+                                && existing_type != VarType::Scalar
+                            {
                                 return Err(Error::Plan(format!(
                                     "variable '{}' already defined with a different type",
                                     var
@@ -2647,7 +2730,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         let current = plan
                             .take()
                             .expect("is_rebind implies an earlier clause populated the plan");
-                        Some(plan_pattern_from_bound(current, pattern, pattern_offset)?)
+                        Some(plan_pattern_from_bound(current, pattern, pattern_offset, &bound_vars)?)
                     } else {
                         let rhs = plan_pattern(pattern, pattern_offset, ctx)?;
                         Some(match plan.take() {

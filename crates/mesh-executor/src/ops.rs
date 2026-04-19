@@ -2460,6 +2460,12 @@ impl Operator for EdgeExpandOp {
                 Some(row) => {
                     let src_id = match row.get(&self.src_var) {
                         Some(Value::Node(n)) => n.id,
+                        // A null source (e.g. from OPTIONAL MATCH
+                        // that matched nothing) drops the input
+                        // row — `MATCH (a)-->(b)` against a null
+                        // `a` is just empty, not an error.
+                        Some(Value::Null)
+                        | Some(Value::Property(mesh_core::Property::Null)) => continue,
                         _ => return Err(Error::UnboundVariable(self.src_var.clone())),
                     };
                     self.pending = match self.direction {
@@ -2869,6 +2875,11 @@ impl Operator for VarLengthExpandOp {
                 Some(row) => {
                     let src_id = match row.get(&self.src_var) {
                         Some(Value::Node(n)) => n.id,
+                        // Null source → no paths. Same
+                        // null-propagating semantics as
+                        // `EdgeExpandOp`.
+                        Some(Value::Null)
+                        | Some(Value::Property(mesh_core::Property::Null)) => continue,
                         _ => return Err(Error::UnboundVariable(self.src_var.clone())),
                     };
                     let (paths, node_paths, targets) = self.enumerate(ctx, src_id)?;
