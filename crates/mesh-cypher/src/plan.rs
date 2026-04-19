@@ -4243,20 +4243,50 @@ fn apply_optional_match(
             .clone()
             .unwrap_or_else(|| format!("__opt_start_{}", bound_vars.len()));
         if !bound_vars.contains_key(&start_var) {
-            // Standalone OPTIONAL MATCH — the start var is not yet
-            // bound. Plan it like a regular MATCH, then wrap with
-            // CoalesceNullRow so the empty-result case emits a
-            // single row with all pattern vars null-bound.
+            // Start var isn't bound by an earlier clause — the
+            // optional pattern has to do a fresh scan. With no
+            // outer row and no WHERE, `CoalesceNullRow` over a
+            // plain pattern scan is enough. When there's an
+            // outer plan to preserve (`MATCH ... WITH ...
+            // OPTIONAL MATCH`) or a WHERE that references outer
+            // bindings, wrap the fresh scan in `OptionalApply`
+            // so each outer row gets its own left-join attempt
+            // and the outer bindings stay in scope for the
+            // WHERE filter.
             let fresh = plan_pattern(pattern_ref, 0, ctx)?;
             let mut pattern_vars: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             collect_pattern_vars(pattern_ref, &mut pattern_vars);
+            // Drop vars already bound by an earlier clause (e.g.
+            // a pre-bound edge reused as a pattern element) —
+            // nulling them on the left-join fallback would
+            // clobber the outer value.
+            for k in bound_vars.keys() {
+                pattern_vars.remove(k);
+            }
             let null_vars: Vec<String> = pattern_vars.into_iter().collect();
+            let has_outer = !matches!(plan, LogicalPlan::SeedRow);
             collect_pattern_vars_typed(pattern_ref, bound_vars)?;
-            plan = LogicalPlan::CoalesceNullRow {
-                input: Box::new(fresh),
-                null_vars,
-            };
+            if has_outer || clause.where_clause.is_some() {
+                let mut body = fresh;
+                if let Some(predicate) = &clause.where_clause {
+                    body = LogicalPlan::Filter {
+                        input: Box::new(body),
+                        predicate: predicate.clone(),
+                    };
+                    where_consumed = true;
+                }
+                plan = LogicalPlan::OptionalApply {
+                    input: Box::new(plan),
+                    body: Box::new(body),
+                    null_vars,
+                };
+            } else {
+                plan = LogicalPlan::CoalesceNullRow {
+                    input: Box::new(fresh),
+                    null_vars,
+                };
+            }
             continue;
         }
 

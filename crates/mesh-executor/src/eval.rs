@@ -25,6 +25,12 @@ pub(crate) struct EvalCtx<'a> {
     pub params: &'a ParamMap,
     pub reader: &'a dyn GraphReader,
     pub procedures: &'a ProcedureRegistry,
+    /// Enclosing rows contributed by outer operators — e.g. the
+    /// per-outer-row body of an `OptionalApply`. Looked up after
+    /// `row` when resolving a bare identifier / property base,
+    /// so a WHERE inside an OPTIONAL MATCH body can still see
+    /// variables the inner scan didn't itself bind.
+    pub outer_rows: &'a [&'a Row],
 }
 
 impl<'a> EvalCtx<'a> {
@@ -38,7 +44,24 @@ impl<'a> EvalCtx<'a> {
             params: self.params,
             reader: self.reader,
             procedures: self.procedures,
+            outer_rows: self.outer_rows,
         }
+    }
+
+    /// Resolve `name` against `row` first, then each outer-scope
+    /// row (innermost first). Mirrors `ExecCtx::lookup_binding`
+    /// so expression eval sees the same scope chain that
+    /// operator-level constraint lookups do.
+    pub(crate) fn lookup(&self, name: &str) -> Option<&Value> {
+        if let Some(v) = self.row.get(name) {
+            return Some(v);
+        }
+        for outer in self.outer_rows {
+            if let Some(v) = outer.get(name) {
+                return Some(v);
+            }
+        }
+        None
     }
 }
 
@@ -58,8 +81,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
         Expr::Literal(lit) => Ok(literal_to_value(lit)),
         Expr::Identifier(name) => ctx
-            .row
-            .get(name)
+            .lookup(name)
             .cloned()
             .ok_or_else(|| Error::UnboundVariable(name.clone())),
         Expr::Parameter(name) => ctx
@@ -69,8 +91,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             .ok_or_else(|| Error::UnboundParameter(name.clone())),
         Expr::Property { var, key } => {
             let bound = ctx
-                .row
-                .get(var)
+                .lookup(var)
                 .ok_or_else(|| Error::UnboundVariable(var.clone()))?;
             match bound {
                 Value::Node(n) => Ok(n

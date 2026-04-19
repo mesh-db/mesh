@@ -70,6 +70,7 @@ impl<'a> ExecCtx<'a> {
             params: self.params,
             reader: self.store,
             procedures: self.procedures,
+            outer_rows: self.outer_rows,
         }
     }
 
@@ -609,6 +610,7 @@ impl Operator for UnwindOp {
                 params: ctx.params,
                 reader: ctx.store,
                 procedures: ctx.procedures,
+                outer_rows: ctx.outer_rows,
             };
             let val = eval_expr(&self.expr, &ectx)?;
             self.items = Some(coerce_unwind_list(val)?);
@@ -677,6 +679,7 @@ impl Operator for UnwindChainOp {
                 params: ctx.params,
                 reader: ctx.store,
                 procedures: ctx.procedures,
+                outer_rows: ctx.outer_rows,
             };
             let val = eval_expr(&self.expr, &ectx)?;
             self.items = coerce_unwind_list(val)?;
@@ -1589,8 +1592,21 @@ impl Operator for OptionalApplyOp {
                 None => return Ok(None),
             };
             let mut body_op = build_op_inner(&self.body_plan, Some(&outer_row));
+            // Push the outer row onto `outer_rows` so Filter /
+            // eval_expr inside the body can resolve outer
+            // bindings (`OPTIONAL MATCH ... WHERE outer_var = x`).
+            let mut stacked: Vec<&Row> = Vec::with_capacity(ctx.outer_rows.len() + 1);
+            stacked.push(&outer_row);
+            stacked.extend_from_slice(ctx.outer_rows);
+            let inner_ctx = ExecCtx {
+                store: ctx.store,
+                writer: ctx.writer,
+                params: ctx.params,
+                procedures: ctx.procedures,
+                outer_rows: &stacked,
+            };
             let mut results = Vec::new();
-            while let Some(body_row) = body_op.next(ctx)? {
+            while let Some(body_row) = body_op.next(&inner_ctx)? {
                 let mut merged = outer_row.clone();
                 for (k, v) in body_row {
                     merged.insert(k, v);
