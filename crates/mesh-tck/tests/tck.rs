@@ -720,7 +720,11 @@ fn then_result_any_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) 
     let headers: Vec<&str> = table.rows[0].iter().map(|s| s.trim()).collect();
     let expected_rows: Vec<Vec<String>> = table.rows[1..]
         .iter()
-        .map(|row| row.iter().map(|s| unescape_gherkin_cell(s.trim())).collect())
+        .map(|row| {
+            row.iter()
+                .map(|s| unescape_gherkin_cell(s.trim()))
+                .collect()
+        })
         .collect();
 
     assert_eq!(
@@ -777,7 +781,11 @@ fn then_result_ignoring_list_order(world: &mut MeshWorld, step: &cucumber::gherk
     let headers: Vec<&str> = table.rows[0].iter().map(|s| s.trim()).collect();
     let expected_rows: Vec<Vec<String>> = table.rows[1..]
         .iter()
-        .map(|row| row.iter().map(|s| unescape_gherkin_cell(s.trim())).collect())
+        .map(|row| {
+            row.iter()
+                .map(|s| unescape_gherkin_cell(s.trim()))
+                .collect()
+        })
         .collect();
 
     assert_eq!(
@@ -864,10 +872,7 @@ fn then_result_ignoring_list_order(world: &mut MeshWorld, step: &cucumber::gherk
 /// [12] uses this shape today (paths grouped by length where
 /// the intra-group path list isn't pinned).
 #[then("the result should be, in order (ignoring element order for lists):")]
-fn then_result_in_order_ignoring_list_order(
-    world: &mut MeshWorld,
-    step: &cucumber::gherkin::Step,
-) {
+fn then_result_in_order_ignoring_list_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
     if let Some(err) = &world.error {
         panic!("Expected results but got error: {err}");
     }
@@ -875,7 +880,11 @@ fn then_result_in_order_ignoring_list_order(
     let headers: Vec<&str> = table.rows[0].iter().map(|s| s.trim()).collect();
     let expected_rows: Vec<Vec<String>> = table.rows[1..]
         .iter()
-        .map(|row| row.iter().map(|s| unescape_gherkin_cell(s.trim())).collect())
+        .map(|row| {
+            row.iter()
+                .map(|s| unescape_gherkin_cell(s.trim()))
+                .collect()
+        })
         .collect();
     let actual_strs: Vec<Vec<String>> = world
         .results
@@ -883,7 +892,9 @@ fn then_result_in_order_ignoring_list_order(
         .map(|row| {
             headers
                 .iter()
-                .map(|h| canonicalise_list_cells(&format_value(row.get(*h).unwrap_or(&Value::Null))))
+                .map(|h| {
+                    canonicalise_list_cells(&format_value(row.get(*h).unwrap_or(&Value::Null)))
+                })
                 .collect()
         })
         .collect();
@@ -950,7 +961,11 @@ fn then_result_in_order(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
     let headers: Vec<&str> = table.rows[0].iter().map(|s| s.trim()).collect();
     let expected_rows: Vec<Vec<String>> = table.rows[1..]
         .iter()
-        .map(|row| row.iter().map(|s| unescape_gherkin_cell(s.trim())).collect())
+        .map(|row| {
+            row.iter()
+                .map(|s| unescape_gherkin_cell(s.trim()))
+                .collect()
+        })
         .collect();
 
     let actual_strs: Vec<Vec<String>> = world

@@ -151,8 +151,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             match bound {
                 Value::Node(n) => {
                     check_not_deleted_node(ctx, n.id)?;
-                    Ok(n
-                        .properties
+                    Ok(n.properties
                         .get(key)
                         .cloned()
                         .map(Value::Property)
@@ -160,8 +159,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 }
                 Value::Edge(e) => {
                     check_not_deleted_edge(ctx, e.id)?;
-                    Ok(e
-                        .properties
+                    Ok(e.properties
                         .get(key)
                         .cloned()
                         .map(Value::Property)
@@ -217,8 +215,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             match v {
                 Value::Node(n) => {
                     check_not_deleted_node(ctx, n.id)?;
-                    Ok(n
-                        .properties
+                    Ok(n.properties
                         .get(key)
                         .cloned()
                         .map(Value::Property)
@@ -226,8 +223,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 }
                 Value::Edge(e) => {
                     check_not_deleted_edge(ctx, e.id)?;
-                    Ok(e
-                        .properties
+                    Ok(e.properties
                         .get(key)
                         .cloned()
                         .map(Value::Property)
@@ -6084,7 +6080,10 @@ pub(crate) fn equal_three_valued(a: &Value, b: &Value) -> Option<bool> {
 /// a pair seals the answer, a null-involved pair makes the entire
 /// comparison `null` because the ordering can't be resolved.
 fn ordered_list_compare(op: CompareOp, l: &Value, r: &Value) -> Option<Value> {
-    if !matches!(op, CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge) {
+    if !matches!(
+        op,
+        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+    ) {
         return None;
     }
     fn as_list(v: &Value) -> Option<Vec<Value>> {

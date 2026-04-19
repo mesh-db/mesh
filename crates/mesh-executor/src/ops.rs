@@ -2454,7 +2454,10 @@ impl Operator for MergeEdgeOp {
                 .collect::<Result<Vec<_>>>()?;
             let edge_matches = |edge: &Edge| -> bool {
                 required_props.iter().all(|(k, want)| {
-                    edge.properties.get(k).map(|have| have == want).unwrap_or(false)
+                    edge.properties
+                        .get(k)
+                        .map(|have| have == want)
+                        .unwrap_or(false)
                 })
             };
 

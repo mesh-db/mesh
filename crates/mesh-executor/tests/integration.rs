@@ -3692,7 +3692,8 @@ fn unbound_parameter_errors_at_execute_time() {
 /// the real server uses, so using it here means the tests exercise
 /// the same `plan_with_context` -> `IndexSeek` rewrite path.
 fn run_with_ctx(store: &Store, q: &str) -> Vec<Row> {
-    let ctx = PlannerContext { outer_bindings: Vec::new(),
+    let ctx = PlannerContext {
+        outer_bindings: Vec::new(),
         indexes: store
             .list_property_indexes()
             .into_iter()
@@ -3714,7 +3715,8 @@ fn run_with_ctx(store: &Store, q: &str) -> Vec<Row> {
 /// `run_with_ctx` plus an explicit `ParamMap` so the index tests can
 /// exercise parameterized seek values.
 fn run_with_ctx_params(store: &Store, q: &str, params: &ParamMap) -> Vec<Row> {
-    let ctx = PlannerContext { outer_bindings: Vec::new(),
+    let ctx = PlannerContext {
+        outer_bindings: Vec::new(),
         indexes: store
             .list_property_indexes()
             .into_iter()

@@ -234,7 +234,8 @@ impl MeshService {
         // when a matching index exists. In Raft/routing modes this is
         // currently always empty because DDL is rejected above; once
         // phases B/C land the same call will surface the full set.
-        let planner_ctx = mesh_cypher::PlannerContext { outer_bindings: Vec::new(),
+        let planner_ctx = mesh_cypher::PlannerContext {
+            outer_bindings: Vec::new(),
             indexes: self
                 .store
                 .list_property_indexes()
