@@ -435,6 +435,7 @@ fn normalize_map_keys(s: &str) -> String {
             let mut d = 0;
             let mut in_s = false;
             let mut sc = '\'';
+            let mut bailed = false;
             for ic in inner.chars() {
                 if in_s {
                     if ic == sc {
@@ -455,11 +456,7 @@ fn normalize_map_keys(s: &str) -> String {
                     if let Some(entry) = split_kv(&buf) {
                         entries.push(entry);
                     } else {
-                        // Not a key:value entry — bail out, keep original.
-                        out.push_str(&s[start..=end]);
-                        i = end + 1;
-                        buf.clear();
-                        entries.clear();
+                        bailed = true;
                         break;
                     }
                     buf.clear();
@@ -467,14 +464,17 @@ fn normalize_map_keys(s: &str) -> String {
                     buf.push(ic);
                 }
             }
-            if !buf.trim().is_empty() {
-                if let Some(entry) = split_kv(&buf) {
-                    entries.push(entry);
-                } else {
-                    out.push_str(&s[start..=end]);
-                    i = end + 1;
-                    continue;
+            if !bailed && !buf.trim().is_empty() {
+                match split_kv(&buf) {
+                    Some(entry) => entries.push(entry),
+                    None => bailed = true,
                 }
+            }
+            if bailed {
+                // Not a key:value map — emit the source unchanged.
+                out.push_str(&s[start..=end]);
+                i = end + 1;
+                continue;
             }
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             out.push('{');
