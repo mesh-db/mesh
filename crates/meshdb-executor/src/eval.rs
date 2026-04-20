@@ -3136,6 +3136,32 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             let is_present = !matches!(v, Value::Null | Value::Property(Property::Null));
             Ok(Value::Property(Property::Bool(is_present)))
         }
+        "isempty" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            match v {
+                Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                Value::Property(Property::String(s)) => {
+                    Ok(Value::Property(Property::Bool(s.is_empty())))
+                }
+                Value::List(items) => Ok(Value::Property(Property::Bool(items.is_empty()))),
+                Value::Property(Property::List(items)) => {
+                    Ok(Value::Property(Property::Bool(items.is_empty())))
+                }
+                Value::Property(Property::Map(m)) => {
+                    Ok(Value::Property(Property::Bool(m.is_empty())))
+                }
+                _ => Err(Error::TypeMismatch),
+            }
+        }
+        "isnan" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            match v {
+                Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
+                Value::Property(Property::Float64(f)) => Ok(Value::Property(Property::Bool(f.is_nan()))),
+                Value::Property(Property::Int64(_)) => Ok(Value::Property(Property::Bool(false))),
+                _ => Err(Error::TypeMismatch),
+            }
+        }
         "tolower" => {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
@@ -3643,6 +3669,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         }
         "degrees" => math_unary(name, arg_exprs, ctx, |f| f.to_degrees()),
         "radians" => math_unary(name, arg_exprs, ctx, |f| f.to_radians()),
+        "haversin" => math_unary(name, arg_exprs, ctx, |f| (1.0 - f.cos()) / 2.0),
 
         "rand" => {
             if !arg_exprs.is_empty() {
