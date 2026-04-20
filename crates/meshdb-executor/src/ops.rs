@@ -8,11 +8,11 @@ use crate::{
 };
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
 use meshdb_cypher::{
-    AggregateArg, AggregateFn, AggregateSpec, BinaryOp, CallArgs, CompareOp, CreateEdgeSpec,
-    CreateNodeSpec, Direction, Expr, Literal, LogicalPlan, RemoveSpec, ReturnItem, SetAssignment,
-    SortItem, UnaryOp, YieldSpec,
+    AggregateArg, AggregateFn, AggregateSpec, BinaryOp, CallArgs, CompareOp, ConstraintKind,
+    CreateEdgeSpec, CreateNodeSpec, Direction, Expr, Literal, LogicalPlan, RemoveSpec, ReturnItem,
+    SetAssignment, SortItem, UnaryOp, YieldSpec,
 };
-use meshdb_storage::RocksDbStorageEngine;
+use meshdb_storage::{PropertyConstraintKind, RocksDbStorageEngine};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -285,8 +285,80 @@ fn try_execute_ddl(
                 .collect();
             Ok(Some(rows))
         }
+        LogicalPlan::CreatePropertyConstraint {
+            name,
+            label,
+            property,
+            kind,
+            if_not_exists,
+        } => {
+            let storage_kind = match kind {
+                ConstraintKind::Unique => PropertyConstraintKind::Unique,
+                ConstraintKind::NotNull => PropertyConstraintKind::NotNull,
+            };
+            let spec = writer.create_property_constraint(
+                name.as_deref(),
+                label,
+                property,
+                storage_kind,
+                *if_not_exists,
+            )?;
+            Ok(Some(vec![constraint_ack_row("created", &spec)]))
+        }
+        LogicalPlan::DropPropertyConstraint { name, if_exists } => {
+            writer.drop_property_constraint(name, *if_exists)?;
+            let mut row = Row::default();
+            row.insert(
+                "state".into(),
+                Value::Property(Property::String("dropped".into())),
+            );
+            row.insert(
+                "name".into(),
+                Value::Property(Property::String(name.clone())),
+            );
+            Ok(Some(vec![row]))
+        }
+        LogicalPlan::ShowPropertyConstraints => {
+            let specs = reader.list_property_constraints()?;
+            let rows = specs.into_iter().map(constraint_show_row).collect();
+            Ok(Some(rows))
+        }
         _ => Ok(None),
     }
+}
+
+/// One-row acknowledgement emitted after `CREATE CONSTRAINT`. Carries
+/// the resolved spec so callers see the final name when they omitted
+/// it. Columns match `SHOW CONSTRAINTS` (plus `state`) so Bolt clients
+/// can uniformly format DDL responses.
+fn constraint_ack_row(state: &str, spec: &meshdb_storage::PropertyConstraintSpec) -> Row {
+    let mut row = constraint_show_row(spec.clone());
+    row.insert(
+        "state".into(),
+        Value::Property(Property::String(state.into())),
+    );
+    row
+}
+
+/// Row shape for `SHOW CONSTRAINTS` and `db.constraints()`. Columns:
+/// `name`, `label`, `property`, `type`. Keeps the order deterministic
+/// so integration tests can match on column presence.
+fn constraint_show_row(spec: meshdb_storage::PropertyConstraintSpec) -> Row {
+    let mut row = Row::default();
+    row.insert("name".into(), Value::Property(Property::String(spec.name)));
+    row.insert(
+        "label".into(),
+        Value::Property(Property::String(spec.label)),
+    );
+    row.insert(
+        "property".into(),
+        Value::Property(Property::String(spec.property)),
+    );
+    row.insert(
+        "type".into(),
+        Value::Property(Property::String(spec.kind.as_str().into())),
+    );
+    row
 }
 
 fn ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
@@ -598,7 +670,10 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
         )),
         LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
-        | LogicalPlan::ShowPropertyIndexes => {
+        | LogicalPlan::ShowPropertyIndexes
+        | LogicalPlan::CreatePropertyConstraint { .. }
+        | LogicalPlan::DropPropertyConstraint { .. }
+        | LogicalPlan::ShowPropertyConstraints => {
             panic!("schema DDL must be dispatched via try_execute_ddl before build_op")
         }
     }

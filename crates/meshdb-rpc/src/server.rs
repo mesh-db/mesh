@@ -916,7 +916,10 @@ fn count_index_seeks(plan: &meshdb_cypher::LogicalPlan) -> u64 {
         | P::LoadCsv { input: None, .. }
         | P::CreatePropertyIndex { .. }
         | P::DropPropertyIndex { .. }
-        | P::ShowPropertyIndexes => 0,
+        | P::ShowPropertyIndexes
+        | P::CreatePropertyConstraint { .. }
+        | P::DropPropertyConstraint { .. }
+        | P::ShowPropertyConstraints => 0,
     }
 }
 

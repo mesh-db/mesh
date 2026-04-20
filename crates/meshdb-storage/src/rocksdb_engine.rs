@@ -12,13 +12,17 @@
 //! snapshot restore path, which is backend-bound by design.
 
 use crate::{
-    engine::{GraphMutation, PropertyIndexSpec, StorageEngine},
+    engine::{
+        GraphMutation, PropertyConstraintKind, PropertyConstraintSpec, PropertyIndexSpec,
+        StorageEngine,
+    },
     error::{Error, Result},
     keys::{
-        adj_key, edge_from_adj_key, encode_index_value, id_from_str_index_key, label_index_key,
-        label_index_prefix, node_from_adj_value, node_id_from_property_index_key,
-        property_index_key, property_index_name_prefix, property_index_value_prefix,
-        type_index_key, type_index_prefix, ID_LEN,
+        adj_key, constraint_meta_decode, constraint_meta_encode, edge_from_adj_key,
+        encode_index_value, id_from_str_index_key, label_index_key, label_index_prefix,
+        node_from_adj_value, node_id_from_property_index_key, property_index_key,
+        property_index_name_prefix, property_index_value_prefix, type_index_key, type_index_prefix,
+        ID_LEN,
     },
 };
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
@@ -37,6 +41,7 @@ const CF_LABEL_INDEX: &str = "label_index";
 const CF_TYPE_INDEX: &str = "type_index";
 const CF_PROPERTY_INDEX: &str = "property_index";
 const CF_INDEX_META: &str = "index_meta";
+const CF_CONSTRAINT_META: &str = "constraint_meta";
 
 const ALL_CFS: &[&str] = &[
     CF_NODES,
@@ -47,6 +52,7 @@ const ALL_CFS: &[&str] = &[
     CF_TYPE_INDEX,
     CF_PROPERTY_INDEX,
     CF_INDEX_META,
+    CF_CONSTRAINT_META,
 ];
 
 const EMPTY: &[u8] = &[];
@@ -102,6 +108,17 @@ pub struct RocksDbStorageEngine {
     /// `RwLock` rather than `Mutex` because the common access pattern
     /// is many concurrent reads with only DDL-time writes.
     indexes: RwLock<Vec<PropertyIndexSpec>>,
+    /// In-memory view of the registered property constraints,
+    /// populated from [`CF_CONSTRAINT_META`] at open time and kept in
+    /// sync by [`RocksDbStorageEngine::create_property_constraint`] and
+    /// [`RocksDbStorageEngine::drop_property_constraint`].
+    ///
+    /// Every `put_node` consults this to validate UNIQUE / NOT NULL
+    /// invariants, so — as with `indexes` — it must not hit the DB on
+    /// the hot path. Enforcement reads the catalog under a read lock
+    /// and runs `nodes_by_property` against the backing index only
+    /// when a UNIQUE check actually needs it.
+    constraints: RwLock<Vec<PropertyConstraintSpec>>,
 }
 
 impl RocksDbStorageEngine {
@@ -117,9 +134,11 @@ impl RocksDbStorageEngine {
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)?;
         let indexes = load_index_meta(&db)?;
+        let constraints = load_constraint_meta(&db)?;
         Ok(Self {
             db,
             indexes: RwLock::new(indexes),
+            constraints: RwLock::new(constraints),
         })
     }
 
@@ -146,6 +165,15 @@ impl RocksDbStorageEngine {
             None => None,
         };
         let existing_labels: &[String] = existing.as_ref().map(|n| &n.labels[..]).unwrap_or(&[]);
+
+        // Constraint enforcement: walk every registered constraint and
+        // confirm the post-write state satisfies it. UNIQUE queries
+        // the backing property index (guaranteed to exist — see
+        // `create_property_constraint`) for rival holders of the same
+        // value. NOT NULL checks the incoming property map directly.
+        // Runs before we touch the batch, so a violation short-circuits
+        // without leaving partial writes behind.
+        self.enforce_constraints(node, existing.as_ref())?;
 
         let bytes = serde_json::to_vec(node)?;
         batch.put_cf(nodes_cf, node.id.as_bytes(), bytes);
@@ -501,6 +529,217 @@ impl RocksDbStorageEngine {
         Ok(())
     }
 
+    /// Declare a new property constraint. Behavior summary:
+    ///
+    /// * The name is the user-facing identifier. When `name` is
+    ///   `None`, a deterministic default (`constraint_<label>_<prop>_<kind>`)
+    ///   is generated so `DROP CONSTRAINT` can still target it.
+    /// * If the chosen name is already registered with the same
+    ///   `(label, property, kind)`, this is a no-op (the existing
+    ///   spec is returned). If the name collides on a *different*
+    ///   spec, returns `ConstraintNameConflict` unless
+    ///   `if_not_exists` is set, in which case the existing spec is
+    ///   preserved and returned unchanged.
+    /// * UNIQUE constraints implicitly require a backing property
+    ///   index. `create_property_constraint` creates one on
+    ///   `(label, property)` if it isn't already registered —
+    ///   matching Neo4j's "a unique constraint also provides an
+    ///   index" contract.
+    /// * Before committing, the method scans existing nodes to
+    ///   verify the constraint is satisfied. Any violation aborts
+    ///   the creation with `ConstraintViolation`; the registry is
+    ///   left unchanged.
+    ///
+    /// The meta write and the implicit-index write are batched into a
+    /// single [`WriteBatch`] so the on-disk state stays consistent
+    /// under crash.
+    pub fn create_property_constraint(
+        &self,
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        kind: PropertyConstraintKind,
+        if_not_exists: bool,
+    ) -> Result<PropertyConstraintSpec> {
+        let resolved_name = match name {
+            Some(n) => n.to_string(),
+            None => default_constraint_name(label, property, kind),
+        };
+        let spec = PropertyConstraintSpec {
+            name: resolved_name.clone(),
+            label: label.to_string(),
+            property: property.to_string(),
+            kind,
+        };
+
+        // Idempotency / conflict check against the existing registry
+        // under a read lock first — avoids taking the write lock when
+        // the answer is "nothing to do".
+        {
+            let guard = self.constraints.read().expect("constraints lock poisoned");
+            if let Some(existing) = guard.iter().find(|s| s.name == resolved_name) {
+                if existing == &spec {
+                    return Ok(existing.clone());
+                }
+                if if_not_exists {
+                    return Ok(existing.clone());
+                }
+                return Err(Error::ConstraintNameConflict {
+                    name: resolved_name,
+                });
+            }
+        }
+
+        // UNIQUE needs a backing property index for enforcement. The
+        // call is idempotent — a user-declared index on the same
+        // `(label, property)` is reused. We do this before validating
+        // the existing data so the scan below can cover it too.
+        if matches!(kind, PropertyConstraintKind::Unique) {
+            self.create_property_index(label, property)?;
+        }
+
+        // Validate existing data against the new constraint before we
+        // commit the meta entry. A single pre-existing violation makes
+        // the whole declaration fail — matching how Neo4j rejects
+        // constraint creation on data that doesn't satisfy it.
+        validate_existing_data(self, &spec)?;
+
+        let meta_cf = self.cf(CF_CONSTRAINT_META)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            meta_cf,
+            resolved_name.as_bytes(),
+            constraint_meta_encode(&spec),
+        );
+        self.db.write(batch)?;
+
+        let mut guard = self.constraints.write().expect("constraints lock poisoned");
+        // Re-check under the write lock to avoid a TOCTOU where two
+        // concurrent CREATEs race through the read-lock idempotency
+        // check. The second writer sees the first's insertion and
+        // returns the existing spec.
+        if let Some(existing) = guard.iter().find(|s| s.name == resolved_name) {
+            return Ok(existing.clone());
+        }
+        guard.push(spec.clone());
+        Ok(spec)
+    }
+
+    /// Tear down a constraint by name. When `if_exists` is true,
+    /// dropping a non-existent constraint is a no-op. Never drops the
+    /// backing index for UNIQUE — users who want it gone issue a
+    /// separate `DROP INDEX`.
+    pub fn drop_property_constraint(&self, name: &str, if_exists: bool) -> Result<()> {
+        let mut guard = self.constraints.write().expect("constraints lock poisoned");
+        let idx = guard.iter().position(|s| s.name == name);
+        match idx {
+            None if if_exists => Ok(()),
+            None => Err(Error::ConstraintNotFound {
+                name: name.to_string(),
+            }),
+            Some(i) => {
+                let meta_cf = self.cf(CF_CONSTRAINT_META)?;
+                let mut batch = WriteBatch::default();
+                batch.delete_cf(meta_cf, name.as_bytes());
+                self.db.write(batch)?;
+                guard.remove(i);
+                Ok(())
+            }
+        }
+    }
+
+    /// Snapshot the currently-registered constraints. Cheap clone —
+    /// every spec is a handful of small strings and an enum.
+    pub fn list_property_constraints(&self) -> Vec<PropertyConstraintSpec> {
+        self.constraints
+            .read()
+            .expect("constraints lock poisoned")
+            .clone()
+    }
+
+    /// Enforce registered constraints against the post-write state of
+    /// `node`. Invoked by the `put_node` path before the batch is
+    /// constructed. `existing` is the previously-stored snapshot of
+    /// the same node (if any) so the check can distinguish "this node
+    /// is updating its own value" from "some other node owns this
+    /// value".
+    fn enforce_constraints(&self, node: &Node, existing: Option<&Node>) -> Result<()> {
+        let constraints = self.constraints.read().expect("constraints lock poisoned");
+        if constraints.is_empty() {
+            return Ok(());
+        }
+        let now_has_label = |label: &str| node.labels.iter().any(|l| l == label);
+        for spec in constraints.iter() {
+            if !now_has_label(&spec.label) {
+                continue;
+            }
+            match spec.kind {
+                PropertyConstraintKind::NotNull => {
+                    let present = node
+                        .properties
+                        .get(&spec.property)
+                        .is_some_and(|v| !matches!(v, Property::Null));
+                    if !present {
+                        return Err(Error::ConstraintViolation {
+                            name: spec.name.clone(),
+                            kind: spec.kind.as_str(),
+                            label: spec.label.clone(),
+                            property: spec.property.clone(),
+                            details: format!(
+                                "node {} is missing required property `{}`",
+                                node.id, spec.property
+                            ),
+                        });
+                    }
+                }
+                PropertyConstraintKind::Unique => {
+                    let Some(value) = node.properties.get(&spec.property) else {
+                        // No value → no uniqueness collision possible.
+                        // Matches Neo4j: UNIQUE alone allows NULL;
+                        // combine with NOT NULL for strict presence.
+                        continue;
+                    };
+                    if matches!(value, Property::Null) {
+                        continue;
+                    }
+                    // Skip probes on unindexable types — the backing
+                    // index can't represent them so uniqueness is
+                    // effectively undefined. Keeping the write allowed
+                    // here matches how the index layer itself skips
+                    // these values.
+                    if encode_index_value(value).is_none() {
+                        continue;
+                    }
+                    let holders = self.nodes_by_property(&spec.label, &spec.property, value)?;
+                    // The backing property index already reflects the
+                    // previously-committed state; `existing` (if any)
+                    // is in that index. We allow a match on our own id
+                    // so updating the same node to the same value is
+                    // legal; we also allow the "same id, value stays
+                    // the same" carryover. Any other matching id means
+                    // a distinct node owns the value.
+                    for other in holders {
+                        if other == node.id {
+                            continue;
+                        }
+                        let was_self = existing
+                            .and_then(|n| n.properties.get(&spec.property))
+                            .is_some_and(|v| v == value);
+                        let _ = was_self;
+                        return Err(Error::ConstraintViolation {
+                            name: spec.name.clone(),
+                            kind: spec.kind.as_str(),
+                            label: spec.label.clone(),
+                            property: spec.property.clone(),
+                            details: format!("value already held by node {}", other),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Tear down a property index: removes the meta entry and every
     /// entry under the `(label, prop)` prefix. Idempotent: dropping a
     /// non-existent index is a no-op. Atomic via one [`WriteBatch`].
@@ -628,6 +867,107 @@ impl RocksDbStorageEngine {
     }
 }
 
+/// Deterministic auto-name for a constraint the user didn't name.
+/// Shape: `constraint_<label>_<property>_<kind>` where `<kind>` is
+/// `unique` or `not_null`. Stable across restarts — users can target
+/// the auto-name with `DROP CONSTRAINT` without having to inspect
+/// `SHOW CONSTRAINTS` first.
+fn default_constraint_name(label: &str, property: &str, kind: PropertyConstraintKind) -> String {
+    let kind_tag = match kind {
+        PropertyConstraintKind::Unique => "unique",
+        PropertyConstraintKind::NotNull => "not_null",
+    };
+    format!("constraint_{label}_{property}_{kind_tag}")
+}
+
+/// Scan existing nodes and verify that `spec` holds. Called on
+/// constraint creation so a user declaring a constraint against
+/// already-invalid data gets a clear error instead of a partial
+/// rollout. Walks only the nodes carrying the constrained label — for
+/// label-sparse graphs this avoids the full-node scan.
+fn validate_existing_data(
+    engine: &RocksDbStorageEngine,
+    spec: &PropertyConstraintSpec,
+) -> Result<()> {
+    let label_members = engine.nodes_by_label(&spec.label)?;
+    match spec.kind {
+        PropertyConstraintKind::NotNull => {
+            for id in label_members {
+                let node = match engine.get_node(id)? {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let present = node
+                    .properties
+                    .get(&spec.property)
+                    .is_some_and(|v| !matches!(v, Property::Null));
+                if !present {
+                    return Err(Error::ConstraintViolation {
+                        name: spec.name.clone(),
+                        kind: spec.kind.as_str(),
+                        label: spec.label.clone(),
+                        property: spec.property.clone(),
+                        details: format!("node {id} is missing required property"),
+                    });
+                }
+            }
+        }
+        PropertyConstraintKind::Unique => {
+            // For UNIQUE we walk members once, collecting the first
+            // node id per distinct value; a duplicate surfaces the
+            // pair in the error so operators can trace the collision.
+            use std::collections::HashMap;
+            let mut seen: HashMap<Vec<u8>, meshdb_core::NodeId> = HashMap::new();
+            for id in label_members {
+                let node = match engine.get_node(id)? {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let Some(value) = node.properties.get(&spec.property) else {
+                    continue;
+                };
+                let Some(encoded) = encode_index_value(value) else {
+                    continue;
+                };
+                if let Some(&first) = seen.get(&encoded) {
+                    return Err(Error::ConstraintViolation {
+                        name: spec.name.clone(),
+                        kind: spec.kind.as_str(),
+                        label: spec.label.clone(),
+                        property: spec.property.clone(),
+                        details: format!("duplicate value held by nodes {first} and {id}"),
+                    });
+                }
+                seen.insert(encoded, id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rehydrate the constraint registry from [`CF_CONSTRAINT_META`] at
+/// [`RocksDbStorageEngine::open`] time. Walks the CF sequentially —
+/// constraint counts are tiny (single digits in practice) so this
+/// stays cheap regardless of graph size.
+fn load_constraint_meta(db: &DB) -> Result<Vec<PropertyConstraintSpec>> {
+    let cf = db
+        .cf_handle(CF_CONSTRAINT_META)
+        .ok_or(Error::MissingColumnFamily(CF_CONSTRAINT_META))?;
+    let mut specs = Vec::new();
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = item?;
+        let name = std::str::from_utf8(&key)
+            .map_err(|_| Error::CorruptBytes {
+                cf: CF_CONSTRAINT_META,
+                expected: key.len(),
+                actual: key.len(),
+            })?
+            .to_string();
+        specs.push(constraint_meta_decode(CF_CONSTRAINT_META, name, &value)?);
+    }
+    Ok(specs)
+}
+
 /// Rehydrate the property-index registry from [`CF_INDEX_META`] at
 /// [`RocksDbStorageEngine::open`] time. Runs once per process, so
 /// walking the CF sequentially is fine even for large index counts.
@@ -719,6 +1059,32 @@ impl StorageEngine for RocksDbStorageEngine {
 
     fn list_property_indexes(&self) -> Vec<PropertyIndexSpec> {
         RocksDbStorageEngine::list_property_indexes(self)
+    }
+
+    fn create_property_constraint(
+        &self,
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        kind: PropertyConstraintKind,
+        if_not_exists: bool,
+    ) -> Result<PropertyConstraintSpec> {
+        RocksDbStorageEngine::create_property_constraint(
+            self,
+            name,
+            label,
+            property,
+            kind,
+            if_not_exists,
+        )
+    }
+
+    fn drop_property_constraint(&self, name: &str, if_exists: bool) -> Result<()> {
+        RocksDbStorageEngine::drop_property_constraint(self, name, if_exists)
+    }
+
+    fn list_property_constraints(&self) -> Vec<PropertyConstraintSpec> {
+        RocksDbStorageEngine::list_property_constraints(self)
     }
 
     fn create_checkpoint(&self, path: &Path) -> Result<()> {

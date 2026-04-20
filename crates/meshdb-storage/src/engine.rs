@@ -35,6 +35,45 @@ pub struct PropertyIndexSpec {
     pub property: String,
 }
 
+/// Kind of single-property constraint. Mirrors the Cypher surface
+/// clauses — `Unique` comes from `REQUIRE n.prop IS UNIQUE`, `NotNull`
+/// from `REQUIRE n.prop IS NOT NULL`. Kept narrow on purpose: v1
+/// covers the two kinds with single-property, single-label scope.
+/// Composite `NODE KEY` and relationship-scope constraints land in a
+/// follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropertyConstraintKind {
+    Unique,
+    NotNull,
+}
+
+impl PropertyConstraintKind {
+    /// Short, human-facing token used in `SHOW CONSTRAINTS` output and
+    /// in the auto-generated constraint name. Stable — do not rename
+    /// without a migration, because the auto-name shows up in user
+    /// `DROP CONSTRAINT` statements.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PropertyConstraintKind::Unique => "UNIQUE",
+            PropertyConstraintKind::NotNull => "NOT NULL",
+        }
+    }
+}
+
+/// Declarative spec for a single-property constraint. Unlike
+/// [`PropertyIndexSpec`], constraints carry a user-facing `name` —
+/// `DROP CONSTRAINT` takes a name, not a `(label, property, kind)`
+/// triple, so the registry keys on name for lookup. When the user
+/// omits the name, [`StorageEngine::create_property_constraint`] fills
+/// in a deterministic one derived from the other fields.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PropertyConstraintSpec {
+    pub name: String,
+    pub label: String,
+    pub property: String,
+    pub kind: PropertyConstraintKind,
+}
+
 /// A single mutation that can be combined with others into an atomic
 /// [`StorageEngine::apply_batch`] call. Backend-neutral: the enum only
 /// names what to do to the graph, not how the backend persists it.
@@ -98,6 +137,39 @@ pub trait StorageEngine: Send + Sync {
     fn create_property_index(&self, label: &str, property: &str) -> Result<()>;
     fn drop_property_index(&self, label: &str, property: &str) -> Result<()>;
     fn list_property_indexes(&self) -> Vec<PropertyIndexSpec>;
+
+    // --- Constraint DDL ---
+
+    /// Declare a new property constraint. If `name` is `None`, the
+    /// backend derives a deterministic name from the other fields so
+    /// `DROP CONSTRAINT` can still target it. When `if_not_exists` is
+    /// true, re-declaring a constraint with the same name is a no-op
+    /// (including when the existing constraint has different
+    /// label/property/kind — matches Neo4j's name-first semantics).
+    /// Returns the final [`PropertyConstraintSpec`] that was either
+    /// installed or already present.
+    ///
+    /// `UNIQUE` constraints implicitly require a backing property
+    /// index; implementations should ensure one exists on the relevant
+    /// `(label, property)` pair. The backing index is NOT torn down
+    /// when the constraint is dropped — users who want it gone must
+    /// issue a separate `DROP INDEX`.
+    fn create_property_constraint(
+        &self,
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        kind: PropertyConstraintKind,
+        if_not_exists: bool,
+    ) -> Result<PropertyConstraintSpec>;
+
+    /// Tear down a constraint identified by `name`. When `if_exists`
+    /// is true, dropping a non-existent constraint is a no-op.
+    fn drop_property_constraint(&self, name: &str, if_exists: bool) -> Result<()>;
+
+    /// Snapshot every registered constraint. Order is insertion order
+    /// for deterministic `SHOW CONSTRAINTS` output across restarts.
+    fn list_property_constraints(&self) -> Vec<PropertyConstraintSpec>;
 
     // --- Snapshot / restore hooks ---
 

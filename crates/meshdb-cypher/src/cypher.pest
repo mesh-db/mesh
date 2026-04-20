@@ -9,6 +9,7 @@ query = { SOI ~ (kw_explain | kw_profile)? ~ query_body ~ EOI }
 // read statements — DDL and CREATE-only statements don't produce
 // unionable row streams and are rejected at parse time.
 query_body = {
+    create_constraint_stmt | drop_constraint_stmt | show_constraints_stmt |
     create_index_stmt | drop_index_stmt | show_indexes_stmt |
     union_query |
     create_stmt
@@ -78,6 +79,58 @@ index_target = { identifier ~ ":" ~ identifier }
 // `n.prop` — same: variable is required to be syntactically valid
 // Cypher but ignored semantically.
 index_property = { identifier ~ "." ~ identifier }
+
+// Schema DDL for constraints. Neo4j 5.x form:
+//   CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label)
+//                     REQUIRE n.prop IS UNIQUE
+//   CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label)
+//                     REQUIRE n.prop IS NOT NULL
+//   DROP CONSTRAINT name [IF EXISTS]
+//   SHOW CONSTRAINTS
+//
+// v1 surface: single-label, single-property constraints, node scope
+// only. Composite `IS NODE KEY` and relationship constraints land in a
+// follow-up — see the Implementation Status section in CLAUDE.md.
+create_constraint_stmt = {
+    kw_create ~ kw_constraint ~
+    constraint_name_opt? ~ if_not_exists? ~
+    kw_for ~ "(" ~ constraint_target ~ ")" ~
+    kw_require ~ constraint_property ~ constraint_requirement
+}
+
+// Negative-lookahead guard: we only commit to parsing an identifier as
+// the user-supplied name when the next token isn't `IF NOT EXISTS` or
+// `FOR`. Without this peek, `CREATE CONSTRAINT IF NOT EXISTS FOR ...`
+// would greedily take `IF` as the name and dead-end at the next token.
+constraint_name_opt = { !if_not_exists ~ !kw_for ~ identifier }
+
+drop_constraint_stmt = {
+    kw_drop ~ kw_constraint ~ identifier ~ if_exists?
+}
+
+show_constraints_stmt = { kw_show ~ kw_constraints }
+
+// `n:Label` / `n.prop` — same shape as the index DDL rules. The
+// pattern variable is grammar-required but discarded by the builder.
+constraint_target = { identifier ~ ":" ~ identifier }
+constraint_property = { identifier ~ "." ~ identifier }
+
+constraint_requirement = { req_unique | req_not_null }
+// Both shapes are atomic so internal whitespace can't collapse into
+// the `identifier` builder — a bare `IS` followed by an identifier
+// wouldn't otherwise terminate. `ws_req` is required between each
+// keyword to match Cypher's single-word-per-token convention.
+req_unique = @{ ^"is" ~ ws_req ~ ^"unique" ~ !id_cont }
+req_not_null = @{ ^"is" ~ ws_req ~ ^"not" ~ ws_req ~ ^"null" ~ !id_cont }
+
+if_not_exists = @{ ^"if" ~ ws_req ~ ^"not" ~ ws_req ~ ^"exists" ~ !id_cont }
+if_exists = @{ ^"if" ~ ws_req ~ ^"exists" ~ !id_cont }
+
+// Whitespace marker used inside atomic rules — the top-level
+// `WHITESPACE` silent rule doesn't fire inside `@{}`, so we spell
+// the whitespace requirement out explicitly wherever an atomic
+// phrase spans multiple keyword tokens.
+ws_req = _{ (" " | "\t" | "\r" | "\n")+ }
 
 unwind_stmt = {
     kw_unwind ~ expression ~ kw_as ~ identifier ~
@@ -524,6 +577,7 @@ reserved = @{
      ^"distinct" | ^"order" | ^"by" | ^"ascending" | ^"asc" | ^"descending" | ^"desc" |
      ^"case" | ^"when" | ^"then" | ^"else" | ^"unwind" |
      ^"index" | ^"indexes" | ^"drop" | ^"show" | ^"for" | ^"on" |
+     ^"constraint" | ^"constraints" | ^"require" | ^"unique" |
      ^"with" | ^"optional" | ^"remove")
     ~ !id_cont
 }
@@ -557,6 +611,9 @@ kw_in = @{ ^"in" ~ !id_cont }
 kw_unwind = @{ ^"unwind" ~ !id_cont }
 kw_index = @{ ^"index" ~ !id_cont }
 kw_indexes = @{ ^"indexes" ~ !id_cont }
+kw_constraint = @{ ^"constraint" ~ !id_cont }
+kw_constraints = @{ ^"constraints" ~ !id_cont }
+kw_require = @{ ^"require" ~ !id_cont }
 kw_drop = @{ ^"drop" ~ !id_cont }
 kw_show = @{ ^"show" ~ !id_cont }
 kw_for = @{ ^"for" ~ !id_cont }

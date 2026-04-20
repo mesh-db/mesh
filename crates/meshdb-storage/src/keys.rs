@@ -1,3 +1,4 @@
+use crate::engine::{PropertyConstraintKind, PropertyConstraintSpec};
 use crate::error::{Error, Result};
 use meshdb_core::{EdgeId, NodeId, Property};
 
@@ -232,6 +233,108 @@ pub(crate) fn property_index_name_prefix(label: &str, prop_key: &str) -> Vec<u8>
     key.extend_from_slice(&prop_len.to_be_bytes());
     key.extend_from_slice(prop_bytes);
     key
+}
+
+/// Type tags for constraint-kind encoding in `CF_CONSTRAINT_META`.
+/// Chosen so future kinds can extend without renumbering. The tags are
+/// part of the on-disk format — do NOT renumber without a migration.
+pub(crate) const CONSTRAINT_KIND_UNIQUE: u8 = 0x01;
+pub(crate) const CONSTRAINT_KIND_NOT_NULL: u8 = 0x02;
+
+/// Encode a constraint spec's value bytes for `CF_CONSTRAINT_META`.
+/// Layout: `[kind:u8][label_len:u16][label][prop_len:u16][prop]`.
+/// The key side carries the constraint's name (identified at write
+/// time), so name is deliberately absent from the value.
+pub(crate) fn constraint_meta_encode(spec: &PropertyConstraintSpec) -> Vec<u8> {
+    let label_bytes = spec.label.as_bytes();
+    let prop_bytes = spec.property.as_bytes();
+    let label_len = u16::try_from(label_bytes.len()).expect("label length fits in u16");
+    let prop_len = u16::try_from(prop_bytes.len()).expect("property length fits in u16");
+    let kind_tag = match spec.kind {
+        PropertyConstraintKind::Unique => CONSTRAINT_KIND_UNIQUE,
+        PropertyConstraintKind::NotNull => CONSTRAINT_KIND_NOT_NULL,
+    };
+    let mut out =
+        Vec::with_capacity(1 + LEN_PREFIX + label_bytes.len() + LEN_PREFIX + prop_bytes.len());
+    out.push(kind_tag);
+    out.extend_from_slice(&label_len.to_be_bytes());
+    out.extend_from_slice(label_bytes);
+    out.extend_from_slice(&prop_len.to_be_bytes());
+    out.extend_from_slice(prop_bytes);
+    out
+}
+
+/// Decode a constraint-meta value back into a [`PropertyConstraintSpec`].
+/// The name is passed in by the caller because it lives in the key,
+/// not the value. Corrupt bytes surface as `Error::CorruptBytes` so
+/// the caller can report the offending CF.
+pub(crate) fn constraint_meta_decode(
+    cf: &'static str,
+    name: String,
+    bytes: &[u8],
+) -> Result<PropertyConstraintSpec> {
+    if bytes.is_empty() {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let kind = match bytes[0] {
+        CONSTRAINT_KIND_UNIQUE => PropertyConstraintKind::Unique,
+        CONSTRAINT_KIND_NOT_NULL => PropertyConstraintKind::NotNull,
+        _ => {
+            return Err(Error::CorruptBytes {
+                cf,
+                expected: 1,
+                actual: bytes.len(),
+            });
+        }
+    };
+    let mut cursor = 1usize;
+    let label = read_len_prefixed_string(cf, bytes, &mut cursor)?;
+    let property = read_len_prefixed_string(cf, bytes, &mut cursor)?;
+    if cursor != bytes.len() {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected: cursor,
+            actual: bytes.len(),
+        });
+    }
+    Ok(PropertyConstraintSpec {
+        name,
+        label,
+        property,
+        kind,
+    })
+}
+
+fn read_len_prefixed_string(cf: &'static str, bytes: &[u8], cursor: &mut usize) -> Result<String> {
+    if *cursor + LEN_PREFIX > bytes.len() {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected: *cursor + LEN_PREFIX,
+            actual: bytes.len(),
+        });
+    }
+    let len = u16::from_be_bytes([bytes[*cursor], bytes[*cursor + 1]]) as usize;
+    *cursor += LEN_PREFIX;
+    if *cursor + len > bytes.len() {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected: *cursor + len,
+            actual: bytes.len(),
+        });
+    }
+    let s = std::str::from_utf8(&bytes[*cursor..*cursor + len])
+        .map_err(|_| Error::CorruptBytes {
+            cf,
+            expected: len,
+            actual: len,
+        })?
+        .to_string();
+    *cursor += len;
+    Ok(s)
 }
 
 /// Extract the trailing node id from a property-index key whose

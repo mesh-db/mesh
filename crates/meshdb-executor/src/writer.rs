@@ -1,6 +1,6 @@
 use crate::error::Result;
 use meshdb_core::{Edge, EdgeId, Node, NodeId};
-use meshdb_storage::StorageEngine;
+use meshdb_storage::{PropertyConstraintKind, PropertyConstraintSpec, StorageEngine};
 
 /// Sink for mutating graph operations produced by the executor. Isolates
 /// write-side concerns from read-side traversal so we can plug in either a
@@ -39,6 +39,37 @@ pub trait GraphWriter {
     /// returns an empty list — remote writers will wire real
     /// fan-out in Phase C.
     fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
+    /// Declare a new property constraint. Default impl errors so
+    /// remote writers that haven't plumbed constraint DDL yet surface
+    /// the limitation immediately — storage-backed writers override
+    /// via the blanket impl.
+    fn create_property_constraint(
+        &self,
+        _name: Option<&str>,
+        _label: &str,
+        _property: &str,
+        _kind: PropertyConstraintKind,
+        _if_not_exists: bool,
+    ) -> Result<PropertyConstraintSpec> {
+        Err(crate::error::Error::Unsupported(
+            "constraint DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Tear down a constraint by name. Mirrors
+    /// [`Self::create_property_constraint`].
+    fn drop_property_constraint(&self, _name: &str, _if_exists: bool) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "constraint DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Snapshot the currently-registered constraints for
+    /// `SHOW CONSTRAINTS`. Default impl returns an empty list.
+    fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
         Ok(Vec::new())
     }
 }
@@ -86,6 +117,33 @@ impl<T: StorageEngine> GraphWriter for T {
             .map(|s| (s.label, s.property))
             .collect())
     }
+
+    fn create_property_constraint(
+        &self,
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        kind: PropertyConstraintKind,
+        if_not_exists: bool,
+    ) -> Result<PropertyConstraintSpec> {
+        Ok(StorageEngine::create_property_constraint(
+            self,
+            name,
+            label,
+            property,
+            kind,
+            if_not_exists,
+        )?)
+    }
+
+    fn drop_property_constraint(&self, name: &str, if_exists: bool) -> Result<()> {
+        StorageEngine::drop_property_constraint(self, name, if_exists)?;
+        Ok(())
+    }
+
+    fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
+        Ok(StorageEngine::list_property_constraints(self))
+    }
 }
 
 /// Adapter that lets a `&dyn StorageEngine` act as a `GraphWriter`.
@@ -132,5 +190,27 @@ impl GraphWriter for StorageWriterAdapter<'_> {
             .into_iter()
             .map(|s| (s.label, s.property))
             .collect())
+    }
+
+    fn create_property_constraint(
+        &self,
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        kind: PropertyConstraintKind,
+        if_not_exists: bool,
+    ) -> Result<PropertyConstraintSpec> {
+        Ok(self
+            .0
+            .create_property_constraint(name, label, property, kind, if_not_exists)?)
+    }
+
+    fn drop_property_constraint(&self, name: &str, if_exists: bool) -> Result<()> {
+        self.0.drop_property_constraint(name, if_exists)?;
+        Ok(())
+    }
+
+    fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
+        Ok(self.0.list_property_constraints())
     }
 }

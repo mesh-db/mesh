@@ -19,6 +19,9 @@ pub enum Statement {
     CreateIndex(IndexDdl),
     DropIndex(IndexDdl),
     ShowIndexes,
+    CreateConstraint(CreateConstraintStmt),
+    DropConstraint(DropConstraintStmt),
+    ShowConstraints,
     /// Multiple read statements joined by `UNION` / `UNION ALL`.
     /// Flat: a chain `a UNION b UNION c` produces a single
     /// `Union` with three branches. Mixing `UNION` and
@@ -111,6 +114,43 @@ pub struct ReturnStmt {
 pub struct IndexDdl {
     pub label: String,
     pub property: String,
+}
+
+/// Kind of property constraint. Mirrors the surface clauses — UNIQUE
+/// comes from `REQUIRE n.prop IS UNIQUE`, NotNull from
+/// `REQUIRE n.prop IS NOT NULL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConstraintKind {
+    Unique,
+    NotNull,
+}
+
+/// Payload for `CREATE CONSTRAINT ... FOR (n:Label) REQUIRE n.prop IS
+/// <kind>`. Unlike indexes, constraints carry an optional
+/// user-supplied name — when `name` is `None` the storage layer
+/// fills in a deterministic auto-generated name so `DROP CONSTRAINT`
+/// can still target it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateConstraintStmt {
+    pub name: Option<String>,
+    pub label: String,
+    pub property: String,
+    pub kind: ConstraintKind,
+    /// `true` when the source carried `IF NOT EXISTS` — makes
+    /// re-declaration with the same name a no-op instead of a
+    /// conflict error.
+    pub if_not_exists: bool,
+}
+
+/// Payload for `DROP CONSTRAINT name [IF EXISTS]`. Identified by
+/// name rather than `(label, property, kind)` because the DROP surface
+/// takes a name: the storage layer resolves it against the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropConstraintStmt {
+    pub name: String,
+    /// `true` when the source carried `IF EXISTS` — makes dropping a
+    /// non-existent constraint a no-op instead of an error.
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

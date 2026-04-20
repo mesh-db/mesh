@@ -99,6 +99,10 @@ pub enum BuiltinProc {
     /// `db.propertyKeys()` — yields one row per distinct property key
     /// observed on any node or edge.
     DbPropertyKeys,
+    /// `db.constraints()` — yields one row per registered constraint,
+    /// carrying `name`, `label`, `property`, and `type` columns.
+    /// Mirrors the `SHOW CONSTRAINTS` surface.
+    DbConstraints,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -133,6 +137,7 @@ impl Procedure {
             Some(BuiltinProc::DbLabels) => builtin_db_labels(reader),
             Some(BuiltinProc::DbRelationshipTypes) => builtin_db_relationship_types(reader),
             Some(BuiltinProc::DbPropertyKeys) => builtin_db_property_keys(reader),
+            Some(BuiltinProc::DbConstraints) => builtin_db_constraints(reader),
         }
     }
 }
@@ -167,6 +172,30 @@ fn builtin_db_relationship_types(reader: &dyn GraphReader) -> Result<Vec<ProcRow
     Ok(types
         .into_iter()
         .map(|t| str_row("relationshipType", t))
+        .collect())
+}
+
+fn builtin_db_constraints(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
+    let specs = reader.list_property_constraints()?;
+    Ok(specs
+        .into_iter()
+        .map(|spec| {
+            let mut row: ProcRow = HashMap::new();
+            row.insert("name".into(), Value::Property(Property::String(spec.name)));
+            row.insert(
+                "label".into(),
+                Value::Property(Property::String(spec.label)),
+            );
+            row.insert(
+                "property".into(),
+                Value::Property(Property::String(spec.property)),
+            );
+            row.insert(
+                "type".into(),
+                Value::Property(Property::String(spec.kind.as_str().into())),
+            );
+            row
+        })
         .collect())
 }
 
@@ -268,6 +297,30 @@ impl ProcedureRegistry {
             }],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::DbPropertyKeys),
+        });
+        self.register(Procedure {
+            qualified_name: vec!["db".into(), "constraints".into()],
+            inputs: Vec::new(),
+            outputs: vec![
+                ProcOutSpec {
+                    name: "name".into(),
+                    ty: ProcType::String,
+                },
+                ProcOutSpec {
+                    name: "label".into(),
+                    ty: ProcType::String,
+                },
+                ProcOutSpec {
+                    name: "property".into(),
+                    ty: ProcType::String,
+                },
+                ProcOutSpec {
+                    name: "type".into(),
+                    ty: ProcType::String,
+                },
+            ],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::DbConstraints),
         });
     }
 }

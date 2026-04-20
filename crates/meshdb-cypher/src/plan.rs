@@ -1,7 +1,7 @@
 use crate::ast::{
-    BinaryOp, CallArgs, CompareOp, CreateStmt, Direction, Expr, IndexDdl, Literal, MatchStmt,
-    NodePattern, Pattern, ReturnItem, ReturnStmt, ShortestKind, SortItem, Statement, UnaryOp,
-    UnionStmt, UnwindStmt,
+    BinaryOp, CallArgs, CompareOp, ConstraintKind, CreateConstraintStmt, CreateStmt, Direction,
+    DropConstraintStmt, Expr, IndexDdl, Literal, MatchStmt, NodePattern, Pattern, ReturnItem,
+    ReturnStmt, ShortestKind, SortItem, Statement, UnaryOp, UnionStmt, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -436,6 +436,28 @@ pub enum LogicalPlan {
     /// describing `(label, property)`. The executor builds the rows
     /// from `Store::list_property_indexes`.
     ShowPropertyIndexes,
+    /// Schema DDL — declare a new property constraint. Same short-
+    /// circuit dispatch pattern as [`LogicalPlan::CreatePropertyIndex`]:
+    /// the executor handles the mutation outside the operator pipeline.
+    /// `name` is `None` when the source omitted it; the storage layer
+    /// fills in a deterministic default.
+    CreatePropertyConstraint {
+        name: Option<String>,
+        label: String,
+        property: String,
+        kind: ConstraintKind,
+        if_not_exists: bool,
+    },
+    /// Schema DDL — tear down a constraint by name. `if_exists`
+    /// makes a missing constraint a no-op instead of an error.
+    DropPropertyConstraint {
+        name: String,
+        if_exists: bool,
+    },
+    /// Schema DDL — emit one row per registered constraint describing
+    /// `name`, `label`, `property`, `type`. Rows are built from
+    /// `Store::list_property_constraints`.
+    ShowPropertyConstraints,
     /// Concatenate row streams from multiple sub-plans, optionally
     /// deduping across the union. Each branch is planned
     /// independently and must project the same set of columns
@@ -620,6 +642,26 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
             property: property.clone(),
         },
         Statement::ShowIndexes => LogicalPlan::ShowPropertyIndexes,
+        Statement::CreateConstraint(CreateConstraintStmt {
+            name,
+            label,
+            property,
+            kind,
+            if_not_exists,
+        }) => LogicalPlan::CreatePropertyConstraint {
+            name: name.clone(),
+            label: label.clone(),
+            property: property.clone(),
+            kind: *kind,
+            if_not_exists: *if_not_exists,
+        },
+        Statement::DropConstraint(DropConstraintStmt { name, if_exists }) => {
+            LogicalPlan::DropPropertyConstraint {
+                name: name.clone(),
+                if_exists: *if_exists,
+            }
+        }
+        Statement::ShowConstraints => LogicalPlan::ShowPropertyConstraints,
         Statement::Union(u) => plan_union(u, ctx)?,
         Statement::Explain(inner) | Statement::Profile(inner) => {
             return plan_with_context(inner, ctx)
@@ -930,6 +972,29 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         }
         LogicalPlan::ShowPropertyIndexes => {
             buf.push_str(&format!("{indent}ShowPropertyIndexes\n"));
+        }
+        LogicalPlan::CreatePropertyConstraint {
+            name,
+            label,
+            property,
+            kind,
+            ..
+        } => {
+            let kind_str = match kind {
+                ConstraintKind::Unique => "UNIQUE",
+                ConstraintKind::NotNull => "NOT NULL",
+            };
+            let name_str = name.as_deref().unwrap_or("<auto>");
+            buf.push_str(&format!(
+                "{indent}CreatePropertyConstraint({name_str}: {label}.{property} IS {kind_str})\n"
+            ));
+        }
+        LogicalPlan::DropPropertyConstraint { name, if_exists } => {
+            let suffix = if *if_exists { " IF EXISTS" } else { "" };
+            buf.push_str(&format!("{indent}DropPropertyConstraint({name}){suffix}\n"));
+        }
+        LogicalPlan::ShowPropertyConstraints => {
+            buf.push_str(&format!("{indent}ShowPropertyConstraints\n"));
         }
     }
 }
@@ -1250,7 +1315,10 @@ where
         | LogicalPlan::LoadCsv { input: None, .. }
         | LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
-        | LogicalPlan::ShowPropertyIndexes => Ok(()),
+        | LogicalPlan::ShowPropertyIndexes
+        | LogicalPlan::CreatePropertyConstraint { .. }
+        | LogicalPlan::DropPropertyConstraint { .. }
+        | LogicalPlan::ShowPropertyConstraints => Ok(()),
     }
 }
 
@@ -1487,6 +1555,9 @@ fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::ShowIndexes
+        | Statement::CreateConstraint(_)
+        | Statement::DropConstraint(_)
+        | Statement::ShowConstraints
         | Statement::CallProcedure(_) => Err(Error::Plan(
             "UNION branches must be read queries (MATCH / UNWIND / RETURN); \
              DDL and CREATE-only statements are not allowed"

@@ -1065,6 +1065,102 @@ fn create_index_rejects_missing_label() {
     assert!(parse("CREATE INDEX FOR (p) ON (p.name)").is_err());
 }
 
+#[test]
+fn create_unique_constraint_parses_without_name() {
+    match parse("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE").unwrap() {
+        Statement::CreateConstraint(stmt) => {
+            assert_eq!(stmt.name, None);
+            assert_eq!(stmt.label, "Person");
+            assert_eq!(stmt.property, "email");
+            assert_eq!(stmt.kind, ConstraintKind::Unique);
+            assert!(!stmt.if_not_exists);
+        }
+        other => panic!("expected CreateConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_not_null_constraint_parses_with_name() {
+    match parse("CREATE CONSTRAINT person_name FOR (p:Person) REQUIRE p.name IS NOT NULL").unwrap()
+    {
+        Statement::CreateConstraint(stmt) => {
+            assert_eq!(stmt.name.as_deref(), Some("person_name"));
+            assert_eq!(stmt.label, "Person");
+            assert_eq!(stmt.property, "name");
+            assert_eq!(stmt.kind, ConstraintKind::NotNull);
+        }
+        other => panic!("expected CreateConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_constraint_if_not_exists_without_name() {
+    match parse("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.email IS UNIQUE").unwrap()
+    {
+        Statement::CreateConstraint(stmt) => {
+            assert!(stmt.if_not_exists);
+            assert_eq!(stmt.name, None);
+        }
+        other => panic!("expected CreateConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_constraint_name_and_if_not_exists() {
+    match parse(
+        "CREATE CONSTRAINT email_unique IF NOT EXISTS FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    )
+    .unwrap()
+    {
+        Statement::CreateConstraint(stmt) => {
+            assert_eq!(stmt.name.as_deref(), Some("email_unique"));
+            assert!(stmt.if_not_exists);
+        }
+        other => panic!("expected CreateConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn drop_constraint_parses() {
+    match parse("DROP CONSTRAINT email_unique").unwrap() {
+        Statement::DropConstraint(stmt) => {
+            assert_eq!(stmt.name, "email_unique");
+            assert!(!stmt.if_exists);
+        }
+        other => panic!("expected DropConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn drop_constraint_if_exists_parses() {
+    match parse("DROP CONSTRAINT email_unique IF EXISTS").unwrap() {
+        Statement::DropConstraint(stmt) => {
+            assert_eq!(stmt.name, "email_unique");
+            assert!(stmt.if_exists);
+        }
+        other => panic!("expected DropConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn show_constraints_parses() {
+    assert!(matches!(
+        parse("SHOW CONSTRAINTS").unwrap(),
+        Statement::ShowConstraints
+    ));
+}
+
+#[test]
+fn create_constraint_rejects_bare_node_pattern() {
+    // Grammar requires `(var:Label)`.
+    assert!(parse("CREATE CONSTRAINT FOR (p) REQUIRE p.email IS UNIQUE").is_err());
+}
+
+#[test]
+fn create_constraint_rejects_missing_requirement() {
+    assert!(parse("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email").is_err());
+}
+
 // ---------------------------------------------------------------
 // WHERE-clause IndexSeek rewrite: planner-level assertions.
 // ---------------------------------------------------------------

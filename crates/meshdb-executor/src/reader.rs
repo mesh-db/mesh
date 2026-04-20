@@ -1,6 +1,6 @@
 use crate::error::Result;
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
-use meshdb_storage::StorageEngine;
+use meshdb_storage::{PropertyConstraintSpec, StorageEngine};
 
 /// Read-side counterpart to [`crate::GraphWriter`]. Gives the executor a
 /// uniform view of the graph regardless of whether the data behind it lives
@@ -37,6 +37,12 @@ pub trait GraphReader: Send + Sync {
     /// overrides via the blanket impl, and partitioned/overlay
     /// readers delegate to their bases.
     fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+    /// Snapshot every registered constraint visible through this
+    /// reader, for `SHOW CONSTRAINTS` and `db.constraints()`. Default
+    /// impl returns empty; storage-backed readers override.
+    fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
         Ok(Vec::new())
     }
     fn outgoing(&self, id: NodeId) -> Result<Vec<(EdgeId, NodeId)>>;
@@ -89,6 +95,10 @@ impl<T: StorageEngine> GraphReader for T {
             .collect())
     }
 
+    fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
+        Ok(StorageEngine::list_property_constraints(self))
+    }
+
     fn outgoing(&self, id: NodeId) -> Result<Vec<(EdgeId, NodeId)>> {
         Ok(StorageEngine::outgoing(self, id)?)
     }
@@ -138,6 +148,10 @@ impl GraphReader for StorageReaderAdapter<'_> {
             .into_iter()
             .map(|s| (s.label, s.property))
             .collect())
+    }
+
+    fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
+        Ok(self.0.list_property_constraints())
     }
 
     fn outgoing(&self, id: NodeId) -> Result<Vec<(EdgeId, NodeId)>> {

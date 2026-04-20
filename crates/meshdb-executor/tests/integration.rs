@@ -7453,3 +7453,220 @@ fn limit_with_expression() {
     let vals: Vec<i64> = rows.iter().map(|r| int_prop(r, "v")).collect();
     assert_eq!(vals, vec![1, 2]);
 }
+
+// ===============================================================
+// Constraint management: CREATE / DROP / SHOW CONSTRAINTS plus
+// enforcement on writes and `db.constraints()` procedure.
+// ===============================================================
+
+/// Like `run`, but surfaces the executor error instead of panicking —
+/// used by constraint-violation tests that need to assert on the
+/// error shape rather than the returned rows.
+fn run_catch(store: &Store, q: &str) -> std::result::Result<Vec<Row>, meshdb_executor::Error> {
+    let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+    let plan = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+    execute(&plan, store)
+}
+
+#[test]
+fn create_unique_constraint_round_trip() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "state"), "created");
+    assert_eq!(str_prop(&rows[0], "label"), "Person");
+    assert_eq!(str_prop(&rows[0], "property"), "email");
+    assert_eq!(str_prop(&rows[0], "type"), "UNIQUE");
+    // Auto-generated name format.
+    assert_eq!(str_prop(&rows[0], "name"), "constraint_Person_email_unique");
+
+    let shown = run(&store, "SHOW CONSTRAINTS");
+    assert_eq!(shown.len(), 1);
+    assert_eq!(str_prop(&shown[0], "label"), "Person");
+    assert_eq!(str_prop(&shown[0], "type"), "UNIQUE");
+}
+
+#[test]
+fn create_named_not_null_constraint_round_trip() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT person_name FOR (p:Person) REQUIRE p.name IS NOT NULL",
+    );
+    let shown = run(&store, "SHOW CONSTRAINTS");
+    assert_eq!(shown.len(), 1);
+    assert_eq!(str_prop(&shown[0], "name"), "person_name");
+    assert_eq!(str_prop(&shown[0], "type"), "NOT NULL");
+}
+
+#[test]
+fn drop_constraint_removes_it_from_show() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT email_uniq FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    );
+    run(&store, "DROP CONSTRAINT email_uniq");
+    assert!(run(&store, "SHOW CONSTRAINTS").is_empty());
+}
+
+#[test]
+fn drop_constraint_missing_without_if_exists_errors() {
+    let (store, _d) = open_store();
+    let err = run_catch(&store, "DROP CONSTRAINT missing_one").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("missing_one"),
+        "error message should mention constraint name; got: {msg}"
+    );
+}
+
+#[test]
+fn drop_constraint_missing_with_if_exists_is_noop() {
+    let (store, _d) = open_store();
+    let rows = run(&store, "DROP CONSTRAINT missing_one IF EXISTS");
+    // A DROP always acks; the "missing" case still emits the row.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "state"), "dropped");
+}
+
+#[test]
+fn create_constraint_if_not_exists_is_idempotent() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT email_uniq FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    );
+    run(
+        &store,
+        "CREATE CONSTRAINT email_uniq IF NOT EXISTS FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    );
+    let shown = run(&store, "SHOW CONSTRAINTS");
+    assert_eq!(shown.len(), 1);
+}
+
+#[test]
+fn unique_constraint_blocks_duplicate_insert() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    );
+    run(&store, "CREATE (:Person {email: 'ada@example.com'})");
+    let err = run_catch(&store, "CREATE (:Person {email: 'ada@example.com'})")
+        .expect_err("duplicate value should violate UNIQUE");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("UNIQUE") && msg.contains("email"),
+        "error should identify the constraint; got: {msg}"
+    );
+}
+
+#[test]
+fn unique_constraint_allows_different_values() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    );
+    run(&store, "CREATE (:Person {email: 'ada@example.com'})");
+    run(&store, "CREATE (:Person {email: 'bob@example.com'})");
+    let shown = run(&store, "MATCH (p:Person) RETURN p.email AS e");
+    assert_eq!(shown.len(), 2);
+}
+
+#[test]
+fn unique_constraint_allows_same_node_update() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    );
+    run(&store, "CREATE (:Person {email: 'ada@example.com'})");
+    // Rename via SET on the same node — uniqueness must allow the
+    // self-update (old entry is being replaced by new).
+    run(
+        &store,
+        "MATCH (p:Person {email: 'ada@example.com'}) SET p.email = 'ada.l@example.com'",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person {email: 'ada.l@example.com'}) RETURN p.email AS e",
+    );
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn not_null_constraint_blocks_missing_property() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.name IS NOT NULL",
+    );
+    let err = run_catch(&store, "CREATE (:Person {email: 'x@example.com'})")
+        .expect_err("missing required property should violate NOT NULL");
+    assert!(err.to_string().contains("NOT NULL"));
+}
+
+#[test]
+fn not_null_constraint_allows_present_property() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.name IS NOT NULL",
+    );
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(&store, "MATCH (p:Person) RETURN p.name AS n");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn create_unique_constraint_rejects_existing_duplicates() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {email: 'a@x.com'})");
+    run(&store, "CREATE (:Person {email: 'a@x.com'})");
+    // Backfill validation should reject the constraint declaration.
+    let err = run_catch(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    )
+    .expect_err("pre-existing duplicates should block constraint creation");
+    assert!(err.to_string().contains("UNIQUE"));
+}
+
+#[test]
+fn db_constraints_procedure_lists_registered() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT email_uniq FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    );
+    let rows = run_with_default_procs(
+        &store,
+        "CALL db.constraints() YIELD name, type RETURN name, type",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "email_uniq");
+    assert_eq!(str_prop(&rows[0], "type"), "UNIQUE");
+}
+
+#[test]
+fn constraint_persists_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = Store::open(dir.path()).unwrap();
+        run(
+            &store,
+            "CREATE CONSTRAINT persist_me FOR (p:Person) REQUIRE p.email IS UNIQUE",
+        );
+    }
+    // Reopen — loader rehydrates CF_CONSTRAINT_META into the
+    // in-memory registry. SHOW should still see the entry.
+    let store = Store::open(dir.path()).unwrap();
+    let shown = run(&store, "SHOW CONSTRAINTS");
+    assert_eq!(shown.len(), 1);
+    assert_eq!(str_prop(&shown[0], "name"), "persist_me");
+}

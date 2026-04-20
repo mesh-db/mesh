@@ -45,6 +45,11 @@ fn build_query_body(pair: Pair<Rule>) -> Result<Statement> {
         Rule::create_index_stmt => Ok(Statement::CreateIndex(build_index_ddl(inner)?)),
         Rule::drop_index_stmt => Ok(Statement::DropIndex(build_index_ddl(inner)?)),
         Rule::show_indexes_stmt => Ok(Statement::ShowIndexes),
+        Rule::create_constraint_stmt => {
+            Ok(Statement::CreateConstraint(build_create_constraint(inner)?))
+        }
+        Rule::drop_constraint_stmt => Ok(Statement::DropConstraint(build_drop_constraint(inner)?)),
+        Rule::show_constraints_stmt => Ok(Statement::ShowConstraints),
         Rule::union_query => build_union_query(inner),
         r => Err(Error::Parse(format!("unexpected rule: {:?}", r))),
     }
@@ -219,6 +224,107 @@ fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
     Ok(crate::ast::IndexDdl {
         label: label.ok_or_else(|| Error::Parse("index ddl missing label".into()))?,
         property: property.ok_or_else(|| Error::Parse("index ddl missing property".into()))?,
+    })
+}
+
+/// Build a `CreateConstraintStmt` from a `create_constraint_stmt` pair.
+/// The grammar gives us (in order): an optional `constraint_name_opt`,
+/// an optional `if_not_exists`, the `constraint_target`, the
+/// `constraint_property`, and a `constraint_requirement`. We walk the
+/// children in a single pass because the grammar guarantees the
+/// relative ordering even when the optional pieces are absent.
+fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstraintStmt> {
+    let mut name: Option<String> = None;
+    let mut if_not_exists = false;
+    let mut label: Option<String> = None;
+    let mut property: Option<String> = None;
+    let mut kind: Option<crate::ast::ConstraintKind> = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::constraint_name_opt => {
+                let ident = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("constraint name missing identifier".into()))?;
+                name = Some(parse_ident(ident.as_str()));
+            }
+            Rule::if_not_exists => {
+                if_not_exists = true;
+            }
+            Rule::constraint_target => {
+                let mut inner = p.into_inner();
+                let _var = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("constraint target missing var".into()))?;
+                let lab = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("constraint target missing label".into()))?;
+                label = Some(parse_ident(lab.as_str()));
+            }
+            Rule::constraint_property => {
+                let mut inner = p.into_inner();
+                let _var = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("constraint property missing var".into()))?;
+                let key = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("constraint property missing key".into()))?;
+                property = Some(parse_ident(key.as_str()));
+            }
+            Rule::constraint_requirement => {
+                // `constraint_requirement` is the `req_unique | req_not_null`
+                // alternation, so the single inner pair tells us which
+                // shape matched. Kept as a pair (not an atomic string
+                // match) so future constraint kinds drop in next to it.
+                let req = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::Parse("empty constraint_requirement".into()))?;
+                kind = Some(match req.as_rule() {
+                    Rule::req_unique => crate::ast::ConstraintKind::Unique,
+                    Rule::req_not_null => crate::ast::ConstraintKind::NotNull,
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected constraint requirement: {r:?}"
+                        )))
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(crate::ast::CreateConstraintStmt {
+        name,
+        label: label.ok_or_else(|| Error::Parse("create constraint missing label".into()))?,
+        property: property
+            .ok_or_else(|| Error::Parse("create constraint missing property".into()))?,
+        kind: kind.ok_or_else(|| Error::Parse("create constraint missing requirement".into()))?,
+        if_not_exists,
+    })
+}
+
+/// Build a `DropConstraintStmt` from a `drop_constraint_stmt` pair.
+/// The grammar pins the order as `identifier` (name) followed by an
+/// optional `if_exists`, so we walk once and pick the pieces out.
+fn build_drop_constraint(pair: Pair<Rule>) -> Result<crate::ast::DropConstraintStmt> {
+    let mut name: Option<String> = None;
+    let mut if_exists = false;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier => {
+                if name.is_none() {
+                    name = Some(parse_ident(p.as_str()));
+                }
+            }
+            Rule::if_exists => {
+                if_exists = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(crate::ast::DropConstraintStmt {
+        name: name.ok_or_else(|| Error::Parse("drop constraint missing name".into()))?,
+        if_exists,
     })
 }
 
