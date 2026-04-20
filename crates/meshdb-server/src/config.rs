@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 /// How a multi-peer server operates on top of its peer list. See
 /// [`ServerConfig::resolved_mode`] for the defaulting rules that apply
 /// when the TOML config omits `mode` entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
 pub enum ClusterMode {
     /// Single-node: no peers, no replication, no partitioning. The
     /// store is local and every query hits it directly. Implicit when

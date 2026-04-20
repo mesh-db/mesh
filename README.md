@@ -77,6 +77,35 @@ INFO meshdb_server: meshdb-server bolt listening addr=127.0.0.1:7687
 Leave it running. Ctrl-C to stop. Wipe `/tmp/mesh-data` between runs if you
 want a clean slate.
 
+#### Running without a config file
+
+For quick tests (and Docker containers where mounting a file is awkward),
+`meshdb-server` accepts CLI flags for the common-case fields. Every flag
+has a matching `MESHDB_*` env var, so:
+
+```sh
+meshdb-server \
+  --self-id 1 \
+  --listen-address 127.0.0.1:7001 \
+  --bolt-address 127.0.0.1:7687 \
+  --data-dir /tmp/mesh-data
+```
+
+is equivalent to:
+
+```sh
+MESHDB_SELF_ID=1 \
+MESHDB_LISTEN_ADDRESS=127.0.0.1:7001 \
+MESHDB_BOLT_ADDRESS=127.0.0.1:7687 \
+MESHDB_DATA_DIR=/tmp/mesh-data \
+meshdb-server
+```
+
+When both `--config` and CLI flags are present, the TOML file is loaded
+first and any set flags override the corresponding fields. Structured
+settings — `peers`, `bolt_auth`, `bolt_tls`, `grpc_tls` — stay TOML-only.
+`meshdb-server --help` lists every flag.
+
 ### 4. Connect from a Bolt client
 
 The easiest path is the official Python driver:

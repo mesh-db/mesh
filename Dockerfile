@@ -18,6 +18,16 @@
 #       -v $(pwd)/my.toml:/etc/meshdb/meshdb.toml:ro \
 #       -v meshdb-data:/var/lib/meshdb \
 #       meshdb-server
+#
+# For common-case fields you can also pass MESHDB_* env vars, which
+# override the bundled TOML without replacing it. Useful when you just
+# want to flip one setting without baking a new config file:
+#
+#     docker run --rm \
+#       -p 7001:7001 -p 7687:7687 \
+#       -e MESHDB_METRICS_ADDRESS=0.0.0.0:9090 \
+#       -v meshdb-data:/var/lib/meshdb \
+#       meshdb-server
 
 # ---------- build ----------
 # Pin to a specific Rust toolchain so the image is reproducible. 1.95+
