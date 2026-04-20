@@ -21,6 +21,50 @@ message PointValue {
   optional double z = 4;
 }
 
+// DateTime with timezone offset. `nanos` in `meshdb_core::Property`
+// is `i128` UTC epoch-nanoseconds; to fit protobuf we split it into
+// `(seconds, subsec_nanos)` following the Bolt DateTime convention —
+// the encoder in meshdb-server does the same split for tag 0x49.
+// `tz_offset_secs` and `tz_name` are both optional, matching the
+// Rust type's `Option<i32>` / `Option<String>`.
+message DateTimeValue {
+  sint64 seconds = 1;
+  int32 subsec_nanos = 2;
+  optional int32 tz_offset_secs = 3;
+  optional string tz_name = 4;
+}
+
+// Naive (no-timezone) datetime — UTC epoch nanos split the same way
+// as `DateTimeValue`. Distinct variant so the zone-less presentation
+// semantics are preserved across the wire.
+message LocalDateTimeValue {
+  sint64 seconds = 1;
+  int32 subsec_nanos = 2;
+}
+
+// Days since the UNIX epoch (1970-01-01). `sint64` so negative days
+// (pre-epoch dates) round-trip without the zig-zag overhead landing
+// on a varint-costly payload.
+message DateValue {
+  sint64 days = 1;
+}
+
+// Time of day with optional zone offset. `nanos` is since midnight.
+message TimeValue {
+  int64 nanos = 1;
+  optional int32 tz_offset_secs = 2;
+}
+
+// Cypher Duration (months, days, seconds, subsec nanos). Calendar
+// units and exact units are kept separate since only the exact
+// units can be reduced without a reference date.
+message DurationValue {
+  int64 months = 1;
+  int64 days = 2;
+  int64 seconds = 3;
+  int32 nanos = 4;
+}
+
 // Primitive property value. List / Map variants are deferred.
 message Property {
   oneof kind {
@@ -30,6 +74,11 @@ message Property {
     double float_val = 4;
     bool bool_val = 5;
     PointValue point_val = 6;
+    DateTimeValue datetime_val = 7;
+    LocalDateTimeValue local_datetime_val = 8;
+    DateValue date_val = 9;
+    TimeValue time_val = 10;
+    DurationValue duration_val = 11;
   }
 }
 
