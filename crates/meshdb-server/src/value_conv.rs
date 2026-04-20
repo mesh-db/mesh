@@ -217,6 +217,25 @@ fn property_to_bolt(p: &Property) -> BoltValue {
             }
             BoltValue::Struct { tag, fields }
         }
+        Property::Point(p) => match p.z {
+            Some(z) => BoltValue::Struct {
+                tag: meshdb_bolt::TAG_POINT_3D,
+                fields: vec![
+                    BoltValue::Int(p.srid as i64),
+                    BoltValue::Float(p.x),
+                    BoltValue::Float(p.y),
+                    BoltValue::Float(z),
+                ],
+            },
+            None => BoltValue::Struct {
+                tag: meshdb_bolt::TAG_POINT_2D,
+                fields: vec![
+                    BoltValue::Int(p.srid as i64),
+                    BoltValue::Float(p.x),
+                    BoltValue::Float(p.y),
+                ],
+            },
+        },
     }
 }
 
@@ -515,7 +534,55 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
                 nanos: nanos_i32,
             }))
         }
+        meshdb_bolt::TAG_POINT_2D => {
+            if fields.len() != 3 {
+                return Err(ParamConversionError::MalformedTemporal {
+                    tag,
+                    reason: "expected 3 fields",
+                });
+            }
+            let srid = temporal_int(fields, 0, tag, "Point2D srid")? as i32;
+            let x = temporal_float(fields, 1, tag, "Point2D x")?;
+            let y = temporal_float(fields, 2, tag, "Point2D y")?;
+            Ok(Property::Point(meshdb_core::Point {
+                srid,
+                x,
+                y,
+                z: None,
+            }))
+        }
+        meshdb_bolt::TAG_POINT_3D => {
+            if fields.len() != 4 {
+                return Err(ParamConversionError::MalformedTemporal {
+                    tag,
+                    reason: "expected 4 fields",
+                });
+            }
+            let srid = temporal_int(fields, 0, tag, "Point3D srid")? as i32;
+            let x = temporal_float(fields, 1, tag, "Point3D x")?;
+            let y = temporal_float(fields, 2, tag, "Point3D y")?;
+            let z = temporal_float(fields, 3, tag, "Point3D z")?;
+            Ok(Property::Point(meshdb_core::Point {
+                srid,
+                x,
+                y,
+                z: Some(z),
+            }))
+        }
         _ => Err(ParamConversionError::GraphValue("Struct")),
+    }
+}
+
+fn temporal_float(
+    fields: &[BoltValue],
+    idx: usize,
+    tag: u8,
+    reason: &'static str,
+) -> Result<f64, ParamConversionError> {
+    match fields.get(idx) {
+        Some(BoltValue::Float(f)) => Ok(*f),
+        Some(BoltValue::Int(i)) => Ok(*i as f64),
+        _ => Err(ParamConversionError::MalformedTemporal { tag, reason }),
     }
 }
 

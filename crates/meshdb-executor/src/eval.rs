@@ -5,11 +5,14 @@ use crate::{
     value::{ParamMap, Row, Value},
 };
 use chrono::{Datelike, Timelike};
-use meshdb_core::{NodeId, Property};
+use meshdb_core::{
+    NodeId, Point, Property, SRID_CARTESIAN_2D, SRID_CARTESIAN_3D, SRID_WGS84_2D, SRID_WGS84_3D,
+};
 use meshdb_cypher::{
     BinaryOp, CallArgs, CompareOp, Direction, Expr, Literal, NodePattern, Pattern, UnaryOp,
 };
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 /// Per-evaluation context threaded through every `eval_expr`
 /// call. Holds the current row, the query parameters, and a
@@ -201,6 +204,7 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     tz_offset_secs,
                 }) => Ok(time_accessor(*nanos, *tz_offset_secs, key)),
                 Value::Property(Property::Duration(ref dur)) => Ok(duration_accessor(dur, key)),
+                Value::Property(Property::Point(p)) => Ok(point_accessor(*p, key)),
                 // Accessing a property on something that isn't a
                 // container (map, node, edge, temporal) is a type
                 // error — openCypher raises `InvalidArgumentType`
@@ -260,6 +264,10 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     tz_offset_secs,
                 }) => Ok(time_accessor(nanos, tz_offset_secs, key)),
                 Value::Property(Property::Duration(ref dur)) => Ok(duration_accessor(dur, key)),
+                Value::Property(Property::Point(p)) => Ok(point_accessor(p, key)),
+                // `Point` above is consumed by value from this owned-
+                // match (the outer arms take ownership of `v`), so no
+                // deref is needed here.
                 // Same rule as `Expr::Property` above — `.key` on a
                 // non-container is a type error, not null.
                 _ => Err(Error::TypeMismatch),
@@ -3772,6 +3780,78 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             )))
         }
 
+        // --- Spatial scalar functions ---
+        "point" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            let map = match v {
+                Value::Null | Value::Property(Property::Null) => return Ok(Value::Null),
+                Value::Property(Property::Map(m)) => m,
+                _ => return Err(Error::TypeMismatch),
+            };
+            let point = build_point_from_map(&map)?;
+            Ok(Value::Property(Property::Point(point)))
+        }
+        "point.distance" | "distance" => {
+            if arg_exprs.len() != 2 {
+                return Err(Error::UnknownScalarFunction(format!(
+                    "{name}() expects 2 arguments"
+                )));
+            }
+            let a = eval_expr(&arg_exprs[0], ctx)?;
+            let b = eval_expr(&arg_exprs[1], ctx)?;
+            let (p1, p2) = match (a, b) {
+                (Value::Null, _)
+                | (_, Value::Null)
+                | (Value::Property(Property::Null), _)
+                | (_, Value::Property(Property::Null)) => return Ok(Value::Null),
+                (Value::Property(Property::Point(p1)), Value::Property(Property::Point(p2))) => {
+                    (p1, p2)
+                }
+                _ => return Err(Error::TypeMismatch),
+            };
+            // Different CRS or different dimensionality → null, matching
+            // Neo4j (it raises `InvalidArgumentValue`, but returning null
+            // keeps the expression total and is friendlier to mixed-data
+            // queries; the TCK treats both as acceptable failure modes).
+            if p1.srid != p2.srid || p1.is_3d() != p2.is_3d() {
+                return Ok(Value::Null);
+            }
+            let d = if p1.is_geographic() {
+                haversine_distance(&p1, &p2)
+            } else {
+                cartesian_distance(&p1, &p2)
+            };
+            Ok(Value::Property(Property::Float64(d)))
+        }
+        "point.withinbbox" => {
+            if arg_exprs.len() != 3 {
+                return Err(Error::UnknownScalarFunction(
+                    "point.withinBBox() expects 3 arguments".into(),
+                ));
+            }
+            let p = eval_expr(&arg_exprs[0], ctx)?;
+            let lo = eval_expr(&arg_exprs[1], ctx)?;
+            let hi = eval_expr(&arg_exprs[2], ctx)?;
+            let any_null = [&p, &lo, &hi]
+                .iter()
+                .any(|v| matches!(v, Value::Null | Value::Property(Property::Null)));
+            if any_null {
+                return Ok(Value::Null);
+            }
+            let (pp, pl, ph) = match (p, lo, hi) {
+                (
+                    Value::Property(Property::Point(pp)),
+                    Value::Property(Property::Point(pl)),
+                    Value::Property(Property::Point(ph)),
+                ) => (pp, pl, ph),
+                _ => return Err(Error::TypeMismatch),
+            };
+            if pp.srid != pl.srid || pp.srid != ph.srid {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Property(Property::Bool(within_bbox(&pp, &pl, &ph))))
+        }
+
         // --- Temporal constructors ---
         //
         // `datetime()`, `date()`, and `timestamp()` with no args
@@ -5785,6 +5865,7 @@ fn value_type_string(v: &Value) -> String {
             }
         }
         Value::Property(Property::Duration(_)) => "DURATION NOT NULL".to_string(),
+        Value::Property(Property::Point(_)) => "POINT NOT NULL".to_string(),
         Value::List(items) => format!("LIST<{}> NOT NULL", list_element_type(items.iter())),
         Value::Property(Property::List(items)) => {
             let as_values: Vec<Value> = items.iter().cloned().map(Value::Property).collect();
@@ -5835,6 +5916,199 @@ fn round_with_precision(value: f64, precision: i64, mode: &str) -> Result<f64> {
         }
     };
     Ok(rounded / factor)
+}
+
+/// Build a [`Point`] from a Cypher map passed to `point({...})`.
+/// Accepts either `x`/`y`/`z` (Cartesian default) or `longitude`/
+/// `latitude`/`height` (WGS-84 default). An explicit `srid` or `crs`
+/// key overrides the default CRS. The 2D/3D distinction comes from
+/// whether `z`/`height` is present and must agree with the SRID.
+fn build_point_from_map(m: &HashMap<String, Property>) -> Result<Point> {
+    fn as_f64(p: &Property, field: &str) -> Result<f64> {
+        match p {
+            Property::Float64(f) => Ok(*f),
+            Property::Int64(i) => Ok(*i as f64),
+            _ => Err(Error::InvalidArgumentValue(format!(
+                "point({field}) must be a number"
+            ))),
+        }
+    }
+    let explicit_srid = match m.get("srid") {
+        Some(Property::Int64(i)) => Some(*i as i32),
+        Some(_) => {
+            return Err(Error::InvalidArgumentValue(
+                "point(srid) must be an integer".into(),
+            ))
+        }
+        None => None,
+    };
+    let explicit_crs = match m.get("crs") {
+        Some(Property::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return Err(Error::InvalidArgumentValue(
+                "point(crs) must be a string".into(),
+            ))
+        }
+        None => None,
+    };
+    let x_prop = m.get("x").or_else(|| m.get("longitude"));
+    let y_prop = m.get("y").or_else(|| m.get("latitude"));
+    let z_prop = m.get("z").or_else(|| m.get("height"));
+    let x = match x_prop {
+        Some(p) => as_f64(p, "x")?,
+        None => {
+            return Err(Error::InvalidArgumentValue(
+                "point() requires 'x' or 'longitude'".into(),
+            ))
+        }
+    };
+    let y = match y_prop {
+        Some(p) => as_f64(p, "y")?,
+        None => {
+            return Err(Error::InvalidArgumentValue(
+                "point() requires 'y' or 'latitude'".into(),
+            ))
+        }
+    };
+    let z = match z_prop {
+        Some(p) => Some(as_f64(p, "z")?),
+        None => None,
+    };
+    let is_geo_default =
+        m.contains_key("latitude") || m.contains_key("longitude") || m.contains_key("height");
+    let srid = if let Some(s) = explicit_srid {
+        s
+    } else if let Some(crs_name) = explicit_crs.as_deref() {
+        match crs_name {
+            "cartesian" => SRID_CARTESIAN_2D,
+            "cartesian-3d" => SRID_CARTESIAN_3D,
+            "wgs-84" => SRID_WGS84_2D,
+            "wgs-84-3d" => SRID_WGS84_3D,
+            other => {
+                return Err(Error::InvalidArgumentValue(format!(
+                    "unknown crs: `{other}`"
+                )))
+            }
+        }
+    } else if is_geo_default {
+        if z.is_some() {
+            SRID_WGS84_3D
+        } else {
+            SRID_WGS84_2D
+        }
+    } else if z.is_some() {
+        SRID_CARTESIAN_3D
+    } else {
+        SRID_CARTESIAN_2D
+    };
+    let three_d = srid == SRID_CARTESIAN_3D || srid == SRID_WGS84_3D;
+    if three_d != z.is_some() {
+        return Err(Error::InvalidArgumentValue(
+            "point() srid/crs does not match coordinate dimension".into(),
+        ));
+    }
+    Ok(Point { srid, x, y, z })
+}
+
+/// Accessor dispatch for `p.x`, `p.longitude`, `p.srid`, etc. Unknown
+/// keys and CRS-incompatible accessors (e.g. `.latitude` on a Cartesian
+/// point) return null, matching map-access semantics.
+fn point_accessor(p: Point, key: &str) -> Value {
+    let f = match key.to_ascii_lowercase().as_str() {
+        "x" => p.x,
+        "y" => p.y,
+        "z" => match p.z {
+            Some(z) => z,
+            None => return Value::Null,
+        },
+        "longitude" if p.is_geographic() => p.x,
+        "latitude" if p.is_geographic() => p.y,
+        "height" if p.is_geographic() => match p.z {
+            Some(z) => z,
+            None => return Value::Null,
+        },
+        "srid" => return Value::Property(Property::Int64(p.srid as i64)),
+        "crs" => return Value::Property(Property::String(p.crs_name().to_string())),
+        _ => return Value::Null,
+    };
+    Value::Property(Property::Float64(f))
+}
+
+/// Render a point the way Neo4j does: `point({x: 1.0, y: 2.0, crs: 'cartesian'})`.
+fn point_to_string(p: &Point) -> String {
+    let fmt = |f: f64| -> String {
+        if f == f.floor() && f.is_finite() {
+            format!("{f:.1}")
+        } else {
+            f.to_string()
+        }
+    };
+    match p.z {
+        Some(z) => format!(
+            "point({{x: {}, y: {}, z: {}, crs: '{}'}})",
+            fmt(p.x),
+            fmt(p.y),
+            fmt(z),
+            p.crs_name()
+        ),
+        None => format!(
+            "point({{x: {}, y: {}, crs: '{}'}})",
+            fmt(p.x),
+            fmt(p.y),
+            p.crs_name()
+        ),
+    }
+}
+
+/// Euclidean distance for Cartesian points — 2D or 3D.
+fn cartesian_distance(p1: &Point, p2: &Point) -> f64 {
+    let dx = p1.x - p2.x;
+    let dy = p1.y - p2.y;
+    match (p1.z, p2.z) {
+        (Some(z1), Some(z2)) => {
+            let dz = z1 - z2;
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        }
+        _ => (dx * dx + dy * dy).sqrt(),
+    }
+}
+
+/// Great-circle distance in metres using the Haversine formula on a
+/// sphere of radius 6 371 008.8 m — Neo4j's mean Earth radius. For
+/// 3D WGS-84 points, combines surface distance with height difference
+/// via Pythagoras.
+fn haversine_distance(p1: &Point, p2: &Point) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_008.8;
+    let lon1 = p1.x.to_radians();
+    let lat1 = p1.y.to_radians();
+    let lon2 = p2.x.to_radians();
+    let lat2 = p2.y.to_radians();
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+    let surface = EARTH_RADIUS_M * c;
+    match (p1.z, p2.z) {
+        (Some(z1), Some(z2)) => {
+            let dz = z1 - z2;
+            (surface * surface + dz * dz).sqrt()
+        }
+        _ => surface,
+    }
+}
+
+/// Coordinate-wise bounding-box check. Assumes `lo` ≤ `hi` on each
+/// axis. Callers must have already verified matching SRID.
+fn within_bbox(p: &Point, lo: &Point, hi: &Point) -> bool {
+    p.x >= lo.x
+        && p.x <= hi.x
+        && p.y >= lo.y
+        && p.y <= hi.y
+        && match (p.z, lo.z, hi.z) {
+            (Some(pz), Some(lz), Some(hz)) => pz >= lz && pz <= hz,
+            (None, None, None) => true,
+            _ => false,
+        }
 }
 
 fn list_element_type<'a>(items: impl Iterator<Item = &'a Value>) -> String {
@@ -5890,6 +6164,9 @@ fn value_to_string(v: Value) -> Value {
         }) => Value::Property(Property::String(format_time_string(nanos, tz_offset_secs))),
         Value::Property(Property::Duration(d)) => {
             Value::Property(Property::String(duration_to_iso_string(&d)))
+        }
+        Value::Property(Property::Point(p)) => {
+            Value::Property(Property::String(point_to_string(&p)))
         }
         other => Value::Property(Property::String(format!("{:?}", other))),
     }
@@ -6129,7 +6406,8 @@ fn type_order_prop(p: &Property) -> u8 {
         | Property::DateTime { .. }
         | Property::LocalDateTime(_)
         | Property::Duration(_)
-        | Property::Time { .. } => 9,
+        | Property::Time { .. }
+        | Property::Point(_) => 9,
         Property::Null => 10,
     }
 }
@@ -6149,7 +6427,8 @@ fn type_order_value(v: &Value) -> u8 {
             | Property::DateTime { .. }
             | Property::LocalDateTime(_)
             | Property::Duration(_)
-            | Property::Time { .. },
+            | Property::Time { .. }
+            | Property::Point(_),
         ) => 9,
         Value::Null | Value::Property(Property::Null) => 10,
     }
@@ -6202,6 +6481,15 @@ pub(crate) fn value_key(v: &Value) -> String {
             tz_offset_secs,
         }) => {
             format!("t:{},{:?}", nanos, tz_offset_secs)
+        }
+        Value::Property(Property::Point(p)) => {
+            format!(
+                "pt:{},{},{},{:?}",
+                p.srid,
+                p.x.to_bits(),
+                p.y.to_bits(),
+                p.z.map(|z| z.to_bits()),
+            )
         }
         Value::Node(n) => format!("N:{}", n.id),
         Value::Edge(e) => format!("E:{}", e.id),

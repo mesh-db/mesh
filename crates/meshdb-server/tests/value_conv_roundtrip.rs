@@ -17,7 +17,10 @@ use meshdb_bolt::{
     decode, encode, BoltValue, TAG_DATE, TAG_DURATION, TAG_LOCAL_DATE_TIME, TAG_NODE, TAG_PATH,
     TAG_RELATIONSHIP, TAG_UNBOUND_RELATIONSHIP,
 };
-use meshdb_core::{Duration, Edge, EdgeId, Node, NodeId, Property};
+use meshdb_core::{
+    Duration, Edge, EdgeId, Node, NodeId, Point, Property, SRID_CARTESIAN_2D, SRID_CARTESIAN_3D,
+    SRID_WGS84_2D, SRID_WGS84_3D,
+};
 use meshdb_executor::{Row, Value};
 use meshdb_server::value_conv::{
     bolt_value_to_property, field_names_from_rows, row_to_bolt_fields,
@@ -135,6 +138,54 @@ fn duration_roundtrip_negative_components() {
         days: -2,
         seconds: -3,
         nanos: -4,
+    });
+    let out = roundtrip_property(input.clone());
+    assert_eq!(out, input);
+}
+
+#[test]
+fn point_2d_cartesian_roundtrip() {
+    let input = Property::Point(Point {
+        srid: SRID_CARTESIAN_2D,
+        x: 12.5,
+        y: -3.25,
+        z: None,
+    });
+    let out = roundtrip_property(input.clone());
+    assert_eq!(out, input);
+}
+
+#[test]
+fn point_3d_cartesian_roundtrip() {
+    let input = Property::Point(Point {
+        srid: SRID_CARTESIAN_3D,
+        x: 1.0,
+        y: 2.0,
+        z: Some(3.5),
+    });
+    let out = roundtrip_property(input.clone());
+    assert_eq!(out, input);
+}
+
+#[test]
+fn point_2d_wgs84_roundtrip() {
+    let input = Property::Point(Point {
+        srid: SRID_WGS84_2D,
+        x: -122.4194,
+        y: 37.7749,
+        z: None,
+    });
+    let out = roundtrip_property(input.clone());
+    assert_eq!(out, input);
+}
+
+#[test]
+fn point_3d_wgs84_roundtrip() {
+    let input = Property::Point(Point {
+        srid: SRID_WGS84_3D,
+        x: 18.0686,
+        y: 59.3293,
+        z: Some(28.0),
     });
     let out = roundtrip_property(input.clone());
     assert_eq!(out, input);

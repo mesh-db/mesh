@@ -46,7 +46,8 @@ pub fn property_to_proto(p: &Property) -> Result<proto::Property, ConvertError> 
         | Property::LocalDateTime(_)
         | Property::Date(_)
         | Property::Duration(_)
-        | Property::Time { .. } => return Err(ConvertError::UnsupportedProperty),
+        | Property::Time { .. }
+        | Property::Point(_) => return Err(ConvertError::UnsupportedProperty),
     };
     Ok(proto::Property { kind: Some(kind) })
 }

@@ -5723,6 +5723,10 @@ fn is_known_scalar_function(name: &str) -> bool {
             | "localtime"
             | "timestamp"
             | "duration"
+            | "point"
+            | "point.distance"
+            | "point.withinbbox"
+            | "distance"
     )
 }
 

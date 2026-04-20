@@ -104,6 +104,14 @@ pub const TAG_LOCAL_TIME: u8 = 0x74;
 /// Bolt Duration struct. Fields
 /// `[months: Int, days: Int, seconds: Int, nanos: Int]`.
 pub const TAG_DURATION: u8 = 0x45;
+/// Bolt Point2D struct. Fields `[srid: Int, x: Float, y: Float]`.
+/// `srid` identifies the coordinate reference system (7203 Cartesian,
+/// 4326 WGS-84); `x` and `y` are always serialised — callers that think
+/// in longitude/latitude map longitude → `x`, latitude → `y`.
+pub const TAG_POINT_2D: u8 = 0x58;
+/// Bolt Point3D struct. Fields `[srid: Int, x: Float, y: Float, z: Float]`.
+/// `srid` is 9157 (Cartesian-3D) or 4979 (WGS-84 3D).
+pub const TAG_POINT_3D: u8 = 0x59;
 
 /// One logical Bolt message. The coarse-grained variants are carried as
 /// `BoltValue::Map`s rather than typed structs so the library stays

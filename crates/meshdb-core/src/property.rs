@@ -15,6 +15,65 @@ pub struct Duration {
     pub nanos: i32,
 }
 
+/// A Cypher spatial point. Stored as raw coordinates plus an EPSG
+/// SRID tag — the SRID determines the coordinate reference system
+/// (CRS) and whether `z` is present:
+///
+/// | SRID | CRS name        | Dims | Axes                        |
+/// |------|-----------------|------|-----------------------------|
+/// | 7203 | `cartesian`     | 2    | x, y                        |
+/// | 9157 | `cartesian-3d`  | 3    | x, y, z                     |
+/// | 4326 | `wgs-84`        | 2    | longitude (x), latitude (y) |
+/// | 4979 | `wgs-84-3d`     | 3    | longitude, latitude, height |
+///
+/// The 2D/3D distinction is carried by `z.is_some()` — the SRID is
+/// required to agree with that (a 2D SRID with `Some(z)`, or a 3D
+/// SRID with `None`, is an invariant violation caller-side).
+///
+/// Matches the Bolt 4.4 Point2D (tag `0x58`) / Point3D (tag `0x59`)
+/// struct shape so the wire conversion is a straight field copy.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Point {
+    pub srid: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: Option<f64>,
+}
+
+/// EPSG SRID for the Cartesian 2D coordinate system.
+pub const SRID_CARTESIAN_2D: i32 = 7203;
+/// EPSG SRID for the Cartesian 3D coordinate system.
+pub const SRID_CARTESIAN_3D: i32 = 9157;
+/// EPSG SRID for WGS-84 (geographic 2D).
+pub const SRID_WGS84_2D: i32 = 4326;
+/// EPSG SRID for WGS-84 3D (geographic + height).
+pub const SRID_WGS84_3D: i32 = 4979;
+
+impl Point {
+    /// The CRS name for this point's SRID, matching Neo4j's output of
+    /// `point.crs` — e.g. `"cartesian"`, `"wgs-84-3d"`. Returns
+    /// `"unknown"` for any SRID outside the four recognised values.
+    pub fn crs_name(&self) -> &'static str {
+        match self.srid {
+            SRID_CARTESIAN_2D => "cartesian",
+            SRID_CARTESIAN_3D => "cartesian-3d",
+            SRID_WGS84_2D => "wgs-84",
+            SRID_WGS84_3D => "wgs-84-3d",
+            _ => "unknown",
+        }
+    }
+
+    /// True when the SRID is a WGS-84 (geographic) CRS.
+    pub fn is_geographic(&self) -> bool {
+        matches!(self.srid, SRID_WGS84_2D | SRID_WGS84_3D)
+    }
+
+    /// True when the point has a z coordinate.
+    pub fn is_3d(&self) -> bool {
+        self.z.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum Property {
@@ -54,6 +113,10 @@ pub enum Property {
         nanos: i64,
         tz_offset_secs: Option<i32>,
     },
+    /// A spatial point — see [`Point`]. Encoded on the Bolt wire as
+    /// either a `Point2D` (tag `0x58`) or `Point3D` (tag `0x59`)
+    /// struct depending on whether `z` is set.
+    Point(Point),
 }
 
 impl Property {
@@ -71,6 +134,7 @@ impl Property {
             Property::Date(_) => "Date",
             Property::Duration(_) => "Duration",
             Property::Time { .. } => "Time",
+            Property::Point(_) => "Point",
         }
     }
 }

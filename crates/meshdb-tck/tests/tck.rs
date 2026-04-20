@@ -1242,6 +1242,30 @@ fn format_property(p: &Property) -> String {
             };
             format!("'{time_str}{tz_str}'")
         }
+        Property::Point(p) => {
+            let fmt = |f: f64| -> String {
+                if f == f.floor() && f.is_finite() {
+                    format!("{f:.1}")
+                } else {
+                    f.to_string()
+                }
+            };
+            match p.z {
+                Some(z) => format!(
+                    "point({{x: {}, y: {}, z: {}, crs: '{}'}})",
+                    fmt(p.x),
+                    fmt(p.y),
+                    fmt(z),
+                    p.crs_name()
+                ),
+                None => format!(
+                    "point({{x: {}, y: {}, crs: '{}'}})",
+                    fmt(p.x),
+                    fmt(p.y),
+                    p.crs_name()
+                ),
+            }
+        }
     }
 }
 

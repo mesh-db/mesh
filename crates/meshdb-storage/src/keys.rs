@@ -151,7 +151,8 @@ pub(crate) fn encode_index_value(value: &Property) -> Option<Vec<u8>> {
         | Property::Map(_)
         | Property::Null
         | Property::Time { .. }
-        | Property::LocalDateTime(_) => None,
+        | Property::LocalDateTime(_)
+        | Property::Point(_) => None,
     }
 }
 
