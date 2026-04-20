@@ -45,11 +45,11 @@ mesh/
   - Write: `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET` (property, `+=` merge, label), `REMOVE` (property, label), `DELETE` / `DETACH DELETE`, `FOREACH`.
   - Flow: `UNWIND`, `CASE ... WHEN ... ELSE ... END` (simple and generic), parameters (`$name`).
   - Patterns: variable-length paths `()-[*1..3]->()`, `shortestPath(...)` (`allShortestPaths` parses but plan rejects).
-  - Expressions: list comprehensions, pattern comprehensions, `reduce`, quantifier predicates (`all`/`any`/`none`/`single`), `EXISTS { ... }` and `COUNT { ... }` subquery expressions.
-  - Procedures / subqueries: `CALL { ... }` (unit and returning), `CALL proc YIELD ...` against a runtime-extensible registry in `meshdb-executor`.
+  - Expressions: list comprehensions, pattern comprehensions, `reduce`, quantifier predicates (`all`/`any`/`none`/`single`), `EXISTS { ... }`, `COUNT { ... }`, and `COLLECT { ... }` subquery expressions.
+  - Procedures / subqueries: `CALL { ... }` (unit and returning), `CALL proc YIELD ...` against a runtime-extensible registry in `meshdb-executor` with built-in `db.labels()` / `db.relationshipTypes()` / `db.propertyKeys()` installed by default.
   - Schema: `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on label+property pairs.
   - Scalars: full openCypher scalar surface (string, math, temporal, spatial) plus the widely-expected Neo4j extensions (`*OrNull`, `*List`, `valueType`, `randomUUID`, `round` with precision+mode, `char_length`).
-- **Not yet implemented:** `COLLECT { ... }` subquery expressions; constraint management (`CREATE CONSTRAINT` / `SHOW CONSTRAINTS`); built-in `db.*` procedures (`db.labels()`, `db.relationshipTypes()`, `db.propertyKeys()`); quantified path patterns (`(a)-->+(b)`, Neo4j 5); APOC.
+- **Not yet implemented:** constraint management (`CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS`); edge (relationship) indexes; quantified path patterns (`(a)-->+(b)`, Neo4j 5); APOC.
 
 ### Query Execution (`meshdb-executor`)
 - Volcano/iterator (pull-based) model — each operator implements `next() -> Option<Row>`.
