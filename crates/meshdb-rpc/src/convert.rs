@@ -35,10 +35,16 @@ pub fn property_to_proto(p: &Property) -> Result<proto::Property, ConvertError> 
         Property::Int64(i) => Kind::IntVal(*i),
         Property::Float64(f) => Kind::FloatVal(*f),
         Property::Bool(b) => Kind::BoolVal(*b),
+        Property::Point(p) => Kind::PointVal(proto::PointValue {
+            srid: p.srid,
+            x: p.x,
+            y: p.y,
+            z: p.z,
+        }),
         // Temporal types aren't wired through gRPC convert yet —
-        // the routing-mode protobuf schema only carries scalars.
-        // Drivers that use temporal properties today go through
-        // Bolt, which has native wire support. Cross-peer
+        // the routing-mode protobuf schema only carries scalars and
+        // spatial points. Drivers that use temporal properties today
+        // go through Bolt, which has native wire support. Cross-peer
         // replication of temporal property values is a follow-up.
         Property::List(_)
         | Property::Map(_)
@@ -46,8 +52,7 @@ pub fn property_to_proto(p: &Property) -> Result<proto::Property, ConvertError> 
         | Property::LocalDateTime(_)
         | Property::Date(_)
         | Property::Duration(_)
-        | Property::Time { .. }
-        | Property::Point(_) => return Err(ConvertError::UnsupportedProperty),
+        | Property::Time { .. } => return Err(ConvertError::UnsupportedProperty),
     };
     Ok(proto::Property { kind: Some(kind) })
 }
@@ -60,6 +65,12 @@ pub fn property_from_proto(p: &proto::Property) -> Property {
         Some(Kind::IntVal(i)) => Property::Int64(*i),
         Some(Kind::FloatVal(f)) => Property::Float64(*f),
         Some(Kind::BoolVal(b)) => Property::Bool(*b),
+        Some(Kind::PointVal(pv)) => Property::Point(meshdb_core::Point {
+            srid: pv.srid,
+            x: pv.x,
+            y: pv.y,
+            z: pv.z,
+        }),
     }
 }
 
@@ -121,4 +132,59 @@ pub fn edge_from_proto(e: proto::Edge) -> Result<Edge, ConvertError> {
         target,
         properties,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meshdb_core::{Point, SRID_CARTESIAN_2D, SRID_CARTESIAN_3D, SRID_WGS84_2D, SRID_WGS84_3D};
+
+    fn roundtrip(p: Property) -> Property {
+        let proto = property_to_proto(&p).expect("to_proto");
+        property_from_proto(&proto)
+    }
+
+    #[test]
+    fn point_2d_cartesian_roundtrips_through_proto() {
+        let input = Property::Point(Point {
+            srid: SRID_CARTESIAN_2D,
+            x: 12.5,
+            y: -3.25,
+            z: None,
+        });
+        assert_eq!(roundtrip(input.clone()), input);
+    }
+
+    #[test]
+    fn point_3d_cartesian_roundtrips_through_proto() {
+        let input = Property::Point(Point {
+            srid: SRID_CARTESIAN_3D,
+            x: 1.0,
+            y: 2.0,
+            z: Some(3.5),
+        });
+        assert_eq!(roundtrip(input.clone()), input);
+    }
+
+    #[test]
+    fn point_2d_wgs84_roundtrips_through_proto() {
+        let input = Property::Point(Point {
+            srid: SRID_WGS84_2D,
+            x: -122.4194,
+            y: 37.7749,
+            z: None,
+        });
+        assert_eq!(roundtrip(input.clone()), input);
+    }
+
+    #[test]
+    fn point_3d_wgs84_roundtrips_through_proto() {
+        let input = Property::Point(Point {
+            srid: SRID_WGS84_3D,
+            x: 18.0686,
+            y: 59.3293,
+            z: Some(28.0),
+        });
+        assert_eq!(roundtrip(input.clone()), input);
+    }
 }

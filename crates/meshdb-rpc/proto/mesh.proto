@@ -10,6 +10,17 @@ message UuidBytes {
 // Marker for the Null variant of Property.
 message NullValue {}
 
+// Spatial point variant of Property. Mirrors `meshdb_core::Point` —
+// an EPSG SRID tag plus raw `x`/`y` coordinates, with `z` present iff
+// the point is 3D. Callers are expected to keep `z.is_some()` in sync
+// with the SRID's dimensionality (7203/4326 → 2D, 9157/4979 → 3D).
+message PointValue {
+  int32 srid = 1;
+  double x = 2;
+  double y = 3;
+  optional double z = 4;
+}
+
 // Primitive property value. List / Map variants are deferred.
 message Property {
   oneof kind {
@@ -18,6 +29,7 @@ message Property {
     int64 int_val = 3;
     double float_val = 4;
     bool bool_val = 5;
+    PointValue point_val = 6;
   }
 }
 
