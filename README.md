@@ -374,7 +374,7 @@ Multi-peer configs pick one of two modes via the top-level `mode` field:
   under `data_dir/coordinator-log.jsonl`. No consensus, so a peer
   crash loses that peer's shard until it restarts.
 
-A two-peer Raft cluster, one bootstrap seed, both speaking Bolt:
+A three-peer Raft cluster, one bootstrap seed, all speaking Bolt:
 
 `/tmp/mesh-a.toml`:
 
@@ -393,6 +393,10 @@ address = "127.0.0.1:7001"
 [[peers]]
 id = 2
 address = "127.0.0.1:7002"
+
+[[peers]]
+id = 3
+address = "127.0.0.1:7003"
 ```
 
 `/tmp/mesh-b.toml`:
@@ -411,22 +415,52 @@ address = "127.0.0.1:7001"
 [[peers]]
 id = 2
 address = "127.0.0.1:7002"
+
+[[peers]]
+id = 3
+address = "127.0.0.1:7003"
 ```
 
-Start both peers in separate terminals (peer A first, since it bootstraps):
+`/tmp/mesh-c.toml`:
+
+```toml
+self_id = 3
+listen_address = "127.0.0.1:7003"
+data_dir = "/tmp/mesh-data-c"
+bolt_address = "127.0.0.1:7689"
+num_partitions = 4
+
+[[peers]]
+id = 1
+address = "127.0.0.1:7001"
+
+[[peers]]
+id = 2
+address = "127.0.0.1:7002"
+
+[[peers]]
+id = 3
+address = "127.0.0.1:7003"
+```
+
+Start each peer in its own terminal (peer A first, since it bootstraps):
 
 ```sh
 ./target/debug/mesh-server --config /tmp/mesh-a.toml
 ./target/debug/mesh-server --config /tmp/mesh-b.toml
+./target/debug/mesh-server --config /tmp/mesh-c.toml
 ```
 
-Connect Bolt clients to either `127.0.0.1:7687` (peer A) or
-`127.0.0.1:7688` (peer B). In Raft mode every peer holds the full graph,
-so reads are cheap on either side; writes go through the leader (with
-transparent forwarding from followers in the auto-commit path).
+Connect Bolt clients to any of `127.0.0.1:7687` (peer A),
+`127.0.0.1:7688` (peer B), or `127.0.0.1:7689` (peer C). In Raft mode
+every peer holds the full graph, so reads are cheap everywhere; writes
+go through the leader (with transparent forwarding from followers in
+the auto-commit path). Three peers also give Raft a proper quorum of
+two — the cluster tolerates one peer being down without losing write
+availability.
 
-To run the same pair in routing (sharded) mode instead, add
-`mode = "routing"` to both configs and drop the `bootstrap` line — no
+To run the same trio in routing (sharded) mode instead, add
+`mode = "routing"` to every config and drop the `bootstrap` line — no
 seed is needed since there's no Raft group to initialize:
 
 ```toml
@@ -444,6 +478,10 @@ address = "127.0.0.1:7001"
 [[peers]]
 id = 2
 address = "127.0.0.1:7002"
+
+[[peers]]
+id = 3
+address = "127.0.0.1:7003"
 ```
 
 ---
