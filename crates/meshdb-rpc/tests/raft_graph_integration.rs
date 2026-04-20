@@ -6,7 +6,9 @@
 //! in **peer B's `Store`** via the Raft `apply_to_state_machine` pipeline.
 
 use meshdb_cluster::raft::{GraphStateMachine, RaftCluster};
-use meshdb_cluster::{ClusterState, GraphCommand, Membership, PartitionMap, Peer, PeerId};
+use meshdb_cluster::{
+    ClusterState, ConstraintKind, GraphCommand, Membership, PartitionMap, Peer, PeerId,
+};
 use meshdb_core::{Edge, Node};
 use meshdb_rpc::{GrpcNetwork, MeshRaftService, StoreGraphApplier};
 use meshdb_storage::{RocksDbStorageEngine as Store, StorageEngine};
@@ -246,4 +248,200 @@ async fn put_edge_and_delete_edge_replicate() {
     }
     assert!(edge_gone, "delete did not replicate to follower");
     assert!(store_a.get_edge(edge_id).unwrap().is_none());
+}
+
+/// CREATE CONSTRAINT on the leader replicates through Raft so the
+/// follower's constraint registry sees the same entry. Then DROP
+/// CONSTRAINT replicates the removal. Confirms the Raft log entry
+/// path for constraint DDL works end-to-end across replicas.
+#[tokio::test]
+async fn constraint_ddl_replicates_to_follower_store() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let store_a: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_a.path()).unwrap());
+    let store_b: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_b.path()).unwrap());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let initial = ClusterState::new(
+        Membership::new(vec![
+            Peer::new(PeerId(1), addr_a.to_string()),
+            Peer::new(PeerId(2), addr_b.to_string()),
+        ]),
+        PartitionMap::round_robin(&[PeerId(1), PeerId(2)], 4).unwrap(),
+    );
+
+    let peer_a = spawn_graph_peer(
+        1,
+        listener_a,
+        store_a.clone(),
+        vec![(2u64, addr_b.to_string())],
+        initial.clone(),
+    )
+    .await;
+    let _peer_b = spawn_graph_peer(
+        2,
+        listener_b,
+        store_b.clone(),
+        vec![(1u64, addr_a.to_string())],
+        initial,
+    )
+    .await;
+
+    let mut members: BTreeMap<u64, BasicNode> = BTreeMap::new();
+    members.insert(1, BasicNode::new(addr_a.to_string()));
+    members.insert(2, BasicNode::new(addr_b.to_string()));
+    peer_a.cluster.initialize(members).await.unwrap();
+
+    // Wait for leadership.
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if peer_a.cluster.raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+
+    // Propose CREATE CONSTRAINT on the leader.
+    peer_a
+        .cluster
+        .propose_graph(GraphCommand::CreateConstraint {
+            name: Some("email_uniq".into()),
+            label: "Person".into(),
+            property: "email".into(),
+            kind: ConstraintKind::Unique,
+            if_not_exists: false,
+        })
+        .await
+        .expect("propose CreateConstraint should commit");
+
+    // Leader's local store has the constraint immediately.
+    let on_a = store_a.list_property_constraints();
+    assert_eq!(on_a.len(), 1);
+    assert_eq!(on_a[0].name, "email_uniq");
+
+    // Follower sees it via Raft replication.
+    let mut replicated = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let specs = store_b.list_property_constraints();
+        if !specs.is_empty() {
+            assert_eq!(specs[0].name, "email_uniq");
+            assert_eq!(specs[0].label, "Person");
+            assert_eq!(specs[0].property, "email");
+            replicated = true;
+            break;
+        }
+    }
+    assert!(
+        replicated,
+        "follower did not observe the replicated constraint"
+    );
+
+    // Now drop it and watch the drop replicate too.
+    peer_a
+        .cluster
+        .propose_graph(GraphCommand::DropConstraint {
+            name: "email_uniq".into(),
+            if_exists: false,
+        })
+        .await
+        .expect("propose DropConstraint should commit");
+
+    let mut dropped = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if store_b.list_property_constraints().is_empty() {
+            dropped = true;
+            break;
+        }
+    }
+    assert!(dropped, "follower did not observe the replicated drop");
+    assert!(store_a.list_property_constraints().is_empty());
+
+    peer_a.cluster.shutdown().await.ok();
+}
+
+/// CREATE CONSTRAINT carrying no user-supplied name resolves to the
+/// same deterministic auto-name on every replica. Without this
+/// property a follower could end up with a differently-named entry
+/// than the leader; DROP by name would then silently miss on some
+/// peers.
+#[tokio::test]
+async fn auto_named_constraint_resolves_consistently() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let store_a: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_a.path()).unwrap());
+    let store_b: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_b.path()).unwrap());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let initial = ClusterState::new(
+        Membership::new(vec![
+            Peer::new(PeerId(1), addr_a.to_string()),
+            Peer::new(PeerId(2), addr_b.to_string()),
+        ]),
+        PartitionMap::round_robin(&[PeerId(1), PeerId(2)], 4).unwrap(),
+    );
+
+    let peer_a = spawn_graph_peer(
+        1,
+        listener_a,
+        store_a.clone(),
+        vec![(2u64, addr_b.to_string())],
+        initial.clone(),
+    )
+    .await;
+    let _peer_b = spawn_graph_peer(
+        2,
+        listener_b,
+        store_b.clone(),
+        vec![(1u64, addr_a.to_string())],
+        initial,
+    )
+    .await;
+
+    let mut members: BTreeMap<u64, BasicNode> = BTreeMap::new();
+    members.insert(1, BasicNode::new(addr_a.to_string()));
+    members.insert(2, BasicNode::new(addr_b.to_string()));
+    peer_a.cluster.initialize(members).await.unwrap();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if peer_a.cluster.raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+
+    peer_a
+        .cluster
+        .propose_graph(GraphCommand::CreateConstraint {
+            name: None,
+            label: "Widget".into(),
+            property: "sku".into(),
+            kind: ConstraintKind::NotNull,
+            if_not_exists: false,
+        })
+        .await
+        .unwrap();
+
+    // Wait for replication.
+    let mut saw = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !store_b.list_property_constraints().is_empty() {
+            saw = true;
+            break;
+        }
+    }
+    assert!(saw);
+
+    let on_a = store_a.list_property_constraints();
+    let on_b = store_b.list_property_constraints();
+    assert_eq!(on_a, on_b, "replicas diverged on auto-generated name");
+    assert_eq!(on_a[0].name, "constraint_Widget_sku_not_null");
 }

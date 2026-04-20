@@ -1838,3 +1838,61 @@ async fn staging_commit_before_ttl_still_succeeds() {
     .await
     .unwrap();
 }
+
+/// Routing-mode `CREATE CONSTRAINT` fans out from peer A to peer B so
+/// both stores end up with the same entry. Then `SHOW CONSTRAINTS`
+/// issued on peer A scatter-gathers through the partitioned reader
+/// and returns the same row shape the single-node DDL path emits.
+/// Together these confirm the constraint DDL fan-out is wired up
+/// end-to-end across the routing-mode server surface.
+#[tokio::test]
+async fn routing_mode_create_constraint_fans_out() {
+    let h = spawn_two_peer().await;
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
+
+    // CREATE CONSTRAINT — executor buffers a `CreateConstraint`
+    // command, `commit_buffered_commands` runs the fan-out, and every
+    // peer's store has a matching entry.
+    client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE CONSTRAINT email_uniq FOR (p:Person) REQUIRE p.email IS UNIQUE"
+                .to_string(),
+            params_json: vec![],
+        })
+        .await
+        .expect("create constraint should succeed in routing mode");
+
+    assert_eq!(h.store_a.list_property_constraints().len(), 1);
+    assert_eq!(h.store_a.list_property_constraints()[0].name, "email_uniq");
+    assert_eq!(h.store_b.list_property_constraints().len(), 1);
+    assert_eq!(h.store_b.list_property_constraints()[0].name, "email_uniq");
+
+    // SHOW CONSTRAINTS through Cypher — routed to peer A, reads from
+    // the local registry (authoritative after fan-out).
+    let resp = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "SHOW CONSTRAINTS".to_string(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"]["Property"]["value"], "email_uniq");
+    assert_eq!(rows[0]["type"]["Property"]["value"], "UNIQUE");
+
+    // DROP CONSTRAINT fans out the same way.
+    client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "DROP CONSTRAINT email_uniq".to_string(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(h.store_a.list_property_constraints().is_empty());
+    assert!(h.store_b.list_property_constraints().is_empty());
+}

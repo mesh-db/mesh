@@ -9,18 +9,24 @@ use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
     AllNodeIdsRequest, AllNodeIdsResponse, BatchPhase, BatchWriteRequest, BatchWriteResponse,
-    CreatePropertyIndexRequest, CreatePropertyIndexResponse, DeleteEdgeRequest, DeleteEdgeResponse,
-    DetachDeleteNodeRequest, DetachDeleteNodeResponse, DropPropertyIndexRequest,
+    ConstraintKind as ProtoConstraintKind, CreatePropertyConstraintRequest,
+    CreatePropertyConstraintResponse, CreatePropertyIndexRequest, CreatePropertyIndexResponse,
+    DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest, DetachDeleteNodeResponse,
+    DropPropertyConstraintRequest, DropPropertyConstraintResponse, DropPropertyIndexRequest,
     DropPropertyIndexResponse, ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest,
     GetEdgeResponse, GetNodeRequest, GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo,
     NeighborRequest, NeighborResponse, NodesByLabelRequest, NodesByLabelResponse,
     NodesByPropertyRequest, NodesByPropertyResponse, PutEdgeRequest, PutEdgeResponse,
     PutNodeRequest, PutNodeResponse,
 };
+use crate::raft_applier::storage_kind;
 use crate::routing::Routing;
 use crate::tx_coordinator::TxCoordinator;
 use meshdb_cluster::raft::RaftCluster;
-use meshdb_cluster::{Error as ClusterError, GraphCommand, PeerId};
+use meshdb_cluster::{
+    resolved_constraint_name, ConstraintKind as ClusterConstraintKind, Error as ClusterError,
+    GraphCommand, PeerId,
+};
 use meshdb_executor::{
     execute_with_reader_and_procs, GraphReader, GraphWriter, ProcedureRegistry,
     StorageReaderAdapter,
@@ -843,8 +849,13 @@ pub(crate) fn flatten_commands(
             GraphCommand::Batch(inner) => flatten_commands(inner, out),
             // Skip silently; the caller is responsible for applying
             // DDL through `StorageEngine::create_property_index` /
-            // `drop_property_index` before (or alongside) this batch.
-            GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => {}
+            // `drop_property_index` / `create_property_constraint` /
+            // `drop_property_constraint` before (or alongside) this
+            // batch.
+            GraphCommand::CreateIndex { .. }
+            | GraphCommand::DropIndex { .. }
+            | GraphCommand::CreateConstraint { .. }
+            | GraphCommand::DropConstraint { .. } => {}
         }
     }
 }
@@ -934,6 +945,25 @@ fn apply_ddl_to_store(
             store.create_property_index(label, property)
         }
         GraphCommand::DropIndex { label, property } => store.drop_property_index(label, property),
+        GraphCommand::CreateConstraint {
+            name,
+            label,
+            property,
+            kind,
+            if_not_exists,
+        } => {
+            store.create_property_constraint(
+                name.as_deref(),
+                label,
+                property,
+                storage_kind(*kind),
+                *if_not_exists,
+            )?;
+            Ok(())
+        }
+        GraphCommand::DropConstraint { name, if_exists } => {
+            store.drop_property_constraint(name, *if_exists)
+        }
         _ => Ok(()),
     }
 }
@@ -953,6 +983,35 @@ fn invert_ddl(cmd: &GraphCommand) -> GraphCommand {
             label: label.clone(),
             property: property.clone(),
         },
+        GraphCommand::CreateConstraint {
+            name,
+            label,
+            property,
+            kind,
+            ..
+        } => {
+            // Rollback of a CREATE is a DROP on the resolved name. The
+            // resolved name is the user's name if supplied, otherwise
+            // the deterministic auto-generated one — both sides of
+            // the fan-out compute it identically. `if_exists: true`
+            // because the forward op may have been a no-op
+            // (`IF NOT EXISTS` or idempotent re-declaration), in
+            // which case the inverse must also succeed as a no-op.
+            GraphCommand::DropConstraint {
+                name: resolved_constraint_name(name, label, property, *kind),
+                if_exists: true,
+            }
+        }
+        GraphCommand::DropConstraint { .. } => {
+            // Inverting a DROP would require the original spec
+            // (label / property / kind) which the DROP command
+            // doesn't carry. The routing fan-out captures
+            // specs-before-drop separately when it needs symmetric
+            // rollback; for unknown callers we return the clone so
+            // the inverse is a no-op (equivalent to DROP IF EXISTS
+            // on an already-absent constraint).
+            cmd.clone()
+        }
         other => other.clone(),
     }
 }
@@ -981,10 +1040,64 @@ async fn try_remote_ddl_on_peer(
                     })
                     .await?;
             }
+            GraphCommand::CreateConstraint {
+                name,
+                label,
+                property,
+                kind,
+                if_not_exists,
+            } => {
+                client
+                    .create_property_constraint(CreatePropertyConstraintRequest {
+                        // Empty string on the wire stands for `None`
+                        // (no user-supplied name). Matches the proto's
+                        // optional-by-convention encoding.
+                        name: name.clone().unwrap_or_default(),
+                        label: label.clone(),
+                        property: property.clone(),
+                        kind: proto_kind(*kind) as i32,
+                        if_not_exists: *if_not_exists,
+                    })
+                    .await?;
+            }
+            GraphCommand::DropConstraint { name, if_exists } => {
+                client
+                    .drop_property_constraint(DropPropertyConstraintRequest {
+                        name: name.clone(),
+                        if_exists: *if_exists,
+                    })
+                    .await?;
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Map the cluster-crate `ConstraintKind` to the proto enum. Kept
+/// next to `try_remote_ddl_on_peer` because that's the only place
+/// we need to flip the outbound direction; the inbound mapping
+/// (proto → cluster / storage) lives on the RPC handler.
+fn proto_kind(kind: ClusterConstraintKind) -> ProtoConstraintKind {
+    match kind {
+        ClusterConstraintKind::Unique => ProtoConstraintKind::Unique,
+        ClusterConstraintKind::NotNull => ProtoConstraintKind::NotNull,
+    }
+}
+
+/// Inverse mapping for inbound proto requests. Defaults to `Unique`
+/// on unspecified — matches the `0` default of proto enums — which
+/// is still safer than a panic because it lets the storage layer
+/// surface a clear error if the spec collides with a differently-
+/// kinded existing constraint.
+fn cluster_kind_from_proto(kind: i32) -> Result<ClusterConstraintKind, Status> {
+    match ProtoConstraintKind::try_from(kind).unwrap_or(ProtoConstraintKind::Unspecified) {
+        ProtoConstraintKind::Unique => Ok(ClusterConstraintKind::Unique),
+        ProtoConstraintKind::NotNull => Ok(ClusterConstraintKind::NotNull),
+        ProtoConstraintKind::Unspecified => {
+            Err(Status::invalid_argument("constraint kind is unspecified"))
+        }
+    }
 }
 
 /// Partition a flat command list into `(ddl, graph)` where `ddl`
@@ -1001,7 +1114,10 @@ pub(crate) fn split_ddl(cmds: Vec<GraphCommand>) -> (Vec<GraphCommand>, Vec<Grap
     let mut graph = Vec::new();
     for cmd in cmds {
         match cmd {
-            GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => ddl.push(cmd),
+            GraphCommand::CreateIndex { .. }
+            | GraphCommand::DropIndex { .. }
+            | GraphCommand::CreateConstraint { .. }
+            | GraphCommand::DropConstraint { .. } => ddl.push(cmd),
             GraphCommand::Batch(inner) => {
                 let (nested_ddl, nested_graph) = split_ddl(inner);
                 ddl.extend(nested_ddl);
@@ -1029,6 +1145,24 @@ fn apply_ddl_commands(
             }
             GraphCommand::DropIndex { label, property } => {
                 store.drop_property_index(label, property)?;
+            }
+            GraphCommand::CreateConstraint {
+                name,
+                label,
+                property,
+                kind,
+                if_not_exists,
+            } => {
+                store.create_property_constraint(
+                    name.as_deref(),
+                    label,
+                    property,
+                    storage_kind(*kind),
+                    *if_not_exists,
+                )?;
+            }
+            GraphCommand::DropConstraint { name, if_exists } => {
+                store.drop_property_constraint(name, *if_exists)?;
             }
             GraphCommand::Batch(inner) => apply_ddl_commands(inner, store)?,
             _ => {}
@@ -1706,5 +1840,45 @@ impl MeshWrite for MeshService {
             .drop_property_index(&req.label, &req.property)
             .map_err(internal)?;
         Ok(Response::new(DropPropertyIndexResponse {}))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "create_property_constraint"))]
+    async fn create_property_constraint(
+        &self,
+        request: Request<CreatePropertyConstraintRequest>,
+    ) -> Result<Response<CreatePropertyConstraintResponse>, Status> {
+        // Local-only: the routing-mode fan-out caller runs its own
+        // local apply, then calls this RPC on every other peer. In
+        // Raft mode it's unused — DDL flows through `propose_graph`
+        // as a `GraphCommand::CreateConstraint` entry.
+        let req = request.into_inner();
+        let kind = cluster_kind_from_proto(req.kind)?;
+        let name = if req.name.is_empty() {
+            None
+        } else {
+            Some(req.name.as_str())
+        };
+        self.store
+            .create_property_constraint(
+                name,
+                &req.label,
+                &req.property,
+                storage_kind(kind),
+                req.if_not_exists,
+            )
+            .map_err(internal)?;
+        Ok(Response::new(CreatePropertyConstraintResponse {}))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "drop_property_constraint"))]
+    async fn drop_property_constraint(
+        &self,
+        request: Request<DropPropertyConstraintRequest>,
+    ) -> Result<Response<DropPropertyConstraintResponse>, Status> {
+        let req = request.into_inner();
+        self.store
+            .drop_property_constraint(&req.name, req.if_exists)
+            .map_err(internal)?;
+        Ok(Response::new(DropPropertyConstraintResponse {}))
     }
 }

@@ -240,6 +240,19 @@ service MeshWrite {
   // `CreatePropertyIndex`: used as both the user-initiated DROP
   // fan-out and the compensating rollback for a partial create.
   rpc DropPropertyIndex(DropPropertyIndexRequest) returns (DropPropertyIndexResponse);
+  // Apply a constraint creation to this peer's local store. Used by
+  // the routing-mode DDL fan-out the same way `CreatePropertyIndex`
+  // is — leader applies locally, then calls this RPC on every other
+  // peer in parallel. Backfill validation runs per peer against the
+  // local graph; any violation surfaces as a gRPC error and triggers
+  // rollback on the leader.
+  rpc CreatePropertyConstraint(CreatePropertyConstraintRequest)
+      returns (CreatePropertyConstraintResponse);
+  // Tear down a constraint on this peer's local store. Mirrors
+  // `CreatePropertyConstraint` — used for user-initiated DROP
+  // fan-out and for rollback of a partial create.
+  rpc DropPropertyConstraint(DropPropertyConstraintRequest)
+      returns (DropPropertyConstraintResponse);
 }
 
 enum BatchPhase {
@@ -296,6 +309,34 @@ message DropPropertyIndexRequest {
   string property = 2;
 }
 message DropPropertyIndexResponse {}
+
+// Mirrors `meshdb_cluster::ConstraintKind`. Two variants today;
+// new kinds land as additional enum values so existing peers can
+// reject unknown kinds rather than silently misapplying.
+enum ConstraintKind {
+  CONSTRAINT_KIND_UNSPECIFIED = 0;
+  CONSTRAINT_KIND_UNIQUE = 1;
+  CONSTRAINT_KIND_NOT_NULL = 2;
+}
+
+message CreatePropertyConstraintRequest {
+  // Optional user-supplied name. Empty string represents `None`;
+  // the receiver resolves the auto-generated default deterministically
+  // from `(label, property, kind)` so every peer ends up with the
+  // same final name.
+  string name = 1;
+  string label = 2;
+  string property = 3;
+  ConstraintKind kind = 4;
+  bool if_not_exists = 5;
+}
+message CreatePropertyConstraintResponse {}
+
+message DropPropertyConstraintRequest {
+  string name = 1;
+  bool if_exists = 2;
+}
+message DropPropertyConstraintResponse {}
 
 // Raft consensus RPCs. Each payload field carries a serde-serialized openraft
 // request/response struct, so the wire schema stays stable even as openraft's

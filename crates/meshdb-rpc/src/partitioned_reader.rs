@@ -248,6 +248,14 @@ impl GraphReader for PartitionedGraphReader {
             .collect())
     }
 
+    fn list_property_constraints(&self) -> ExecResult<Vec<meshdb_storage::PropertyConstraintSpec>> {
+        // Constraint DDL replicates to every peer via Raft or
+        // routing-mode fan-out, so the local registry is an
+        // authoritative view. Same rationale as
+        // `list_property_indexes`: no scatter-gather needed.
+        Ok(self.local.list_property_constraints())
+    }
+
     fn nodes_by_property(
         &self,
         label: &str,

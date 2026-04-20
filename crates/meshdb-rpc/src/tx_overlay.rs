@@ -102,7 +102,10 @@ impl TxOverlayState {
             // graph writes will still see the DDL effect on commit
             // via the applier path; the overlay just doesn't have
             // to pretend the index is already there mid-tx.
-            GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => {}
+            GraphCommand::CreateIndex { .. }
+            | GraphCommand::DropIndex { .. }
+            | GraphCommand::CreateConstraint { .. }
+            | GraphCommand::DropConstraint { .. } => {}
         }
     }
 
@@ -195,6 +198,13 @@ impl<'a> GraphReader for OverlayGraphReader<'a> {
         // Index DDL lives on the store, not in the per-tx overlay,
         // so read-through to the base is correct even mid-tx.
         self.base.list_property_indexes()
+    }
+
+    fn list_property_constraints(&self) -> ExecResult<Vec<meshdb_storage::PropertyConstraintSpec>> {
+        // Same rationale as `list_property_indexes`: constraint
+        // registry lives on the store, so reading through to the
+        // base is correct even mid-tx.
+        self.base.list_property_constraints()
     }
 
     fn nodes_by_property(

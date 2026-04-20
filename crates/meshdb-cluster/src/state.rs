@@ -63,6 +63,71 @@ pub enum GraphCommand {
         label: String,
         property: String,
     },
+    /// Declare a property constraint on every replica. Reaches every
+    /// peer through the Raft log / routing-mode fan-out, so the
+    /// resulting registry entry and its on-write enforcement agree
+    /// across the cluster. `name` is `None` when the user omitted it
+    /// at the surface; each peer resolves the default name
+    /// deterministically during apply, so the log entry stays
+    /// idempotent under re-replay.
+    CreateConstraint {
+        name: Option<String>,
+        label: String,
+        property: String,
+        kind: ConstraintKind,
+        if_not_exists: bool,
+    },
+    /// Tear down a constraint by name across every replica. Mirrors
+    /// `CreateConstraint`. `if_exists` lets replicas treat a missing
+    /// constraint as a no-op rather than erroring — needed for
+    /// routing-mode rollback so a DROP that only reached some peers
+    /// can be safely retried / inverted.
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+    },
+}
+
+/// Cluster-visible constraint kind. Mirrors
+/// `meshdb_storage::PropertyConstraintKind` but kept in the
+/// cluster crate so the Raft log entry doesn't need to depend on the
+/// storage crate. Converters on both sides keep the two enums in
+/// lockstep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConstraintKind {
+    Unique,
+    NotNull,
+}
+
+impl ConstraintKind {
+    /// Lower-case tag used to build the auto-generated constraint
+    /// name. Must match `meshdb_storage::PropertyConstraintKind`'s
+    /// naming scheme — the storage layer uses the same tag — so
+    /// `GraphCommand::DropConstraint` rollbacks can reconstruct the
+    /// resolved name without a cross-crate lookup.
+    pub fn name_tag(&self) -> &'static str {
+        match self {
+            ConstraintKind::Unique => "unique",
+            ConstraintKind::NotNull => "not_null",
+        }
+    }
+}
+
+/// Deterministic auto-name for an un-named constraint. Matches the
+/// format the storage layer uses so followers resolving a
+/// `CreateConstraint { name: None, ... }` entry produce the same
+/// final name as the proposer. Exposed so the routing-mode DDL
+/// fan-out can compute the drop name during rollback.
+pub fn resolved_constraint_name(
+    name: &Option<String>,
+    label: &str,
+    property: &str,
+    kind: ConstraintKind,
+) -> String {
+    match name {
+        Some(n) => n.clone(),
+        None => format!("constraint_{label}_{property}_{}", kind.name_tag()),
+    }
 }
 
 /// Top-level Raft log entry: either a cluster-metadata mutation or a graph

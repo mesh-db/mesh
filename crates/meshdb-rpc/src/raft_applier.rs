@@ -29,8 +29,8 @@
 //! [`Checkpoint`]: meshdb_storage::StorageEngine::create_checkpoint
 
 use meshdb_cluster::raft::GraphStateMachine;
-use meshdb_cluster::GraphCommand;
-use meshdb_storage::{GraphMutation, RocksDbStorageEngine, StorageEngine};
+use meshdb_cluster::{ConstraintKind as ClusterConstraintKind, GraphCommand};
+use meshdb_storage::{GraphMutation, PropertyConstraintKind, RocksDbStorageEngine, StorageEngine};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -111,6 +111,27 @@ impl GraphStateMachine for StoreGraphApplier {
             GraphCommand::DropIndex { label, property } => self
                 .store
                 .drop_property_index(label, property)
+                .map_err(|e| e.to_string()),
+            GraphCommand::CreateConstraint {
+                name,
+                label,
+                property,
+                kind,
+                if_not_exists,
+            } => self
+                .store
+                .create_property_constraint(
+                    name.as_deref(),
+                    label,
+                    property,
+                    storage_kind(*kind),
+                    *if_not_exists,
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            GraphCommand::DropConstraint { name, if_exists } => self
+                .store
+                .drop_property_constraint(name, *if_exists)
                 .map_err(|e| e.to_string()),
         }
     }
@@ -412,9 +433,41 @@ fn apply_ddl_and_collect(
             GraphCommand::DropIndex { label, property } => store
                 .drop_property_index(label, property)
                 .map_err(|e| e.to_string())?,
+            GraphCommand::CreateConstraint {
+                name,
+                label,
+                property,
+                kind,
+                if_not_exists,
+            } => {
+                store
+                    .create_property_constraint(
+                        name.as_deref(),
+                        label,
+                        property,
+                        storage_kind(*kind),
+                        *if_not_exists,
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            GraphCommand::DropConstraint { name, if_exists } => store
+                .drop_property_constraint(name, *if_exists)
+                .map_err(|e| e.to_string())?,
         }
     }
     Ok(())
+}
+
+/// Bridge the cluster-crate [`ClusterConstraintKind`] into the
+/// storage-crate [`PropertyConstraintKind`]. Lives here because the
+/// cluster crate intentionally doesn't depend on `meshdb-storage` —
+/// the Raft log entry stays storage-agnostic, and every applier that
+/// terminates against a concrete store does the mapping locally.
+pub(crate) fn storage_kind(kind: ClusterConstraintKind) -> PropertyConstraintKind {
+    match kind {
+        ClusterConstraintKind::Unique => PropertyConstraintKind::Unique,
+        ClusterConstraintKind::NotNull => PropertyConstraintKind::NotNull,
+    }
 }
 
 #[cfg(test)]

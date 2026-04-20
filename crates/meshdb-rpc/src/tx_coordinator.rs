@@ -257,7 +257,10 @@ impl<'a> TxCoordinator<'a> {
                 // `split_ddl` in `commit_buffered_commands` before
                 // it reaches the coordinator, so seeing one here is
                 // an internal bug rather than user-visible state.
-                GraphCommand::CreateIndex { .. } | GraphCommand::DropIndex { .. } => {
+                GraphCommand::CreateIndex { .. }
+                | GraphCommand::DropIndex { .. }
+                | GraphCommand::CreateConstraint { .. }
+                | GraphCommand::DropConstraint { .. } => {
                     debug_assert!(
                         false,
                         "DDL command reached the routing coordinator; \

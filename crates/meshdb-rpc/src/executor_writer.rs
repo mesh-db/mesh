@@ -1,9 +1,21 @@
 use meshdb_cluster::raft::RaftCluster;
-use meshdb_cluster::GraphCommand;
+use meshdb_cluster::{ConstraintKind as ClusterConstraintKind, GraphCommand};
 use meshdb_core::{Edge, EdgeId, Node, NodeId};
 use meshdb_executor::{Error as ExecError, GraphWriter, Result as ExecResult};
+use meshdb_storage::{PropertyConstraintKind, PropertyConstraintSpec};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
+
+/// Bridge the storage-crate `PropertyConstraintKind` back into the
+/// cluster-crate enum. The cluster enum is the "wire type" for DDL
+/// replication; every writer that accepts a storage-side kind has to
+/// translate on the way into the Raft log / routing fan-out.
+fn cluster_kind(kind: PropertyConstraintKind) -> ClusterConstraintKind {
+    match kind {
+        PropertyConstraintKind::Unique => ClusterConstraintKind::Unique,
+        PropertyConstraintKind::NotNull => ClusterConstraintKind::NotNull,
+    }
+}
 
 /// Executor write sink that proposes every mutation through Raft. Must be
 /// invoked from inside a `spawn_blocking` context, because the methods
@@ -59,6 +71,56 @@ impl GraphWriter for RaftGraphWriter {
             label: label.to_string(),
             property: property.to_string(),
         })
+    }
+
+    fn create_property_constraint(
+        &self,
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        kind: PropertyConstraintKind,
+        if_not_exists: bool,
+    ) -> ExecResult<PropertyConstraintSpec> {
+        // Propose the creation through Raft. The state machine on
+        // every replica applies the same command and returns a spec;
+        // this writer has no way to thread that return value back
+        // through `propose_graph`, so we synthesize the spec locally
+        // from the supplied fields. The resolved name uses the same
+        // deterministic formula as the storage layer.
+        let resolved = meshdb_cluster::resolved_constraint_name(
+            &name.map(str::to_string),
+            label,
+            property,
+            cluster_kind(kind),
+        );
+        self.propose(GraphCommand::CreateConstraint {
+            name: name.map(str::to_string),
+            label: label.to_string(),
+            property: property.to_string(),
+            kind: cluster_kind(kind),
+            if_not_exists,
+        })?;
+        Ok(PropertyConstraintSpec {
+            name: resolved,
+            label: label.to_string(),
+            property: property.to_string(),
+            kind,
+        })
+    }
+
+    fn drop_property_constraint(&self, name: &str, if_exists: bool) -> ExecResult<()> {
+        self.propose(GraphCommand::DropConstraint {
+            name: name.to_string(),
+            if_exists,
+        })
+    }
+
+    fn list_property_constraints(&self) -> ExecResult<Vec<PropertyConstraintSpec>> {
+        // RaftGraphWriter can't read; snapshotting the registry is
+        // the reader's job. Returning empty matches the default trait
+        // impl — the executor only calls this on read paths, which
+        // funnel through a reader instead of this sink.
+        Ok(Vec::new())
     }
 }
 
@@ -136,5 +198,61 @@ impl GraphWriter for BufferingGraphWriter {
             property: property.to_string(),
         });
         Ok(())
+    }
+
+    fn create_property_constraint(
+        &self,
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        kind: PropertyConstraintKind,
+        if_not_exists: bool,
+    ) -> ExecResult<PropertyConstraintSpec> {
+        // Same synthesis trick as `RaftGraphWriter`: the real apply
+        // happens later via `apply_prepared_batch` or the Raft log;
+        // the caller only needs a plausible `PropertyConstraintSpec`
+        // for the DDL acknowledgement row. Name resolution is
+        // deterministic so the spec we return matches what the
+        // applier will install on every replica.
+        let resolved = meshdb_cluster::resolved_constraint_name(
+            &name.map(str::to_string),
+            label,
+            property,
+            cluster_kind(kind),
+        );
+        self.buffer
+            .lock()
+            .unwrap()
+            .push(GraphCommand::CreateConstraint {
+                name: name.map(str::to_string),
+                label: label.to_string(),
+                property: property.to_string(),
+                kind: cluster_kind(kind),
+                if_not_exists,
+            });
+        Ok(PropertyConstraintSpec {
+            name: resolved,
+            label: label.to_string(),
+            property: property.to_string(),
+            kind,
+        })
+    }
+
+    fn drop_property_constraint(&self, name: &str, if_exists: bool) -> ExecResult<()> {
+        self.buffer
+            .lock()
+            .unwrap()
+            .push(GraphCommand::DropConstraint {
+                name: name.to_string(),
+                if_exists,
+            });
+        Ok(())
+    }
+
+    fn list_property_constraints(&self) -> ExecResult<Vec<PropertyConstraintSpec>> {
+        // Writers never read — the executor consults the reader
+        // for `SHOW CONSTRAINTS` / `db.constraints()`. Returning
+        // empty mirrors the index-side default.
+        Ok(Vec::new())
     }
 }
