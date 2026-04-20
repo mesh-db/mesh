@@ -346,8 +346,10 @@ mesh/
 │   ├── mesh-cypher/      # Pest grammar, AST, parser, planner
 │   ├── mesh-executor/    # Volcano-model operators, eval, GraphReader/Writer traits
 │   ├── mesh-cluster/     # Raft via openraft, partitioner, cluster state
-│   ├── mesh-rpc/         # tonic gRPC services, partitioned reader/writer, 2PC
+│   ├── mesh-rpc/         # tonic gRPC services, partitioned reader/writer, 2PC, TLS helpers
 │   ├── mesh-bolt/        # Pure-protocol Bolt library: PackStream, framing, handshake, messages
+│   ├── mesh-client/      # Binary: TUI client for Bolt-compatible graph DBs (Mesh, Neo4j)
+│   ├── mesh-tck/         # openCypher TCK (Technology Compatibility Kit) runner
 │   └── mesh-server/      # Binary: config, startup, gRPC listener, Bolt listener
 └── .github/workflows/
     └── ci.yml            # Build + test + fmt check on push and PR
@@ -355,7 +357,9 @@ mesh/
 
 Each crate has its own `Error` type via `thiserror` and its own `tests/`
 directory. Integration tests in `mesh-server/tests/bolt.rs` drive the full
-pipeline end-to-end with a raw TCP Bolt client.
+pipeline end-to-end with a raw TCP Bolt client; `mesh-server/tests/bolt_tls.rs`
+and `mesh-server/tests/grpc_tls.rs` cover the TLS listeners with rcgen-generated
+self-signed certs.
 
 ---
 
