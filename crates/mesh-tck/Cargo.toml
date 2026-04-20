@@ -3,13 +3,14 @@ name = "mesh-tck"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "openCypher TCK (Technology Compatibility Kit) runner for Mesh"
 
 [dependencies]
-mesh-core = { path = "../mesh-core" }
-mesh-storage = { path = "../mesh-storage" }
-mesh-cypher = { path = "../mesh-cypher" }
-mesh-executor = { path = "../mesh-executor" }
+mesh-core = { workspace = true }
+mesh-storage = { workspace = true }
+mesh-cypher = { workspace = true }
+mesh-executor = { workspace = true }
 tempfile = "3"
 cucumber = "0.21"
 futures = "0.3"

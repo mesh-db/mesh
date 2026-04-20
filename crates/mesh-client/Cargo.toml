@@ -3,6 +3,7 @@ name = "mesh-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "TUI client for Bolt-compatible graph databases (Mesh, Neo4j)"
 
 [[bin]]
@@ -10,7 +11,7 @@ name = "mesh-client"
 path = "src/main.rs"
 
 [dependencies]
-mesh-bolt = { path = "../mesh-bolt" }
+mesh-bolt = { workspace = true }
 
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

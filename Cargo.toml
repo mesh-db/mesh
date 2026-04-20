@@ -21,6 +21,17 @@ license = "MIT"
 repository = "https://github.com/mesh-db/mesh"
 
 [workspace.dependencies]
+# Internal crates. Version is required (in addition to `path`) so
+# `cargo package` / `cargo publish` can resolve them against crates.io
+# when path deps are stripped on publish.
+mesh-core = { path = "crates/mesh-core", version = "0.1.0-alpha.1" }
+mesh-storage = { path = "crates/mesh-storage", version = "0.1.0-alpha.1" }
+mesh-cypher = { path = "crates/mesh-cypher", version = "0.1.0-alpha.1" }
+mesh-executor = { path = "crates/mesh-executor", version = "0.1.0-alpha.1" }
+mesh-cluster = { path = "crates/mesh-cluster", version = "0.1.0-alpha.1" }
+mesh-rpc = { path = "crates/mesh-rpc", version = "0.1.0-alpha.1" }
+mesh-bolt = { path = "crates/mesh-bolt", version = "0.1.0-alpha.1" }
+
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

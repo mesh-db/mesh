@@ -3,6 +3,7 @@ name = "mesh-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Mesh graph database server binary"
 
 [[bin]]
@@ -14,12 +15,12 @@ name = "mesh_server"
 path = "src/lib.rs"
 
 [dependencies]
-mesh-core = { path = "../mesh-core" }
-mesh-storage = { path = "../mesh-storage" }
-mesh-cluster = { path = "../mesh-cluster" }
-mesh-rpc = { path = "../mesh-rpc" }
-mesh-bolt = { path = "../mesh-bolt" }
-mesh-executor = { path = "../mesh-executor" }
+mesh-core = { workspace = true }
+mesh-storage = { workspace = true }
+mesh-cluster = { workspace = true }
+mesh-rpc = { workspace = true }
+mesh-bolt = { workspace = true }
+mesh-executor = { workspace = true }
 anyhow = "1"
 thiserror = { workspace = true }
 clap = { version = "4", features = ["derive"] }
@@ -39,7 +40,7 @@ rustls-pemfile = "2"
 [dev-dependencies]
 tempfile = "3"
 serde_json = { workspace = true }
-mesh-bolt = { path = "../mesh-bolt" }
+mesh-bolt = { workspace = true }
 reqwest = { version = "0.12", default-features = false }
 bcrypt = { workspace = true }
 rcgen = "0.13"

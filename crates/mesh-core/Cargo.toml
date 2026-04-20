@@ -3,6 +3,7 @@ name = "mesh-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Core types for the Mesh graph database"
 
 [dependencies]

@@ -3,10 +3,11 @@ name = "mesh-cypher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Cypher parser and planner for Mesh"
 
 [dependencies]
-mesh-core = { path = "../mesh-core" }
+mesh-core = { workspace = true }
 pest = "2"
 pest_derive = "2"
 thiserror.workspace = true
