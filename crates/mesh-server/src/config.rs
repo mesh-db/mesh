@@ -85,6 +85,15 @@ pub struct ServerConfig {
     #[serde(default)]
     pub bolt_auth: Option<BoltAuthConfig>,
 
+    /// Optional TLS termination for the Bolt listener. When set, the
+    /// listener negotiates TLS on every accepted socket before entering
+    /// the Bolt handshake — clients connect with `bolt+s://` (or
+    /// `bolt+ssc://` with self-signed certs) rather than plain `bolt://`.
+    /// Omitted → plaintext Bolt, which is the pre-TLS default and fine
+    /// for `127.0.0.1` dev setups.
+    #[serde(default)]
+    pub bolt_tls: Option<BoltTlsConfig>,
+
     /// Cluster operating mode. Omitted → inferred from `peers` (empty
     /// → Single, non-empty → Raft) for backward compatibility with
     /// configs from before this field existed. Set explicitly to
@@ -135,6 +144,27 @@ pub struct BoltAuthConfig {
 pub struct BoltUser {
     pub username: String,
     pub password: String,
+}
+
+/// TLS material for the Bolt listener. Both files are PEM-encoded:
+///
+///   * `cert_path` → one or more X.509 certificates. The server presents
+///     them as the chain, leaf first.
+///   * `key_path` → the private key matching the leaf certificate.
+///     PKCS#8, SEC1 (EC), and RSA formats are all accepted — the first
+///     private key found in the file wins.
+///
+/// Generate a self-signed cert for local dev with:
+/// ```sh
+/// openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+///   -keyout key.pem -out cert.pem -days 365 -nodes \
+///   -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost'
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoltTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
 }
 
 impl BoltAuthConfig {
@@ -316,6 +346,11 @@ impl ServerConfig {
             _ => {
                 if has_peers && !self.peers.iter().any(|p| p.id == self.self_id) {
                     return Err(format!("self_id {} is not in the peers list", self.self_id));
+                }
+                if self.bolt_tls.is_some() && self.bolt_address.is_none() {
+                    return Err("`bolt_tls` set but `bolt_address` is missing; \
+                                TLS only applies when the Bolt listener is enabled"
+                        .into());
                 }
                 Ok(())
             }

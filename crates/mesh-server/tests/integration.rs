@@ -101,6 +101,7 @@ async fn spawn_single_node_server() -> Harness {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -155,6 +156,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: Some(mesh_server::config::ClusterMode::Routing),
     };
     let config_b = ServerConfig {
@@ -167,6 +169,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: Some(mesh_server::config::ClusterMode::Routing),
     };
 
@@ -480,6 +483,7 @@ async fn build_components_single_node_has_no_raft() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let components = mesh_server::build_components(&config).await.unwrap();
@@ -509,6 +513,7 @@ async fn build_components_multi_peer_builds_raft() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let components = mesh_server::build_components(&config).await.unwrap();
@@ -541,6 +546,7 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: Some(mesh_server::config::ClusterMode::Routing),
     };
     let components = mesh_server::build_components(&config).await.unwrap();
@@ -593,6 +599,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -605,6 +612,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -754,6 +762,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -766,6 +775,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -962,6 +972,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -974,6 +985,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -1107,6 +1119,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -1119,6 +1132,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -1255,6 +1269,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -1267,6 +1282,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -1498,6 +1514,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b1 = ServerConfig {
@@ -1510,6 +1527,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -1605,6 +1623,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -1746,6 +1765,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -1758,6 +1778,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -1918,6 +1939,7 @@ async fn cypher_merge_replicates_through_raft() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -1930,6 +1952,7 @@ async fn cypher_merge_replicates_through_raft() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -2070,6 +2093,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -2082,6 +2106,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -2225,6 +2250,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
     let config_b = ServerConfig {
@@ -2237,6 +2263,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 
@@ -2353,6 +2380,7 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
         bolt_address: None,
         metrics_address: None,
         bolt_auth: None,
+        bolt_tls: None,
         mode: None,
     };
 

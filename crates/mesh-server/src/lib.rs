@@ -255,11 +255,27 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         } else {
             "disabled"
         };
-        tracing::info!(addr = %bolt_local, auth = auth_state, "mesh-server bolt listening");
+        let tls_acceptor = if let Some(tls_cfg) = config.bolt_tls.as_ref() {
+            bolt::install_default_crypto_provider();
+            Some(
+                bolt::build_tls_acceptor(&tls_cfg.cert_path, &tls_cfg.key_path)
+                    .context("building bolt tls acceptor")?,
+            )
+        } else {
+            None
+        };
+        let tls_state = if tls_acceptor.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        tracing::info!(addr = %bolt_local, auth = auth_state, tls = tls_state, "mesh-server bolt listening");
         let bolt_service = service_arc.clone();
         let bolt_auth_clone = bolt_auth.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = bolt::run_listener(bolt_listener, bolt_service, bolt_auth_clone).await {
+            if let Err(e) =
+                bolt::run_listener(bolt_listener, bolt_service, bolt_auth_clone, tls_acceptor).await
+            {
                 tracing::error!(error = %e, "bolt listener exited");
             }
         }))

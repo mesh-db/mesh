@@ -244,9 +244,55 @@ connection, which driver SDKs translate into an `AuthError`.
 
 ---
 
+## Bolt TLS
+
+The Bolt listener can terminate TLS directly. Add a `[bolt_tls]` section
+pointing at PEM-encoded certificate and key files:
+
+```toml
+[bolt_tls]
+cert_path = "/etc/mesh/bolt-cert.pem"
+key_path = "/etc/mesh/bolt-key.pem"
+```
+
+The cert file may contain a leaf certificate followed by any
+intermediates (leaf first); the key file may be PKCS#8, SEC1 (EC), or
+RSA — the first private key found wins. A short-lived self-signed
+pair for local dev is one command:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout key.pem -out cert.pem -days 365 -nodes \
+  -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost'
+```
+
+Once TLS is enabled on the server, clients connect with `bolt+s://`
+(TLS, verifies the chain) or `bolt+ssc://` (TLS, self-signed — skips
+verification for dev):
+
+```python
+from neo4j import GraphDatabase
+
+# Production: server presents a cert signed by a trusted CA.
+driver = GraphDatabase.driver("bolt+s://mesh.example.com:7687",
+                               auth=("neo4j", "my-password"))
+
+# Local dev with the self-signed cert generated above.
+driver = GraphDatabase.driver("bolt+ssc://127.0.0.1:7687",
+                               auth=("neo4j", "my-password"))
+```
+
+Plain `bolt://` against a TLS listener will fail the handshake — pick
+one or the other per listener. `bolt_tls` and `bolt_auth` compose, so
+you can require both credentials and TLS by setting both sections.
+
+---
+
 ## Known limitations
 
-- **No TLS** on either the Bolt or gRPC listener.
+- **No TLS on the gRPC listener.** Bolt TLS is supported (see
+  [Bolt TLS](#bolt-tls) below); the internal gRPC listener that carries
+  Raft / 2PC traffic is still plaintext only.
 - **No built-in APOC procedure library.** The `CALL` procedure framework
   and an extensible `ProcedureRegistry` are in place, but no APOC-compatible
   procedures ship with Mesh.

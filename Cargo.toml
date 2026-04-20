@@ -17,7 +17,9 @@ members = [
 name = "meshdb"
 version = "0.1.0-alpha.1"
 edition = "2021"
+description = "A distributed, Cypher-compliant graph database written in Rust."
 license = "MIT"
+repository = "https://github.com/mesh-db/mesh"
 
 [workspace.dependencies]
 thiserror = "2"

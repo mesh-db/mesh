@@ -54,6 +54,7 @@
 //! `mesh-rpc/src/tx_overlay.rs` for the exact semantics.
 
 use crate::value_conv::{bolt_params_to_param_map, field_names_from_rows, row_to_bolt_fields};
+use anyhow::Context;
 use mesh_bolt::{
     perform_server_handshake, read_message, write_message, BoltError, BoltMessage, BoltValue,
     BOLT_4_4, BOLT_5_0, BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4,
@@ -61,9 +62,11 @@ use mesh_bolt::{
 use mesh_cluster::GraphCommand;
 use mesh_executor::Row;
 use mesh_rpc::MeshService;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 /// Current connection phase used by the message-dispatch loop.
 #[derive(Debug)]
@@ -115,20 +118,96 @@ pub async fn run_listener(
     listener: TcpListener,
     service: Arc<MeshService>,
     auth: Option<Arc<crate::config::BoltAuthConfig>>,
+    tls: Option<TlsAcceptor>,
 ) -> anyhow::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         tracing::debug!(%peer, "bolt connection accepted");
         let service = service.clone();
         let auth = auth.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(socket, service, auth).await {
-                tracing::warn!(%peer, error = %e, "bolt connection terminated");
-            } else {
-                tracing::debug!(%peer, "bolt connection closed cleanly");
+            // If TLS is configured, negotiate it before handing the
+            // socket to the Bolt state machine. `serve_connection` is
+            // generic over `AsyncRead + AsyncWrite`, so the TLS stream
+            // drops in transparently once the handshake succeeds.
+            match tls {
+                Some(acceptor) => match acceptor.accept(socket).await {
+                    Ok(tls_stream) => {
+                        if let Err(e) = serve_connection(tls_stream, service, auth).await {
+                            tracing::warn!(%peer, error = %e, "bolt connection terminated");
+                        } else {
+                            tracing::debug!(%peer, "bolt connection closed cleanly");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%peer, error = %e, "bolt tls handshake failed");
+                    }
+                },
+                None => {
+                    if let Err(e) = serve_connection(socket, service, auth).await {
+                        tracing::warn!(%peer, error = %e, "bolt connection terminated");
+                    } else {
+                        tracing::debug!(%peer, "bolt connection closed cleanly");
+                    }
+                }
             }
         });
     }
+}
+
+/// Build a [`TlsAcceptor`] from PEM-encoded certificate + private key
+/// files. The certificate file may contain one or more X.509
+/// certificates (leaf first, then any intermediates); the private key
+/// file may hold a PKCS#8, SEC1 (EC), or RSA-format key — the first
+/// key found wins.
+///
+/// The caller is responsible for installing a rustls crypto provider
+/// before calling this (see [`install_default_crypto_provider`]).
+pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAcceptor> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::ServerConfig;
+
+    let cert_bytes = std::fs::read(cert_path)
+        .with_context(|| format!("reading bolt tls cert {}", cert_path.display()))?;
+    let key_bytes = std::fs::read(key_path)
+        .with_context(|| format!("reading bolt tls key {}", key_path.display()))?;
+
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_bytes.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing bolt tls cert {}", cert_path.display()))?;
+    if certs.is_empty() {
+        anyhow::bail!(
+            "bolt tls cert {} contained no CERTIFICATE PEM blocks",
+            cert_path.display()
+        );
+    }
+
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_bytes.as_slice())
+        .with_context(|| format!("parsing bolt tls key {}", key_path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "bolt tls key {} contained no PRIVATE KEY PEM block",
+                key_path.display()
+            )
+        })?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("building rustls ServerConfig")?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Install the default rustls crypto provider (aws-lc-rs). Safe to call
+/// repeatedly — subsequent calls are silently ignored, which is exactly
+/// the behavior we want when a test binary spawns multiple servers in
+/// the same process.
+pub fn install_default_crypto_provider() {
+    // `install_default` returns `Result<(), CryptoProvider>`; the `Err`
+    // case means a provider is already installed, which is fine.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// Run the full Bolt lifecycle on a single socket: handshake, HELLO,
