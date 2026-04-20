@@ -3663,6 +3663,17 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             Ok(Value::Property(Property::Float64(val)))
         }
 
+        "randomuuid" => {
+            if !arg_exprs.is_empty() {
+                return Err(Error::UnknownScalarFunction(
+                    "randomUUID() takes no arguments".into(),
+                ));
+            }
+            Ok(Value::Property(Property::String(
+                uuid::Uuid::new_v4().to_string(),
+            )))
+        }
+
         // --- Temporal constructors ---
         //
         // `datetime()`, `date()`, and `timestamp()` with no args

@@ -5701,6 +5701,7 @@ fn is_known_scalar_function(name: &str) -> bool {
             | "degrees"
             | "radians"
             | "rand"
+            | "randomuuid"
             | "date"
             | "datetime"
             | "localdatetime"
