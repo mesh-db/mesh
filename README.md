@@ -149,18 +149,22 @@ and `UNWIND $list` — the full driver-facing surface as of today.
 
 - `MATCH` with single-hop and multi-hop patterns
 - Variable-length paths `()-[*1..3]->()`
-- `WHERE` with `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`,
-  property access, function calls
+- `WHERE` with `=`, `<>`, `<`, `<=`, `>`, `>=`, `=~` (regex), `AND`, `OR`,
+  `NOT`, property access, function calls
 - `CREATE` for nodes and relationships
 - `MERGE` (match-or-create)
 - `DELETE` and `DETACH DELETE`
 - `SET` for property updates, label additions, replace (`=`) and merge (`+=`)
   property maps
 - `RETURN` with aliases and `DISTINCT`
+- `WITH` for chained query pipelines (multi-stage `MATCH ... WITH ... MATCH`)
+- `CALL` procedures (pluggable registry; no APOC library ships by default)
 - `ORDER BY`, `LIMIT`, `SKIP`
 - Aggregates: `count`, `sum`, `avg`, `min`, `max`, `collect` (with `DISTINCT`)
 - Scalar functions: `size`, `length`, `labels`, `keys`, `type`, `tolower`,
   `toupper`, `tostring`, `tointeger`, `coalesce`
+- Temporal functions: `datetime`, `localdatetime`, `date`, `time`,
+  `localtime`, `duration`
 - `CASE` (both simple and generic forms)
 - `UNWIND`
 - List literals and list comprehensions `[x IN list WHERE pred | proj]`
@@ -242,21 +246,10 @@ connection, which driver SDKs translate into an `AuthError`.
 
 ## Known limitations
 
-- **No read-after-write inside an explicit transaction.** A `MATCH` after
-  a `CREATE` in the same `BEGIN`/`COMMIT` block sees the store as it was at
-  `BEGIN` time and will *not* observe the buffered write. Auto-commit RUNs
-  outside a transaction are not affected.
-- **Coordinator crash recovery for 2PC is not implemented yet.** If the
-  coordinating peer crashes between PREPARE and COMMIT, participants are
-  left with stuck staged batches until restart.
-- **Snapshot serialization is JSON.** `StoreGraphApplier::snapshot`
-  serializes the whole graph as one JSON document. Fine for small clusters
-  and tests; will not scale to large datasets without a streaming
-  checkpoint API.
 - **No TLS** on either the Bolt or gRPC listener.
-- **Some deferred Cypher features**: chained `WITH` / multi-MATCH
-  pipelines, `CALL` procedures, regex (`=~`), temporal functions, APOC
-  procedures.
+- **No built-in APOC procedure library.** The `CALL` procedure framework
+  and an extensible `ProcedureRegistry` are in place, but no APOC-compatible
+  procedures ship with Mesh.
 
 ---
 
