@@ -3157,7 +3157,9 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null | Value::Property(Property::Null) => Ok(Value::Null),
-                Value::Property(Property::Float64(f)) => Ok(Value::Property(Property::Bool(f.is_nan()))),
+                Value::Property(Property::Float64(f)) => {
+                    Ok(Value::Property(Property::Bool(f.is_nan())))
+                }
                 Value::Property(Property::Int64(_)) => Ok(Value::Property(Property::Bool(false))),
                 _ => Err(Error::TypeMismatch),
             }
@@ -3434,36 +3436,32 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         }
         "tointegerornull" => {
             let v = single_arg(name, arg_exprs, ctx)?;
-            Ok(try_to_integer(&v)
-                .map_or(Value::Null, |i| Value::Property(Property::Int64(i))))
+            Ok(try_to_integer(&v).map_or(Value::Null, |i| Value::Property(Property::Int64(i))))
         }
         "tofloatornull" => {
             let v = single_arg(name, arg_exprs, ctx)?;
-            Ok(try_to_float(&v)
-                .map_or(Value::Null, |f| Value::Property(Property::Float64(f))))
+            Ok(try_to_float(&v).map_or(Value::Null, |f| Value::Property(Property::Float64(f))))
         }
         "tobooleanornull" => {
             let v = single_arg(name, arg_exprs, ctx)?;
-            Ok(try_to_boolean(&v)
-                .map_or(Value::Null, |b| Value::Property(Property::Bool(b))))
+            Ok(try_to_boolean(&v).map_or(Value::Null, |b| Value::Property(Property::Bool(b))))
         }
         "tostringornull" => {
             let v = single_arg(name, arg_exprs, ctx)?;
-            Ok(try_to_string(&v)
-                .map_or(Value::Null, |s| Value::Property(Property::String(s))))
+            Ok(try_to_string(&v).map_or(Value::Null, |s| Value::Property(Property::String(s))))
         }
-        "tointegerlist" => {
-            cast_list(name, arg_exprs, ctx, |v| try_to_integer(v).map(Property::Int64))
-        }
-        "tofloatlist" => {
-            cast_list(name, arg_exprs, ctx, |v| try_to_float(v).map(Property::Float64))
-        }
-        "tobooleanlist" => {
-            cast_list(name, arg_exprs, ctx, |v| try_to_boolean(v).map(Property::Bool))
-        }
-        "tostringlist" => {
-            cast_list(name, arg_exprs, ctx, |v| try_to_string(v).map(Property::String))
-        }
+        "tointegerlist" => cast_list(name, arg_exprs, ctx, |v| {
+            try_to_integer(v).map(Property::Int64)
+        }),
+        "tofloatlist" => cast_list(name, arg_exprs, ctx, |v| {
+            try_to_float(v).map(Property::Float64)
+        }),
+        "tobooleanlist" => cast_list(name, arg_exprs, ctx, |v| {
+            try_to_boolean(v).map(Property::Bool)
+        }),
+        "tostringlist" => cast_list(name, arg_exprs, ctx, |v| {
+            try_to_string(v).map(Property::String)
+        }),
         "valuetype" => {
             let v = single_arg(name, arg_exprs, ctx)?;
             Ok(Value::Property(Property::String(value_type_string(&v))))
@@ -5744,9 +5742,7 @@ fn cast_list(
     let items: Vec<Value> = match v {
         Value::Null | Value::Property(Property::Null) => return Ok(Value::Null),
         Value::List(items) => items,
-        Value::Property(Property::List(items)) => {
-            items.into_iter().map(Value::Property).collect()
-        }
+        Value::Property(Property::List(items)) => items.into_iter().map(Value::Property).collect(),
         _ => return Err(Error::TypeMismatch),
     };
     let out: Vec<Property> = items
