@@ -1,4 +1,4 @@
-use crate::engine::{PropertyConstraintKind, PropertyConstraintSpec};
+use crate::engine::{PropertyConstraintKind, PropertyConstraintSpec, PropertyType};
 use crate::error::{Error, Result};
 use meshdb_core::{EdgeId, NodeId, Property};
 
@@ -240,28 +240,62 @@ pub(crate) fn property_index_name_prefix(label: &str, prop_key: &str) -> Vec<u8>
 /// part of the on-disk format — do NOT renumber without a migration.
 pub(crate) const CONSTRAINT_KIND_UNIQUE: u8 = 0x01;
 pub(crate) const CONSTRAINT_KIND_NOT_NULL: u8 = 0x02;
+pub(crate) const CONSTRAINT_KIND_PROPERTY_TYPE: u8 = 0x03;
+
+/// Sub-tags identifying the target type of a `PROPERTY_TYPE` kind.
+/// Only meaningful when the outer tag is `CONSTRAINT_KIND_PROPERTY_TYPE`.
+pub(crate) const PROPERTY_TYPE_STRING: u8 = 0x01;
+pub(crate) const PROPERTY_TYPE_INTEGER: u8 = 0x02;
+pub(crate) const PROPERTY_TYPE_FLOAT: u8 = 0x03;
+pub(crate) const PROPERTY_TYPE_BOOLEAN: u8 = 0x04;
 
 /// Encode a constraint spec's value bytes for `CF_CONSTRAINT_META`.
-/// Layout: `[kind:u8][label_len:u16][label][prop_len:u16][prop]`.
-/// The key side carries the constraint's name (identified at write
-/// time), so name is deliberately absent from the value.
+/// Layout: `[kind:u8][?type:u8][label_len:u16][label][prop_len:u16][prop]`.
+/// The `type` byte is only emitted when `kind == PROPERTY_TYPE`;
+/// `Unique` / `NotNull` omit it so their on-disk size stays minimal.
 pub(crate) fn constraint_meta_encode(spec: &PropertyConstraintSpec) -> Vec<u8> {
     let label_bytes = spec.label.as_bytes();
     let prop_bytes = spec.property.as_bytes();
     let label_len = u16::try_from(label_bytes.len()).expect("label length fits in u16");
     let prop_len = u16::try_from(prop_bytes.len()).expect("property length fits in u16");
-    let kind_tag = match spec.kind {
-        PropertyConstraintKind::Unique => CONSTRAINT_KIND_UNIQUE,
-        PropertyConstraintKind::NotNull => CONSTRAINT_KIND_NOT_NULL,
-    };
     let mut out =
-        Vec::with_capacity(1 + LEN_PREFIX + label_bytes.len() + LEN_PREFIX + prop_bytes.len());
-    out.push(kind_tag);
+        Vec::with_capacity(2 + LEN_PREFIX + label_bytes.len() + LEN_PREFIX + prop_bytes.len());
+    match spec.kind {
+        PropertyConstraintKind::Unique => out.push(CONSTRAINT_KIND_UNIQUE),
+        PropertyConstraintKind::NotNull => out.push(CONSTRAINT_KIND_NOT_NULL),
+        PropertyConstraintKind::PropertyType(t) => {
+            out.push(CONSTRAINT_KIND_PROPERTY_TYPE);
+            out.push(property_type_tag(t));
+        }
+    }
     out.extend_from_slice(&label_len.to_be_bytes());
     out.extend_from_slice(label_bytes);
     out.extend_from_slice(&prop_len.to_be_bytes());
     out.extend_from_slice(prop_bytes);
     out
+}
+
+fn property_type_tag(t: PropertyType) -> u8 {
+    match t {
+        PropertyType::String => PROPERTY_TYPE_STRING,
+        PropertyType::Integer => PROPERTY_TYPE_INTEGER,
+        PropertyType::Float => PROPERTY_TYPE_FLOAT,
+        PropertyType::Boolean => PROPERTY_TYPE_BOOLEAN,
+    }
+}
+
+fn property_type_from_tag(cf: &'static str, tag: u8) -> Result<PropertyType> {
+    match tag {
+        PROPERTY_TYPE_STRING => Ok(PropertyType::String),
+        PROPERTY_TYPE_INTEGER => Ok(PropertyType::Integer),
+        PROPERTY_TYPE_FLOAT => Ok(PropertyType::Float),
+        PROPERTY_TYPE_BOOLEAN => Ok(PropertyType::Boolean),
+        _ => Err(Error::CorruptBytes {
+            cf,
+            expected: 1,
+            actual: 1,
+        }),
+    }
 }
 
 /// Decode a constraint-meta value back into a [`PropertyConstraintSpec`].
@@ -280,9 +314,20 @@ pub(crate) fn constraint_meta_decode(
             actual: 0,
         });
     }
-    let kind = match bytes[0] {
-        CONSTRAINT_KIND_UNIQUE => PropertyConstraintKind::Unique,
-        CONSTRAINT_KIND_NOT_NULL => PropertyConstraintKind::NotNull,
+    let (kind, kind_header_len) = match bytes[0] {
+        CONSTRAINT_KIND_UNIQUE => (PropertyConstraintKind::Unique, 1usize),
+        CONSTRAINT_KIND_NOT_NULL => (PropertyConstraintKind::NotNull, 1usize),
+        CONSTRAINT_KIND_PROPERTY_TYPE => {
+            if bytes.len() < 2 {
+                return Err(Error::CorruptBytes {
+                    cf,
+                    expected: 2,
+                    actual: bytes.len(),
+                });
+            }
+            let t = property_type_from_tag(cf, bytes[1])?;
+            (PropertyConstraintKind::PropertyType(t), 2usize)
+        }
         _ => {
             return Err(Error::CorruptBytes {
                 cf,
@@ -291,7 +336,7 @@ pub(crate) fn constraint_meta_decode(
             });
         }
     };
-    let mut cursor = 1usize;
+    let mut cursor = kind_header_len;
     let label = read_len_prefixed_string(cf, bytes, &mut cursor)?;
     let property = read_len_prefixed_string(cf, bytes, &mut cursor)?;
     if cursor != bytes.len() {

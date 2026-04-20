@@ -1161,6 +1161,42 @@ fn create_constraint_rejects_missing_requirement() {
     assert!(parse("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email").is_err());
 }
 
+#[test]
+fn create_property_type_constraint_parses_every_type() {
+    for (src, expected) in [
+        ("STRING", PropertyType::String),
+        ("INTEGER", PropertyType::Integer),
+        ("FLOAT", PropertyType::Float),
+        ("BOOLEAN", PropertyType::Boolean),
+    ] {
+        let q = format!("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.prop IS :: {src}");
+        match parse(&q).unwrap_or_else(|e| panic!("parse {src}: {e}")) {
+            Statement::CreateConstraint(stmt) => {
+                assert_eq!(stmt.kind, ConstraintKind::PropertyType(expected));
+            }
+            other => panic!("expected CreateConstraint for {src}, got {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn create_property_type_constraint_is_case_insensitive() {
+    match parse("create constraint for (p:Person) require p.age is :: integer").unwrap() {
+        Statement::CreateConstraint(stmt) => {
+            assert_eq!(
+                stmt.kind,
+                ConstraintKind::PropertyType(PropertyType::Integer)
+            );
+        }
+        other => panic!("expected CreateConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_property_type_constraint_rejects_unknown_type() {
+    assert!(parse("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS :: BIGINT").is_err());
+}
+
 // ---------------------------------------------------------------
 // WHERE-clause IndexSeek rewrite: planner-level assertions.
 // ---------------------------------------------------------------

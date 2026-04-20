@@ -9,10 +9,13 @@ use crate::{
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
 use meshdb_cypher::{
     AggregateArg, AggregateFn, AggregateSpec, BinaryOp, CallArgs, CompareOp, ConstraintKind,
-    CreateEdgeSpec, CreateNodeSpec, Direction, Expr, Literal, LogicalPlan, RemoveSpec, ReturnItem,
-    SetAssignment, SortItem, UnaryOp, YieldSpec,
+    CreateEdgeSpec, CreateNodeSpec, Direction, Expr, Literal, LogicalPlan,
+    PropertyType as CypherPropertyType, RemoveSpec, ReturnItem, SetAssignment, SortItem, UnaryOp,
+    YieldSpec,
 };
-use meshdb_storage::{PropertyConstraintKind, RocksDbStorageEngine};
+use meshdb_storage::{
+    PropertyConstraintKind, PropertyType as StoragePropertyType, RocksDbStorageEngine,
+};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -295,6 +298,9 @@ fn try_execute_ddl(
             let storage_kind = match kind {
                 ConstraintKind::Unique => PropertyConstraintKind::Unique,
                 ConstraintKind::NotNull => PropertyConstraintKind::NotNull,
+                ConstraintKind::PropertyType(t) => {
+                    PropertyConstraintKind::PropertyType(cypher_to_storage_property_type(*t))
+                }
             };
             let spec = writer.create_property_constraint(
                 name.as_deref(),
@@ -356,9 +362,22 @@ fn constraint_show_row(spec: meshdb_storage::PropertyConstraintSpec) -> Row {
     );
     row.insert(
         "type".into(),
-        Value::Property(Property::String(spec.kind.as_str().into())),
+        Value::Property(Property::String(spec.kind.as_string())),
     );
     row
+}
+
+/// Convert the Cypher AST's `PropertyType` into the storage-layer
+/// enum. Narrow bridge — the two enums carry the same four variants
+/// but live in different crates to keep the dependency direction
+/// clean (cypher → executor → storage, never the reverse).
+fn cypher_to_storage_property_type(t: CypherPropertyType) -> StoragePropertyType {
+    match t {
+        CypherPropertyType::String => StoragePropertyType::String,
+        CypherPropertyType::Integer => StoragePropertyType::Integer,
+        CypherPropertyType::Float => StoragePropertyType::Float,
+        CypherPropertyType::Boolean => StoragePropertyType::Boolean,
+    }
 }
 
 fn ddl_ack_row(state: &str, label: &str, property: &str) -> Row {

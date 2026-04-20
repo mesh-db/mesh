@@ -115,13 +115,23 @@ show_constraints_stmt = { kw_show ~ kw_constraints }
 constraint_target = { identifier ~ ":" ~ identifier }
 constraint_property = { identifier ~ "." ~ identifier }
 
-constraint_requirement = { req_unique | req_not_null }
+constraint_requirement = { req_unique | req_not_null | req_property_type }
 // Both shapes are atomic so internal whitespace can't collapse into
 // the `identifier` builder — a bare `IS` followed by an identifier
 // wouldn't otherwise terminate. `ws_req` is required between each
 // keyword to match Cypher's single-word-per-token convention.
 req_unique = @{ ^"is" ~ ws_req ~ ^"unique" ~ !id_cont }
 req_not_null = @{ ^"is" ~ ws_req ~ ^"not" ~ ws_req ~ ^"null" ~ !id_cont }
+
+// `IS :: <TYPE>` — property-type requirement. The `::` is a literal
+// two-char token; whitespace around it is optional. `property_type_tag`
+// is a separate non-atomic rule so the builder can pull the matched
+// type name out as a distinct child pair.
+req_property_type = { kw_is ~ "::" ~ property_type_tag }
+kw_is = @{ ^"is" ~ !id_cont }
+property_type_tag = @{
+    (^"string" | ^"integer" | ^"float" | ^"boolean") ~ !id_cont
+}
 
 if_not_exists = @{ ^"if" ~ ws_req ~ ^"not" ~ ws_req ~ ^"exists" ~ !id_cont }
 if_exists = @{ ^"if" ~ ws_req ~ ^"exists" ~ !id_cont }

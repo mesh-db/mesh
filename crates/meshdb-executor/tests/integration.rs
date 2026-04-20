@@ -7654,6 +7654,106 @@ fn db_constraints_procedure_lists_registered() {
 }
 
 #[test]
+fn property_type_constraint_allows_matching_values() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.name IS :: STRING",
+    );
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(&store, "MATCH (p:Person) RETURN p.name AS n");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn property_type_constraint_rejects_wrong_type() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS :: INTEGER",
+    );
+    let err = run_catch(&store, "CREATE (:Person {age: 'thirty'})")
+        .expect_err("string value should violate INTEGER type constraint");
+    assert!(
+        err.to_string().contains("IS :: INTEGER"),
+        "error should identify the kind; got: {err}"
+    );
+}
+
+#[test]
+fn property_type_constraint_is_strict_no_int_to_float_coercion() {
+    // Neo4j's `IS :: FLOAT` rejects integers; we follow suit.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (w:Widget) REQUIRE w.weight IS :: FLOAT",
+    );
+    let err = run_catch(&store, "CREATE (:Widget {weight: 42})")
+        .expect_err("integer must not satisfy FLOAT");
+    assert!(err.to_string().contains("FLOAT"));
+}
+
+#[test]
+fn property_type_constraint_allows_missing_property() {
+    // `IS :: T` alone allows null / missing; pair with NOT NULL for
+    // strict presence.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS :: INTEGER",
+    );
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(&store, "MATCH (p:Person) RETURN p.name AS n");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn property_type_and_not_null_compose() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT age_type FOR (p:Person) REQUIRE p.age IS :: INTEGER",
+    );
+    run(
+        &store,
+        "CREATE CONSTRAINT age_present FOR (p:Person) REQUIRE p.age IS NOT NULL",
+    );
+    // Missing property — NOT NULL triggers.
+    assert!(run_catch(&store, "CREATE (:Person {name: 'Ada'})").is_err());
+    // Wrong type — PROPERTY_TYPE triggers.
+    assert!(run_catch(&store, "CREATE (:Person {age: 'thirty'})").is_err());
+    // Both satisfied.
+    run(&store, "CREATE (:Person {age: 30})");
+    assert_eq!(run(&store, "MATCH (p:Person) RETURN p").len(), 1);
+}
+
+#[test]
+fn property_type_constraint_shown_in_show_constraints() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.name IS :: STRING",
+    );
+    let rows = run(&store, "SHOW CONSTRAINTS");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "type"), "IS :: STRING");
+}
+
+#[test]
+fn property_type_constraint_rejects_existing_bad_data() {
+    // Backfill validation: pre-existing wrong-typed data blocks the
+    // constraint from being declared.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {age: 'thirty'})");
+    let err = run_catch(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS :: INTEGER",
+    )
+    .expect_err("pre-existing wrong type should block constraint creation");
+    assert!(err.to_string().contains("INTEGER"));
+}
+
+#[test]
 fn constraint_persists_across_reopen() {
     let dir = TempDir::new().unwrap();
     {

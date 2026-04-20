@@ -116,13 +116,28 @@ pub struct IndexDdl {
     pub property: String,
 }
 
-/// Kind of property constraint. Mirrors the surface clauses — UNIQUE
-/// comes from `REQUIRE n.prop IS UNIQUE`, NotNull from
-/// `REQUIRE n.prop IS NOT NULL`.
+/// Kind of property constraint. UNIQUE comes from
+/// `REQUIRE n.prop IS UNIQUE`, NotNull from `REQUIRE n.prop IS NOT
+/// NULL`, and `PropertyType(t)` from `REQUIRE n.prop IS :: <TYPE>`.
+/// PropertyType carries the target type inline so the constraint-kind
+/// enum stays a single shape rather than exploding into one variant
+/// per primitive type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConstraintKind {
     Unique,
     NotNull,
+    PropertyType(PropertyType),
+}
+
+/// Property types recognised by `IS :: <TYPE>`. Matches the four
+/// primitive Cypher types used in practice; temporal / spatial / list
+/// / map constraints are a follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropertyType {
+    String,
+    Integer,
+    Float,
+    Boolean,
 }
 
 /// Payload for `CREATE CONSTRAINT ... FOR (n:Label) REQUIRE n.prop IS

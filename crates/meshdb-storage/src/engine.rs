@@ -35,27 +35,78 @@ pub struct PropertyIndexSpec {
     pub property: String,
 }
 
-/// Kind of single-property constraint. Mirrors the Cypher surface
-/// clauses — `Unique` comes from `REQUIRE n.prop IS UNIQUE`, `NotNull`
-/// from `REQUIRE n.prop IS NOT NULL`. Kept narrow on purpose: v1
-/// covers the two kinds with single-property, single-label scope.
-/// Composite `NODE KEY` and relationship-scope constraints land in a
-/// follow-up.
+/// Kind of single-property constraint. `Unique` comes from
+/// `REQUIRE n.prop IS UNIQUE`, `NotNull` from `REQUIRE n.prop IS NOT
+/// NULL`, and `PropertyType(t)` from `REQUIRE n.prop IS :: <TYPE>`.
+/// `PropertyType` carries the target type so a single constraint-kind
+/// enum covers all four flavours without blowing up into one variant
+/// per type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PropertyConstraintKind {
     Unique,
     NotNull,
+    PropertyType(PropertyType),
+}
+
+/// Property types recognised by `IS :: <TYPE>`. Covers the four
+/// primitive Cypher types used in practice; temporal / spatial / list
+/// / map type constraints are a follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropertyType {
+    String,
+    Integer,
+    Float,
+    Boolean,
+}
+
+impl PropertyType {
+    /// User-facing token used by `SHOW CONSTRAINTS` output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PropertyType::String => "STRING",
+            PropertyType::Integer => "INTEGER",
+            PropertyType::Float => "FLOAT",
+            PropertyType::Boolean => "BOOLEAN",
+        }
+    }
+
+    /// Lowercase tag used when generating a default constraint name —
+    /// must match the tag the cluster crate uses on the Raft-log side
+    /// so auto-names resolve identically across replicas.
+    pub fn name_tag(&self) -> &'static str {
+        match self {
+            PropertyType::String => "string",
+            PropertyType::Integer => "integer",
+            PropertyType::Float => "float",
+            PropertyType::Boolean => "boolean",
+        }
+    }
 }
 
 impl PropertyConstraintKind {
-    /// Short, human-facing token used in `SHOW CONSTRAINTS` output and
-    /// in the auto-generated constraint name. Stable — do not rename
-    /// without a migration, because the auto-name shows up in user
-    /// `DROP CONSTRAINT` statements.
-    pub fn as_str(&self) -> &'static str {
+    /// Short, human-facing token used in `SHOW CONSTRAINTS` output.
+    /// For `PropertyType` the string carries the target type inside
+    /// parentheses so operators reading the output can see what the
+    /// constraint enforces at a glance. Stable — do not rename
+    /// without a migration, because the auto-name the storage layer
+    /// derives from this tag is part of the user-visible DROP surface.
+    pub fn as_string(&self) -> String {
         match self {
-            PropertyConstraintKind::Unique => "UNIQUE",
-            PropertyConstraintKind::NotNull => "NOT NULL",
+            PropertyConstraintKind::Unique => "UNIQUE".into(),
+            PropertyConstraintKind::NotNull => "NOT NULL".into(),
+            PropertyConstraintKind::PropertyType(t) => format!("IS :: {}", t.as_str()),
+        }
+    }
+
+    /// Lowercase tag used when generating a default constraint name.
+    /// `PropertyType(T)` contributes `type_<t>` so every distinct type
+    /// gets its own auto-name and two type constraints on the same
+    /// `(label, property)` can coexist if they ever need to.
+    pub fn name_tag(&self) -> String {
+        match self {
+            PropertyConstraintKind::Unique => "unique".into(),
+            PropertyConstraintKind::NotNull => "not_null".into(),
+            PropertyConstraintKind::PropertyType(t) => format!("type_{}", t.name_tag()),
         }
     }
 }

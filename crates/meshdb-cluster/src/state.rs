@@ -92,11 +92,36 @@ pub enum GraphCommand {
 /// `meshdb_storage::PropertyConstraintKind` but kept in the
 /// cluster crate so the Raft log entry doesn't need to depend on the
 /// storage crate. Converters on both sides keep the two enums in
-/// lockstep.
+/// lockstep. `PropertyType` carries the target type inline so a
+/// single variant covers every `IS :: <TYPE>` flavour instead of
+/// exploding into one per type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConstraintKind {
     Unique,
     NotNull,
+    PropertyType(PropertyType),
+}
+
+/// Property types recognised by `IS :: <TYPE>`. Kept numeric-neutral
+/// (Integer vs Float distinct, no coercion) to match the storage
+/// layer's strict semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PropertyType {
+    String,
+    Integer,
+    Float,
+    Boolean,
+}
+
+impl PropertyType {
+    pub fn name_tag(&self) -> &'static str {
+        match self {
+            PropertyType::String => "string",
+            PropertyType::Integer => "integer",
+            PropertyType::Float => "float",
+            PropertyType::Boolean => "boolean",
+        }
+    }
 }
 
 impl ConstraintKind {
@@ -105,10 +130,11 @@ impl ConstraintKind {
     /// naming scheme — the storage layer uses the same tag — so
     /// `GraphCommand::DropConstraint` rollbacks can reconstruct the
     /// resolved name without a cross-crate lookup.
-    pub fn name_tag(&self) -> &'static str {
+    pub fn name_tag(&self) -> String {
         match self {
-            ConstraintKind::Unique => "unique",
-            ConstraintKind::NotNull => "not_null",
+            ConstraintKind::Unique => "unique".into(),
+            ConstraintKind::NotNull => "not_null".into(),
+            ConstraintKind::PropertyType(t) => format!("type_{}", t.name_tag()),
         }
     }
 }

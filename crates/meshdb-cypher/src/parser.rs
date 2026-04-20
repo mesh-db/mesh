@@ -272,10 +272,12 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstra
                 property = Some(parse_ident(key.as_str()));
             }
             Rule::constraint_requirement => {
-                // `constraint_requirement` is the `req_unique | req_not_null`
-                // alternation, so the single inner pair tells us which
-                // shape matched. Kept as a pair (not an atomic string
-                // match) so future constraint kinds drop in next to it.
+                // `constraint_requirement` is the
+                // `req_unique | req_not_null | req_property_type`
+                // alternation, so the single inner pair tells us
+                // which shape matched. Kept as a pair (not an atomic
+                // string match) so future constraint kinds drop in
+                // next to it.
                 let req = p
                     .into_inner()
                     .next()
@@ -283,6 +285,26 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstra
                 kind = Some(match req.as_rule() {
                     Rule::req_unique => crate::ast::ConstraintKind::Unique,
                     Rule::req_not_null => crate::ast::ConstraintKind::NotNull,
+                    Rule::req_property_type => {
+                        let tag = req
+                            .into_inner()
+                            .find(|inner| inner.as_rule() == Rule::property_type_tag)
+                            .ok_or_else(|| {
+                                Error::Parse("req_property_type missing type tag".into())
+                            })?;
+                        let pt = match tag.as_str().to_ascii_uppercase().as_str() {
+                            "STRING" => crate::ast::PropertyType::String,
+                            "INTEGER" => crate::ast::PropertyType::Integer,
+                            "FLOAT" => crate::ast::PropertyType::Float,
+                            "BOOLEAN" => crate::ast::PropertyType::Boolean,
+                            other => {
+                                return Err(Error::Parse(format!(
+                                    "unknown property type `{other}`"
+                                )))
+                            }
+                        };
+                        crate::ast::ConstraintKind::PropertyType(pt)
+                    }
                     r => {
                         return Err(Error::Parse(format!(
                             "unexpected constraint requirement: {r:?}"

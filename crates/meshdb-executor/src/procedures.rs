@@ -192,7 +192,7 @@ fn builtin_db_constraints(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
             );
             row.insert(
                 "type".into(),
-                Value::Property(Property::String(spec.kind.as_str().into())),
+                Value::Property(Property::String(spec.kind.as_string())),
             );
             row
         })

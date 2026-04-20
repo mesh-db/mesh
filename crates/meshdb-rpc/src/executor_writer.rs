@@ -1,8 +1,10 @@
 use meshdb_cluster::raft::RaftCluster;
-use meshdb_cluster::{ConstraintKind as ClusterConstraintKind, GraphCommand};
+use meshdb_cluster::{
+    ConstraintKind as ClusterConstraintKind, GraphCommand, PropertyType as ClusterPropertyType,
+};
 use meshdb_core::{Edge, EdgeId, Node, NodeId};
 use meshdb_executor::{Error as ExecError, GraphWriter, Result as ExecResult};
-use meshdb_storage::{PropertyConstraintKind, PropertyConstraintSpec};
+use meshdb_storage::{PropertyConstraintKind, PropertyConstraintSpec, PropertyType};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 
@@ -14,6 +16,18 @@ fn cluster_kind(kind: PropertyConstraintKind) -> ClusterConstraintKind {
     match kind {
         PropertyConstraintKind::Unique => ClusterConstraintKind::Unique,
         PropertyConstraintKind::NotNull => ClusterConstraintKind::NotNull,
+        PropertyConstraintKind::PropertyType(t) => {
+            ClusterConstraintKind::PropertyType(cluster_property_type(t))
+        }
+    }
+}
+
+fn cluster_property_type(t: PropertyType) -> ClusterPropertyType {
+    match t {
+        PropertyType::String => ClusterPropertyType::String,
+        PropertyType::Integer => ClusterPropertyType::Integer,
+        PropertyType::Float => ClusterPropertyType::Float,
+        PropertyType::Boolean => ClusterPropertyType::Boolean,
     }
 }
 

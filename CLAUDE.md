@@ -47,7 +47,7 @@ mesh/
   - Patterns: variable-length paths `()-[*1..3]->()`, `shortestPath(...)` (`allShortestPaths` parses but plan rejects).
   - Expressions: list comprehensions, pattern comprehensions, `reduce`, quantifier predicates (`all`/`any`/`none`/`single`), `EXISTS { ... }`, `COUNT { ... }`, and `COLLECT { ... }` subquery expressions.
   - Procedures / subqueries: `CALL { ... }` (unit and returning), `CALL proc YIELD ...` against a runtime-extensible registry in `meshdb-executor` with built-in `db.labels()` / `db.relationshipTypes()` / `db.propertyKeys()` installed by default.
-  - Schema: `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on label+property pairs; `CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for single-property UNIQUE and NOT NULL constraints (with optional name + `IF [NOT] EXISTS`), replicated across Raft and routing clusters; built-in `db.constraints()` procedure.
+  - Schema: `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on label+property pairs; `CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for single-property UNIQUE, NOT NULL, and `IS :: <TYPE>` (STRING/INTEGER/FLOAT/BOOLEAN) constraints (with optional name + `IF [NOT] EXISTS`), replicated across Raft and routing clusters; built-in `db.constraints()` procedure.
   - Scalars: full openCypher scalar surface (string, math, temporal, spatial) plus the widely-expected Neo4j extensions (`*OrNull`, `*List`, `valueType`, `randomUUID`, `round` with precision+mode, `char_length`).
 - **Not yet implemented:** composite `IS NODE KEY` and relationship-scope constraints, property-type constraints (`IS :: <TYPE>`); edge (relationship) indexes; quantified path patterns (`(a)-->+(b)`, Neo4j 5); APOC.
 

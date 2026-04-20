@@ -29,8 +29,13 @@
 //! [`Checkpoint`]: meshdb_storage::StorageEngine::create_checkpoint
 
 use meshdb_cluster::raft::GraphStateMachine;
-use meshdb_cluster::{ConstraintKind as ClusterConstraintKind, GraphCommand};
-use meshdb_storage::{GraphMutation, PropertyConstraintKind, RocksDbStorageEngine, StorageEngine};
+use meshdb_cluster::{
+    ConstraintKind as ClusterConstraintKind, GraphCommand, PropertyType as ClusterPropertyType,
+};
+use meshdb_storage::{
+    GraphMutation, PropertyConstraintKind, PropertyType as StoragePropertyType,
+    RocksDbStorageEngine, StorageEngine,
+};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -467,6 +472,21 @@ pub(crate) fn storage_kind(kind: ClusterConstraintKind) -> PropertyConstraintKin
     match kind {
         ClusterConstraintKind::Unique => PropertyConstraintKind::Unique,
         ClusterConstraintKind::NotNull => PropertyConstraintKind::NotNull,
+        ClusterConstraintKind::PropertyType(t) => {
+            PropertyConstraintKind::PropertyType(storage_property_type(t))
+        }
+    }
+}
+
+/// Bridge for the inner `PropertyType`. Symmetric to `storage_kind`
+/// above — every `PropertyType` variant maps 1:1 to its storage
+/// counterpart.
+pub(crate) fn storage_property_type(t: ClusterPropertyType) -> StoragePropertyType {
+    match t {
+        ClusterPropertyType::String => StoragePropertyType::String,
+        ClusterPropertyType::Integer => StoragePropertyType::Integer,
+        ClusterPropertyType::Float => StoragePropertyType::Float,
+        ClusterPropertyType::Boolean => StoragePropertyType::Boolean,
     }
 }
 

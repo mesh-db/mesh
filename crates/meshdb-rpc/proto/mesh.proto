@@ -310,13 +310,28 @@ message DropPropertyIndexRequest {
 }
 message DropPropertyIndexResponse {}
 
-// Mirrors `meshdb_cluster::ConstraintKind`. Two variants today;
-// new kinds land as additional enum values so existing peers can
-// reject unknown kinds rather than silently misapplying.
+// Mirrors `meshdb_cluster::ConstraintKind`. New kinds land as
+// additional enum values so existing peers can reject unknown kinds
+// rather than silently misapplying. `PROPERTY_TYPE` pairs with a
+// separate `PropertyTypeKind` field on the request that identifies
+// the target type.
 enum ConstraintKind {
   CONSTRAINT_KIND_UNSPECIFIED = 0;
   CONSTRAINT_KIND_UNIQUE = 1;
   CONSTRAINT_KIND_NOT_NULL = 2;
+  CONSTRAINT_KIND_PROPERTY_TYPE = 3;
+}
+
+// Target-type sub-enum for `IS :: <TYPE>` constraints. Only
+// meaningful when `kind == PROPERTY_TYPE`; ignored otherwise. Kept
+// separate from `ConstraintKind` so the top-level enum doesn't
+// explode into one variant per type.
+enum PropertyTypeKind {
+  PROPERTY_TYPE_KIND_UNSPECIFIED = 0;
+  PROPERTY_TYPE_KIND_STRING = 1;
+  PROPERTY_TYPE_KIND_INTEGER = 2;
+  PROPERTY_TYPE_KIND_FLOAT = 3;
+  PROPERTY_TYPE_KIND_BOOLEAN = 4;
 }
 
 message CreatePropertyConstraintRequest {
@@ -329,6 +344,9 @@ message CreatePropertyConstraintRequest {
   string property = 3;
   ConstraintKind kind = 4;
   bool if_not_exists = 5;
+  // Only meaningful when `kind == CONSTRAINT_KIND_PROPERTY_TYPE`.
+  // Ignored for UNIQUE / NOT NULL.
+  PropertyTypeKind property_type = 6;
 }
 message CreatePropertyConstraintResponse {}
 

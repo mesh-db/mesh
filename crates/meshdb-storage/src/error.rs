@@ -54,12 +54,14 @@ pub enum Error {
 
     /// A write would put the store into a state that violates a
     /// registered constraint. The `kind` field carries the constraint
-    /// type (`UNIQUE` / `NOT NULL`) so callers can format a clear
-    /// message.
+    /// type (e.g. `UNIQUE`, `NOT NULL`, `IS :: STRING`) so callers can
+    /// format a clear message. `kind` is `String` rather than
+    /// `&'static str` because `PropertyConstraintKind::PropertyType`
+    /// carries a runtime-selected type name.
     #[error("constraint `{name}` violated: {kind} on {label}.{property} {details}")]
     ConstraintViolation {
         name: String,
-        kind: &'static str,
+        kind: String,
         label: String,
         property: String,
         details: String,

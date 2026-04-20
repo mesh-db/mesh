@@ -981,8 +981,17 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             ..
         } => {
             let kind_str = match kind {
-                ConstraintKind::Unique => "UNIQUE",
-                ConstraintKind::NotNull => "NOT NULL",
+                ConstraintKind::Unique => "UNIQUE".to_string(),
+                ConstraintKind::NotNull => "NOT NULL".to_string(),
+                ConstraintKind::PropertyType(t) => format!(
+                    ":: {}",
+                    match t {
+                        crate::ast::PropertyType::String => "STRING",
+                        crate::ast::PropertyType::Integer => "INTEGER",
+                        crate::ast::PropertyType::Float => "FLOAT",
+                        crate::ast::PropertyType::Boolean => "BOOLEAN",
+                    }
+                ),
             };
             let name_str = name.as_deref().unwrap_or("<auto>");
             buf.push_str(&format!(

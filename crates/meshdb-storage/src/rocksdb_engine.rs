@@ -14,7 +14,7 @@
 use crate::{
     engine::{
         GraphMutation, PropertyConstraintKind, PropertyConstraintSpec, PropertyIndexSpec,
-        StorageEngine,
+        PropertyType, StorageEngine,
     },
     error::{Error, Result},
     keys::{
@@ -682,7 +682,7 @@ impl RocksDbStorageEngine {
                     if !present {
                         return Err(Error::ConstraintViolation {
                             name: spec.name.clone(),
-                            kind: spec.kind.as_str(),
+                            kind: spec.kind.as_string(),
                             label: spec.label.clone(),
                             property: spec.property.clone(),
                             details: format!(
@@ -728,10 +728,37 @@ impl RocksDbStorageEngine {
                         let _ = was_self;
                         return Err(Error::ConstraintViolation {
                             name: spec.name.clone(),
-                            kind: spec.kind.as_str(),
+                            kind: spec.kind.as_string(),
                             label: spec.label.clone(),
                             property: spec.property.clone(),
                             details: format!("value already held by node {}", other),
+                        });
+                    }
+                }
+                PropertyConstraintKind::PropertyType(target) => {
+                    // `IS :: <TYPE>` — the property, if present, must
+                    // be of the declared type. Null / missing is
+                    // allowed; pair with `IS NOT NULL` for strict
+                    // presence. Matching Neo4j: strict kind match
+                    // (no numeric coercion between Int and Float).
+                    let Some(value) = node.properties.get(&spec.property) else {
+                        continue;
+                    };
+                    if matches!(value, Property::Null) {
+                        continue;
+                    }
+                    if !property_matches_type(value, target) {
+                        return Err(Error::ConstraintViolation {
+                            name: spec.name.clone(),
+                            kind: spec.kind.as_string(),
+                            label: spec.label.clone(),
+                            property: spec.property.clone(),
+                            details: format!(
+                                "node {} has value of type {} (expected {})",
+                                node.id,
+                                value.type_name(),
+                                target.as_str()
+                            ),
                         });
                     }
                 }
@@ -869,15 +896,11 @@ impl RocksDbStorageEngine {
 
 /// Deterministic auto-name for a constraint the user didn't name.
 /// Shape: `constraint_<label>_<property>_<kind>` where `<kind>` is
-/// `unique` or `not_null`. Stable across restarts — users can target
-/// the auto-name with `DROP CONSTRAINT` without having to inspect
-/// `SHOW CONSTRAINTS` first.
+/// `unique`, `not_null`, or `type_<t>` (e.g. `type_string`). Stable
+/// across restarts — users can target the auto-name with `DROP
+/// CONSTRAINT` without having to inspect `SHOW CONSTRAINTS` first.
 fn default_constraint_name(label: &str, property: &str, kind: PropertyConstraintKind) -> String {
-    let kind_tag = match kind {
-        PropertyConstraintKind::Unique => "unique",
-        PropertyConstraintKind::NotNull => "not_null",
-    };
-    format!("constraint_{label}_{property}_{kind_tag}")
+    format!("constraint_{label}_{property}_{}", kind.name_tag())
 }
 
 /// Scan existing nodes and verify that `spec` holds. Called on
@@ -904,7 +927,7 @@ fn validate_existing_data(
                 if !present {
                     return Err(Error::ConstraintViolation {
                         name: spec.name.clone(),
-                        kind: spec.kind.as_str(),
+                        kind: spec.kind.as_string(),
                         label: spec.label.clone(),
                         property: spec.property.clone(),
                         details: format!("node {id} is missing required property"),
@@ -932,7 +955,7 @@ fn validate_existing_data(
                 if let Some(&first) = seen.get(&encoded) {
                     return Err(Error::ConstraintViolation {
                         name: spec.name.clone(),
-                        kind: spec.kind.as_str(),
+                        kind: spec.kind.as_string(),
                         label: spec.label.clone(),
                         property: spec.property.clone(),
                         details: format!("duplicate value held by nodes {first} and {id}"),
@@ -941,8 +964,50 @@ fn validate_existing_data(
                 seen.insert(encoded, id);
             }
         }
+        PropertyConstraintKind::PropertyType(target) => {
+            for id in label_members {
+                let node = match engine.get_node(id)? {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let Some(value) = node.properties.get(&spec.property) else {
+                    continue;
+                };
+                if matches!(value, Property::Null) {
+                    continue;
+                }
+                if !property_matches_type(value, target) {
+                    return Err(Error::ConstraintViolation {
+                        name: spec.name.clone(),
+                        kind: spec.kind.as_string(),
+                        label: spec.label.clone(),
+                        property: spec.property.clone(),
+                        details: format!(
+                            "node {id} has value of type {} (expected {})",
+                            value.type_name(),
+                            target.as_str()
+                        ),
+                    });
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Strict `Property` / `PropertyType` match. No numeric coercion — an
+/// `Int64` does NOT satisfy `FLOAT`, matching Neo4j's `IS :: FLOAT`
+/// semantics. Returns `false` for `Null`; callers should pre-filter
+/// null values (`IS :: T` allows nulls by convention — pair with
+/// `IS NOT NULL` for strict presence).
+fn property_matches_type(value: &Property, target: PropertyType) -> bool {
+    matches!(
+        (target, value),
+        (PropertyType::String, Property::String(_))
+            | (PropertyType::Integer, Property::Int64(_))
+            | (PropertyType::Float, Property::Float64(_))
+            | (PropertyType::Boolean, Property::Bool(_))
+    )
 }
 
 /// Rehydrate the constraint registry from [`CF_CONSTRAINT_META`] at

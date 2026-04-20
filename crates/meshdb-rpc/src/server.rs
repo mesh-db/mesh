@@ -16,8 +16,8 @@ use crate::proto::{
     DropPropertyIndexResponse, ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest,
     GetEdgeResponse, GetNodeRequest, GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo,
     NeighborRequest, NeighborResponse, NodesByLabelRequest, NodesByLabelResponse,
-    NodesByPropertyRequest, NodesByPropertyResponse, PutEdgeRequest, PutEdgeResponse,
-    PutNodeRequest, PutNodeResponse,
+    NodesByPropertyRequest, NodesByPropertyResponse, PropertyTypeKind as ProtoPropertyTypeKind,
+    PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
 };
 use crate::raft_applier::storage_kind;
 use crate::routing::Routing;
@@ -25,7 +25,7 @@ use crate::tx_coordinator::TxCoordinator;
 use meshdb_cluster::raft::RaftCluster;
 use meshdb_cluster::{
     resolved_constraint_name, ConstraintKind as ClusterConstraintKind, Error as ClusterError,
-    GraphCommand, PeerId,
+    GraphCommand, PeerId, PropertyType as ClusterPropertyType,
 };
 use meshdb_executor::{
     execute_with_reader_and_procs, GraphReader, GraphWriter, ProcedureRegistry,
@@ -1057,6 +1057,7 @@ async fn try_remote_ddl_on_peer(
                         property: property.clone(),
                         kind: proto_kind(*kind) as i32,
                         if_not_exists: *if_not_exists,
+                        property_type: proto_property_type_from_kind(*kind) as i32,
                     })
                     .await?;
             }
@@ -1082,18 +1083,48 @@ fn proto_kind(kind: ClusterConstraintKind) -> ProtoConstraintKind {
     match kind {
         ClusterConstraintKind::Unique => ProtoConstraintKind::Unique,
         ClusterConstraintKind::NotNull => ProtoConstraintKind::NotNull,
+        ClusterConstraintKind::PropertyType(_) => ProtoConstraintKind::PropertyType,
     }
 }
 
-/// Inverse mapping for inbound proto requests. Defaults to `Unique`
-/// on unspecified — matches the `0` default of proto enums — which
-/// is still safer than a panic because it lets the storage layer
-/// surface a clear error if the spec collides with a differently-
-/// kinded existing constraint.
-fn cluster_kind_from_proto(kind: i32) -> Result<ClusterConstraintKind, Status> {
+/// Derive the proto `property_type` field from a constraint kind.
+/// Returns `Unspecified` for non-`PropertyType` kinds — the server
+/// ignores the field in those cases.
+fn proto_property_type_from_kind(kind: ClusterConstraintKind) -> ProtoPropertyTypeKind {
+    match kind {
+        ClusterConstraintKind::PropertyType(t) => match t {
+            ClusterPropertyType::String => ProtoPropertyTypeKind::String,
+            ClusterPropertyType::Integer => ProtoPropertyTypeKind::Integer,
+            ClusterPropertyType::Float => ProtoPropertyTypeKind::Float,
+            ClusterPropertyType::Boolean => ProtoPropertyTypeKind::Boolean,
+        },
+        _ => ProtoPropertyTypeKind::Unspecified,
+    }
+}
+
+/// Inverse mapping for inbound proto requests. For `PropertyType`
+/// kind, the caller also supplies a `property_type` tag which we
+/// carry here as a second argument.
+fn cluster_kind_from_proto(kind: i32, property_type: i32) -> Result<ClusterConstraintKind, Status> {
     match ProtoConstraintKind::try_from(kind).unwrap_or(ProtoConstraintKind::Unspecified) {
         ProtoConstraintKind::Unique => Ok(ClusterConstraintKind::Unique),
         ProtoConstraintKind::NotNull => Ok(ClusterConstraintKind::NotNull),
+        ProtoConstraintKind::PropertyType => {
+            let t = match ProtoPropertyTypeKind::try_from(property_type)
+                .unwrap_or(ProtoPropertyTypeKind::Unspecified)
+            {
+                ProtoPropertyTypeKind::String => ClusterPropertyType::String,
+                ProtoPropertyTypeKind::Integer => ClusterPropertyType::Integer,
+                ProtoPropertyTypeKind::Float => ClusterPropertyType::Float,
+                ProtoPropertyTypeKind::Boolean => ClusterPropertyType::Boolean,
+                ProtoPropertyTypeKind::Unspecified => {
+                    return Err(Status::invalid_argument(
+                        "property_type is unspecified for PROPERTY_TYPE constraint",
+                    ))
+                }
+            };
+            Ok(ClusterConstraintKind::PropertyType(t))
+        }
         ProtoConstraintKind::Unspecified => {
             Err(Status::invalid_argument("constraint kind is unspecified"))
         }
@@ -1852,7 +1883,7 @@ impl MeshWrite for MeshService {
         // Raft mode it's unused — DDL flows through `propose_graph`
         // as a `GraphCommand::CreateConstraint` entry.
         let req = request.into_inner();
-        let kind = cluster_kind_from_proto(req.kind)?;
+        let kind = cluster_kind_from_proto(req.kind, req.property_type)?;
         let name = if req.name.is_empty() {
             None
         } else {

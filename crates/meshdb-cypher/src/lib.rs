@@ -4,6 +4,11 @@ mod parser;
 mod plan;
 
 pub use ast::*;
+// `PropertyType` lives in `ast` but needs an explicit re-export
+// alongside the glob so downstream `use meshdb_cypher::PropertyType`
+// resolves; the glob takes care of the common types and this line
+// makes the intent explicit for any future star-less consumer.
+pub use ast::PropertyType;
 pub use error::{Error, Result};
 pub use parser::parse;
 pub use plan::{
