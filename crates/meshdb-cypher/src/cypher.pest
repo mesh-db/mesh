@@ -95,8 +95,16 @@ create_constraint_stmt = {
     kw_create ~ kw_constraint ~
     constraint_name_opt? ~ if_not_exists? ~
     kw_for ~ "(" ~ constraint_target ~ ")" ~
-    kw_require ~ constraint_property ~ constraint_requirement
+    kw_require ~ (constraint_property_list | constraint_property) ~
+    constraint_requirement
 }
+
+// Parenthesized property list for composite constraints:
+//   REQUIRE (n.a, n.b) IS NODE KEY
+// The single-property form stays on `constraint_property` — the
+// alternation in `create_constraint_stmt` tries the list form first
+// so a leading `(` commits deterministically.
+constraint_property_list = { "(" ~ constraint_property ~ ("," ~ constraint_property)* ~ ")" }
 
 // Negative-lookahead guard: we only commit to parsing an identifier as
 // the user-supplied name when the next token isn't `IF NOT EXISTS` or
@@ -115,13 +123,16 @@ show_constraints_stmt = { kw_show ~ kw_constraints }
 constraint_target = { identifier ~ ":" ~ identifier }
 constraint_property = { identifier ~ "." ~ identifier }
 
-constraint_requirement = { req_unique | req_not_null | req_property_type }
+constraint_requirement = { req_unique | req_not_null | req_node_key | req_property_type }
 // Both shapes are atomic so internal whitespace can't collapse into
 // the `identifier` builder — a bare `IS` followed by an identifier
 // wouldn't otherwise terminate. `ws_req` is required between each
 // keyword to match Cypher's single-word-per-token convention.
 req_unique = @{ ^"is" ~ ws_req ~ ^"unique" ~ !id_cont }
 req_not_null = @{ ^"is" ~ ws_req ~ ^"not" ~ ws_req ~ ^"null" ~ !id_cont }
+// `IS NODE KEY` — composite uniqueness + existence. Atomic so the
+// two-word tail stays one token from the grammar's perspective.
+req_node_key = @{ ^"is" ~ ws_req ~ ^"node" ~ ws_req ~ ^"key" ~ !id_cont }
 
 // `IS :: <TYPE>` — property-type requirement. The `::` is a literal
 // two-char token; whitespace around it is optional. `property_type_tag`

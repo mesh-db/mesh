@@ -127,6 +127,11 @@ pub enum ConstraintKind {
     Unique,
     NotNull,
     PropertyType(PropertyType),
+    /// `REQUIRE (n.a, n.b) IS NODE KEY` — composite uniqueness +
+    /// existence. Single-property form (`REQUIRE n.a IS NODE KEY`) is
+    /// also allowed syntactically and behaves like UNIQUE + NOT NULL
+    /// on the one property.
+    NodeKey,
 }
 
 /// Property types recognised by `IS :: <TYPE>`. Matches the four
@@ -140,16 +145,18 @@ pub enum PropertyType {
     Boolean,
 }
 
-/// Payload for `CREATE CONSTRAINT ... FOR (n:Label) REQUIRE n.prop IS
-/// <kind>`. Unlike indexes, constraints carry an optional
+/// Payload for `CREATE CONSTRAINT ... FOR (n:Label) REQUIRE <prop-list>
+/// IS <kind>`. Unlike indexes, constraints carry an optional
 /// user-supplied name — when `name` is `None` the storage layer
 /// fills in a deterministic auto-generated name so `DROP CONSTRAINT`
-/// can still target it.
+/// can still target it. `properties` is a list so composite
+/// `NODE KEY` constraints fit the same shape; single-property kinds
+/// pass a one-element list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateConstraintStmt {
     pub name: Option<String>,
     pub label: String,
-    pub property: String,
+    pub properties: Vec<String>,
     pub kind: ConstraintKind,
     /// `true` when the source carried `IF NOT EXISTS` — makes
     /// re-declaration with the same name a no-op instead of a

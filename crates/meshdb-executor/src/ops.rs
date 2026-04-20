@@ -291,13 +291,14 @@ fn try_execute_ddl(
         LogicalPlan::CreatePropertyConstraint {
             name,
             label,
-            property,
+            properties,
             kind,
             if_not_exists,
         } => {
             let storage_kind = match kind {
                 ConstraintKind::Unique => PropertyConstraintKind::Unique,
                 ConstraintKind::NotNull => PropertyConstraintKind::NotNull,
+                ConstraintKind::NodeKey => PropertyConstraintKind::NodeKey,
                 ConstraintKind::PropertyType(t) => {
                     PropertyConstraintKind::PropertyType(cypher_to_storage_property_type(*t))
                 }
@@ -305,7 +306,7 @@ fn try_execute_ddl(
             let spec = writer.create_property_constraint(
                 name.as_deref(),
                 label,
-                property,
+                properties,
                 storage_kind,
                 *if_not_exists,
             )?;
@@ -347,8 +348,9 @@ fn constraint_ack_row(state: &str, spec: &meshdb_storage::PropertyConstraintSpec
 }
 
 /// Row shape for `SHOW CONSTRAINTS` and `db.constraints()`. Columns:
-/// `name`, `label`, `property`, `type`. Keeps the order deterministic
-/// so integration tests can match on column presence.
+/// `name`, `label`, `properties` (list), and `type`. Single-property
+/// constraints still carry a one-element `properties` list; composite
+/// kinds (e.g. `NodeKey`) carry the full tuple in source order.
 fn constraint_show_row(spec: meshdb_storage::PropertyConstraintSpec) -> Row {
     let mut row = Row::default();
     row.insert("name".into(), Value::Property(Property::String(spec.name)));
@@ -356,10 +358,8 @@ fn constraint_show_row(spec: meshdb_storage::PropertyConstraintSpec) -> Row {
         "label".into(),
         Value::Property(Property::String(spec.label)),
     );
-    row.insert(
-        "property".into(),
-        Value::Property(Property::String(spec.property)),
-    );
+    let props: Vec<Property> = spec.properties.into_iter().map(Property::String).collect();
+    row.insert("properties".into(), Value::Property(Property::List(props)));
     row.insert(
         "type".into(),
         Value::Property(Property::String(spec.kind.as_string())),

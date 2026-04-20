@@ -1071,7 +1071,7 @@ fn create_unique_constraint_parses_without_name() {
         Statement::CreateConstraint(stmt) => {
             assert_eq!(stmt.name, None);
             assert_eq!(stmt.label, "Person");
-            assert_eq!(stmt.property, "email");
+            assert_eq!(stmt.properties, vec!["email".to_string()]);
             assert_eq!(stmt.kind, ConstraintKind::Unique);
             assert!(!stmt.if_not_exists);
         }
@@ -1086,7 +1086,7 @@ fn create_not_null_constraint_parses_with_name() {
         Statement::CreateConstraint(stmt) => {
             assert_eq!(stmt.name.as_deref(), Some("person_name"));
             assert_eq!(stmt.label, "Person");
-            assert_eq!(stmt.property, "name");
+            assert_eq!(stmt.properties, vec!["name".to_string()]);
             assert_eq!(stmt.kind, ConstraintKind::NotNull);
         }
         other => panic!("expected CreateConstraint, got {:?}", other),
@@ -1195,6 +1195,46 @@ fn create_property_type_constraint_is_case_insensitive() {
 #[test]
 fn create_property_type_constraint_rejects_unknown_type() {
     assert!(parse("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS :: BIGINT").is_err());
+}
+
+#[test]
+fn create_node_key_constraint_parses_single_property() {
+    match parse("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.id IS NODE KEY").unwrap() {
+        Statement::CreateConstraint(stmt) => {
+            assert_eq!(stmt.kind, ConstraintKind::NodeKey);
+            assert_eq!(stmt.properties, vec!["id".to_string()]);
+        }
+        other => panic!("expected CreateConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_node_key_constraint_parses_composite() {
+    match parse("CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.first_name, p.last_name) IS NODE KEY")
+        .unwrap()
+    {
+        Statement::CreateConstraint(stmt) => {
+            assert_eq!(stmt.kind, ConstraintKind::NodeKey);
+            assert_eq!(
+                stmt.properties,
+                vec!["first_name".to_string(), "last_name".to_string()]
+            );
+        }
+        other => panic!("expected CreateConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_node_key_preserves_property_order() {
+    match parse("CREATE CONSTRAINT FOR (p:P) REQUIRE (p.z, p.a, p.m) IS NODE KEY").unwrap() {
+        Statement::CreateConstraint(stmt) => {
+            assert_eq!(
+                stmt.properties,
+                vec!["z".to_string(), "a".to_string(), "m".to_string()]
+            );
+        }
+        other => panic!("expected CreateConstraint, got {:?}", other),
+    }
 }
 
 // ---------------------------------------------------------------

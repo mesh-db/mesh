@@ -241,6 +241,7 @@ pub(crate) fn property_index_name_prefix(label: &str, prop_key: &str) -> Vec<u8>
 pub(crate) const CONSTRAINT_KIND_UNIQUE: u8 = 0x01;
 pub(crate) const CONSTRAINT_KIND_NOT_NULL: u8 = 0x02;
 pub(crate) const CONSTRAINT_KIND_PROPERTY_TYPE: u8 = 0x03;
+pub(crate) const CONSTRAINT_KIND_NODE_KEY: u8 = 0x04;
 
 /// Sub-tags identifying the target type of a `PROPERTY_TYPE` kind.
 /// Only meaningful when the outer tag is `CONSTRAINT_KIND_PROPERTY_TYPE`.
@@ -250,16 +251,23 @@ pub(crate) const PROPERTY_TYPE_FLOAT: u8 = 0x03;
 pub(crate) const PROPERTY_TYPE_BOOLEAN: u8 = 0x04;
 
 /// Encode a constraint spec's value bytes for `CF_CONSTRAINT_META`.
-/// Layout: `[kind:u8][?type:u8][label_len:u16][label][prop_len:u16][prop]`.
+/// Layout:
+///   `[kind:u8][?type:u8][label_len:u16][label][prop_count:u16]([prop_len:u16][prop])*`
 /// The `type` byte is only emitted when `kind == PROPERTY_TYPE`;
-/// `Unique` / `NotNull` omit it so their on-disk size stays minimal.
+/// the property list is always length-prefixed with a count and
+/// per-entry length so `NodeKey`'s composite tuple round-trips.
 pub(crate) fn constraint_meta_encode(spec: &PropertyConstraintSpec) -> Vec<u8> {
     let label_bytes = spec.label.as_bytes();
-    let prop_bytes = spec.property.as_bytes();
     let label_len = u16::try_from(label_bytes.len()).expect("label length fits in u16");
-    let prop_len = u16::try_from(prop_bytes.len()).expect("property length fits in u16");
-    let mut out =
-        Vec::with_capacity(2 + LEN_PREFIX + label_bytes.len() + LEN_PREFIX + prop_bytes.len());
+    let prop_count = u16::try_from(spec.properties.len()).expect("property count fits in u16");
+    let props_total: usize = spec.properties.iter().map(|p| p.len()).sum();
+    let mut out = Vec::with_capacity(
+        2 + LEN_PREFIX
+            + label_bytes.len()
+            + LEN_PREFIX
+            + props_total
+            + LEN_PREFIX * spec.properties.len(),
+    );
     match spec.kind {
         PropertyConstraintKind::Unique => out.push(CONSTRAINT_KIND_UNIQUE),
         PropertyConstraintKind::NotNull => out.push(CONSTRAINT_KIND_NOT_NULL),
@@ -267,11 +275,17 @@ pub(crate) fn constraint_meta_encode(spec: &PropertyConstraintSpec) -> Vec<u8> {
             out.push(CONSTRAINT_KIND_PROPERTY_TYPE);
             out.push(property_type_tag(t));
         }
+        PropertyConstraintKind::NodeKey => out.push(CONSTRAINT_KIND_NODE_KEY),
     }
     out.extend_from_slice(&label_len.to_be_bytes());
     out.extend_from_slice(label_bytes);
-    out.extend_from_slice(&prop_len.to_be_bytes());
-    out.extend_from_slice(prop_bytes);
+    out.extend_from_slice(&prop_count.to_be_bytes());
+    for prop in &spec.properties {
+        let bytes = prop.as_bytes();
+        let len = u16::try_from(bytes.len()).expect("property length fits in u16");
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
     out
 }
 
@@ -328,6 +342,7 @@ pub(crate) fn constraint_meta_decode(
             let t = property_type_from_tag(cf, bytes[1])?;
             (PropertyConstraintKind::PropertyType(t), 2usize)
         }
+        CONSTRAINT_KIND_NODE_KEY => (PropertyConstraintKind::NodeKey, 1usize),
         _ => {
             return Err(Error::CorruptBytes {
                 cf,
@@ -338,7 +353,24 @@ pub(crate) fn constraint_meta_decode(
     };
     let mut cursor = kind_header_len;
     let label = read_len_prefixed_string(cf, bytes, &mut cursor)?;
-    let property = read_len_prefixed_string(cf, bytes, &mut cursor)?;
+    // Property list: u16 count followed by `count` length-prefixed
+    // strings. Zero-count is accepted by the decoder but the storage
+    // layer rejects it at create time — keeping the decode side
+    // permissive lets future kinds with no properties slot in without
+    // a format bump.
+    if cursor + LEN_PREFIX > bytes.len() {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected: cursor + LEN_PREFIX,
+            actual: bytes.len(),
+        });
+    }
+    let prop_count = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+    cursor += LEN_PREFIX;
+    let mut properties = Vec::with_capacity(prop_count);
+    for _ in 0..prop_count {
+        properties.push(read_len_prefixed_string(cf, bytes, &mut cursor)?);
+    }
     if cursor != bytes.len() {
         return Err(Error::CorruptBytes {
             cf,
@@ -349,7 +381,7 @@ pub(crate) fn constraint_meta_decode(
     Ok(PropertyConstraintSpec {
         name,
         label,
-        property,
+        properties,
         kind,
     })
 }

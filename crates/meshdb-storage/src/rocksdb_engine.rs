@@ -557,18 +557,33 @@ impl RocksDbStorageEngine {
         &self,
         name: Option<&str>,
         label: &str,
-        property: &str,
+        properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
     ) -> Result<PropertyConstraintSpec> {
+        // Arity validation: single-property kinds get exactly one
+        // property; NodeKey accepts any positive count. Empty lists
+        // are always invalid.
+        if properties.is_empty() {
+            return Err(Error::ConstraintArity {
+                kind: kind.as_string(),
+                details: "at least one property is required".into(),
+            });
+        }
+        if !kind.allows_multi_property() && properties.len() != 1 {
+            return Err(Error::ConstraintArity {
+                kind: kind.as_string(),
+                details: format!("expects exactly one property, got {}", properties.len()),
+            });
+        }
         let resolved_name = match name {
             Some(n) => n.to_string(),
-            None => default_constraint_name(label, property, kind),
+            None => default_constraint_name(label, properties, kind),
         };
         let spec = PropertyConstraintSpec {
             name: resolved_name.clone(),
             label: label.to_string(),
-            property: property.to_string(),
+            properties: properties.to_vec(),
             kind,
         };
 
@@ -592,10 +607,11 @@ impl RocksDbStorageEngine {
 
         // UNIQUE needs a backing property index for enforcement. The
         // call is idempotent — a user-declared index on the same
-        // `(label, property)` is reused. We do this before validating
-        // the existing data so the scan below can cover it too.
+        // `(label, property)` is reused. NodeKey doesn't get a
+        // backing index today (we enforce via label scan); adding a
+        // composite index is a follow-up optimization.
         if matches!(kind, PropertyConstraintKind::Unique) {
-            self.create_property_index(label, property)?;
+            self.create_property_index(label, &properties[0])?;
         }
 
         // Validate existing data against the new constraint before we
@@ -673,27 +689,30 @@ impl RocksDbStorageEngine {
             if !now_has_label(&spec.label) {
                 continue;
             }
+            // Single-property kinds store the target in
+            // `properties[0]`; NodeKey walks the whole list.
+            let primary = spec.primary_property();
             match spec.kind {
                 PropertyConstraintKind::NotNull => {
                     let present = node
                         .properties
-                        .get(&spec.property)
+                        .get(primary)
                         .is_some_and(|v| !matches!(v, Property::Null));
                     if !present {
                         return Err(Error::ConstraintViolation {
                             name: spec.name.clone(),
                             kind: spec.kind.as_string(),
                             label: spec.label.clone(),
-                            property: spec.property.clone(),
+                            property: primary.to_string(),
                             details: format!(
                                 "node {} is missing required property `{}`",
-                                node.id, spec.property
+                                node.id, primary
                             ),
                         });
                     }
                 }
                 PropertyConstraintKind::Unique => {
-                    let Some(value) = node.properties.get(&spec.property) else {
+                    let Some(value) = node.properties.get(primary) else {
                         // No value → no uniqueness collision possible.
                         // Matches Neo4j: UNIQUE alone allows NULL;
                         // combine with NOT NULL for strict presence.
@@ -702,46 +721,29 @@ impl RocksDbStorageEngine {
                     if matches!(value, Property::Null) {
                         continue;
                     }
-                    // Skip probes on unindexable types — the backing
-                    // index can't represent them so uniqueness is
-                    // effectively undefined. Keeping the write allowed
-                    // here matches how the index layer itself skips
-                    // these values.
                     if encode_index_value(value).is_none() {
                         continue;
                     }
-                    let holders = self.nodes_by_property(&spec.label, &spec.property, value)?;
-                    // The backing property index already reflects the
-                    // previously-committed state; `existing` (if any)
-                    // is in that index. We allow a match on our own id
-                    // so updating the same node to the same value is
-                    // legal; we also allow the "same id, value stays
-                    // the same" carryover. Any other matching id means
-                    // a distinct node owns the value.
+                    let holders = self.nodes_by_property(&spec.label, primary, value)?;
                     for other in holders {
                         if other == node.id {
                             continue;
                         }
                         let was_self = existing
-                            .and_then(|n| n.properties.get(&spec.property))
+                            .and_then(|n| n.properties.get(primary))
                             .is_some_and(|v| v == value);
                         let _ = was_self;
                         return Err(Error::ConstraintViolation {
                             name: spec.name.clone(),
                             kind: spec.kind.as_string(),
                             label: spec.label.clone(),
-                            property: spec.property.clone(),
+                            property: primary.to_string(),
                             details: format!("value already held by node {}", other),
                         });
                     }
                 }
                 PropertyConstraintKind::PropertyType(target) => {
-                    // `IS :: <TYPE>` — the property, if present, must
-                    // be of the declared type. Null / missing is
-                    // allowed; pair with `IS NOT NULL` for strict
-                    // presence. Matching Neo4j: strict kind match
-                    // (no numeric coercion between Int and Float).
-                    let Some(value) = node.properties.get(&spec.property) else {
+                    let Some(value) = node.properties.get(primary) else {
                         continue;
                     };
                     if matches!(value, Property::Null) {
@@ -752,7 +754,7 @@ impl RocksDbStorageEngine {
                             name: spec.name.clone(),
                             kind: spec.kind.as_string(),
                             label: spec.label.clone(),
-                            property: spec.property.clone(),
+                            property: primary.to_string(),
                             details: format!(
                                 "node {} has value of type {} (expected {})",
                                 node.id,
@@ -760,6 +762,65 @@ impl RocksDbStorageEngine {
                                 target.as_str()
                             ),
                         });
+                    }
+                }
+                PropertyConstraintKind::NodeKey => {
+                    // Two-part check: every property must be
+                    // present-and-non-null, and the tuple of their
+                    // values must be unique across other label
+                    // members. Presence fails fast — if any slot is
+                    // missing we stop before the O(N) uniqueness
+                    // scan. Uniqueness walks the label's nodes
+                    // because we don't have composite indexes yet;
+                    // complexity is O(M × K) per insert where M is
+                    // the label's cardinality and K is the tuple
+                    // length. Good enough for v1; a composite index
+                    // is a follow-up.
+                    let mut my_tuple: Vec<&Property> = Vec::with_capacity(spec.properties.len());
+                    for prop in &spec.properties {
+                        match node.properties.get(prop) {
+                            Some(v) if !matches!(v, Property::Null) => my_tuple.push(v),
+                            _ => {
+                                return Err(Error::ConstraintViolation {
+                                    name: spec.name.clone(),
+                                    kind: spec.kind.as_string(),
+                                    label: spec.label.clone(),
+                                    property: prop.clone(),
+                                    details: format!(
+                                        "node {} is missing required property `{}`",
+                                        node.id, prop
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    for other_id in self.nodes_by_label(&spec.label)? {
+                        if other_id == node.id {
+                            continue;
+                        }
+                        let other = match self.get_node(other_id)? {
+                            Some(n) => n,
+                            None => continue,
+                        };
+                        let mut matches_all = true;
+                        for (prop, mine) in spec.properties.iter().zip(my_tuple.iter()) {
+                            match other.properties.get(prop) {
+                                Some(theirs) if theirs == *mine => continue,
+                                _ => {
+                                    matches_all = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if matches_all {
+                            return Err(Error::ConstraintViolation {
+                                name: spec.name.clone(),
+                                kind: spec.kind.as_string(),
+                                label: spec.label.clone(),
+                                property: spec.properties.join(","),
+                                details: format!("tuple already held by node {}", other_id),
+                            });
+                        }
                     }
                 }
             }
@@ -895,12 +956,18 @@ impl RocksDbStorageEngine {
 }
 
 /// Deterministic auto-name for a constraint the user didn't name.
-/// Shape: `constraint_<label>_<property>_<kind>` where `<kind>` is
-/// `unique`, `not_null`, or `type_<t>` (e.g. `type_string`). Stable
-/// across restarts — users can target the auto-name with `DROP
-/// CONSTRAINT` without having to inspect `SHOW CONSTRAINTS` first.
-fn default_constraint_name(label: &str, property: &str, kind: PropertyConstraintKind) -> String {
-    format!("constraint_{label}_{property}_{}", kind.name_tag())
+/// Shape: `constraint_<label>_<property_list>_<kind>` where the
+/// property list joins the property names with `_` and `<kind>` is
+/// `unique`, `not_null`, `type_<t>`, or `node_key`. Stable across
+/// restarts — users can target the auto-name with `DROP CONSTRAINT`
+/// without having to inspect `SHOW CONSTRAINTS` first.
+fn default_constraint_name(
+    label: &str,
+    properties: &[String],
+    kind: PropertyConstraintKind,
+) -> String {
+    let joined = properties.join("_");
+    format!("constraint_{label}_{joined}_{}", kind.name_tag())
 }
 
 /// Scan existing nodes and verify that `spec` holds. Called on
@@ -913,6 +980,7 @@ fn validate_existing_data(
     spec: &PropertyConstraintSpec,
 ) -> Result<()> {
     let label_members = engine.nodes_by_label(&spec.label)?;
+    let primary = spec.primary_property();
     match spec.kind {
         PropertyConstraintKind::NotNull => {
             for id in label_members {
@@ -922,23 +990,20 @@ fn validate_existing_data(
                 };
                 let present = node
                     .properties
-                    .get(&spec.property)
+                    .get(primary)
                     .is_some_and(|v| !matches!(v, Property::Null));
                 if !present {
                     return Err(Error::ConstraintViolation {
                         name: spec.name.clone(),
                         kind: spec.kind.as_string(),
                         label: spec.label.clone(),
-                        property: spec.property.clone(),
+                        property: primary.to_string(),
                         details: format!("node {id} is missing required property"),
                     });
                 }
             }
         }
         PropertyConstraintKind::Unique => {
-            // For UNIQUE we walk members once, collecting the first
-            // node id per distinct value; a duplicate surfaces the
-            // pair in the error so operators can trace the collision.
             use std::collections::HashMap;
             let mut seen: HashMap<Vec<u8>, meshdb_core::NodeId> = HashMap::new();
             for id in label_members {
@@ -946,7 +1011,7 @@ fn validate_existing_data(
                     Some(n) => n,
                     None => continue,
                 };
-                let Some(value) = node.properties.get(&spec.property) else {
+                let Some(value) = node.properties.get(primary) else {
                     continue;
                 };
                 let Some(encoded) = encode_index_value(value) else {
@@ -957,7 +1022,7 @@ fn validate_existing_data(
                         name: spec.name.clone(),
                         kind: spec.kind.as_string(),
                         label: spec.label.clone(),
-                        property: spec.property.clone(),
+                        property: primary.to_string(),
                         details: format!("duplicate value held by nodes {first} and {id}"),
                     });
                 }
@@ -970,7 +1035,7 @@ fn validate_existing_data(
                     Some(n) => n,
                     None => continue,
                 };
-                let Some(value) = node.properties.get(&spec.property) else {
+                let Some(value) = node.properties.get(primary) else {
                     continue;
                 };
                 if matches!(value, Property::Null) {
@@ -981,7 +1046,7 @@ fn validate_existing_data(
                         name: spec.name.clone(),
                         kind: spec.kind.as_string(),
                         label: spec.label.clone(),
-                        property: spec.property.clone(),
+                        property: primary.to_string(),
                         details: format!(
                             "node {id} has value of type {} (expected {})",
                             value.type_name(),
@@ -989,6 +1054,62 @@ fn validate_existing_data(
                         ),
                     });
                 }
+            }
+        }
+        PropertyConstraintKind::NodeKey => {
+            // Composite existence + uniqueness: drop into a scratch
+            // map keyed by the encoded tuple, so a pre-existing pair
+            // with identical values surfaces the exact colliding ids
+            // in the error. Missing-property checks fail immediately
+            // — no point scanning for duplicates if the invariant is
+            // already broken.
+            use std::collections::HashMap;
+            let mut seen: HashMap<Vec<Vec<u8>>, meshdb_core::NodeId> = HashMap::new();
+            for id in label_members {
+                let node = match engine.get_node(id)? {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let mut tuple: Vec<Vec<u8>> = Vec::with_capacity(spec.properties.len());
+                let mut missing: Option<&str> = None;
+                for prop in &spec.properties {
+                    match node.properties.get(prop) {
+                        Some(v) if !matches!(v, Property::Null) => {
+                            if let Some(encoded) = encode_index_value(v) {
+                                tuple.push(encoded);
+                            } else {
+                                // Unindexable value type — skip this
+                                // node, since the tuple can't be
+                                // compared meaningfully.
+                                missing = Some(prop);
+                                break;
+                            }
+                        }
+                        _ => {
+                            missing = Some(prop.as_str());
+                            break;
+                        }
+                    }
+                }
+                if let Some(prop) = missing {
+                    return Err(Error::ConstraintViolation {
+                        name: spec.name.clone(),
+                        kind: spec.kind.as_string(),
+                        label: spec.label.clone(),
+                        property: prop.to_string(),
+                        details: format!("node {id} is missing required property `{prop}`"),
+                    });
+                }
+                if let Some(&first) = seen.get(&tuple) {
+                    return Err(Error::ConstraintViolation {
+                        name: spec.name.clone(),
+                        kind: spec.kind.as_string(),
+                        label: spec.label.clone(),
+                        property: spec.properties.join(","),
+                        details: format!("duplicate tuple held by nodes {first} and {id}"),
+                    });
+                }
+                seen.insert(tuple, id);
             }
         }
     }
@@ -1130,7 +1251,7 @@ impl StorageEngine for RocksDbStorageEngine {
         &self,
         name: Option<&str>,
         label: &str,
-        property: &str,
+        properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
     ) -> Result<PropertyConstraintSpec> {
@@ -1138,7 +1259,7 @@ impl StorageEngine for RocksDbStorageEngine {
             self,
             name,
             label,
-            property,
+            properties,
             kind,
             if_not_exists,
         )

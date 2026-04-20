@@ -19,6 +19,7 @@ fn cluster_kind(kind: PropertyConstraintKind) -> ClusterConstraintKind {
         PropertyConstraintKind::PropertyType(t) => {
             ClusterConstraintKind::PropertyType(cluster_property_type(t))
         }
+        PropertyConstraintKind::NodeKey => ClusterConstraintKind::NodeKey,
     }
 }
 
@@ -91,7 +92,7 @@ impl GraphWriter for RaftGraphWriter {
         &self,
         name: Option<&str>,
         label: &str,
-        property: &str,
+        properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
     ) -> ExecResult<PropertyConstraintSpec> {
@@ -104,20 +105,20 @@ impl GraphWriter for RaftGraphWriter {
         let resolved = meshdb_cluster::resolved_constraint_name(
             &name.map(str::to_string),
             label,
-            property,
+            properties,
             cluster_kind(kind),
         );
         self.propose(GraphCommand::CreateConstraint {
             name: name.map(str::to_string),
             label: label.to_string(),
-            property: property.to_string(),
+            properties: properties.to_vec(),
             kind: cluster_kind(kind),
             if_not_exists,
         })?;
         Ok(PropertyConstraintSpec {
             name: resolved,
             label: label.to_string(),
-            property: property.to_string(),
+            properties: properties.to_vec(),
             kind,
         })
     }
@@ -218,7 +219,7 @@ impl GraphWriter for BufferingGraphWriter {
         &self,
         name: Option<&str>,
         label: &str,
-        property: &str,
+        properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
     ) -> ExecResult<PropertyConstraintSpec> {
@@ -231,7 +232,7 @@ impl GraphWriter for BufferingGraphWriter {
         let resolved = meshdb_cluster::resolved_constraint_name(
             &name.map(str::to_string),
             label,
-            property,
+            properties,
             cluster_kind(kind),
         );
         self.buffer
@@ -240,14 +241,14 @@ impl GraphWriter for BufferingGraphWriter {
             .push(GraphCommand::CreateConstraint {
                 name: name.map(str::to_string),
                 label: label.to_string(),
-                property: property.to_string(),
+                properties: properties.to_vec(),
                 kind: cluster_kind(kind),
                 if_not_exists,
             });
         Ok(PropertyConstraintSpec {
             name: resolved,
             label: label.to_string(),
-            property: property.to_string(),
+            properties: properties.to_vec(),
             kind,
         })
     }

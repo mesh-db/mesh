@@ -186,10 +186,8 @@ fn builtin_db_constraints(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
                 "label".into(),
                 Value::Property(Property::String(spec.label)),
             );
-            row.insert(
-                "property".into(),
-                Value::Property(Property::String(spec.property)),
-            );
+            let props: Vec<Property> = spec.properties.into_iter().map(Property::String).collect();
+            row.insert("properties".into(), Value::Property(Property::List(props)));
             row.insert(
                 "type".into(),
                 Value::Property(Property::String(spec.kind.as_string())),
@@ -311,8 +309,12 @@ impl ProcedureRegistry {
                     ty: ProcType::String,
                 },
                 ProcOutSpec {
-                    name: "property".into(),
-                    ty: ProcType::String,
+                    name: "properties".into(),
+                    // Returned as a list of strings; the type lattice
+                    // doesn't have a dedicated `List<String>` variant
+                    // so `ANY` is the closest fit — the executor
+                    // preserves the actual List value at call time.
+                    ty: ProcType::Any,
                 },
                 ProcOutSpec {
                     name: "type".into(),

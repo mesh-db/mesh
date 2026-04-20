@@ -948,14 +948,14 @@ fn apply_ddl_to_store(
         GraphCommand::CreateConstraint {
             name,
             label,
-            property,
+            properties,
             kind,
             if_not_exists,
         } => {
             store.create_property_constraint(
                 name.as_deref(),
                 label,
-                property,
+                properties,
                 storage_kind(*kind),
                 *if_not_exists,
             )?;
@@ -986,7 +986,7 @@ fn invert_ddl(cmd: &GraphCommand) -> GraphCommand {
         GraphCommand::CreateConstraint {
             name,
             label,
-            property,
+            properties,
             kind,
             ..
         } => {
@@ -998,7 +998,7 @@ fn invert_ddl(cmd: &GraphCommand) -> GraphCommand {
             // (`IF NOT EXISTS` or idempotent re-declaration), in
             // which case the inverse must also succeed as a no-op.
             GraphCommand::DropConstraint {
-                name: resolved_constraint_name(name, label, property, *kind),
+                name: resolved_constraint_name(name, label, properties, *kind),
                 if_exists: true,
             }
         }
@@ -1043,7 +1043,7 @@ async fn try_remote_ddl_on_peer(
             GraphCommand::CreateConstraint {
                 name,
                 label,
-                property,
+                properties,
                 kind,
                 if_not_exists,
             } => {
@@ -1054,7 +1054,7 @@ async fn try_remote_ddl_on_peer(
                         // optional-by-convention encoding.
                         name: name.clone().unwrap_or_default(),
                         label: label.clone(),
-                        property: property.clone(),
+                        properties: properties.clone(),
                         kind: proto_kind(*kind) as i32,
                         if_not_exists: *if_not_exists,
                         property_type: proto_property_type_from_kind(*kind) as i32,
@@ -1084,6 +1084,7 @@ fn proto_kind(kind: ClusterConstraintKind) -> ProtoConstraintKind {
         ClusterConstraintKind::Unique => ProtoConstraintKind::Unique,
         ClusterConstraintKind::NotNull => ProtoConstraintKind::NotNull,
         ClusterConstraintKind::PropertyType(_) => ProtoConstraintKind::PropertyType,
+        ClusterConstraintKind::NodeKey => ProtoConstraintKind::NodeKey,
     }
 }
 
@@ -1109,6 +1110,7 @@ fn cluster_kind_from_proto(kind: i32, property_type: i32) -> Result<ClusterConst
     match ProtoConstraintKind::try_from(kind).unwrap_or(ProtoConstraintKind::Unspecified) {
         ProtoConstraintKind::Unique => Ok(ClusterConstraintKind::Unique),
         ProtoConstraintKind::NotNull => Ok(ClusterConstraintKind::NotNull),
+        ProtoConstraintKind::NodeKey => Ok(ClusterConstraintKind::NodeKey),
         ProtoConstraintKind::PropertyType => {
             let t = match ProtoPropertyTypeKind::try_from(property_type)
                 .unwrap_or(ProtoPropertyTypeKind::Unspecified)
@@ -1180,14 +1182,14 @@ fn apply_ddl_commands(
             GraphCommand::CreateConstraint {
                 name,
                 label,
-                property,
+                properties,
                 kind,
                 if_not_exists,
             } => {
                 store.create_property_constraint(
                     name.as_deref(),
                     label,
-                    property,
+                    properties,
                     storage_kind(*kind),
                     *if_not_exists,
                 )?;
@@ -1893,7 +1895,7 @@ impl MeshWrite for MeshService {
             .create_property_constraint(
                 name,
                 &req.label,
-                &req.property,
+                &req.properties,
                 storage_kind(kind),
                 req.if_not_exists,
             )

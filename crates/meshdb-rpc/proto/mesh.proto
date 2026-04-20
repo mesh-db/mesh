@@ -320,6 +320,7 @@ enum ConstraintKind {
   CONSTRAINT_KIND_UNIQUE = 1;
   CONSTRAINT_KIND_NOT_NULL = 2;
   CONSTRAINT_KIND_PROPERTY_TYPE = 3;
+  CONSTRAINT_KIND_NODE_KEY = 4;
 }
 
 // Target-type sub-enum for `IS :: <TYPE>` constraints. Only
@@ -337,15 +338,17 @@ enum PropertyTypeKind {
 message CreatePropertyConstraintRequest {
   // Optional user-supplied name. Empty string represents `None`;
   // the receiver resolves the auto-generated default deterministically
-  // from `(label, property, kind)` so every peer ends up with the
+  // from `(label, properties, kind)` so every peer ends up with the
   // same final name.
   string name = 1;
   string label = 2;
-  string property = 3;
+  // Non-empty property list. Single-property kinds carry a one-
+  // element list; `NODE_KEY` carries the full tuple.
+  repeated string properties = 3;
   ConstraintKind kind = 4;
   bool if_not_exists = 5;
   // Only meaningful when `kind == CONSTRAINT_KIND_PROPERTY_TYPE`.
-  // Ignored for UNIQUE / NOT NULL.
+  // Ignored for UNIQUE / NOT NULL / NODE_KEY.
   PropertyTypeKind property_type = 6;
 }
 message CreatePropertyConstraintResponse {}

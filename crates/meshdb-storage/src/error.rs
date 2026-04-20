@@ -52,6 +52,14 @@ pub enum Error {
     #[error("no constraint named `{name}`")]
     ConstraintNotFound { name: String },
 
+    /// Property-arity mismatch: the caller passed a property list
+    /// whose length is wrong for the constraint kind — e.g. two
+    /// properties to a `UNIQUE` (which accepts exactly one) or an
+    /// empty list to any kind. Surfaced so the Cypher surface can
+    /// give a clear error instead of silently clipping the list.
+    #[error("invalid property arity for {kind}: {details}")]
+    ConstraintArity { kind: String, details: String },
+
     /// A write would put the store into a state that violates a
     /// registered constraint. The `kind` field carries the constraint
     /// type (e.g. `UNIQUE`, `NOT NULL`, `IS :: STRING`) so callers can

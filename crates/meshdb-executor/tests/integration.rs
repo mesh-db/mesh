@@ -69,6 +69,22 @@ fn str_prop(row: &Row, key: &str) -> String {
     }
 }
 
+/// Extract a list-of-strings property column. Used by the constraint
+/// tests, where `SHOW CONSTRAINTS` emits `properties` as a list to
+/// accommodate composite kinds (`NODE KEY`).
+fn str_list_prop(row: &Row, key: &str) -> Vec<String> {
+    match row.get(key) {
+        Some(Value::Property(Property::List(items))) => items
+            .iter()
+            .map(|v| match v {
+                Property::String(s) => s.clone(),
+                other => panic!("expected string element in list at {key}, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected list at {key}, got {other:?}"),
+    }
+}
+
 fn int_prop(row: &Row, key: &str) -> i64 {
     match row.get(key) {
         Some(Value::Property(Property::Int64(i))) => *i,
@@ -7478,7 +7494,7 @@ fn create_unique_constraint_round_trip() {
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "state"), "created");
     assert_eq!(str_prop(&rows[0], "label"), "Person");
-    assert_eq!(str_prop(&rows[0], "property"), "email");
+    assert_eq!(str_list_prop(&rows[0], "properties"), vec!["email"]);
     assert_eq!(str_prop(&rows[0], "type"), "UNIQUE");
     // Auto-generated name format.
     assert_eq!(str_prop(&rows[0], "name"), "constraint_Person_email_unique");
@@ -7737,6 +7753,102 @@ fn property_type_constraint_shown_in_show_constraints() {
     let rows = run(&store, "SHOW CONSTRAINTS");
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "type"), "IS :: STRING");
+}
+
+#[test]
+fn node_key_constraint_single_property_enforces_presence_and_uniqueness() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.id IS NODE KEY",
+    );
+    run(&store, "CREATE (:Person {id: 1})");
+    // Missing id — fails NODE KEY (existence).
+    assert!(run_catch(&store, "CREATE (:Person {name: 'Ada'})").is_err());
+    // Duplicate id — fails NODE KEY (uniqueness).
+    assert!(run_catch(&store, "CREATE (:Person {id: 1})").is_err());
+    // New distinct id — allowed.
+    run(&store, "CREATE (:Person {id: 2})");
+    assert_eq!(run(&store, "MATCH (p:Person) RETURN p").len(), 2);
+}
+
+#[test]
+fn node_key_composite_constraint_enforces_tuple_uniqueness() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.first, p.last) IS NODE KEY",
+    );
+    run(&store, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})");
+    // Same first, different last — allowed.
+    run(&store, "CREATE (:Person {first: 'Ada', last: 'Byron'})");
+    // Same last, different first — allowed.
+    run(
+        &store,
+        "CREATE (:Person {first: 'Grace', last: 'Lovelace'})",
+    );
+    // Exact tuple duplicate — rejected.
+    let err = run_catch(&store, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})").unwrap_err();
+    assert!(err.to_string().contains("NODE KEY"));
+    // Missing one of the composite properties — rejected.
+    assert!(run_catch(&store, "CREATE (:Person {first: 'Alan'})").is_err());
+    assert_eq!(run(&store, "MATCH (p:Person) RETURN p").len(), 3);
+}
+
+#[test]
+fn node_key_shown_as_list_in_show_constraints() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.first, p.last) IS NODE KEY",
+    );
+    let rows = run(&store, "SHOW CONSTRAINTS");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "type"), "NODE KEY");
+    assert_eq!(
+        str_list_prop(&rows[0], "properties"),
+        vec!["first".to_string(), "last".to_string()]
+    );
+}
+
+#[test]
+fn node_key_rejects_existing_duplicate_tuple() {
+    // Backfill validation: pre-existing duplicate tuple blocks the
+    // composite constraint from being declared.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})");
+    run(&store, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})");
+    let err = run_catch(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.first, p.last) IS NODE KEY",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("NODE KEY"));
+}
+
+#[test]
+fn node_key_rejects_existing_missing_property() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {first: 'Ada'})");
+    let err = run_catch(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.first, p.last) IS NODE KEY",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("NODE KEY"));
+}
+
+#[test]
+fn node_key_auto_name_includes_all_properties() {
+    let (store, _d) = open_store();
+    let rows = run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.first, p.last) IS NODE KEY",
+    );
+    assert_eq!(
+        str_prop(&rows[0], "name"),
+        "constraint_Person_first_last_node_key"
+    );
 }
 
 #[test]

@@ -444,7 +444,7 @@ pub enum LogicalPlan {
     CreatePropertyConstraint {
         name: Option<String>,
         label: String,
-        property: String,
+        properties: Vec<String>,
         kind: ConstraintKind,
         if_not_exists: bool,
     },
@@ -645,13 +645,13 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
         Statement::CreateConstraint(CreateConstraintStmt {
             name,
             label,
-            property,
+            properties,
             kind,
             if_not_exists,
         }) => LogicalPlan::CreatePropertyConstraint {
             name: name.clone(),
             label: label.clone(),
-            property: property.clone(),
+            properties: properties.clone(),
             kind: *kind,
             if_not_exists: *if_not_exists,
         },
@@ -976,13 +976,14 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         LogicalPlan::CreatePropertyConstraint {
             name,
             label,
-            property,
+            properties,
             kind,
             ..
         } => {
             let kind_str = match kind {
                 ConstraintKind::Unique => "UNIQUE".to_string(),
                 ConstraintKind::NotNull => "NOT NULL".to_string(),
+                ConstraintKind::NodeKey => "NODE KEY".to_string(),
                 ConstraintKind::PropertyType(t) => format!(
                     ":: {}",
                     match t {
@@ -994,8 +995,9 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
                 ),
             };
             let name_str = name.as_deref().unwrap_or("<auto>");
+            let props = properties.join(", ");
             buf.push_str(&format!(
-                "{indent}CreatePropertyConstraint({name_str}: {label}.{property} IS {kind_str})\n"
+                "{indent}CreatePropertyConstraint({name_str}: {label}.({props}) IS {kind_str})\n"
             ));
         }
         LogicalPlan::DropPropertyConstraint { name, if_exists } => {

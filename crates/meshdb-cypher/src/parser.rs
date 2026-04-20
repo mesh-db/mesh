@@ -237,7 +237,7 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstra
     let mut name: Option<String> = None;
     let mut if_not_exists = false;
     let mut label: Option<String> = None;
-    let mut property: Option<String> = None;
+    let mut properties: Vec<String> = Vec::new();
     let mut kind: Option<crate::ast::ConstraintKind> = None;
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -269,7 +269,21 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstra
                 let key = inner
                     .next()
                     .ok_or_else(|| Error::Parse("constraint property missing key".into()))?;
-                property = Some(parse_ident(key.as_str()));
+                properties.push(parse_ident(key.as_str()));
+            }
+            Rule::constraint_property_list => {
+                for child in p.into_inner() {
+                    if child.as_rule() == Rule::constraint_property {
+                        let mut inner = child.into_inner();
+                        let _var = inner.next().ok_or_else(|| {
+                            Error::Parse("constraint property missing var".into())
+                        })?;
+                        let key = inner.next().ok_or_else(|| {
+                            Error::Parse("constraint property missing key".into())
+                        })?;
+                        properties.push(parse_ident(key.as_str()));
+                    }
+                }
             }
             Rule::constraint_requirement => {
                 // `constraint_requirement` is the
@@ -285,6 +299,7 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstra
                 kind = Some(match req.as_rule() {
                     Rule::req_unique => crate::ast::ConstraintKind::Unique,
                     Rule::req_not_null => crate::ast::ConstraintKind::NotNull,
+                    Rule::req_node_key => crate::ast::ConstraintKind::NodeKey,
                     Rule::req_property_type => {
                         let tag = req
                             .into_inner()
@@ -315,11 +330,13 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstra
             _ => {}
         }
     }
+    if properties.is_empty() {
+        return Err(Error::Parse("create constraint missing property".into()));
+    }
     Ok(crate::ast::CreateConstraintStmt {
         name,
         label: label.ok_or_else(|| Error::Parse("create constraint missing label".into()))?,
-        property: property
-            .ok_or_else(|| Error::Parse("create constraint missing property".into()))?,
+        properties,
         kind: kind.ok_or_else(|| Error::Parse("create constraint missing requirement".into()))?,
         if_not_exists,
     })

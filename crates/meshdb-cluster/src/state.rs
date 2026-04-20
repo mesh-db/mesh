@@ -73,7 +73,11 @@ pub enum GraphCommand {
     CreateConstraint {
         name: Option<String>,
         label: String,
-        property: String,
+        /// Non-empty list of property names the constraint applies
+        /// to. Single-property kinds (`Unique`, `NotNull`,
+        /// `PropertyType`) carry a one-element list; `NodeKey`
+        /// carries the full composite tuple.
+        properties: Vec<String>,
         kind: ConstraintKind,
         if_not_exists: bool,
     },
@@ -100,6 +104,11 @@ pub enum ConstraintKind {
     Unique,
     NotNull,
     PropertyType(PropertyType),
+    /// Composite `REQUIRE (n.a, n.b) IS NODE KEY` — tuple uniqueness
+    /// plus a NOT NULL obligation on every listed property. The
+    /// property list lives on the enclosing `GraphCommand::CreateConstraint`
+    /// so replicas see the exact tuple the proposer sent.
+    NodeKey,
 }
 
 /// Property types recognised by `IS :: <TYPE>`. Kept numeric-neutral
@@ -135,6 +144,7 @@ impl ConstraintKind {
             ConstraintKind::Unique => "unique".into(),
             ConstraintKind::NotNull => "not_null".into(),
             ConstraintKind::PropertyType(t) => format!("type_{}", t.name_tag()),
+            ConstraintKind::NodeKey => "node_key".into(),
         }
     }
 }
@@ -147,12 +157,15 @@ impl ConstraintKind {
 pub fn resolved_constraint_name(
     name: &Option<String>,
     label: &str,
-    property: &str,
+    properties: &[String],
     kind: ConstraintKind,
 ) -> String {
     match name {
         Some(n) => n.clone(),
-        None => format!("constraint_{label}_{property}_{}", kind.name_tag()),
+        None => {
+            let joined = properties.join("_");
+            format!("constraint_{label}_{joined}_{}", kind.name_tag())
+        }
     }
 }
 

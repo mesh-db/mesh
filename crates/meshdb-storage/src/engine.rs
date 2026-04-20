@@ -46,6 +46,12 @@ pub enum PropertyConstraintKind {
     Unique,
     NotNull,
     PropertyType(PropertyType),
+    /// `REQUIRE (n.a, n.b) IS NODE KEY` — composite uniqueness + NOT
+    /// NULL. The constraint holds across the tuple of values the
+    /// spec's `properties` list names; each property must be present
+    /// and the tuple must be unique across every node carrying the
+    /// constrained label.
+    NodeKey,
 }
 
 /// Property types recognised by `IS :: <TYPE>`. Covers the four
@@ -95,6 +101,7 @@ impl PropertyConstraintKind {
             PropertyConstraintKind::Unique => "UNIQUE".into(),
             PropertyConstraintKind::NotNull => "NOT NULL".into(),
             PropertyConstraintKind::PropertyType(t) => format!("IS :: {}", t.as_str()),
+            PropertyConstraintKind::NodeKey => "NODE KEY".into(),
         }
     }
 
@@ -107,22 +114,45 @@ impl PropertyConstraintKind {
             PropertyConstraintKind::Unique => "unique".into(),
             PropertyConstraintKind::NotNull => "not_null".into(),
             PropertyConstraintKind::PropertyType(t) => format!("type_{}", t.name_tag()),
+            PropertyConstraintKind::NodeKey => "node_key".into(),
         }
+    }
+
+    /// True iff the kind accepts more than one property in its spec.
+    /// Used by the storage layer to validate the `properties` list
+    /// length at create time — single-property kinds must not receive
+    /// a multi-element list.
+    pub fn allows_multi_property(&self) -> bool {
+        matches!(self, PropertyConstraintKind::NodeKey)
     }
 }
 
-/// Declarative spec for a single-property constraint. Unlike
+/// Declarative spec for a property constraint. Unlike
 /// [`PropertyIndexSpec`], constraints carry a user-facing `name` —
-/// `DROP CONSTRAINT` takes a name, not a `(label, property, kind)`
-/// triple, so the registry keys on name for lookup. When the user
+/// `DROP CONSTRAINT` takes a name, not a `(label, properties, kind)`
+/// tuple, so the registry keys on name for lookup. When the user
 /// omits the name, [`StorageEngine::create_property_constraint`] fills
 /// in a deterministic one derived from the other fields.
+///
+/// `properties` is a list so that [`PropertyConstraintKind::NodeKey`]
+/// can carry its composite tuple here alongside single-property kinds;
+/// the single-property kinds (`Unique`, `NotNull`, `PropertyType`)
+/// enforce a length-one invariant at creation time.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PropertyConstraintSpec {
     pub name: String,
     pub label: String,
-    pub property: String,
+    pub properties: Vec<String>,
     pub kind: PropertyConstraintKind,
+}
+
+impl PropertyConstraintSpec {
+    /// The constraint's first (and for single-property kinds, only)
+    /// property name. Handy shorthand for call sites that already
+    /// know the spec is single-property.
+    pub fn primary_property(&self) -> &str {
+        self.properties.first().map(String::as_str).unwrap_or("")
+    }
 }
 
 /// A single mutation that can be combined with others into an atomic
@@ -209,7 +239,7 @@ pub trait StorageEngine: Send + Sync {
         &self,
         name: Option<&str>,
         label: &str,
-        property: &str,
+        properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
     ) -> Result<PropertyConstraintSpec>;

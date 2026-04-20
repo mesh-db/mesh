@@ -310,7 +310,7 @@ async fn constraint_ddl_replicates_to_follower_store() {
         .propose_graph(GraphCommand::CreateConstraint {
             name: Some("email_uniq".into()),
             label: "Person".into(),
-            property: "email".into(),
+            properties: vec!["email".into()],
             kind: ConstraintKind::Unique,
             if_not_exists: false,
         })
@@ -330,7 +330,7 @@ async fn constraint_ddl_replicates_to_follower_store() {
         if !specs.is_empty() {
             assert_eq!(specs[0].name, "email_uniq");
             assert_eq!(specs[0].label, "Person");
-            assert_eq!(specs[0].property, "email");
+            assert_eq!(specs[0].properties, vec!["email".to_string()]);
             replicated = true;
             break;
         }
@@ -422,7 +422,7 @@ async fn auto_named_constraint_resolves_consistently() {
         .propose_graph(GraphCommand::CreateConstraint {
             name: None,
             label: "Widget".into(),
-            property: "sku".into(),
+            properties: vec!["sku".into()],
             kind: ConstraintKind::NotNull,
             if_not_exists: false,
         })

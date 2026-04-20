@@ -120,7 +120,7 @@ impl GraphStateMachine for StoreGraphApplier {
             GraphCommand::CreateConstraint {
                 name,
                 label,
-                property,
+                properties,
                 kind,
                 if_not_exists,
             } => self
@@ -128,7 +128,7 @@ impl GraphStateMachine for StoreGraphApplier {
                 .create_property_constraint(
                     name.as_deref(),
                     label,
-                    property,
+                    properties,
                     storage_kind(*kind),
                     *if_not_exists,
                 )
@@ -441,7 +441,7 @@ fn apply_ddl_and_collect(
             GraphCommand::CreateConstraint {
                 name,
                 label,
-                property,
+                properties,
                 kind,
                 if_not_exists,
             } => {
@@ -449,7 +449,7 @@ fn apply_ddl_and_collect(
                     .create_property_constraint(
                         name.as_deref(),
                         label,
-                        property,
+                        properties,
                         storage_kind(*kind),
                         *if_not_exists,
                     )
@@ -475,6 +475,7 @@ pub(crate) fn storage_kind(kind: ClusterConstraintKind) -> PropertyConstraintKin
         ClusterConstraintKind::PropertyType(t) => {
             PropertyConstraintKind::PropertyType(storage_property_type(t))
         }
+        ClusterConstraintKind::NodeKey => PropertyConstraintKind::NodeKey,
     }
 }
 

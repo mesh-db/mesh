@@ -45,12 +45,14 @@ pub trait GraphWriter {
     /// Declare a new property constraint. Default impl errors so
     /// remote writers that haven't plumbed constraint DDL yet surface
     /// the limitation immediately — storage-backed writers override
-    /// via the blanket impl.
+    /// via the blanket impl. `properties` is a list to accommodate
+    /// composite kinds (`NodeKey`); single-property kinds pass a
+    /// one-element slice.
     fn create_property_constraint(
         &self,
         _name: Option<&str>,
         _label: &str,
-        _property: &str,
+        _properties: &[String],
         _kind: PropertyConstraintKind,
         _if_not_exists: bool,
     ) -> Result<PropertyConstraintSpec> {
@@ -122,7 +124,7 @@ impl<T: StorageEngine> GraphWriter for T {
         &self,
         name: Option<&str>,
         label: &str,
-        property: &str,
+        properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
     ) -> Result<PropertyConstraintSpec> {
@@ -130,7 +132,7 @@ impl<T: StorageEngine> GraphWriter for T {
             self,
             name,
             label,
-            property,
+            properties,
             kind,
             if_not_exists,
         )?)
@@ -196,13 +198,13 @@ impl GraphWriter for StorageWriterAdapter<'_> {
         &self,
         name: Option<&str>,
         label: &str,
-        property: &str,
+        properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
     ) -> Result<PropertyConstraintSpec> {
         Ok(self
             .0
-            .create_property_constraint(name, label, property, kind, if_not_exists)?)
+            .create_property_constraint(name, label, properties, kind, if_not_exists)?)
     }
 
     fn drop_property_constraint(&self, name: &str, if_exists: bool) -> Result<()> {
