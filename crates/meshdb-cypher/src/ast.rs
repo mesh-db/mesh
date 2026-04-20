@@ -606,6 +606,13 @@ pub enum Expr {
     CountSubquery {
         body: Box<Statement>,
     },
+    /// `collect { read_stmt }` — returns a list of the subquery's
+    /// single-column RETURN values in row order. The body must
+    /// project exactly one column; multi-column RETURNs raise at
+    /// plan time.
+    CollectSubquery {
+        body: Box<Statement>,
+    },
     /// `any(x IN list WHERE pred)`, `all(...)`, `none(...)`, `single(...)`
     ListPredicate {
         kind: ListPredicateKind,

@@ -817,6 +817,10 @@ pub(crate) fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 Ok(Value::Property(Property::Int64(n)))
             }
         }
+        Expr::CollectSubquery { body } => {
+            let items = execute_collect_subquery(body, ctx)?;
+            Ok(Value::List(items))
+        }
         Expr::PatternComprehension {
             pattern,
             predicate,
@@ -1061,6 +1065,54 @@ fn walk_subquery_hops(
             Ok(count)
         }
     }
+}
+
+/// Run a `COLLECT { ... }` subquery body and gather its single-column
+/// return values into a list. Requires exactly one return column;
+/// raises `InvalidArgumentValue` at runtime when the body projects
+/// zero or multiple columns. Outer-row bindings are correlated the
+/// same way `execute_subquery_body` does it.
+fn execute_collect_subquery(
+    body: &meshdb_cypher::Statement,
+    ctx: &EvalCtx,
+) -> Result<Vec<Value>> {
+    let mut planner_ctx = meshdb_cypher::PlannerContext::default();
+    for (name, value) in ctx.row.iter() {
+        let kind = match value {
+            Value::Node(_) => meshdb_cypher::OuterBindingKind::Node,
+            Value::Edge(_) => meshdb_cypher::OuterBindingKind::Edge,
+            _ => meshdb_cypher::OuterBindingKind::Scalar,
+        };
+        planner_ctx.outer_bindings.push((name.clone(), kind));
+    }
+    let plan = meshdb_cypher::plan_with_context(body, &planner_ctx)
+        .map_err(|e| Error::Unsupported(e.to_string()))?;
+    let mut op = crate::ops::build_op_inner(&plan, Some(ctx.row));
+    let noop = crate::ops::NoOpWriter;
+    let tombstones = crate::ops::Tombstones::default();
+    let exec_ctx = crate::ops::ExecCtx {
+        store: ctx.reader,
+        writer: &noop,
+        params: ctx.params,
+        procedures: ctx.procedures,
+        outer_rows: &[],
+        tombstones: &tombstones,
+    };
+    let mut out: Vec<Value> = Vec::new();
+    while let Some(row) = op.next(&exec_ctx)? {
+        // openCypher requires a COLLECT subquery to project exactly
+        // one return column. `row` here is a HashMap keyed by the
+        // return alias, so size != 1 → raise.
+        if row.len() != 1 {
+            return Err(Error::InvalidArgumentValue(format!(
+                "COLLECT {{ ... }} must return a single column, got {}",
+                row.len()
+            )));
+        }
+        let (_, v) = row.into_iter().next().unwrap();
+        out.push(v);
+    }
+    Ok(out)
 }
 
 fn execute_subquery_body(body: &meshdb_cypher::Statement, ctx: &EvalCtx) -> Result<i64> {

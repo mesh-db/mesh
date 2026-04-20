@@ -2366,6 +2366,16 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
                 body: Box::new(stmt),
             })
         }
+        Rule::collect_subquery => {
+            let inner = pair
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::subquery_body)
+                .ok_or_else(|| Error::Parse("collect subquery missing body".into()))?;
+            let stmt = build_subquery_body(inner)?;
+            Ok(Expr::CollectSubquery {
+                body: Box::new(stmt),
+            })
+        }
         Rule::pattern_predicate => {
             // `pattern_predicate` has a simpler inner structure
             // than the top-level `pattern` rule (no

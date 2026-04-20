@@ -1,7 +1,8 @@
 use meshdb_core::{Edge, Node, NodeId, Property};
 use meshdb_cypher::{parse, plan, plan_with_context, PlannerContext};
 use meshdb_executor::{
-    execute, execute_with_reader, explain, profile, GraphReader, GraphWriter, ParamMap, Row, Value,
+    execute, execute_with_reader, execute_with_reader_and_procs, explain, profile, GraphReader,
+    GraphWriter, ParamMap, ProcedureRegistry, Row, Value,
 };
 use meshdb_storage::RocksDbStorageEngine as Store;
 use tempfile::TempDir;
@@ -24,6 +25,26 @@ fn run(store: &Store, q: &str) -> Vec<Row> {
     }
     let p = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
     execute(&p, store).unwrap_or_else(|e| panic!("exec {q}: {e}"))
+}
+
+/// Like `run`, but registers the default `db.*` procedures so tests
+/// for `CALL db.labels()` / `db.relationshipTypes()` / `db.propertyKeys()`
+/// can invoke them — the plain `run` helper uses an empty procedure
+/// registry.
+fn run_with_default_procs(store: &Store, q: &str) -> Vec<Row> {
+    let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+    let p = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+    let mut procs = ProcedureRegistry::new();
+    procs.register_defaults();
+    let params = ParamMap::new();
+    execute_with_reader_and_procs(
+        &p,
+        store as &dyn GraphReader,
+        store as &dyn GraphWriter,
+        &params,
+        &procs,
+    )
+    .unwrap_or_else(|e| panic!("exec {q}: {e}"))
 }
 
 /// Same as `run` but threads a `ParamMap` through to the executor —
@@ -3195,6 +3216,110 @@ fn count_function_still_works_as_aggregate() {
     let rows = run(&store, "MATCH (n:N) RETURN count(*) AS c");
     assert_eq!(rows.len(), 1);
     assert_eq!(int_prop(&rows[0], "c"), 3);
+}
+
+// --- collect { } subquery -----------------------------------------------
+
+#[test]
+fn collect_subquery_returns_correlated_values_as_list() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}) \
+         CREATE (a)-[:KNOWS]->(:Person {name: 'Cara'})",
+    );
+    let rows = run(
+        &store,
+        "MATCH (p:Person {name: 'Ada'}) \
+         RETURN collect { MATCH (p)-[:KNOWS]->(f) RETURN f.name } AS friends",
+    );
+    assert_eq!(rows.len(), 1);
+    let friends = match rows[0].get("friends") {
+        Some(Value::List(items)) => items.clone(),
+        other => panic!("expected list, got {other:?}"),
+    };
+    let mut names: Vec<String> = friends
+        .iter()
+        .map(|v| match v {
+            Value::Property(Property::String(s)) => s.clone(),
+            other => panic!("expected string element, got {other:?}"),
+        })
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Bob".to_string(), "Cara".to_string()]);
+}
+
+#[test]
+fn collect_subquery_empty_when_no_matches() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    let rows = run(
+        &store,
+        "MATCH (p:Person) \
+         RETURN collect { MATCH (p)-[:NOPE]->(x) RETURN x.name } AS xs",
+    );
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("xs") {
+        Some(Value::List(items)) => assert!(items.is_empty()),
+        other => panic!("expected empty list, got {other:?}"),
+    }
+}
+
+// --- built-in db.* procedures ------------------------------------------
+
+#[test]
+fn db_labels_yields_distinct_node_labels() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person)");
+    run(&store, "CREATE (:Person)");
+    run(&store, "CREATE (:City)");
+    run(&store, "CREATE (:City:Capital)");
+    let rows = run_with_default_procs(&store, "CALL db.labels() YIELD label RETURN label");
+    let mut labels: Vec<String> = rows.iter().map(|r| str_prop(r, "label")).collect();
+    labels.sort();
+    assert_eq!(labels, vec!["Capital", "City", "Person"]);
+}
+
+#[test]
+fn db_relationship_types_yields_distinct_edge_types() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:A)-[:KNOWS]->(:A)");
+    run(&store, "CREATE (:A)-[:KNOWS]->(:A)");
+    run(&store, "CREATE (:A)-[:FOLLOWS]->(:A)");
+    let rows = run_with_default_procs(
+        &store,
+        "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType",
+    );
+    let mut types: Vec<String> = rows
+        .iter()
+        .map(|r| str_prop(r, "relationshipType"))
+        .collect();
+    types.sort();
+    assert_eq!(types, vec!["FOLLOWS", "KNOWS"]);
+}
+
+#[test]
+fn db_property_keys_includes_node_and_edge_keys() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'Ada', age: 36})");
+    run(
+        &store,
+        "MATCH (p:P) CREATE (p)-[:R {since: 2020}]->(:P {name: 'Bob'})",
+    );
+    let rows = run_with_default_procs(
+        &store,
+        "CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey",
+    );
+    let mut keys: Vec<String> = rows.iter().map(|r| str_prop(r, "propertyKey")).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["age", "name", "since"]);
 }
 
 // --- CALL { } subquery --------------------------------------------------

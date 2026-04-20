@@ -375,6 +375,7 @@ base_primary = {
     list_predicate |
     count_subquery |
     exists_subquery |
+    collect_subquery |
     pattern_comprehension |
     list_comp |
     list_literal |
@@ -402,6 +403,14 @@ count_subquery = {
 
 exists_subquery = {
     kw_exists ~ "{" ~ subquery_body ~ "}"
+}
+
+// `COLLECT { <read_stmt> }` — Cypher 5 subquery expression that
+// evaluates the body and gathers the results into a list. The
+// body must project exactly one return column; evaluation returns
+// the column values in row order as a `Property::List`.
+collect_subquery = {
+    kw_collect ~ "{" ~ subquery_body ~ "}"
 }
 
 subquery_body = { read_stmt | bare_match_body | bare_pattern_body }
@@ -562,6 +571,7 @@ kw_explain = @{ ^"explain" ~ !id_cont }
 kw_profile = @{ ^"profile" ~ !id_cont }
 kw_remove = _{ ^"remove" }
 kw_count = @{ ^"count" ~ !id_cont }
+kw_collect = @{ ^"collect" ~ !id_cont }
 kw_call = _{ ^"call" }
 kw_yield = @{ ^"yield" ~ !id_cont }
 kw_foreach = _{ ^"foreach" }

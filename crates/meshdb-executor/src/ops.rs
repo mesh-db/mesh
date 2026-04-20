@@ -1892,7 +1892,8 @@ impl ProcedureCallOp {
             return Ok(());
         }
         let args = self.evaluate_args(ctx, input_row, proc)?;
-        for proc_row in &proc.rows {
+        let rows = proc.resolve_rows(ctx.store)?;
+        for proc_row in &rows {
             if !proc.row_matches(proc_row, &args) {
                 continue;
             }

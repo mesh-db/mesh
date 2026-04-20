@@ -21,7 +21,10 @@ use crate::routing::Routing;
 use crate::tx_coordinator::TxCoordinator;
 use meshdb_cluster::raft::RaftCluster;
 use meshdb_cluster::{Error as ClusterError, GraphCommand, PeerId};
-use meshdb_executor::{execute_with_reader, GraphReader, GraphWriter, StorageReaderAdapter};
+use meshdb_executor::{
+    execute_with_reader_and_procs, GraphReader, GraphWriter, ProcedureRegistry,
+    StorageReaderAdapter,
+};
 use meshdb_storage::StorageEngine;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -327,6 +330,8 @@ impl MeshService {
                 // for in-tx RUNs so the executor sees the prior writes.
                 let overlay = crate::TxOverlayState::from_commands(&prev_commands);
 
+                let mut procs = ProcedureRegistry::new();
+                procs.register_defaults();
                 let rows = if let Some(r) = routing.as_ref() {
                     // Routing mode: reads go through a partitioned
                     // reader. Single-node and Raft modes use the local
@@ -335,20 +340,22 @@ impl MeshService {
                         PartitionedGraphReader::new(store.clone(), r.clone());
                     let base: &dyn GraphReader = &partitioned;
                     let reader = crate::OverlayGraphReader::new(base, &overlay);
-                    execute_with_reader(
+                    execute_with_reader_and_procs(
                         &plan,
                         &reader as &dyn GraphReader,
                         &writer as &dyn GraphWriter,
                         &exec_params,
+                        &procs,
                     )?
                 } else {
                     let base: &dyn GraphReader = &storage_reader;
                     let reader = crate::OverlayGraphReader::new(base, &overlay);
-                    execute_with_reader(
+                    execute_with_reader_and_procs(
                         &plan,
                         &reader as &dyn GraphReader,
                         &writer as &dyn GraphWriter,
                         &exec_params,
+                        &procs,
                     )?
                 };
                 Ok((rows, writer.into_commands()))

@@ -962,7 +962,10 @@ fn validate_pattern_predicates(plan: &LogicalPlan) -> Result<()> {
             if let Expr::PatternExists(pattern) = e {
                 validate_pattern_predicate(pattern)?;
             }
-            if let Expr::ExistsSubquery { body } | Expr::CountSubquery { body } = e {
+            if let Expr::ExistsSubquery { body }
+            | Expr::CountSubquery { body }
+            | Expr::CollectSubquery { body } = e
+            {
                 validate_subquery_body_is_read_only(body)?;
             }
             Ok(())
@@ -1380,7 +1383,9 @@ where
         // inner expressions get validated too. The pattern's
         // shape is checked separately by the subquery
         // validation pass.
-        Expr::ExistsSubquery { .. } | Expr::CountSubquery { .. } => Ok(()),
+        Expr::ExistsSubquery { .. }
+        | Expr::CountSubquery { .. }
+        | Expr::CollectSubquery { .. } => Ok(()),
         // Pattern comprehension: the pattern itself carries no
         // sub-expressions the walker cares about (same rule as
         // `PatternExists`), but the WHERE / projection are plain
@@ -1916,7 +1921,10 @@ fn check_set_expr_scope_inner(
         }
         Expr::UnaryOp { operand, .. } => check_set_expr_scope_inner(operand, bound, locals),
         // Subquery / pattern predicate bodies manage their own scope; skip.
-        Expr::PatternExists(_) | Expr::ExistsSubquery { .. } | Expr::CountSubquery { .. } => Ok(()),
+        Expr::PatternExists(_)
+        | Expr::ExistsSubquery { .. }
+        | Expr::CountSubquery { .. }
+        | Expr::CollectSubquery { .. } => Ok(()),
         // Pattern comprehension binds the pattern's node / edge
         // variables locally, so WHERE / projection see them on
         // top of the outer scope. Skipping the pattern itself
@@ -3231,6 +3239,7 @@ fn infer_expr_type(expr: &Expr, bound_vars: &HashMap<String, VarType>) -> VarTyp
         | Expr::PatternExists(_)
         | Expr::ExistsSubquery { .. }
         | Expr::CountSubquery { .. }
+        | Expr::CollectSubquery { .. }
         | Expr::ListComprehension { .. }
         | Expr::PatternComprehension { .. }
         | Expr::Reduce { .. }
@@ -5243,6 +5252,7 @@ fn verify_non_agg_refs(expr: &Expr, top_level_refs: &[&Expr]) -> Result<()> {
         // scopes; don't descend for the purposes of this check.
         Expr::ExistsSubquery { .. }
         | Expr::CountSubquery { .. }
+        | Expr::CollectSubquery { .. }
         | Expr::PatternExists(_)
         | Expr::PatternComprehension { .. }
         | Expr::ListComprehension { .. }

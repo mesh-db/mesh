@@ -1,6 +1,8 @@
+use crate::error::Result;
+use crate::reader::GraphReader;
 use crate::value::Value;
 use meshdb_core::Property;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Declared argument / output type for a procedure signature.
 /// Mirrors the openCypher type names the TCK uses (`STRING?`,
@@ -71,12 +73,32 @@ pub struct ProcOutSpec {
 /// input-column values (matched against call arguments) and the
 /// trailing cells are the output-column values (projected by
 /// YIELD).
+///
+/// Built-in procedures — `db.labels()` and friends — leave `rows`
+/// empty and set `builtin` so the executor materialises the row set
+/// live from the current graph via [`Procedure::resolve_rows`].
 #[derive(Debug, Clone)]
 pub struct Procedure {
     pub qualified_name: Vec<String>,
     pub inputs: Vec<ProcArgSpec>,
     pub outputs: Vec<ProcOutSpec>,
     pub rows: Vec<ProcRow>,
+    pub builtin: Option<BuiltinProc>,
+}
+
+/// Identifies a procedure whose rows are derived from the live graph
+/// at call time rather than pre-populated in [`Procedure::rows`].
+/// Keeps the procedure surface uniform — the executor still iterates
+/// `ProcRow`s; the only difference is who produced them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinProc {
+    /// `db.labels()` — yields one row per distinct node label.
+    DbLabels,
+    /// `db.relationshipTypes()` — yields one row per distinct edge type.
+    DbRelationshipTypes,
+    /// `db.propertyKeys()` — yields one row per distinct property key
+    /// observed on any node or edge.
+    DbPropertyKeys,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -101,6 +123,73 @@ impl Procedure {
         }
         true
     }
+
+    /// Produce the row set the executor should iterate. Static
+    /// procedures simply hand back their pre-populated `rows`;
+    /// built-ins derive their rows from the live graph via `reader`.
+    pub fn resolve_rows(&self, reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
+        match self.builtin {
+            None => Ok(self.rows.clone()),
+            Some(BuiltinProc::DbLabels) => builtin_db_labels(reader),
+            Some(BuiltinProc::DbRelationshipTypes) => builtin_db_relationship_types(reader),
+            Some(BuiltinProc::DbPropertyKeys) => builtin_db_property_keys(reader),
+        }
+    }
+}
+
+fn str_row(column: &str, value: String) -> ProcRow {
+    let mut row = HashMap::new();
+    row.insert(
+        column.to_string(),
+        Value::Property(Property::String(value)),
+    );
+    row
+}
+
+fn builtin_db_labels(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
+    let mut labels: BTreeSet<String> = BTreeSet::new();
+    for id in reader.all_node_ids()? {
+        if let Some(n) = reader.get_node(id)? {
+            for l in n.labels {
+                labels.insert(l);
+            }
+        }
+    }
+    Ok(labels.into_iter().map(|l| str_row("label", l)).collect())
+}
+
+fn builtin_db_relationship_types(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
+    let mut types: BTreeSet<String> = BTreeSet::new();
+    for id in reader.all_node_ids()? {
+        for (edge_id, _) in reader.outgoing(id)? {
+            if let Some(e) = reader.get_edge(edge_id)? {
+                types.insert(e.edge_type);
+            }
+        }
+    }
+    Ok(types
+        .into_iter()
+        .map(|t| str_row("relationshipType", t))
+        .collect())
+}
+
+fn builtin_db_property_keys(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    for id in reader.all_node_ids()? {
+        if let Some(n) = reader.get_node(id)? {
+            for k in n.properties.keys() {
+                keys.insert(k.clone());
+            }
+            for (edge_id, _) in reader.outgoing(id)? {
+                if let Some(e) = reader.get_edge(edge_id)? {
+                    for k in e.properties.keys() {
+                        keys.insert(k.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(keys.into_iter().map(|k| str_row("propertyKey", k)).collect())
 }
 
 fn values_equal_for_procedure(a: &Value, b: &Value) -> bool {
@@ -142,5 +231,43 @@ impl ProcedureRegistry {
 
     pub fn get(&self, qualified_name: &[String]) -> Option<&Procedure> {
         self.procs.get(&qualified_name.join("."))
+    }
+
+    /// Register the built-in `db.labels`, `db.relationshipTypes`, and
+    /// `db.propertyKeys` procedures. Call once at server startup —
+    /// the executor materialises each call's row set from the live
+    /// graph, so no data needs to be recomputed here when new
+    /// labels / types / keys appear.
+    pub fn register_defaults(&mut self) {
+        self.register(Procedure {
+            qualified_name: vec!["db".into(), "labels".into()],
+            inputs: Vec::new(),
+            outputs: vec![ProcOutSpec {
+                name: "label".into(),
+                ty: ProcType::String,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::DbLabels),
+        });
+        self.register(Procedure {
+            qualified_name: vec!["db".into(), "relationshipTypes".into()],
+            inputs: Vec::new(),
+            outputs: vec![ProcOutSpec {
+                name: "relationshipType".into(),
+                ty: ProcType::String,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::DbRelationshipTypes),
+        });
+        self.register(Procedure {
+            qualified_name: vec!["db".into(), "propertyKeys".into()],
+            inputs: Vec::new(),
+            outputs: vec![ProcOutSpec {
+                name: "propertyKey".into(),
+                ty: ProcType::String,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::DbPropertyKeys),
+        });
     }
 }
