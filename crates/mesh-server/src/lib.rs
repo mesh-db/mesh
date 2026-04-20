@@ -69,12 +69,32 @@ fn build_routing_service(
         Cluster::new(PeerId(config.self_id), config.num_partitions, peers)
             .context("building cluster")?,
     );
-    let routing = Arc::new(Routing::new(cluster).context("building routing")?);
+    let client_tls = build_grpc_client_tls(config)?;
+    let routing = Arc::new(match client_tls.clone() {
+        Some(tls) => Routing::with_tls(cluster, tls).context("building routing")?,
+        None => Routing::new(cluster).context("building routing")?,
+    });
     let log = Arc::new(
         CoordinatorLog::open(coordinator_log_path(&config.data_dir))
             .context("opening coordinator log")?,
     );
-    Ok(MeshService::with_routing_and_log(store, routing, Some(log)))
+    Ok(MeshService::with_routing_and_log(store, routing, Some(log)).with_client_tls(client_tls))
+}
+
+/// Build the [`tonic::transport::ClientTlsConfig`] used for outgoing
+/// peer channels when `config.grpc_tls` is set, or `Ok(None)` when
+/// it's not. Called by both the routing- and Raft-mode builders so
+/// every code path gets the same config.
+fn build_grpc_client_tls(
+    config: &ServerConfig,
+) -> Result<Option<tonic::transport::ClientTlsConfig>> {
+    let Some(tls_cfg) = config.grpc_tls.as_ref() else {
+        return Ok(None);
+    };
+    mesh_rpc::tls::install_default_crypto_provider();
+    let client = mesh_rpc::tls::build_client_tls_config(&tls_cfg.ca_path)
+        .context("building grpc client tls config")?;
+    Ok(Some(client))
 }
 
 /// Path of the coordinator recovery log inside the configured data
@@ -142,7 +162,11 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
         .filter(|p| p.id != config.self_id)
         .map(|p| (p.id, p.address.clone()))
         .collect();
-    let network = GrpcNetwork::new(peer_map).context("building grpc network")?;
+    let client_tls = build_grpc_client_tls(config)?;
+    let network = match client_tls.clone() {
+        Some(tls) => GrpcNetwork::with_tls(peer_map, tls).context("building grpc network")?,
+        None => GrpcNetwork::new(peer_map).context("building grpc network")?,
+    };
 
     // The graph applier translates committed GraphCommand entries into
     // local store writes — this is what makes the Raft replication actually
@@ -166,7 +190,7 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
 
     // The MeshService routes writes through Raft so every replica's local
     // store ends up consistent.
-    let service = MeshService::with_raft(store, raft.clone());
+    let service = MeshService::with_raft(store, raft.clone()).with_client_tls(client_tls);
 
     Ok(ServerComponents {
         service,
@@ -301,10 +325,31 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         None
     };
 
+    // Server-side TLS identity for the gRPC listener. Built up-front
+    // so a bad cert path fails before we spawn the server task.
+    let grpc_server_tls = if let Some(tls_cfg) = config.grpc_tls.as_ref() {
+        mesh_rpc::tls::install_default_crypto_provider();
+        Some(
+            mesh_rpc::tls::build_server_tls_config(&tls_cfg.cert_path, &tls_cfg.key_path)
+                .context("building grpc server tls config")?,
+        )
+    } else {
+        None
+    };
+    if grpc_server_tls.is_some() {
+        tracing::info!(addr = %local_addr, "mesh-server grpc tls enabled");
+    }
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let server_task = tokio::spawn(async move {
-        let mut router = Server::builder()
+        let mut builder = Server::builder();
+        if let Some(tls) = grpc_server_tls {
+            builder = builder
+                .tls_config(tls)
+                .context("applying grpc tls config")?;
+        }
+        let mut router = builder
             .add_service(service.clone().into_query_server())
             .add_service(service.into_write_server());
         if let Some(rs) = raft_service {

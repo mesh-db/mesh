@@ -200,14 +200,12 @@ pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<T
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-/// Install the default rustls crypto provider (aws-lc-rs). Safe to call
-/// repeatedly — subsequent calls are silently ignored, which is exactly
-/// the behavior we want when a test binary spawns multiple servers in
-/// the same process.
+/// Install the default rustls crypto provider (aws-lc-rs). Delegates
+/// to [`mesh_rpc::tls::install_default_crypto_provider`] so the Bolt
+/// and gRPC listeners share one source of truth. Safe to call
+/// repeatedly — subsequent calls are silently ignored.
 pub fn install_default_crypto_provider() {
-    // `install_default` returns `Result<(), CryptoProvider>`; the `Err`
-    // case means a provider is already installed, which is fine.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    mesh_rpc::tls::install_default_crypto_provider();
 }
 
 /// Run the full Bolt lifecycle on a single socket: handshake, HELLO,

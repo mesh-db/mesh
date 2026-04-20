@@ -288,11 +288,48 @@ you can require both credentials and TLS by setting both sections.
 
 ---
 
+## gRPC TLS
+
+The gRPC listener — which carries Raft replication, 2PC coordination,
+and scatter-gather queries between peers — can also terminate TLS.
+Unlike Bolt, every peer is both a gRPC server *and* a gRPC client
+(heartbeats, leader forwarding, remote reads), so the config describes
+both roles in one section:
+
+```toml
+[grpc_tls]
+cert_path = "/etc/mesh/peer-cert.pem"   # server identity presented to peers
+key_path  = "/etc/mesh/peer-key.pem"    # matching private key
+ca_path   = "/etc/mesh/peer-ca.pem"     # trust bundle for verifying peers
+```
+
+When `grpc_tls` is set on a peer, the URI scheme for outbound channels
+flips from `http://` to `https://` automatically; the section must be
+set on **every** peer in the cluster, since Mesh doesn't support
+mixed TLS / plaintext clusters.
+
+The simplest working setup for a small cluster is one shared
+self-signed certificate acting as its own CA, with every peer using
+the same cert/key/ca triple. The cert's Subject Alternative Names
+must cover every address peers dial — for the two-peer loopback
+example below that's `DNS:localhost, IP:127.0.0.1`:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout peer-key.pem -out peer-cert.pem -days 365 -nodes \
+  -subj '/CN=mesh-peer' \
+  -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+cp peer-cert.pem peer-ca.pem   # self-signed: cert is its own CA
+```
+
+Production deployments with a private CA signing one cert per peer
+follow the same shape — set `cert_path` / `key_path` to the per-peer
+pair, `ca_path` to the shared CA bundle.
+
+---
+
 ## Known limitations
 
-- **No TLS on the gRPC listener.** Bolt TLS is supported (see
-  [Bolt TLS](#bolt-tls) below); the internal gRPC listener that carries
-  Raft / 2PC traffic is still plaintext only.
 - **No built-in APOC procedure library.** The `CALL` procedure framework
   and an extensible `ProcedureRegistry` are in place, but no APOC-compatible
   procedures ship with Mesh.

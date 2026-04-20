@@ -25,7 +25,7 @@ use mesh_executor::{execute_with_reader, GraphReader, GraphWriter, StorageReader
 use mesh_storage::StorageEngine;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
@@ -42,6 +42,13 @@ pub struct MeshService {
     /// Durable 2PC coordinator log. Only populated in routing mode,
     /// where multi-peer transactions need a crash-recovery record.
     coordinator_log: Option<Arc<crate::CoordinatorLog>>,
+    /// Client TLS config used when this service builds ad-hoc gRPC
+    /// endpoints (leader forwarding in Raft mode, for example). `None`
+    /// means inter-peer gRPC traffic is plaintext. The `Routing` /
+    /// `GrpcNetwork` channels carry their own TLS config; this field
+    /// exists for the callsites that construct endpoints from a bare
+    /// `&str` address rather than looking them up in `Routing`.
+    client_tls: Option<ClientTlsConfig>,
 }
 
 impl MeshService {
@@ -53,6 +60,7 @@ impl MeshService {
             raft: None,
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
+            client_tls: None,
         }
     }
 
@@ -77,6 +85,7 @@ impl MeshService {
             raft: None,
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log,
+            client_tls: None,
         }
     }
 
@@ -91,7 +100,39 @@ impl MeshService {
             raft: Some(raft),
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
+            client_tls: None,
         }
+    }
+
+    /// Set the client TLS config used for ad-hoc gRPC endpoints built
+    /// inside the service — currently the two leader-forwarding sites
+    /// that construct an [`Endpoint`] from a peer address each call.
+    /// `None` (the default) means inter-peer gRPC traffic is plaintext
+    /// and URIs use `http://`; `Some(cfg)` switches to `https://` and
+    /// applies the TLS config on every outgoing channel.
+    pub fn with_client_tls(mut self, tls: Option<ClientTlsConfig>) -> Self {
+        self.client_tls = tls;
+        self
+    }
+
+    /// Build an [`Endpoint`] for a peer address, applying this
+    /// service's client TLS config when one is configured. Used by the
+    /// leader-forwarding helpers below.
+    fn peer_endpoint(&self, addr: &str) -> Result<Endpoint, Status> {
+        let scheme = if self.client_tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let uri = format!("{scheme}://{addr}");
+        let mut endpoint = Endpoint::from_shared(uri)
+            .map_err(|e| Status::internal(format!("invalid peer address {addr}: {e}")))?;
+        if let Some(tls) = self.client_tls.clone() {
+            endpoint = endpoint.tls_config(tls).map_err(|e| {
+                Status::internal(format!("applying tls to peer endpoint {addr}: {e}"))
+            })?;
+        }
+        Ok(endpoint)
     }
 
     /// Replace the default participant staging with a custom one.
@@ -682,8 +723,7 @@ impl MeshService {
         query: String,
         params: mesh_executor::ParamMap,
     ) -> std::result::Result<Vec<mesh_executor::Row>, Status> {
-        let endpoint = Endpoint::from_shared(format!("http://{}", addr))
-            .map_err(|e| Status::internal(format!("invalid leader address {addr}: {e}")))?;
+        let endpoint = self.peer_endpoint(addr)?;
         let mut client =
             crate::proto::mesh_query_client::MeshQueryClient::new(endpoint.connect_lazy());
         let params_json = serde_json::to_vec(&params)
@@ -987,10 +1027,11 @@ fn raft_propose_failed<E: std::fmt::Display>(e: E) -> Status {
     Status::internal(format!("raft propose failed: {e}"))
 }
 
-fn leader_write_client(addr: &str) -> Result<MeshWriteClient<Channel>, Status> {
-    let endpoint = Endpoint::from_shared(format!("http://{}", addr))
-        .map_err(|e| Status::internal(format!("invalid leader address {addr}: {e}")))?;
-    Ok(MeshWriteClient::new(endpoint.connect_lazy()))
+impl MeshService {
+    fn leader_write_client(&self, addr: &str) -> Result<MeshWriteClient<Channel>, Status> {
+        let endpoint = self.peer_endpoint(addr)?;
+        Ok(MeshWriteClient::new(endpoint.connect_lazy()))
+    }
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> Status {
@@ -1363,7 +1404,7 @@ impl MeshWrite for MeshService {
                     leader_address: Some(addr),
                     ..
                 }) => {
-                    let mut client = leader_write_client(&addr)?;
+                    let mut client = self.leader_write_client(&addr)?;
                     return client
                         .put_node(PutNodeRequest {
                             node: Some(proto_node),
@@ -1415,7 +1456,7 @@ impl MeshWrite for MeshService {
                     leader_address: Some(addr),
                     ..
                 }) => {
-                    let mut client = leader_write_client(&addr)?;
+                    let mut client = self.leader_write_client(&addr)?;
                     return client
                         .put_edge(PutEdgeRequest {
                             edge: Some(proto_edge),
@@ -1480,7 +1521,7 @@ impl MeshWrite for MeshService {
                     leader_address: Some(addr),
                     ..
                 }) => {
-                    let mut client = leader_write_client(&addr)?;
+                    let mut client = self.leader_write_client(&addr)?;
                     return client
                         .delete_edge(DeleteEdgeRequest {
                             edge_id: Some(id_proto),
@@ -1540,7 +1581,7 @@ impl MeshWrite for MeshService {
                     leader_address: Some(addr),
                     ..
                 }) => {
-                    let mut client = leader_write_client(&addr)?;
+                    let mut client = self.leader_write_client(&addr)?;
                     return client
                         .detach_delete_node(DetachDeleteNodeRequest {
                             node_id: Some(id_proto),

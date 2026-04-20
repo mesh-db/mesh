@@ -14,8 +14,9 @@ mesh-cluster = { path = "../mesh-cluster" }
 openraft = { version = "0.9", features = ["serde", "loosen-follower-log-revert"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
+rustls = "0.23"
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 thiserror.workspace = true

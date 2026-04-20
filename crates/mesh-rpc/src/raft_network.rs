@@ -17,7 +17,7 @@ use openraft::raft::{
 use openraft::BasicNode;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 /// Maps peer ids to their gRPC addresses. The factory holds lazy channels so
 /// `new_client` is cheap to call from openraft.
@@ -31,14 +31,41 @@ impl GrpcNetwork {
     pub fn new(
         peers: impl IntoIterator<Item = (NodeId, String)>,
     ) -> Result<Self, GrpcNetworkError> {
+        Self::build(peers, None)
+    }
+
+    /// Same as [`GrpcNetwork::new`] but wraps every peer channel with
+    /// the given [`ClientTlsConfig`] and switches the URI scheme to
+    /// `https://`. Use this when the remote gRPC listeners terminate
+    /// TLS.
+    pub fn with_tls(
+        peers: impl IntoIterator<Item = (NodeId, String)>,
+        tls: ClientTlsConfig,
+    ) -> Result<Self, GrpcNetworkError> {
+        Self::build(peers, Some(tls))
+    }
+
+    fn build(
+        peers: impl IntoIterator<Item = (NodeId, String)>,
+        tls: Option<ClientTlsConfig>,
+    ) -> Result<Self, GrpcNetworkError> {
         let mut channels = HashMap::new();
+        let scheme = if tls.is_some() { "https" } else { "http" };
         for (id, addr) in peers {
-            let uri = format!("http://{}", addr);
-            let endpoint =
+            let uri = format!("{scheme}://{addr}");
+            let mut endpoint =
                 Endpoint::from_shared(uri).map_err(|e| GrpcNetworkError::InvalidEndpoint {
                     id,
                     message: e.to_string(),
                 })?;
+            if let Some(tls) = tls.clone() {
+                endpoint = endpoint
+                    .tls_config(tls)
+                    .map_err(|e| GrpcNetworkError::TlsConfig {
+                        id,
+                        message: e.to_string(),
+                    })?;
+            }
             channels.insert(id, endpoint.connect_lazy());
         }
         Ok(Self {
@@ -51,6 +78,8 @@ impl GrpcNetwork {
 pub enum GrpcNetworkError {
     #[error("invalid endpoint for peer {id}: {message}")]
     InvalidEndpoint { id: NodeId, message: String },
+    #[error("applying tls config for peer {id}: {message}")]
+    TlsConfig { id: NodeId, message: String },
 }
 
 impl RaftNetworkFactory<MeshRaftConfig> for GrpcNetwork {

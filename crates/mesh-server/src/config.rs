@@ -94,6 +94,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub bolt_tls: Option<BoltTlsConfig>,
 
+    /// Optional TLS for the gRPC listener and outgoing inter-peer gRPC
+    /// channels. Every peer is both a gRPC server and a gRPC client
+    /// (Raft heartbeats, leader forwarding, scatter-gather reads), so
+    /// the same section describes both the identity this peer presents
+    /// and the CA it uses to verify remote peers. When set on one peer
+    /// of a cluster it must be set on all peers; mixed-mode clusters
+    /// are not supported.
+    #[serde(default)]
+    pub grpc_tls: Option<GrpcTlsConfig>,
+
     /// Cluster operating mode. Omitted → inferred from `peers` (empty
     /// → Single, non-empty → Raft) for backward compatibility with
     /// configs from before this field existed. Set explicitly to
@@ -165,6 +175,35 @@ pub struct BoltUser {
 pub struct BoltTlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+}
+
+/// TLS material for the gRPC listener and outbound peer channels.
+/// Every field is PEM-encoded:
+///
+///   * `cert_path` → the certificate chain this peer presents to both
+///     inbound connections (as the server identity) and to peer
+///     verification (the chain must validate against every other
+///     peer's `ca_path`). Leaf first.
+///   * `key_path` → the private key matching the leaf certificate.
+///   * `ca_path` → the bundle of trusted CA certificates this peer
+///     uses when *connecting* to remote peers as a client. For small
+///     setups this is usually the same self-signed cert that every
+///     peer presents; for PKI-backed clusters it's the root / issuing
+///     CA that signed each peer's cert.
+///
+/// All three fields must point at readable files when the section is
+/// present — validated at startup so a typo in the path surfaces
+/// immediately rather than on the first inter-peer RPC.
+///
+/// Peer certificates should carry Subject Alternative Names covering
+/// every address peers reach this server by. For a loopback dev setup
+/// on `127.0.0.1:7001` that means `DNS:localhost, IP:127.0.0.1`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub ca_path: PathBuf,
 }
 
 impl BoltAuthConfig {
@@ -351,6 +390,20 @@ impl ServerConfig {
                     return Err("`bolt_tls` set but `bolt_address` is missing; \
                                 TLS only applies when the Bolt listener is enabled"
                         .into());
+                }
+                if let Some(tls) = &self.grpc_tls {
+                    for (role, path) in [
+                        ("grpc_tls.cert_path", &tls.cert_path),
+                        ("grpc_tls.key_path", &tls.key_path),
+                        ("grpc_tls.ca_path", &tls.ca_path),
+                    ] {
+                        if !path.is_file() {
+                            return Err(format!(
+                                "{role} points at {}, which is not a readable file",
+                                path.display()
+                            ));
+                        }
+                    }
                 }
                 Ok(())
             }

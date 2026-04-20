@@ -15,6 +15,7 @@ mod routing;
 mod routing_writer;
 mod server;
 mod staging;
+pub mod tls;
 mod tx_coordinator;
 mod tx_overlay;
 
