@@ -1,0 +1,17 @@
+[package]
+name = "meshdb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RocksDB-backed storage engine for Mesh"
+
+[dependencies]
+meshdb-core = { workspace = true }
+rocksdb = "0.23"
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

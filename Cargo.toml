@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/mesh-core",
-    "crates/mesh-storage",
-    "crates/mesh-cypher",
-    "crates/mesh-executor",
-    "crates/mesh-rpc",
-    "crates/mesh-cluster",
-    "crates/mesh-bolt",
-    "crates/mesh-client",
-    "crates/mesh-server",
-    "crates/mesh-tck",
+    "crates/meshdb-core",
+    "crates/meshdb-storage",
+    "crates/meshdb-cypher",
+    "crates/meshdb-executor",
+    "crates/meshdb-rpc",
+    "crates/meshdb-cluster",
+    "crates/meshdb-bolt",
+    "crates/meshdb-client",
+    "crates/meshdb-server",
+    "crates/meshdb-tck",
 ]
 
 [workspace.package]
@@ -24,13 +24,13 @@ repository = "https://github.com/mesh-db/mesh"
 # Internal crates. Version is required (in addition to `path`) so
 # `cargo package` / `cargo publish` can resolve them against crates.io
 # when path deps are stripped on publish.
-mesh-core = { path = "crates/mesh-core", version = "0.1.0-alpha.1" }
-mesh-storage = { path = "crates/mesh-storage", version = "0.1.0-alpha.1" }
-mesh-cypher = { path = "crates/mesh-cypher", version = "0.1.0-alpha.1" }
-mesh-executor = { path = "crates/mesh-executor", version = "0.1.0-alpha.1" }
-mesh-cluster = { path = "crates/mesh-cluster", version = "0.1.0-alpha.1" }
-mesh-rpc = { path = "crates/mesh-rpc", version = "0.1.0-alpha.1" }
-mesh-bolt = { path = "crates/mesh-bolt", version = "0.1.0-alpha.1" }
+meshdb-core = { path = "crates/meshdb-core", version = "0.1.0-alpha.1" }
+meshdb-storage = { path = "crates/meshdb-storage", version = "0.1.0-alpha.1" }
+meshdb-cypher = { path = "crates/meshdb-cypher", version = "0.1.0-alpha.1" }
+meshdb-executor = { path = "crates/meshdb-executor", version = "0.1.0-alpha.1" }
+meshdb-cluster = { path = "crates/meshdb-cluster", version = "0.1.0-alpha.1" }
+meshdb-rpc = { path = "crates/meshdb-rpc", version = "0.1.0-alpha.1" }
+meshdb-bolt = { path = "crates/meshdb-bolt", version = "0.1.0-alpha.1" }
 
 thiserror = "2"
 anyhow = "1"
@@ -42,7 +42,7 @@ tokio = { version = "1", features = ["full"] }
 prometheus = { version = "0.13", default-features = false }
 bcrypt = { version = "0.15", default-features = false, features = ["std"] }
 # chrono: only pulled in for ISO 8601 / RFC 3339 string parsing in
-# the mesh-executor temporal scalar functions (`datetime(string)`,
+# the meshdb-executor temporal scalar functions (`datetime(string)`,
 # `date(string)`). Storage and wire formats use raw epoch counts, so
 # chrono never touches the persistence path.
 chrono = { version = "0.4", default-features = false, features = ["std"] }

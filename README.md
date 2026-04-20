@@ -32,18 +32,18 @@ It runs in three modes:
 ### 1. Build
 
 ```sh
-cargo build -p mesh-server
+cargo build -p meshdb-server
 ```
 
 Or for an optimized binary:
 
 ```sh
-cargo build -p mesh-server --release
+cargo build -p meshdb-server --release
 ```
 
 The build needs `clang` / `libclang-dev` on Linux because `rust-rocksdb`
 generates bindings at compile time. `protoc` is **not** required —
-`mesh-rpc/build.rs` uses a vendored binary.
+`meshdb-rpc/build.rs` uses a vendored binary.
 
 ### 2. Write a minimal config
 
@@ -63,15 +63,15 @@ standard Neo4j Bolt port (every driver defaults to it).
 ### 3. Run the server
 
 ```sh
-RUST_LOG=info ./target/debug/mesh-server --config /tmp/mesh.toml
+RUST_LOG=info ./target/debug/meshdb-server --config /tmp/mesh.toml
 ```
 
 You should see something like:
 
 ```
-INFO mesh_server: starting mesh-server self_id=1 listen_address=127.0.0.1:7001 data_dir=/tmp/mesh-data peers=0
-INFO mesh_server: mesh-server listening addr=127.0.0.1:7001
-INFO mesh_server: mesh-server bolt listening addr=127.0.0.1:7687
+INFO meshdb_server: starting meshdb-server self_id=1 listen_address=127.0.0.1:7001 data_dir=/tmp/mesh-data peers=0
+INFO meshdb_server: meshdb-server listening addr=127.0.0.1:7001
+INFO meshdb_server: meshdb-server bolt listening addr=127.0.0.1:7687
 ```
 
 Leave it running. Ctrl-C to stop. Wipe `/tmp/mesh-data` between runs if you
@@ -190,7 +190,7 @@ and `UNWIND $list` — the full driver-facing surface as of today.
   GOODBYE, BEGIN, COMMIT, ROLLBACK, TELEMETRY), parameters, explicit
   transactions with atomic batch commit
 - **gRPC** via tonic: `MeshQuery`, `MeshWrite`, `MeshRaft` services. See
-  `crates/mesh-rpc/proto/mesh.proto`.
+  `crates/meshdb-rpc/proto/mesh.proto`.
 
 ---
 
@@ -341,24 +341,24 @@ pair, `ca_path` to the shared CA bundle.
 ```
 mesh/
 ├── crates/
-│   ├── mesh-core/        # NodeId / EdgeId / Property types
-│   ├── mesh-storage/     # RocksDB-backed Store, indexes, batching
-│   ├── mesh-cypher/      # Pest grammar, AST, parser, planner
-│   ├── mesh-executor/    # Volcano-model operators, eval, GraphReader/Writer traits
-│   ├── mesh-cluster/     # Raft via openraft, partitioner, cluster state
-│   ├── mesh-rpc/         # tonic gRPC services, partitioned reader/writer, 2PC, TLS helpers
-│   ├── mesh-bolt/        # Pure-protocol Bolt library: PackStream, framing, handshake, messages
-│   ├── mesh-client/      # Binary: TUI client for Bolt-compatible graph DBs (Mesh, Neo4j)
-│   ├── mesh-tck/         # openCypher TCK (Technology Compatibility Kit) runner
-│   └── mesh-server/      # Binary: config, startup, gRPC listener, Bolt listener
+│   ├── meshdb-core/        # NodeId / EdgeId / Property types
+│   ├── meshdb-storage/     # RocksDB-backed Store, indexes, batching
+│   ├── meshdb-cypher/      # Pest grammar, AST, parser, planner
+│   ├── meshdb-executor/    # Volcano-model operators, eval, GraphReader/Writer traits
+│   ├── meshdb-cluster/     # Raft via openraft, partitioner, cluster state
+│   ├── meshdb-rpc/         # tonic gRPC services, partitioned reader/writer, 2PC, TLS helpers
+│   ├── meshdb-bolt/        # Pure-protocol Bolt library: PackStream, framing, handshake, messages
+│   ├── meshdb-client/      # Binary: TUI client for Bolt-compatible graph DBs (Mesh, Neo4j)
+│   ├── meshdb-tck/         # openCypher TCK (Technology Compatibility Kit) runner
+│   └── meshdb-server/      # Binary: config, startup, gRPC listener, Bolt listener
 └── .github/workflows/
     └── ci.yml            # Build + test + fmt check on push and PR
 ```
 
 Each crate has its own `Error` type via `thiserror` and its own `tests/`
-directory. Integration tests in `mesh-server/tests/bolt.rs` drive the full
-pipeline end-to-end with a raw TCP Bolt client; `mesh-server/tests/bolt_tls.rs`
-and `mesh-server/tests/grpc_tls.rs` cover the TLS listeners with rcgen-generated
+directory. Integration tests in `meshdb-server/tests/bolt.rs` drive the full
+pipeline end-to-end with a raw TCP Bolt client; `meshdb-server/tests/bolt_tls.rs`
+and `meshdb-server/tests/grpc_tls.rs` cover the TLS listeners with rcgen-generated
 self-signed certs.
 
 ---
@@ -450,9 +450,9 @@ address = "127.0.0.1:7003"
 Start each peer in its own terminal (peer A first, since it bootstraps):
 
 ```sh
-./target/debug/mesh-server --config /tmp/mesh-a.toml
-./target/debug/mesh-server --config /tmp/mesh-b.toml
-./target/debug/mesh-server --config /tmp/mesh-c.toml
+./target/debug/meshdb-server --config /tmp/mesh-a.toml
+./target/debug/meshdb-server --config /tmp/mesh-b.toml
+./target/debug/meshdb-server --config /tmp/mesh-c.toml
 ```
 
 Connect Bolt clients to any of `127.0.0.1:7687` (peer A),

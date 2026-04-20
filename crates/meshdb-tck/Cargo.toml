@@ -1,0 +1,22 @@
+[package]
+name = "meshdb-tck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "openCypher TCK (Technology Compatibility Kit) runner for Mesh"
+
+[dependencies]
+meshdb-core = { workspace = true }
+meshdb-storage = { workspace = true }
+meshdb-cypher = { workspace = true }
+meshdb-executor = { workspace = true }
+tempfile = "3"
+cucumber = "0.21"
+futures = "0.3"
+regex = "1"
+chrono = { workspace = true }
+
+[[test]]
+name = "tck"
+harness = false

@@ -1,0 +1,20 @@
+[package]
+name = "meshdb-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Physical operators and query execution for Mesh"
+
+[dependencies]
+meshdb-core = { workspace = true }
+meshdb-storage = { workspace = true }
+meshdb-cypher = { workspace = true }
+serde = { workspace = true }
+thiserror.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"

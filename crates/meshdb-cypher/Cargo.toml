@@ -1,0 +1,13 @@
+[package]
+name = "meshdb-cypher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cypher parser and planner for Mesh"
+
+[dependencies]
+meshdb-core = { workspace = true }
+pest = "2"
+pest_derive = "2"
+thiserror.workspace = true
