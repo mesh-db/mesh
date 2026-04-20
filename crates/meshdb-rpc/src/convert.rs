@@ -82,11 +82,20 @@ pub fn property_to_proto(p: &Property) -> Result<proto::Property, ConvertError> 
             seconds: d.seconds,
             nanos: d.nanos,
         }),
-        // List and Map are recursive — representing them requires a
-        // self-referential protobuf schema. Left for a follow-up so
-        // this change stays focused on the temporal + spatial
-        // scalars that cross peers in the routing-mode write path.
-        Property::List(_) | Property::Map(_) => return Err(ConvertError::UnsupportedProperty),
+        Property::List(items) => {
+            let values = items
+                .iter()
+                .map(property_to_proto)
+                .collect::<Result<Vec<_>, _>>()?;
+            Kind::ListVal(proto::ListValue { values })
+        }
+        Property::Map(entries) => {
+            let mut out = HashMap::with_capacity(entries.len());
+            for (k, v) in entries {
+                out.insert(k.clone(), property_to_proto(v)?);
+            }
+            Kind::MapVal(proto::MapValue { entries: out })
+        }
     };
     Ok(proto::Property { kind: Some(kind) })
 }
@@ -124,6 +133,16 @@ pub fn property_from_proto(p: &proto::Property) -> Property {
             seconds: v.seconds,
             nanos: v.nanos,
         }),
+        Some(Kind::ListVal(lv)) => {
+            Property::List(lv.values.iter().map(property_from_proto).collect())
+        }
+        Some(Kind::MapVal(mv)) => {
+            let mut out = HashMap::with_capacity(mv.entries.len());
+            for (k, v) in &mv.entries {
+                out.insert(k.clone(), property_from_proto(v));
+            }
+            Property::Map(out)
+        }
     }
 }
 
@@ -331,5 +350,61 @@ mod tests {
             nanos: -4,
         });
         assert_eq!(roundtrip(input.clone()), input);
+    }
+
+    #[test]
+    fn list_of_scalars_roundtrips() {
+        let input = Property::List(vec![
+            Property::Int64(1),
+            Property::String("two".into()),
+            Property::Bool(true),
+            Property::Null,
+        ]);
+        assert_eq!(roundtrip(input.clone()), input);
+    }
+
+    #[test]
+    fn map_of_scalars_roundtrips() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("name".into(), Property::String("Ada".into()));
+        m.insert("age".into(), Property::Int64(36));
+        m.insert("active".into(), Property::Bool(true));
+        let input = Property::Map(m);
+        assert_eq!(roundtrip(input.clone()), input);
+    }
+
+    #[test]
+    fn nested_list_and_map_roundtrip() {
+        // List of maps, each with a nested list and a Point — exercises
+        // every recursive path through `property_to_proto` /
+        // `property_from_proto`.
+        let mut inner_map = std::collections::HashMap::new();
+        inner_map.insert(
+            "coords".into(),
+            Property::List(vec![Property::Float64(1.5), Property::Float64(-2.25)]),
+        );
+        inner_map.insert(
+            "home".into(),
+            Property::Point(Point {
+                srid: SRID_WGS84_2D,
+                x: 18.0686,
+                y: 59.3293,
+                z: None,
+            }),
+        );
+        let input = Property::List(vec![Property::Map(inner_map), Property::Null]);
+        assert_eq!(roundtrip(input.clone()), input);
+    }
+
+    #[test]
+    fn empty_list_and_map_roundtrip() {
+        assert_eq!(
+            roundtrip(Property::List(Vec::new())),
+            Property::List(Vec::new())
+        );
+        assert_eq!(
+            roundtrip(Property::Map(std::collections::HashMap::new())),
+            Property::Map(std::collections::HashMap::new())
+        );
     }
 }

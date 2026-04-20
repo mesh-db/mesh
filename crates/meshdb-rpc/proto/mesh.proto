@@ -65,7 +65,21 @@ message DurationValue {
   int32 nanos = 4;
 }
 
-// Primitive property value. List / Map variants are deferred.
+// Ordered, heterogeneous list of Property values. Self-referential
+// — the values themselves are Property, so nested lists and maps
+// round-trip without flattening.
+message ListValue {
+  repeated Property values = 1;
+}
+
+// String-keyed map of Property values. Self-referential for the
+// same reason as `ListValue`.
+message MapValue {
+  map<string, Property> entries = 1;
+}
+
+// Full Property surface — covers every `meshdb_core::Property`
+// variant, so cross-peer traffic no longer needs a fallback.
 message Property {
   oneof kind {
     NullValue null_val = 1;
@@ -79,6 +93,8 @@ message Property {
     DateValue date_val = 9;
     TimeValue time_val = 10;
     DurationValue duration_val = 11;
+    ListValue list_val = 12;
+    MapValue map_val = 13;
   }
 }
 

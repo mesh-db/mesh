@@ -7,7 +7,4 @@ pub enum ConvertError {
 
     #[error("expected 16-byte UUID, got {0} bytes")]
     InvalidUuidLength(usize),
-
-    #[error("unsupported property value (list/map conversions not yet implemented)")]
-    UnsupportedProperty,
 }
