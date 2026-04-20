@@ -335,13 +335,25 @@ enum PropertyTypeKind {
   PROPERTY_TYPE_KIND_BOOLEAN = 4;
 }
 
+// Scope a constraint applies to. `NODE` uses `scope_target` as a
+// label; `RELATIONSHIP` uses it as an edge type.
+enum ConstraintScopeKind {
+  CONSTRAINT_SCOPE_KIND_UNSPECIFIED = 0;
+  CONSTRAINT_SCOPE_KIND_NODE = 1;
+  CONSTRAINT_SCOPE_KIND_RELATIONSHIP = 2;
+}
+
 message CreatePropertyConstraintRequest {
   // Optional user-supplied name. Empty string represents `None`;
   // the receiver resolves the auto-generated default deterministically
-  // from `(label, properties, kind)` so every peer ends up with the
+  // from `(scope, properties, kind)` so every peer ends up with the
   // same final name.
   string name = 1;
-  string label = 2;
+  // `scope_kind` plus `scope_target` together identify the target.
+  // Replaces the old `label` field so relationship scopes share the
+  // same shape.
+  ConstraintScopeKind scope_kind = 2;
+  string scope_target = 7;
   // Non-empty property list. Single-property kinds carry a one-
   // element list; `NODE_KEY` carries the full tuple.
   repeated string properties = 3;

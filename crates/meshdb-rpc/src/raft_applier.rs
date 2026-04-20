@@ -30,11 +30,12 @@
 
 use meshdb_cluster::raft::GraphStateMachine;
 use meshdb_cluster::{
-    ConstraintKind as ClusterConstraintKind, GraphCommand, PropertyType as ClusterPropertyType,
+    ConstraintKind as ClusterConstraintKind, ConstraintScope as ClusterConstraintScope,
+    GraphCommand, PropertyType as ClusterPropertyType,
 };
 use meshdb_storage::{
-    GraphMutation, PropertyConstraintKind, PropertyType as StoragePropertyType,
-    RocksDbStorageEngine, StorageEngine,
+    ConstraintScope as StorageConstraintScope, GraphMutation, PropertyConstraintKind,
+    PropertyType as StoragePropertyType, RocksDbStorageEngine, StorageEngine,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -119,7 +120,7 @@ impl GraphStateMachine for StoreGraphApplier {
                 .map_err(|e| e.to_string()),
             GraphCommand::CreateConstraint {
                 name,
-                label,
+                scope,
                 properties,
                 kind,
                 if_not_exists,
@@ -127,7 +128,7 @@ impl GraphStateMachine for StoreGraphApplier {
                 .store
                 .create_property_constraint(
                     name.as_deref(),
-                    label,
+                    &storage_scope(scope),
                     properties,
                     storage_kind(*kind),
                     *if_not_exists,
@@ -440,7 +441,7 @@ fn apply_ddl_and_collect(
                 .map_err(|e| e.to_string())?,
             GraphCommand::CreateConstraint {
                 name,
-                label,
+                scope,
                 properties,
                 kind,
                 if_not_exists,
@@ -448,7 +449,7 @@ fn apply_ddl_and_collect(
                 store
                     .create_property_constraint(
                         name.as_deref(),
-                        label,
+                        &storage_scope(scope),
                         properties,
                         storage_kind(*kind),
                         *if_not_exists,
@@ -476,6 +477,16 @@ pub(crate) fn storage_kind(kind: ClusterConstraintKind) -> PropertyConstraintKin
             PropertyConstraintKind::PropertyType(storage_property_type(t))
         }
         ClusterConstraintKind::NodeKey => PropertyConstraintKind::NodeKey,
+    }
+}
+
+/// Bridge the cluster-crate `ConstraintScope` into the storage-crate
+/// enum. Same shape on both sides; the separation preserves the
+/// dependency direction (cluster doesn't know about storage).
+pub(crate) fn storage_scope(scope: &ClusterConstraintScope) -> StorageConstraintScope {
+    match scope {
+        ClusterConstraintScope::Node(l) => StorageConstraintScope::Node(l.clone()),
+        ClusterConstraintScope::Relationship(t) => StorageConstraintScope::Relationship(t.clone()),
     }
 }
 

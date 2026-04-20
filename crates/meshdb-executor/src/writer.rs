@@ -1,6 +1,8 @@
 use crate::error::Result;
 use meshdb_core::{Edge, EdgeId, Node, NodeId};
-use meshdb_storage::{PropertyConstraintKind, PropertyConstraintSpec, StorageEngine};
+use meshdb_storage::{
+    ConstraintScope, PropertyConstraintKind, PropertyConstraintSpec, StorageEngine,
+};
 
 /// Sink for mutating graph operations produced by the executor. Isolates
 /// write-side concerns from read-side traversal so we can plug in either a
@@ -51,7 +53,7 @@ pub trait GraphWriter {
     fn create_property_constraint(
         &self,
         _name: Option<&str>,
-        _label: &str,
+        _scope: &ConstraintScope,
         _properties: &[String],
         _kind: PropertyConstraintKind,
         _if_not_exists: bool,
@@ -123,7 +125,7 @@ impl<T: StorageEngine> GraphWriter for T {
     fn create_property_constraint(
         &self,
         name: Option<&str>,
-        label: &str,
+        scope: &ConstraintScope,
         properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
@@ -131,7 +133,7 @@ impl<T: StorageEngine> GraphWriter for T {
         Ok(StorageEngine::create_property_constraint(
             self,
             name,
-            label,
+            scope,
             properties,
             kind,
             if_not_exists,
@@ -197,14 +199,14 @@ impl GraphWriter for StorageWriterAdapter<'_> {
     fn create_property_constraint(
         &self,
         name: Option<&str>,
-        label: &str,
+        scope: &ConstraintScope,
         properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
     ) -> Result<PropertyConstraintSpec> {
         Ok(self
             .0
-            .create_property_constraint(name, label, properties, kind, if_not_exists)?)
+            .create_property_constraint(name, scope, properties, kind, if_not_exists)?)
     }
 
     fn drop_property_constraint(&self, name: &str, if_exists: bool) -> Result<()> {

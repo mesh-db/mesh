@@ -9,23 +9,25 @@ use crate::proto::mesh_write_client::MeshWriteClient;
 use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
     AllNodeIdsRequest, AllNodeIdsResponse, BatchPhase, BatchWriteRequest, BatchWriteResponse,
-    ConstraintKind as ProtoConstraintKind, CreatePropertyConstraintRequest,
-    CreatePropertyConstraintResponse, CreatePropertyIndexRequest, CreatePropertyIndexResponse,
-    DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest, DetachDeleteNodeResponse,
-    DropPropertyConstraintRequest, DropPropertyConstraintResponse, DropPropertyIndexRequest,
-    DropPropertyIndexResponse, ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest,
-    GetEdgeResponse, GetNodeRequest, GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo,
-    NeighborRequest, NeighborResponse, NodesByLabelRequest, NodesByLabelResponse,
-    NodesByPropertyRequest, NodesByPropertyResponse, PropertyTypeKind as ProtoPropertyTypeKind,
-    PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
+    ConstraintKind as ProtoConstraintKind, ConstraintScopeKind as ProtoConstraintScopeKind,
+    CreatePropertyConstraintRequest, CreatePropertyConstraintResponse, CreatePropertyIndexRequest,
+    CreatePropertyIndexResponse, DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest,
+    DetachDeleteNodeResponse, DropPropertyConstraintRequest, DropPropertyConstraintResponse,
+    DropPropertyIndexRequest, DropPropertyIndexResponse, ExecuteCypherRequest,
+    ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse, GetNodeRequest, GetNodeResponse,
+    HealthRequest, HealthResponse, NeighborInfo, NeighborRequest, NeighborResponse,
+    NodesByLabelRequest, NodesByLabelResponse, NodesByPropertyRequest, NodesByPropertyResponse,
+    PropertyTypeKind as ProtoPropertyTypeKind, PutEdgeRequest, PutEdgeResponse, PutNodeRequest,
+    PutNodeResponse,
 };
-use crate::raft_applier::storage_kind;
+use crate::raft_applier::{storage_kind, storage_scope};
 use crate::routing::Routing;
 use crate::tx_coordinator::TxCoordinator;
 use meshdb_cluster::raft::RaftCluster;
 use meshdb_cluster::{
-    resolved_constraint_name, ConstraintKind as ClusterConstraintKind, Error as ClusterError,
-    GraphCommand, PeerId, PropertyType as ClusterPropertyType,
+    resolved_constraint_name, ConstraintKind as ClusterConstraintKind,
+    ConstraintScope as ClusterConstraintScope, Error as ClusterError, GraphCommand, PeerId,
+    PropertyType as ClusterPropertyType,
 };
 use meshdb_executor::{
     execute_with_reader_and_procs, GraphReader, GraphWriter, ProcedureRegistry,
@@ -947,14 +949,14 @@ fn apply_ddl_to_store(
         GraphCommand::DropIndex { label, property } => store.drop_property_index(label, property),
         GraphCommand::CreateConstraint {
             name,
-            label,
+            scope,
             properties,
             kind,
             if_not_exists,
         } => {
             store.create_property_constraint(
                 name.as_deref(),
-                label,
+                &storage_scope(scope),
                 properties,
                 storage_kind(*kind),
                 *if_not_exists,
@@ -985,7 +987,7 @@ fn invert_ddl(cmd: &GraphCommand) -> GraphCommand {
         },
         GraphCommand::CreateConstraint {
             name,
-            label,
+            scope,
             properties,
             kind,
             ..
@@ -998,7 +1000,7 @@ fn invert_ddl(cmd: &GraphCommand) -> GraphCommand {
             // (`IF NOT EXISTS` or idempotent re-declaration), in
             // which case the inverse must also succeed as a no-op.
             GraphCommand::DropConstraint {
-                name: resolved_constraint_name(name, label, properties, *kind),
+                name: resolved_constraint_name(name, scope, properties, *kind),
                 if_exists: true,
             }
         }
@@ -1042,18 +1044,20 @@ async fn try_remote_ddl_on_peer(
             }
             GraphCommand::CreateConstraint {
                 name,
-                label,
+                scope,
                 properties,
                 kind,
                 if_not_exists,
             } => {
+                let (scope_kind, scope_target) = proto_scope(scope);
                 client
                     .create_property_constraint(CreatePropertyConstraintRequest {
                         // Empty string on the wire stands for `None`
                         // (no user-supplied name). Matches the proto's
                         // optional-by-convention encoding.
                         name: name.clone().unwrap_or_default(),
-                        label: label.clone(),
+                        scope_kind: scope_kind as i32,
+                        scope_target,
                         properties: properties.clone(),
                         kind: proto_kind(*kind) as i32,
                         if_not_exists: *if_not_exists,
@@ -1073,6 +1077,37 @@ async fn try_remote_ddl_on_peer(
         }
     }
     Ok(())
+}
+
+/// Map the cluster-crate `ConstraintScope` into proto wire form:
+/// a scope-kind enum plus the target string (label or edge type).
+fn proto_scope(scope: &ClusterConstraintScope) -> (ProtoConstraintScopeKind, String) {
+    match scope {
+        ClusterConstraintScope::Node(l) => (ProtoConstraintScopeKind::Node, l.clone()),
+        ClusterConstraintScope::Relationship(t) => {
+            (ProtoConstraintScopeKind::Relationship, t.clone())
+        }
+    }
+}
+
+/// Inverse of [`proto_scope`] for inbound RPCs. Returns an error on
+/// unspecified scope so the storage layer never sees an ambiguous
+/// target.
+fn cluster_scope_from_proto(
+    scope_kind: i32,
+    scope_target: String,
+) -> Result<ClusterConstraintScope, Status> {
+    match ProtoConstraintScopeKind::try_from(scope_kind)
+        .unwrap_or(ProtoConstraintScopeKind::Unspecified)
+    {
+        ProtoConstraintScopeKind::Node => Ok(ClusterConstraintScope::Node(scope_target)),
+        ProtoConstraintScopeKind::Relationship => {
+            Ok(ClusterConstraintScope::Relationship(scope_target))
+        }
+        ProtoConstraintScopeKind::Unspecified => {
+            Err(Status::invalid_argument("constraint scope is unspecified"))
+        }
+    }
 }
 
 /// Map the cluster-crate `ConstraintKind` to the proto enum. Kept
@@ -1181,14 +1216,14 @@ fn apply_ddl_commands(
             }
             GraphCommand::CreateConstraint {
                 name,
-                label,
+                scope,
                 properties,
                 kind,
                 if_not_exists,
             } => {
                 store.create_property_constraint(
                     name.as_deref(),
-                    label,
+                    &storage_scope(scope),
                     properties,
                     storage_kind(*kind),
                     *if_not_exists,
@@ -1886,6 +1921,7 @@ impl MeshWrite for MeshService {
         // as a `GraphCommand::CreateConstraint` entry.
         let req = request.into_inner();
         let kind = cluster_kind_from_proto(req.kind, req.property_type)?;
+        let cluster_scope = cluster_scope_from_proto(req.scope_kind, req.scope_target)?;
         let name = if req.name.is_empty() {
             None
         } else {
@@ -1894,7 +1930,7 @@ impl MeshWrite for MeshService {
         self.store
             .create_property_constraint(
                 name,
-                &req.label,
+                &storage_scope(&cluster_scope),
                 &req.properties,
                 storage_kind(kind),
                 req.if_not_exists,

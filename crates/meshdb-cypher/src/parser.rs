@@ -236,7 +236,7 @@ fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
 fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstraintStmt> {
     let mut name: Option<String> = None;
     let mut if_not_exists = false;
-    let mut label: Option<String> = None;
+    let mut scope: Option<crate::ast::ConstraintScope> = None;
     let mut properties: Vec<String> = Vec::new();
     let mut kind: Option<crate::ast::ConstraintKind> = None;
     for p in pair.into_inner() {
@@ -251,7 +251,43 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstra
             Rule::if_not_exists => {
                 if_not_exists = true;
             }
+            Rule::constraint_node_source => {
+                // Wrapping rule; descend into the `constraint_target`.
+                let target = p
+                    .into_inner()
+                    .find(|c| c.as_rule() == Rule::constraint_target)
+                    .ok_or_else(|| Error::Parse("constraint_node_source missing target".into()))?;
+                let mut inner = target.into_inner();
+                let _var = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("constraint target missing var".into()))?;
+                let lab = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("constraint target missing label".into()))?;
+                scope = Some(crate::ast::ConstraintScope::Node(parse_ident(lab.as_str())));
+            }
+            Rule::constraint_rel_source => {
+                // Layout: `()` `rel_edge` `[` var `:` edge_type `]`
+                // `rel_edge` `()`. Identifier children arrive in
+                // source order: [var, edge_type]. We skip the
+                // rel_edge children since direction doesn't matter
+                // for the constraint's scope.
+                let mut idents = p.into_inner().filter(|c| c.as_rule() == Rule::identifier);
+                let _var = idents
+                    .next()
+                    .ok_or_else(|| Error::Parse("constraint rel source missing var".into()))?;
+                let et = idents.next().ok_or_else(|| {
+                    Error::Parse("constraint rel source missing edge type".into())
+                })?;
+                scope = Some(crate::ast::ConstraintScope::Relationship(parse_ident(
+                    et.as_str(),
+                )));
+            }
             Rule::constraint_target => {
+                // Legacy pest might still hand back the old
+                // `constraint_target` rule directly; keep the
+                // single-rule path working so downstream tests that
+                // construct pairs by hand don't have to wrap.
                 let mut inner = p.into_inner();
                 let _var = inner
                     .next()
@@ -259,7 +295,7 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstra
                 let lab = inner
                     .next()
                     .ok_or_else(|| Error::Parse("constraint target missing label".into()))?;
-                label = Some(parse_ident(lab.as_str()));
+                scope = Some(crate::ast::ConstraintScope::Node(parse_ident(lab.as_str())));
             }
             Rule::constraint_property => {
                 let mut inner = p.into_inner();
@@ -335,7 +371,7 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<crate::ast::CreateConstra
     }
     Ok(crate::ast::CreateConstraintStmt {
         name,
-        label: label.ok_or_else(|| Error::Parse("create constraint missing label".into()))?,
+        scope: scope.ok_or_else(|| Error::Parse("create constraint missing scope".into()))?,
         properties,
         kind: kind.ok_or_else(|| Error::Parse("create constraint missing requirement".into()))?,
         if_not_exists,

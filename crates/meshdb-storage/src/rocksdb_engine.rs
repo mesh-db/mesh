@@ -13,8 +13,8 @@
 
 use crate::{
     engine::{
-        GraphMutation, PropertyConstraintKind, PropertyConstraintSpec, PropertyIndexSpec,
-        PropertyType, StorageEngine,
+        ConstraintScope, GraphMutation, PropertyConstraintKind, PropertyConstraintSpec,
+        PropertyIndexSpec, PropertyType, StorageEngine,
     },
     error::{Error, Result},
     keys::{
@@ -254,6 +254,13 @@ impl RocksDbStorageEngine {
         let out_cf = self.cf(CF_ADJ_OUT)?;
         let in_cf = self.cf(CF_ADJ_IN)?;
         let type_cf = self.cf(CF_TYPE_INDEX)?;
+
+        // Relationship-scope constraint enforcement. Same short-
+        // circuit pattern as `append_put_node` — if a constraint
+        // would be violated, abort before touching the batch so the
+        // write never lands.
+        let existing_edge = self.get_edge(edge.id)?;
+        self.enforce_edge_constraints(edge, existing_edge.as_ref())?;
 
         let bytes = serde_json::to_vec(edge)?;
         batch.put_cf(edges_cf, edge.id.as_bytes(), bytes);
@@ -556,14 +563,17 @@ impl RocksDbStorageEngine {
     pub fn create_property_constraint(
         &self,
         name: Option<&str>,
-        label: &str,
+        scope: &ConstraintScope,
         properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
     ) -> Result<PropertyConstraintSpec> {
         // Arity validation: single-property kinds get exactly one
         // property; NodeKey accepts any positive count. Empty lists
-        // are always invalid.
+        // are always invalid. NodeKey on relationship scope isn't
+        // allowed — the "NODE" in the name is specifically about
+        // node semantics; relationship equivalents would need their
+        // own variant.
         if properties.is_empty() {
             return Err(Error::ConstraintArity {
                 kind: kind.as_string(),
@@ -576,13 +586,21 @@ impl RocksDbStorageEngine {
                 details: format!("expects exactly one property, got {}", properties.len()),
             });
         }
+        if matches!(kind, PropertyConstraintKind::NodeKey)
+            && matches!(scope, ConstraintScope::Relationship(_))
+        {
+            return Err(Error::ConstraintArity {
+                kind: kind.as_string(),
+                details: "NODE KEY cannot be applied to a relationship scope".into(),
+            });
+        }
         let resolved_name = match name {
             Some(n) => n.to_string(),
-            None => default_constraint_name(label, properties, kind),
+            None => default_constraint_name(scope, properties, kind),
         };
         let spec = PropertyConstraintSpec {
             name: resolved_name.clone(),
-            label: label.to_string(),
+            scope: scope.clone(),
             properties: properties.to_vec(),
             kind,
         };
@@ -605,13 +623,16 @@ impl RocksDbStorageEngine {
             }
         }
 
-        // UNIQUE needs a backing property index for enforcement. The
-        // call is idempotent — a user-declared index on the same
-        // `(label, property)` is reused. NodeKey doesn't get a
-        // backing index today (we enforce via label scan); adding a
-        // composite index is a follow-up optimization.
+        // UNIQUE on node scope needs a backing property index for
+        // enforcement; the call is idempotent. Relationship-scope
+        // UNIQUE has no backing edge-property index today, so we
+        // enforce via edges_by_type scan — O(E_type) per insert, same
+        // tradeoff as NodeKey. Composite / edge indexes are
+        // follow-ups.
         if matches!(kind, PropertyConstraintKind::Unique) {
-            self.create_property_index(label, &properties[0])?;
+            if let ConstraintScope::Node(label) = scope {
+                self.create_property_index(label, &properties[0])?;
+            }
         }
 
         // Validate existing data against the new constraint before we
@@ -678,7 +699,8 @@ impl RocksDbStorageEngine {
     /// constructed. `existing` is the previously-stored snapshot of
     /// the same node (if any) so the check can distinguish "this node
     /// is updating its own value" from "some other node owns this
-    /// value".
+    /// value". Relationship-scope constraints are ignored here — the
+    /// edge write path has its own entry point.
     fn enforce_constraints(&self, node: &Node, existing: Option<&Node>) -> Result<()> {
         let constraints = self.constraints.read().expect("constraints lock poisoned");
         if constraints.is_empty() {
@@ -686,7 +708,14 @@ impl RocksDbStorageEngine {
         }
         let now_has_label = |label: &str| node.labels.iter().any(|l| l == label);
         for spec in constraints.iter() {
-            if !now_has_label(&spec.label) {
+            let label = match &spec.scope {
+                ConstraintScope::Node(l) => l,
+                // Relationship-scope constraints apply to edges, not
+                // nodes. Skip here; `enforce_edge_constraints` runs
+                // on the edge write path.
+                ConstraintScope::Relationship(_) => continue,
+            };
+            if !now_has_label(label) {
                 continue;
             }
             // Single-property kinds store the target in
@@ -702,7 +731,7 @@ impl RocksDbStorageEngine {
                         return Err(Error::ConstraintViolation {
                             name: spec.name.clone(),
                             kind: spec.kind.as_string(),
-                            label: spec.label.clone(),
+                            label: label.clone(),
                             property: primary.to_string(),
                             details: format!(
                                 "node {} is missing required property `{}`",
@@ -724,7 +753,7 @@ impl RocksDbStorageEngine {
                     if encode_index_value(value).is_none() {
                         continue;
                     }
-                    let holders = self.nodes_by_property(&spec.label, primary, value)?;
+                    let holders = self.nodes_by_property(label, primary, value)?;
                     for other in holders {
                         if other == node.id {
                             continue;
@@ -736,7 +765,7 @@ impl RocksDbStorageEngine {
                         return Err(Error::ConstraintViolation {
                             name: spec.name.clone(),
                             kind: spec.kind.as_string(),
-                            label: spec.label.clone(),
+                            label: label.clone(),
                             property: primary.to_string(),
                             details: format!("value already held by node {}", other),
                         });
@@ -753,7 +782,7 @@ impl RocksDbStorageEngine {
                         return Err(Error::ConstraintViolation {
                             name: spec.name.clone(),
                             kind: spec.kind.as_string(),
-                            label: spec.label.clone(),
+                            label: label.clone(),
                             property: primary.to_string(),
                             details: format!(
                                 "node {} has value of type {} (expected {})",
@@ -784,7 +813,7 @@ impl RocksDbStorageEngine {
                                 return Err(Error::ConstraintViolation {
                                     name: spec.name.clone(),
                                     kind: spec.kind.as_string(),
-                                    label: spec.label.clone(),
+                                    label: label.clone(),
                                     property: prop.clone(),
                                     details: format!(
                                         "node {} is missing required property `{}`",
@@ -794,7 +823,7 @@ impl RocksDbStorageEngine {
                             }
                         }
                     }
-                    for other_id in self.nodes_by_label(&spec.label)? {
+                    for other_id in self.nodes_by_label(label)? {
                         if other_id == node.id {
                             continue;
                         }
@@ -816,12 +845,120 @@ impl RocksDbStorageEngine {
                             return Err(Error::ConstraintViolation {
                                 name: spec.name.clone(),
                                 kind: spec.kind.as_string(),
-                                label: spec.label.clone(),
+                                label: label.clone(),
                                 property: spec.properties.join(","),
                                 details: format!("tuple already held by node {}", other_id),
                             });
                         }
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce registered relationship-scope constraints against the
+    /// post-write state of `edge`. Invoked by the `put_edge` path
+    /// before the batch is constructed. Walks every constraint whose
+    /// scope matches the edge's type and runs the kind-specific
+    /// check. `existing` is the prior on-disk snapshot of the same
+    /// edge (if any) so the uniqueness check can allow self-updates.
+    fn enforce_edge_constraints(&self, edge: &Edge, existing: Option<&Edge>) -> Result<()> {
+        let constraints = self.constraints.read().expect("constraints lock poisoned");
+        if constraints.is_empty() {
+            return Ok(());
+        }
+        for spec in constraints.iter() {
+            let edge_type = match &spec.scope {
+                ConstraintScope::Relationship(t) => t,
+                // Node-scope constraints don't concern edges.
+                ConstraintScope::Node(_) => continue,
+            };
+            if edge_type != &edge.edge_type {
+                continue;
+            }
+            let primary = spec.primary_property();
+            match spec.kind {
+                PropertyConstraintKind::NotNull => {
+                    let present = edge
+                        .properties
+                        .get(primary)
+                        .is_some_and(|v| !matches!(v, Property::Null));
+                    if !present {
+                        return Err(Error::ConstraintViolation {
+                            name: spec.name.clone(),
+                            kind: spec.kind.as_string(),
+                            label: edge_type.clone(),
+                            property: primary.to_string(),
+                            details: format!(
+                                "edge {} is missing required property `{}`",
+                                edge.id, primary
+                            ),
+                        });
+                    }
+                }
+                PropertyConstraintKind::Unique => {
+                    let Some(value) = edge.properties.get(primary) else {
+                        continue;
+                    };
+                    if matches!(value, Property::Null) {
+                        continue;
+                    }
+                    // No edge property index in v1, so we scan every
+                    // edge of the constrained type. O(E_type) per
+                    // insert. Future: add an edge-property index to
+                    // accelerate this path.
+                    for other_id in self.edges_by_type(edge_type)? {
+                        if other_id == edge.id {
+                            continue;
+                        }
+                        let other = match self.get_edge(other_id)? {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        if other.properties.get(primary) == Some(value) {
+                            let was_self = existing
+                                .and_then(|e| e.properties.get(primary))
+                                .is_some_and(|v| v == value);
+                            let _ = was_self;
+                            return Err(Error::ConstraintViolation {
+                                name: spec.name.clone(),
+                                kind: spec.kind.as_string(),
+                                label: edge_type.clone(),
+                                property: primary.to_string(),
+                                details: format!("value already held by edge {}", other_id),
+                            });
+                        }
+                    }
+                }
+                PropertyConstraintKind::PropertyType(target) => {
+                    let Some(value) = edge.properties.get(primary) else {
+                        continue;
+                    };
+                    if matches!(value, Property::Null) {
+                        continue;
+                    }
+                    if !property_matches_type(value, target) {
+                        return Err(Error::ConstraintViolation {
+                            name: spec.name.clone(),
+                            kind: spec.kind.as_string(),
+                            label: edge_type.clone(),
+                            property: primary.to_string(),
+                            details: format!(
+                                "edge {} has value of type {} (expected {})",
+                                edge.id,
+                                value.type_name(),
+                                target.as_str()
+                            ),
+                        });
+                    }
+                }
+                PropertyConstraintKind::NodeKey => {
+                    // Disallowed at create time — see
+                    // `create_property_constraint`.
+                    unreachable!(
+                        "NODE KEY on relationship scope should have been rejected at create time"
+                    );
                 }
             }
         }
@@ -962,12 +1099,17 @@ impl RocksDbStorageEngine {
 /// restarts — users can target the auto-name with `DROP CONSTRAINT`
 /// without having to inspect `SHOW CONSTRAINTS` first.
 fn default_constraint_name(
-    label: &str,
+    scope: &ConstraintScope,
     properties: &[String],
     kind: PropertyConstraintKind,
 ) -> String {
     let joined = properties.join("_");
-    format!("constraint_{label}_{joined}_{}", kind.name_tag())
+    format!(
+        "constraint_{scope_tag}_{target}_{joined}_{kind_tag}",
+        scope_tag = scope.name_tag(),
+        target = scope.target(),
+        kind_tag = kind.name_tag(),
+    )
 }
 
 /// Scan existing nodes and verify that `spec` holds. Called on
@@ -979,7 +1121,20 @@ fn validate_existing_data(
     engine: &RocksDbStorageEngine,
     spec: &PropertyConstraintSpec,
 ) -> Result<()> {
-    let label_members = engine.nodes_by_label(&spec.label)?;
+    match &spec.scope {
+        ConstraintScope::Node(label) => validate_existing_nodes(engine, spec, label),
+        ConstraintScope::Relationship(edge_type) => {
+            validate_existing_edges(engine, spec, edge_type)
+        }
+    }
+}
+
+fn validate_existing_nodes(
+    engine: &RocksDbStorageEngine,
+    spec: &PropertyConstraintSpec,
+    label: &str,
+) -> Result<()> {
+    let label_members = engine.nodes_by_label(label)?;
     let primary = spec.primary_property();
     match spec.kind {
         PropertyConstraintKind::NotNull => {
@@ -996,7 +1151,7 @@ fn validate_existing_data(
                     return Err(Error::ConstraintViolation {
                         name: spec.name.clone(),
                         kind: spec.kind.as_string(),
-                        label: spec.label.clone(),
+                        label: label.to_string(),
                         property: primary.to_string(),
                         details: format!("node {id} is missing required property"),
                     });
@@ -1021,7 +1176,7 @@ fn validate_existing_data(
                     return Err(Error::ConstraintViolation {
                         name: spec.name.clone(),
                         kind: spec.kind.as_string(),
-                        label: spec.label.clone(),
+                        label: label.to_string(),
                         property: primary.to_string(),
                         details: format!("duplicate value held by nodes {first} and {id}"),
                     });
@@ -1045,7 +1200,7 @@ fn validate_existing_data(
                     return Err(Error::ConstraintViolation {
                         name: spec.name.clone(),
                         kind: spec.kind.as_string(),
-                        label: spec.label.clone(),
+                        label: label.to_string(),
                         property: primary.to_string(),
                         details: format!(
                             "node {id} has value of type {} (expected {})",
@@ -1057,12 +1212,6 @@ fn validate_existing_data(
             }
         }
         PropertyConstraintKind::NodeKey => {
-            // Composite existence + uniqueness: drop into a scratch
-            // map keyed by the encoded tuple, so a pre-existing pair
-            // with identical values surfaces the exact colliding ids
-            // in the error. Missing-property checks fail immediately
-            // — no point scanning for duplicates if the invariant is
-            // already broken.
             use std::collections::HashMap;
             let mut seen: HashMap<Vec<Vec<u8>>, meshdb_core::NodeId> = HashMap::new();
             for id in label_members {
@@ -1078,9 +1227,6 @@ fn validate_existing_data(
                             if let Some(encoded) = encode_index_value(v) {
                                 tuple.push(encoded);
                             } else {
-                                // Unindexable value type — skip this
-                                // node, since the tuple can't be
-                                // compared meaningfully.
                                 missing = Some(prop);
                                 break;
                             }
@@ -1095,7 +1241,7 @@ fn validate_existing_data(
                     return Err(Error::ConstraintViolation {
                         name: spec.name.clone(),
                         kind: spec.kind.as_string(),
-                        label: spec.label.clone(),
+                        label: label.to_string(),
                         property: prop.to_string(),
                         details: format!("node {id} is missing required property `{prop}`"),
                     });
@@ -1104,13 +1250,106 @@ fn validate_existing_data(
                     return Err(Error::ConstraintViolation {
                         name: spec.name.clone(),
                         kind: spec.kind.as_string(),
-                        label: spec.label.clone(),
+                        label: label.to_string(),
                         property: spec.properties.join(","),
                         details: format!("duplicate tuple held by nodes {first} and {id}"),
                     });
                 }
                 seen.insert(tuple, id);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Relationship-scope analogue to `validate_existing_nodes`. Walks
+/// `edges_by_type(edge_type)` because we don't have an edge property
+/// index; complexity is O(E_type) per newly-declared constraint. `NodeKey` is rejected at create time
+/// for relationship scope, so this path doesn't handle it.
+fn validate_existing_edges(
+    engine: &RocksDbStorageEngine,
+    spec: &PropertyConstraintSpec,
+    edge_type: &str,
+) -> Result<()> {
+    let edge_ids = engine.edges_by_type(edge_type)?;
+    let primary = spec.primary_property();
+    match spec.kind {
+        PropertyConstraintKind::NotNull => {
+            for id in edge_ids {
+                let edge = match engine.get_edge(id)? {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let present = edge
+                    .properties
+                    .get(primary)
+                    .is_some_and(|v| !matches!(v, Property::Null));
+                if !present {
+                    return Err(Error::ConstraintViolation {
+                        name: spec.name.clone(),
+                        kind: spec.kind.as_string(),
+                        label: edge_type.to_string(),
+                        property: primary.to_string(),
+                        details: format!("edge {id} is missing required property"),
+                    });
+                }
+            }
+        }
+        PropertyConstraintKind::Unique => {
+            use std::collections::HashMap;
+            let mut seen: HashMap<Vec<u8>, meshdb_core::EdgeId> = HashMap::new();
+            for id in edge_ids {
+                let edge = match engine.get_edge(id)? {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let Some(value) = edge.properties.get(primary) else {
+                    continue;
+                };
+                let Some(encoded) = encode_index_value(value) else {
+                    continue;
+                };
+                if let Some(&first) = seen.get(&encoded) {
+                    return Err(Error::ConstraintViolation {
+                        name: spec.name.clone(),
+                        kind: spec.kind.as_string(),
+                        label: edge_type.to_string(),
+                        property: primary.to_string(),
+                        details: format!("duplicate value held by edges {first} and {id}"),
+                    });
+                }
+                seen.insert(encoded, id);
+            }
+        }
+        PropertyConstraintKind::PropertyType(target) => {
+            for id in edge_ids {
+                let edge = match engine.get_edge(id)? {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let Some(value) = edge.properties.get(primary) else {
+                    continue;
+                };
+                if matches!(value, Property::Null) {
+                    continue;
+                }
+                if !property_matches_type(value, target) {
+                    return Err(Error::ConstraintViolation {
+                        name: spec.name.clone(),
+                        kind: spec.kind.as_string(),
+                        label: edge_type.to_string(),
+                        property: primary.to_string(),
+                        details: format!(
+                            "edge {id} has value of type {} (expected {})",
+                            value.type_name(),
+                            target.as_str()
+                        ),
+                    });
+                }
+            }
+        }
+        PropertyConstraintKind::NodeKey => {
+            unreachable!("NODE KEY on relationship scope rejected at create time")
         }
     }
     Ok(())
@@ -1250,7 +1489,7 @@ impl StorageEngine for RocksDbStorageEngine {
     fn create_property_constraint(
         &self,
         name: Option<&str>,
-        label: &str,
+        scope: &ConstraintScope,
         properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
@@ -1258,7 +1497,7 @@ impl StorageEngine for RocksDbStorageEngine {
         RocksDbStorageEngine::create_property_constraint(
             self,
             name,
-            label,
+            scope,
             properties,
             kind,
             if_not_exists,

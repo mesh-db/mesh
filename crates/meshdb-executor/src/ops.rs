@@ -9,12 +9,13 @@ use crate::{
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
 use meshdb_cypher::{
     AggregateArg, AggregateFn, AggregateSpec, BinaryOp, CallArgs, CompareOp, ConstraintKind,
-    CreateEdgeSpec, CreateNodeSpec, Direction, Expr, Literal, LogicalPlan,
-    PropertyType as CypherPropertyType, RemoveSpec, ReturnItem, SetAssignment, SortItem, UnaryOp,
-    YieldSpec,
+    ConstraintScope as CypherConstraintScope, CreateEdgeSpec, CreateNodeSpec, Direction, Expr,
+    Literal, LogicalPlan, PropertyType as CypherPropertyType, RemoveSpec, ReturnItem,
+    SetAssignment, SortItem, UnaryOp, YieldSpec,
 };
 use meshdb_storage::{
-    PropertyConstraintKind, PropertyType as StoragePropertyType, RocksDbStorageEngine,
+    ConstraintScope as StorageConstraintScope, PropertyConstraintKind,
+    PropertyType as StoragePropertyType, RocksDbStorageEngine,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -290,7 +291,7 @@ fn try_execute_ddl(
         }
         LogicalPlan::CreatePropertyConstraint {
             name,
-            label,
+            scope,
             properties,
             kind,
             if_not_exists,
@@ -303,9 +304,10 @@ fn try_execute_ddl(
                     PropertyConstraintKind::PropertyType(cypher_to_storage_property_type(*t))
                 }
             };
+            let storage_scope = cypher_to_storage_scope(scope);
             let spec = writer.create_property_constraint(
                 name.as_deref(),
-                label,
+                &storage_scope,
                 properties,
                 storage_kind,
                 *if_not_exists,
@@ -348,16 +350,26 @@ fn constraint_ack_row(state: &str, spec: &meshdb_storage::PropertyConstraintSpec
 }
 
 /// Row shape for `SHOW CONSTRAINTS` and `db.constraints()`. Columns:
-/// `name`, `label`, `properties` (list), and `type`. Single-property
-/// constraints still carry a one-element `properties` list; composite
-/// kinds (e.g. `NodeKey`) carry the full tuple in source order.
+/// `name`, `scope` ("NODE" / "RELATIONSHIP"), `label` (label or edge
+/// type, depending on scope), `properties` (list), and `type`.
+/// Single-property constraints still carry a one-element `properties`
+/// list; composite kinds (e.g. `NodeKey`) carry the full tuple.
 fn constraint_show_row(spec: meshdb_storage::PropertyConstraintSpec) -> Row {
     let mut row = Row::default();
     row.insert("name".into(), Value::Property(Property::String(spec.name)));
+    let (scope_tag, target) = match spec.scope {
+        meshdb_storage::ConstraintScope::Node(l) => ("NODE", l),
+        meshdb_storage::ConstraintScope::Relationship(t) => ("RELATIONSHIP", t),
+    };
     row.insert(
-        "label".into(),
-        Value::Property(Property::String(spec.label)),
+        "scope".into(),
+        Value::Property(Property::String(scope_tag.into())),
     );
+    // `label` stays for backwards compatibility — it carries the
+    // scope's target regardless of node vs relationship, matching
+    // the index DDL row's column for historical consistency. A
+    // separate `scope` column tells you what kind of target it is.
+    row.insert("label".into(), Value::Property(Property::String(target)));
     let props: Vec<Property> = spec.properties.into_iter().map(Property::String).collect();
     row.insert("properties".into(), Value::Property(Property::List(props)));
     row.insert(
@@ -365,6 +377,16 @@ fn constraint_show_row(spec: meshdb_storage::PropertyConstraintSpec) -> Row {
         Value::Property(Property::String(spec.kind.as_string())),
     );
     row
+}
+
+/// Convert the Cypher AST's `ConstraintScope` into the storage-layer
+/// enum. Narrow bridge — same shape on both sides; kept in
+/// different crates to preserve the dependency direction.
+fn cypher_to_storage_scope(scope: &CypherConstraintScope) -> StorageConstraintScope {
+    match scope {
+        CypherConstraintScope::Node(l) => StorageConstraintScope::Node(l.clone()),
+        CypherConstraintScope::Relationship(t) => StorageConstraintScope::Relationship(t.clone()),
+    }
 }
 
 /// Convert the Cypher AST's `PropertyType` into the storage-layer

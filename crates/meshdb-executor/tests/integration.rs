@@ -7497,7 +7497,10 @@ fn create_unique_constraint_round_trip() {
     assert_eq!(str_list_prop(&rows[0], "properties"), vec!["email"]);
     assert_eq!(str_prop(&rows[0], "type"), "UNIQUE");
     // Auto-generated name format.
-    assert_eq!(str_prop(&rows[0], "name"), "constraint_Person_email_unique");
+    assert_eq!(
+        str_prop(&rows[0], "name"),
+        "constraint_node_Person_email_unique"
+    );
 
     let shown = run(&store, "SHOW CONSTRAINTS");
     assert_eq!(shown.len(), 1);
@@ -7847,8 +7850,123 @@ fn node_key_auto_name_includes_all_properties() {
     );
     assert_eq!(
         str_prop(&rows[0], "name"),
-        "constraint_Person_first_last_node_key"
+        "constraint_node_Person_first_last_node_key"
     );
+}
+
+#[test]
+fn relationship_not_null_constraint_enforces_on_put_edge() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR ()-[r:KNOWS]-() REQUIRE r.since IS NOT NULL",
+    );
+    run(&store, "CREATE (a:Person {id: 1})");
+    run(&store, "CREATE (b:Person {id: 2})");
+    // Missing `since` on KNOWS — violates NOT NULL.
+    let err = run_catch(
+        &store,
+        "MATCH (a:Person {id: 1}), (b:Person {id: 2}) CREATE (a)-[:KNOWS]->(b)",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("NOT NULL"),
+        "error should identify the constraint kind; got: {err}"
+    );
+    // Supplying `since` succeeds.
+    run(
+        &store,
+        "MATCH (a:Person {id: 1}), (b:Person {id: 2}) \
+         CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    );
+    let rows = run(&store, "MATCH ()-[r:KNOWS]->() RETURN r.since AS s");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "s"), 2020);
+}
+
+#[test]
+fn relationship_unique_constraint_blocks_duplicate_property() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR ()-[r:KNOWS]-() REQUIRE r.token IS UNIQUE",
+    );
+    run(&store, "CREATE (:Person {id: 1})");
+    run(&store, "CREATE (:Person {id: 2})");
+    run(&store, "CREATE (:Person {id: 3})");
+    run(
+        &store,
+        "MATCH (a:Person {id: 1}), (b:Person {id: 2}) \
+         CREATE (a)-[:KNOWS {token: 'abc'}]->(b)",
+    );
+    // Same token on a different pair — violates UNIQUE on the edge.
+    let err = run_catch(
+        &store,
+        "MATCH (a:Person {id: 2}), (b:Person {id: 3}) \
+         CREATE (a)-[:KNOWS {token: 'abc'}]->(b)",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"));
+}
+
+#[test]
+fn relationship_property_type_constraint_rejects_wrong_type() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR ()-[r:RATES]-() REQUIRE r.score IS :: INTEGER",
+    );
+    run(&store, "CREATE (:Item {id: 1})");
+    run(&store, "CREATE (:Item {id: 2})");
+    let err = run_catch(
+        &store,
+        "MATCH (a:Item {id: 1}), (b:Item {id: 2}) \
+         CREATE (a)-[:RATES {score: 'great'}]->(b)",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("IS :: INTEGER"));
+}
+
+#[test]
+fn relationship_constraint_shown_with_relationship_scope() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR ()-[r:KNOWS]-() REQUIRE r.since IS NOT NULL",
+    );
+    let rows = run(&store, "SHOW CONSTRAINTS");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "scope"), "RELATIONSHIP");
+    assert_eq!(str_prop(&rows[0], "label"), "KNOWS");
+    assert_eq!(str_prop(&rows[0], "type"), "NOT NULL");
+}
+
+#[test]
+fn relationship_constraint_rejects_node_key() {
+    // NODE KEY isn't meaningful for relationships; the storage layer
+    // rejects the combination at declaration time.
+    let (store, _d) = open_store();
+    let err = run_catch(
+        &store,
+        "CREATE CONSTRAINT FOR ()-[r:KNOWS]-() REQUIRE (r.a, r.b) IS NODE KEY",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("relationship"));
+}
+
+#[test]
+fn relationship_and_node_constraints_coexist() {
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE",
+    );
+    run(
+        &store,
+        "CREATE CONSTRAINT FOR ()-[r:KNOWS]-() REQUIRE r.since IS NOT NULL",
+    );
+    let rows = run(&store, "SHOW CONSTRAINTS");
+    assert_eq!(rows.len(), 2);
 }
 
 #[test]

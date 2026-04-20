@@ -1070,7 +1070,7 @@ fn create_unique_constraint_parses_without_name() {
     match parse("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE").unwrap() {
         Statement::CreateConstraint(stmt) => {
             assert_eq!(stmt.name, None);
-            assert_eq!(stmt.label, "Person");
+            assert_eq!(stmt.scope, ConstraintScope::Node("Person".into()));
             assert_eq!(stmt.properties, vec!["email".to_string()]);
             assert_eq!(stmt.kind, ConstraintKind::Unique);
             assert!(!stmt.if_not_exists);
@@ -1085,7 +1085,7 @@ fn create_not_null_constraint_parses_with_name() {
     {
         Statement::CreateConstraint(stmt) => {
             assert_eq!(stmt.name.as_deref(), Some("person_name"));
-            assert_eq!(stmt.label, "Person");
+            assert_eq!(stmt.scope, ConstraintScope::Node("Person".into()));
             assert_eq!(stmt.properties, vec!["name".to_string()]);
             assert_eq!(stmt.kind, ConstraintKind::NotNull);
         }
@@ -1221,6 +1221,40 @@ fn create_node_key_constraint_parses_composite() {
             );
         }
         other => panic!("expected CreateConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_relationship_constraint_parses_not_null() {
+    match parse("CREATE CONSTRAINT FOR ()-[r:KNOWS]-() REQUIRE r.since IS NOT NULL").unwrap() {
+        Statement::CreateConstraint(stmt) => {
+            assert_eq!(stmt.scope, ConstraintScope::Relationship("KNOWS".into()));
+            assert_eq!(stmt.properties, vec!["since".to_string()]);
+            assert_eq!(stmt.kind, ConstraintKind::NotNull);
+        }
+        other => panic!("expected CreateConstraint, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_relationship_constraint_accepts_arrow_directions() {
+    // Direction is not meaningful for constraints — accept the
+    // undirected form and both arrow shapes.
+    for src in [
+        "CREATE CONSTRAINT FOR ()-[r:LIKES]->() REQUIRE r.weight IS :: FLOAT",
+        "CREATE CONSTRAINT FOR ()<-[r:LIKES]-() REQUIRE r.weight IS :: FLOAT",
+        "CREATE CONSTRAINT FOR ()-[r:LIKES]-() REQUIRE r.weight IS :: FLOAT",
+    ] {
+        match parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}")) {
+            Statement::CreateConstraint(stmt) => {
+                assert_eq!(
+                    stmt.scope,
+                    ConstraintScope::Relationship("LIKES".into()),
+                    "src: {src}",
+                );
+            }
+            other => panic!("expected CreateConstraint for {src}, got {:?}", other),
+        }
     }
 }
 

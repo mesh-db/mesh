@@ -145,17 +145,27 @@ pub enum PropertyType {
     Boolean,
 }
 
-/// Payload for `CREATE CONSTRAINT ... FOR (n:Label) REQUIRE <prop-list>
-/// IS <kind>`. Unlike indexes, constraints carry an optional
-/// user-supplied name — when `name` is `None` the storage layer
-/// fills in a deterministic auto-generated name so `DROP CONSTRAINT`
-/// can still target it. `properties` is a list so composite
-/// `NODE KEY` constraints fit the same shape; single-property kinds
+/// Scope a constraint applies to. `Node(label)` covers every node
+/// with the label; `Relationship(edge_type)` covers every edge with
+/// the type. The storage / cluster crates carry mirror copies of
+/// this enum — converters in the executor keep them in lockstep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintScope {
+    Node(String),
+    Relationship(String),
+}
+
+/// Payload for `CREATE CONSTRAINT ... FOR <source> REQUIRE <prop-list>
+/// IS <kind>` where `<source>` is either a node pattern `(n:Label)`
+/// or a relationship pattern `()-[r:TYPE]-()`. `name` is optional —
+/// absent names auto-resolve to a deterministic identifier so `DROP
+/// CONSTRAINT` can still target the entry. `properties` is a list so
+/// composite `NODE KEY` fits the same shape; single-property kinds
 /// pass a one-element list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateConstraintStmt {
     pub name: Option<String>,
-    pub label: String,
+    pub scope: ConstraintScope,
     pub properties: Vec<String>,
     pub kind: ConstraintKind,
     /// `true` when the source carried `IF NOT EXISTS` — makes

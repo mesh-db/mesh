@@ -1,12 +1,25 @@
 use meshdb_cluster::raft::RaftCluster;
 use meshdb_cluster::{
-    ConstraintKind as ClusterConstraintKind, GraphCommand, PropertyType as ClusterPropertyType,
+    ConstraintKind as ClusterConstraintKind, ConstraintScope as ClusterConstraintScope,
+    GraphCommand, PropertyType as ClusterPropertyType,
 };
 use meshdb_core::{Edge, EdgeId, Node, NodeId};
 use meshdb_executor::{Error as ExecError, GraphWriter, Result as ExecResult};
-use meshdb_storage::{PropertyConstraintKind, PropertyConstraintSpec, PropertyType};
+use meshdb_storage::{
+    ConstraintScope, PropertyConstraintKind, PropertyConstraintSpec, PropertyType,
+};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
+
+/// Bridge the storage-crate `ConstraintScope` into the cluster-crate
+/// enum so proposals can be serialized without the Raft log depending
+/// on the storage crate.
+fn cluster_scope(scope: &ConstraintScope) -> ClusterConstraintScope {
+    match scope {
+        ConstraintScope::Node(l) => ClusterConstraintScope::Node(l.clone()),
+        ConstraintScope::Relationship(t) => ClusterConstraintScope::Relationship(t.clone()),
+    }
+}
 
 /// Bridge the storage-crate `PropertyConstraintKind` back into the
 /// cluster-crate enum. The cluster enum is the "wire type" for DDL
@@ -91,7 +104,7 @@ impl GraphWriter for RaftGraphWriter {
     fn create_property_constraint(
         &self,
         name: Option<&str>,
-        label: &str,
+        scope: &ConstraintScope,
         properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
@@ -102,22 +115,23 @@ impl GraphWriter for RaftGraphWriter {
         // through `propose_graph`, so we synthesize the spec locally
         // from the supplied fields. The resolved name uses the same
         // deterministic formula as the storage layer.
+        let cluster_scope = cluster_scope(scope);
         let resolved = meshdb_cluster::resolved_constraint_name(
             &name.map(str::to_string),
-            label,
+            &cluster_scope,
             properties,
             cluster_kind(kind),
         );
         self.propose(GraphCommand::CreateConstraint {
             name: name.map(str::to_string),
-            label: label.to_string(),
+            scope: cluster_scope,
             properties: properties.to_vec(),
             kind: cluster_kind(kind),
             if_not_exists,
         })?;
         Ok(PropertyConstraintSpec {
             name: resolved,
-            label: label.to_string(),
+            scope: scope.clone(),
             properties: properties.to_vec(),
             kind,
         })
@@ -218,7 +232,7 @@ impl GraphWriter for BufferingGraphWriter {
     fn create_property_constraint(
         &self,
         name: Option<&str>,
-        label: &str,
+        scope: &ConstraintScope,
         properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
@@ -229,9 +243,10 @@ impl GraphWriter for BufferingGraphWriter {
         // for the DDL acknowledgement row. Name resolution is
         // deterministic so the spec we return matches what the
         // applier will install on every replica.
+        let cluster_scope = cluster_scope(scope);
         let resolved = meshdb_cluster::resolved_constraint_name(
             &name.map(str::to_string),
-            label,
+            &cluster_scope,
             properties,
             cluster_kind(kind),
         );
@@ -240,14 +255,14 @@ impl GraphWriter for BufferingGraphWriter {
             .unwrap()
             .push(GraphCommand::CreateConstraint {
                 name: name.map(str::to_string),
-                label: label.to_string(),
+                scope: cluster_scope,
                 properties: properties.to_vec(),
                 kind: cluster_kind(kind),
                 if_not_exists,
             });
         Ok(PropertyConstraintSpec {
             name: resolved,
-            label: label.to_string(),
+            scope: scope.clone(),
             properties: properties.to_vec(),
             kind,
         })

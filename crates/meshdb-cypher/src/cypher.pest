@@ -94,10 +94,25 @@ index_property = { identifier ~ "." ~ identifier }
 create_constraint_stmt = {
     kw_create ~ kw_constraint ~
     constraint_name_opt? ~ if_not_exists? ~
-    kw_for ~ "(" ~ constraint_target ~ ")" ~
+    kw_for ~ (constraint_rel_source | constraint_node_source) ~
     kw_require ~ (constraint_property_list | constraint_property) ~
     constraint_requirement
 }
+
+// Node source: `(var:Label)`. The enclosing `create_constraint_stmt`
+// accepts either this or the relationship source; alternation tries
+// the relationship form first because its `()-[...]-()` prefix is
+// unambiguous.
+constraint_node_source = { "(" ~ constraint_target ~ ")" }
+
+// Relationship source: `()-[var:TYPE]-()`. Direction is not
+// significant for constraints — edges of the type are constrained
+// regardless of which endpoint you scanned from — so we accept the
+// undirected form and both arrow shapes at the same priority.
+constraint_rel_source = {
+    "(" ~ ")" ~ rel_edge ~ "[" ~ identifier ~ ":" ~ identifier ~ "]" ~ rel_edge ~ "(" ~ ")"
+}
+rel_edge = { "<-" | "->" | "-" }
 
 // Parenthesized property list for composite constraints:
 //   REQUIRE (n.a, n.b) IS NODE KEY

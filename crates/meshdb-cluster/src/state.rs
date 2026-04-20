@@ -72,7 +72,7 @@ pub enum GraphCommand {
     /// idempotent under re-replay.
     CreateConstraint {
         name: Option<String>,
-        label: String,
+        scope: ConstraintScope,
         /// Non-empty list of property names the constraint applies
         /// to. Single-property kinds (`Unique`, `NotNull`,
         /// `PropertyType`) carry a one-element list; `NodeKey`
@@ -90,6 +90,32 @@ pub enum GraphCommand {
         name: String,
         if_exists: bool,
     },
+}
+
+/// Cluster-visible scope for a constraint. Mirrors
+/// `meshdb_storage::ConstraintScope` — kept here so the Raft log
+/// entry stays storage-agnostic. Converters in meshdb-rpc bridge
+/// the two sides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConstraintScope {
+    Node(String),
+    Relationship(String),
+}
+
+impl ConstraintScope {
+    pub fn target(&self) -> &str {
+        match self {
+            ConstraintScope::Node(l) => l,
+            ConstraintScope::Relationship(t) => t,
+        }
+    }
+
+    pub fn name_tag(&self) -> &'static str {
+        match self {
+            ConstraintScope::Node(_) => "node",
+            ConstraintScope::Relationship(_) => "rel",
+        }
+    }
 }
 
 /// Cluster-visible constraint kind. Mirrors
@@ -156,7 +182,7 @@ impl ConstraintKind {
 /// fan-out can compute the drop name during rollback.
 pub fn resolved_constraint_name(
     name: &Option<String>,
-    label: &str,
+    scope: &ConstraintScope,
     properties: &[String],
     kind: ConstraintKind,
 ) -> String {
@@ -164,7 +190,12 @@ pub fn resolved_constraint_name(
         Some(n) => n.clone(),
         None => {
             let joined = properties.join("_");
-            format!("constraint_{label}_{joined}_{}", kind.name_tag())
+            format!(
+                "constraint_{scope_tag}_{target}_{joined}_{kind_tag}",
+                scope_tag = scope.name_tag(),
+                target = scope.target(),
+                kind_tag = kind.name_tag(),
+            )
         }
     }
 }

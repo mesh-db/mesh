@@ -1,4 +1,6 @@
-use crate::engine::{PropertyConstraintKind, PropertyConstraintSpec, PropertyType};
+use crate::engine::{
+    ConstraintScope, PropertyConstraintKind, PropertyConstraintSpec, PropertyType,
+};
 use crate::error::{Error, Result};
 use meshdb_core::{EdgeId, NodeId, Property};
 
@@ -250,20 +252,31 @@ pub(crate) const PROPERTY_TYPE_INTEGER: u8 = 0x02;
 pub(crate) const PROPERTY_TYPE_FLOAT: u8 = 0x03;
 pub(crate) const PROPERTY_TYPE_BOOLEAN: u8 = 0x04;
 
+/// Scope tags for constraint meta. `NODE` predates
+/// `RELATIONSHIP` — the original format stored only a label,
+/// implicitly node-scoped; the new format prefixes every entry with a
+/// scope tag so on-disk reads can tell the two apart. Old entries
+/// written before this tag existed aren't automatically readable —
+/// users on pre-relationship builds will need to re-declare their
+/// constraints after upgrading.
+pub(crate) const SCOPE_NODE: u8 = 0x01;
+pub(crate) const SCOPE_RELATIONSHIP: u8 = 0x02;
+
 /// Encode a constraint spec's value bytes for `CF_CONSTRAINT_META`.
 /// Layout:
-///   `[kind:u8][?type:u8][label_len:u16][label][prop_count:u16]([prop_len:u16][prop])*`
+///   `[kind:u8][?type:u8][scope:u8][target_len:u16][target][prop_count:u16]([prop_len:u16][prop])*`
 /// The `type` byte is only emitted when `kind == PROPERTY_TYPE`;
 /// the property list is always length-prefixed with a count and
-/// per-entry length so `NodeKey`'s composite tuple round-trips.
+/// per-entry length so `NodeKey`'s composite tuple round-trips. The
+/// scope byte distinguishes node-label from relationship-type targets.
 pub(crate) fn constraint_meta_encode(spec: &PropertyConstraintSpec) -> Vec<u8> {
-    let label_bytes = spec.label.as_bytes();
-    let label_len = u16::try_from(label_bytes.len()).expect("label length fits in u16");
+    let target_bytes = spec.scope.target().as_bytes();
+    let target_len = u16::try_from(target_bytes.len()).expect("scope target length fits in u16");
     let prop_count = u16::try_from(spec.properties.len()).expect("property count fits in u16");
     let props_total: usize = spec.properties.iter().map(|p| p.len()).sum();
     let mut out = Vec::with_capacity(
-        2 + LEN_PREFIX
-            + label_bytes.len()
+        3 + LEN_PREFIX
+            + target_bytes.len()
             + LEN_PREFIX
             + props_total
             + LEN_PREFIX * spec.properties.len(),
@@ -277,8 +290,12 @@ pub(crate) fn constraint_meta_encode(spec: &PropertyConstraintSpec) -> Vec<u8> {
         }
         PropertyConstraintKind::NodeKey => out.push(CONSTRAINT_KIND_NODE_KEY),
     }
-    out.extend_from_slice(&label_len.to_be_bytes());
-    out.extend_from_slice(label_bytes);
+    out.push(match spec.scope {
+        ConstraintScope::Node(_) => SCOPE_NODE,
+        ConstraintScope::Relationship(_) => SCOPE_RELATIONSHIP,
+    });
+    out.extend_from_slice(&target_len.to_be_bytes());
+    out.extend_from_slice(target_bytes);
     out.extend_from_slice(&prop_count.to_be_bytes());
     for prop in &spec.properties {
         let bytes = prop.as_bytes();
@@ -352,7 +369,27 @@ pub(crate) fn constraint_meta_decode(
         }
     };
     let mut cursor = kind_header_len;
-    let label = read_len_prefixed_string(cf, bytes, &mut cursor)?;
+    if cursor >= bytes.len() {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected: cursor + 1,
+            actual: bytes.len(),
+        });
+    }
+    let scope_tag = bytes[cursor];
+    cursor += 1;
+    let target = read_len_prefixed_string(cf, bytes, &mut cursor)?;
+    let scope = match scope_tag {
+        SCOPE_NODE => ConstraintScope::Node(target),
+        SCOPE_RELATIONSHIP => ConstraintScope::Relationship(target),
+        _ => {
+            return Err(Error::CorruptBytes {
+                cf,
+                expected: 1,
+                actual: 1,
+            });
+        }
+    };
     // Property list: u16 count followed by `count` length-prefixed
     // strings. Zero-count is accepted by the decoder but the storage
     // layer rejects it at create time — keeping the decode side
@@ -380,7 +417,7 @@ pub(crate) fn constraint_meta_decode(
     }
     Ok(PropertyConstraintSpec {
         name,
-        label,
+        scope,
         properties,
         kind,
     })

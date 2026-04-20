@@ -182,10 +182,15 @@ fn builtin_db_constraints(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
         .map(|spec| {
             let mut row: ProcRow = HashMap::new();
             row.insert("name".into(), Value::Property(Property::String(spec.name)));
+            let (scope_tag, target) = match spec.scope {
+                meshdb_storage::ConstraintScope::Node(l) => ("NODE", l),
+                meshdb_storage::ConstraintScope::Relationship(t) => ("RELATIONSHIP", t),
+            };
             row.insert(
-                "label".into(),
-                Value::Property(Property::String(spec.label)),
+                "scope".into(),
+                Value::Property(Property::String(scope_tag.into())),
             );
+            row.insert("label".into(), Value::Property(Property::String(target)));
             let props: Vec<Property> = spec.properties.into_iter().map(Property::String).collect();
             row.insert("properties".into(), Value::Property(Property::List(props)));
             row.insert(
@@ -302,6 +307,10 @@ impl ProcedureRegistry {
             outputs: vec![
                 ProcOutSpec {
                     name: "name".into(),
+                    ty: ProcType::String,
+                },
+                ProcOutSpec {
+                    name: "scope".into(),
                     ty: ProcType::String,
                 },
                 ProcOutSpec {

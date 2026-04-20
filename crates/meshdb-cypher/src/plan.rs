@@ -1,7 +1,8 @@
 use crate::ast::{
-    BinaryOp, CallArgs, CompareOp, ConstraintKind, CreateConstraintStmt, CreateStmt, Direction,
-    DropConstraintStmt, Expr, IndexDdl, Literal, MatchStmt, NodePattern, Pattern, ReturnItem,
-    ReturnStmt, ShortestKind, SortItem, Statement, UnaryOp, UnionStmt, UnwindStmt,
+    BinaryOp, CallArgs, CompareOp, ConstraintKind, ConstraintScope, CreateConstraintStmt,
+    CreateStmt, Direction, DropConstraintStmt, Expr, IndexDdl, Literal, MatchStmt, NodePattern,
+    Pattern, ReturnItem, ReturnStmt, ShortestKind, SortItem, Statement, UnaryOp, UnionStmt,
+    UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -443,7 +444,7 @@ pub enum LogicalPlan {
     /// fills in a deterministic default.
     CreatePropertyConstraint {
         name: Option<String>,
-        label: String,
+        scope: ConstraintScope,
         properties: Vec<String>,
         kind: ConstraintKind,
         if_not_exists: bool,
@@ -644,13 +645,13 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
         Statement::ShowIndexes => LogicalPlan::ShowPropertyIndexes,
         Statement::CreateConstraint(CreateConstraintStmt {
             name,
-            label,
+            scope,
             properties,
             kind,
             if_not_exists,
         }) => LogicalPlan::CreatePropertyConstraint {
             name: name.clone(),
-            label: label.clone(),
+            scope: scope.clone(),
             properties: properties.clone(),
             kind: *kind,
             if_not_exists: *if_not_exists,
@@ -975,7 +976,7 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         }
         LogicalPlan::CreatePropertyConstraint {
             name,
-            label,
+            scope,
             properties,
             kind,
             ..
@@ -996,8 +997,12 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             };
             let name_str = name.as_deref().unwrap_or("<auto>");
             let props = properties.join(", ");
+            let scope_str = match scope {
+                ConstraintScope::Node(l) => format!("Node({l})"),
+                ConstraintScope::Relationship(t) => format!("Rel({t})"),
+            };
             buf.push_str(&format!(
-                "{indent}CreatePropertyConstraint({name_str}: {label}.({props}) IS {kind_str})\n"
+                "{indent}CreatePropertyConstraint({name_str}: {scope_str}.({props}) IS {kind_str})\n"
             ));
         }
         LogicalPlan::DropPropertyConstraint { name, if_exists } => {

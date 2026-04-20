@@ -7,7 +7,8 @@
 
 use meshdb_cluster::raft::{GraphStateMachine, RaftCluster};
 use meshdb_cluster::{
-    ClusterState, ConstraintKind, GraphCommand, Membership, PartitionMap, Peer, PeerId,
+    ClusterState, ConstraintKind, ConstraintScope, GraphCommand, Membership, PartitionMap, Peer,
+    PeerId,
 };
 use meshdb_core::{Edge, Node};
 use meshdb_rpc::{GrpcNetwork, MeshRaftService, StoreGraphApplier};
@@ -309,7 +310,7 @@ async fn constraint_ddl_replicates_to_follower_store() {
         .cluster
         .propose_graph(GraphCommand::CreateConstraint {
             name: Some("email_uniq".into()),
-            label: "Person".into(),
+            scope: ConstraintScope::Node("Person".into()),
             properties: vec!["email".into()],
             kind: ConstraintKind::Unique,
             if_not_exists: false,
@@ -329,7 +330,10 @@ async fn constraint_ddl_replicates_to_follower_store() {
         let specs = store_b.list_property_constraints();
         if !specs.is_empty() {
             assert_eq!(specs[0].name, "email_uniq");
-            assert_eq!(specs[0].label, "Person");
+            assert_eq!(
+                specs[0].scope,
+                meshdb_storage::ConstraintScope::Node("Person".into())
+            );
             assert_eq!(specs[0].properties, vec!["email".to_string()]);
             replicated = true;
             break;
@@ -421,7 +425,7 @@ async fn auto_named_constraint_resolves_consistently() {
         .cluster
         .propose_graph(GraphCommand::CreateConstraint {
             name: None,
-            label: "Widget".into(),
+            scope: ConstraintScope::Node("Widget".into()),
             properties: vec!["sku".into()],
             kind: ConstraintKind::NotNull,
             if_not_exists: false,
@@ -443,5 +447,5 @@ async fn auto_named_constraint_resolves_consistently() {
     let on_a = store_a.list_property_constraints();
     let on_b = store_b.list_property_constraints();
     assert_eq!(on_a, on_b, "replicas diverged on auto-generated name");
-    assert_eq!(on_a[0].name, "constraint_Widget_sku_not_null");
+    assert_eq!(on_a[0].name, "constraint_node_Widget_sku_not_null");
 }

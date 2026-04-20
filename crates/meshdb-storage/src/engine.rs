@@ -127,9 +127,42 @@ impl PropertyConstraintKind {
     }
 }
 
+/// Scope a constraint applies to. `Node(label)` covers every node
+/// carrying the label; `Relationship(edge_type)` covers every edge
+/// with the given type. Kept as an enum rather than a plain string
+/// so future scope extensions (e.g. specific pattern shapes) land
+/// additively.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConstraintScope {
+    Node(String),
+    Relationship(String),
+}
+
+impl ConstraintScope {
+    /// The scope's target string — label for node scope, edge type
+    /// for relationship scope. Handy when the caller has already
+    /// dispatched on the variant and just needs the name.
+    pub fn target(&self) -> &str {
+        match self {
+            ConstraintScope::Node(l) => l,
+            ConstraintScope::Relationship(t) => t,
+        }
+    }
+
+    /// Short tag used to disambiguate auto-generated constraint
+    /// names so a node and a relationship constraint on the same
+    /// target-and-property don't collide.
+    pub fn name_tag(&self) -> &'static str {
+        match self {
+            ConstraintScope::Node(_) => "node",
+            ConstraintScope::Relationship(_) => "rel",
+        }
+    }
+}
+
 /// Declarative spec for a property constraint. Unlike
 /// [`PropertyIndexSpec`], constraints carry a user-facing `name` —
-/// `DROP CONSTRAINT` takes a name, not a `(label, properties, kind)`
+/// `DROP CONSTRAINT` takes a name, not a `(scope, properties, kind)`
 /// tuple, so the registry keys on name for lookup. When the user
 /// omits the name, [`StorageEngine::create_property_constraint`] fills
 /// in a deterministic one derived from the other fields.
@@ -141,7 +174,7 @@ impl PropertyConstraintKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PropertyConstraintSpec {
     pub name: String,
-    pub label: String,
+    pub scope: ConstraintScope,
     pub properties: Vec<String>,
     pub kind: PropertyConstraintKind,
 }
@@ -238,7 +271,7 @@ pub trait StorageEngine: Send + Sync {
     fn create_property_constraint(
         &self,
         name: Option<&str>,
-        label: &str,
+        scope: &ConstraintScope,
         properties: &[String],
         kind: PropertyConstraintKind,
         if_not_exists: bool,
