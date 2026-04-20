@@ -1383,9 +1383,9 @@ where
         // inner expressions get validated too. The pattern's
         // shape is checked separately by the subquery
         // validation pass.
-        Expr::ExistsSubquery { .. }
-        | Expr::CountSubquery { .. }
-        | Expr::CollectSubquery { .. } => Ok(()),
+        Expr::ExistsSubquery { .. } | Expr::CountSubquery { .. } | Expr::CollectSubquery { .. } => {
+            Ok(())
+        }
         // Pattern comprehension: the pattern itself carries no
         // sub-expressions the walker cares about (same rule as
         // `PatternExists`), but the WHERE / projection are plain

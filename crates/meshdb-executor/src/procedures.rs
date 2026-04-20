@@ -139,10 +139,7 @@ impl Procedure {
 
 fn str_row(column: &str, value: String) -> ProcRow {
     let mut row = HashMap::new();
-    row.insert(
-        column.to_string(),
-        Value::Property(Property::String(value)),
-    );
+    row.insert(column.to_string(), Value::Property(Property::String(value)));
     row
 }
 
@@ -189,7 +186,10 @@ fn builtin_db_property_keys(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
             }
         }
     }
-    Ok(keys.into_iter().map(|k| str_row("propertyKey", k)).collect())
+    Ok(keys
+        .into_iter()
+        .map(|k| str_row("propertyKey", k))
+        .collect())
 }
 
 fn values_equal_for_procedure(a: &Value, b: &Value) -> bool {

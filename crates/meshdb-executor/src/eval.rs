@@ -1072,10 +1072,7 @@ fn walk_subquery_hops(
 /// raises `InvalidArgumentValue` at runtime when the body projects
 /// zero or multiple columns. Outer-row bindings are correlated the
 /// same way `execute_subquery_body` does it.
-fn execute_collect_subquery(
-    body: &meshdb_cypher::Statement,
-    ctx: &EvalCtx,
-) -> Result<Vec<Value>> {
+fn execute_collect_subquery(body: &meshdb_cypher::Statement, ctx: &EvalCtx) -> Result<Vec<Value>> {
     let mut planner_ctx = meshdb_cypher::PlannerContext::default();
     for (name, value) in ctx.row.iter() {
         let kind = match value {
