@@ -2974,7 +2974,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         }
     };
     match name.to_ascii_lowercase().as_str() {
-        "size" | "length" => {
+        "size" | "length" | "char_length" | "character_length" => {
             let v = single_arg(name, arg_exprs, ctx)?;
             match v {
                 Value::Null => Ok(Value::Null),
@@ -3622,7 +3622,44 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         }
         "ceil" => math_unary(name, arg_exprs, ctx, |f| f.ceil()),
         "floor" => math_unary(name, arg_exprs, ctx, |f| f.floor()),
-        "round" => math_unary(name, arg_exprs, ctx, |f| f.round()),
+        "round" => match arg_exprs.len() {
+            1 => math_unary(name, arg_exprs, ctx, |f| f.round()),
+            2 | 3 => {
+                let vv = eval_expr(&arg_exprs[0], ctx)?;
+                let pv = eval_expr(&arg_exprs[1], ctx)?;
+                if matches!(vv, Value::Null | Value::Property(Property::Null))
+                    || matches!(pv, Value::Null | Value::Property(Property::Null))
+                {
+                    return Ok(Value::Null);
+                }
+                let value = match vv {
+                    Value::Property(Property::Float64(f)) => f,
+                    Value::Property(Property::Int64(i)) => i as f64,
+                    _ => return Err(Error::TypeMismatch),
+                };
+                let precision = match pv {
+                    Value::Property(Property::Int64(i)) => i,
+                    _ => return Err(Error::TypeMismatch),
+                };
+                let mode = if arg_exprs.len() == 3 {
+                    let mv = eval_expr(&arg_exprs[2], ctx)?;
+                    if matches!(mv, Value::Null | Value::Property(Property::Null)) {
+                        return Ok(Value::Null);
+                    }
+                    match mv {
+                        Value::Property(Property::String(s)) => s,
+                        _ => return Err(Error::TypeMismatch),
+                    }
+                } else {
+                    "HALF_UP".to_string()
+                };
+                let out = round_with_precision(value, precision, &mode)?;
+                Ok(Value::Property(Property::Float64(out)))
+            }
+            _ => Err(Error::UnknownScalarFunction(
+                "round() expects 1, 2, or 3 arguments".into(),
+            )),
+        },
         "sqrt" => math_unary(name, arg_exprs, ctx, |f| f.sqrt()),
         "sign" => {
             // Returns -1, 0, or 1 as Int64 regardless of
@@ -5758,6 +5795,50 @@ fn value_type_string(v: &Value) -> String {
             format!("LIST<{}> NOT NULL", list_element_type(as_values.iter()))
         }
     }
+}
+
+/// Round `value` to `precision` decimal places using `mode`. Mirrors the
+/// Neo4j 5 rounding-mode set; default callers pass `"HALF_UP"` (Cypher's
+/// documented default, also what `f64::round` implements).
+fn round_with_precision(value: f64, precision: i64, mode: &str) -> Result<f64> {
+    if !value.is_finite() {
+        return Ok(value);
+    }
+    let factor = 10f64.powi(precision as i32);
+    let scaled = value * factor;
+    let rounded = match mode.to_ascii_uppercase().as_str() {
+        "UP" => scaled.abs().ceil().copysign(scaled),
+        "DOWN" => scaled.abs().floor().copysign(scaled),
+        "CEILING" => scaled.ceil(),
+        "FLOOR" => scaled.floor(),
+        "HALF_UP" => scaled.round(),
+        "HALF_DOWN" => {
+            let abs = scaled.abs();
+            let floor = abs.floor();
+            let frac = abs - floor;
+            let r = if frac > 0.5 { floor + 1.0 } else { floor };
+            r.copysign(scaled)
+        }
+        "HALF_EVEN" => {
+            let floor = scaled.floor();
+            let frac = scaled - floor;
+            if frac < 0.5 {
+                floor
+            } else if frac > 0.5 {
+                floor + 1.0
+            } else if (floor as i64) % 2 == 0 {
+                floor
+            } else {
+                floor + 1.0
+            }
+        }
+        _ => {
+            return Err(Error::InvalidArgumentValue(format!(
+                "unknown rounding mode: `{mode}`"
+            )))
+        }
+    };
+    Ok(rounded / factor)
 }
 
 fn list_element_type<'a>(items: impl Iterator<Item = &'a Value>) -> String {

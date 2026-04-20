@@ -5647,6 +5647,8 @@ fn is_known_scalar_function(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "size"
             | "length"
+            | "char_length"
+            | "character_length"
             | "nodes"
             | "relationships"
             | "labels"
