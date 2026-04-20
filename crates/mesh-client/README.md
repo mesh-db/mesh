@@ -1,20 +1,19 @@
 # mesh-client
 
-A terminal UI for Bolt-compatible graph databases and FalkorDB. One binary,
-three tabs — Cypher REPL, schema browser, and an ASCII graph view of the nodes
-and edges in the last result.
+A terminal UI for Bolt-compatible graph databases. One binary, three tabs —
+Cypher REPL, schema browser, and an ASCII graph view of the nodes and edges
+in the last result.
 
-Part of the [mesh](../../) workspace. Speaks Bolt 5.4 / 5.0 / 4.4 (against
-Mesh, Neo4j, or anything else on the wire) and Redis `GRAPH.QUERY` (against
-FalkorDB).
+Part of the [mesh](../../) workspace. Speaks Bolt 5.4 / 5.0 / 4.4, so it
+works against Mesh, Neo4j, or anything else that implements the Bolt
+protocol.
 
 ## Backends
 
-| Backend  | Protocol                 | Notes                                                                |
-|----------|--------------------------|----------------------------------------------------------------------|
-| Mesh     | Bolt 5.4 / 5.0 / 4.4     | Uses the in-workspace `mesh-bolt` crate directly.                    |
-| Neo4j    | Bolt 5.4 / 5.0 / 4.4     | Same wire code path as Mesh. HELLO→LOGON split handled for 5.1+.     |
-| FalkorDB | Redis `GRAPH.QUERY`      | Verbose mode; best-effort node/edge parsing.                         |
+| Backend | Protocol                 | Notes                                                            |
+|---------|--------------------------|------------------------------------------------------------------|
+| Mesh    | Bolt 5.4 / 5.0 / 4.4     | Uses the in-workspace `mesh-bolt` crate directly.                |
+| Neo4j   | Bolt 5.4 / 5.0 / 4.4     | Same wire code path as Mesh. HELLO→LOGON split handled for 5.1+. |
 
 ### URI schemes
 
@@ -23,7 +22,6 @@ FalkorDB).
 | `bolt://`, `neo4j://`           | Plaintext TCP.                                                  |
 | `bolt+s://`, `neo4j+s://`       | TLS verified against the Mozilla root bundle (`webpki-roots`).  |
 | `bolt+ssc://`, `neo4j+ssc://`   | TLS, accepts any server cert — **dev / self-signed only**.      |
-| `redis://`                      | Plaintext Redis (FalkorDB).                                     |
 
 The `neo4j://` schemes are treated identically to `bolt://` — server-side
 routing isn't implemented, so connections go straight to the host/port in
@@ -46,9 +44,9 @@ The binary lands at `target/release/mesh-client`.
 cargo run -p mesh-client --release -- --profile mesh-local
 ```
 
-On first launch with no `~/.config/mesh-client/config.toml`, three sensible
-defaults are seeded in-memory: `mesh-local`, `neo4j-local`, `falkor-local`.
-Write your own config (see below) to override.
+On first launch with no `~/.config/mesh-client/config.toml`, two sensible
+defaults are seeded in-memory: `mesh-local` and `neo4j-local`. Write your
+own config (see below) to override.
 
 Flags:
 
@@ -84,7 +82,7 @@ typically steal.
 ```toml
 [[profiles]]
 name = "mesh-local"
-kind = "mesh"                           # "mesh" | "neo4j" | "falkor"
+kind = "mesh"                           # "mesh" | "neo4j"
 uri = "bolt://127.0.0.1:7687"
 username = "neo4j"
 password = "password"
@@ -103,17 +101,10 @@ kind = "neo4j"
 uri = "bolt+s://graph.example.com:7687"
 username = "neo4j"
 password = "s3cret"
-
-[[profiles]]
-name = "falkor-local"
-kind = "falkor"
-uri = "redis://127.0.0.1:6379"
-graph = "my-graph"
 ```
 
 `username` / `password` are optional — leaving both off sends `scheme: none`
-on the Bolt HELLO/LOGON. `database` is forwarded on Neo4j connections;
-`graph` names the FalkorDB graph key.
+on the Bolt HELLO/LOGON. `database` is forwarded on Neo4j connections.
 
 Pick a profile at startup with `--profile <name>`, or point at a different
 config with `--config <path>`.
@@ -143,8 +134,7 @@ src/
 ├── config.rs            # Serde-backed profile config, default-path lookup
 ├── backend/
 │   ├── mod.rs           # GraphBackend trait, Value/Node/Edge/QueryResult types
-│   ├── bolt.rs          # Bolt 4.4/5.x client on mesh-bolt, with TLS
-│   └── falkor.rs        # redis::cmd("GRAPH.QUERY"), verbose-mode parsing
+│   └── bolt.rs          # Bolt 4.4/5.x client on mesh-bolt, with TLS
 └── ui/
     ├── mod.rs           # top-level layout, tab bar, status line
     ├── repl.rs          # query textarea + results table
@@ -155,21 +145,15 @@ src/
 ## Dependencies worth knowing about
 
 - **`mesh-bolt`** (intra-workspace) — the Bolt 5 client used for every
-  Bolt-compatible backend. Picks the newest version each side supports
-  via `perform_client_handshake`.
+  backend. Picks the newest version each side supports via
+  `perform_client_handshake`.
 - **`tokio-rustls`** + **`webpki-roots`** — TLS for `+s://` schemes. The
   `+ssc://` variants swap in a no-op cert verifier for dev against
   self-signed servers.
-- **`redis`** — the `tokio-comp` client used only by the FalkorDB backend.
-  Mesh / Neo4j don't pull it in at runtime.
 - **`ratatui`** + **`crossterm`** + **`tui-textarea`** — the TUI stack.
 
 ## Known limitations
 
-- **FalkorDB parser is verbose-mode only.** Compact mode would be faster
-  and give label/property-key resolution through the per-connection
-  `db.labels()` / `db.propertyKeys()` caches, but verbose mode is
-  simpler and adequate for reading small graphs.
 - **Graph layout is circular, not force-directed.** Stable and fast, but
   gets visually busy past ~30 nodes. Good upgrade path for later.
 - **No server-side routing.** `neo4j://` URIs are treated as direct

@@ -19,8 +19,6 @@ pub struct Profile {
     pub password: Option<String>,
     #[serde(default)]
     pub database: Option<String>,
-    #[serde(default)]
-    pub graph: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +26,6 @@ pub struct Profile {
 pub enum BackendKind {
     Mesh,
     Neo4j,
-    Falkor,
 }
 
 impl BackendKind {
@@ -36,7 +33,6 @@ impl BackendKind {
         match self {
             BackendKind::Mesh => "mesh",
             BackendKind::Neo4j => "neo4j",
-            BackendKind::Falkor => "falkordb",
         }
     }
 }
@@ -69,7 +65,6 @@ impl Config {
                     username: Some("neo4j".into()),
                     password: Some("password".into()),
                     database: None,
-                    graph: None,
                 },
                 Profile {
                     name: "neo4j-local".into(),
@@ -78,16 +73,6 @@ impl Config {
                     username: Some("neo4j".into()),
                     password: Some("password".into()),
                     database: Some("neo4j".into()),
-                    graph: None,
-                },
-                Profile {
-                    name: "falkor-local".into(),
-                    kind: BackendKind::Falkor,
-                    uri: "redis://127.0.0.1:6379".into(),
-                    username: None,
-                    password: None,
-                    database: None,
-                    graph: Some("default".into()),
                 },
             ],
         }

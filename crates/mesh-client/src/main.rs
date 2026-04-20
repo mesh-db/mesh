@@ -21,7 +21,7 @@ use crate::config::Config;
 #[derive(Parser, Debug)]
 #[command(name = "mesh-client", version, about = "TUI for graph databases")]
 struct Args {
-    /// Profile name from config (e.g. mesh-local, neo4j-local, falkor-local)
+    /// Profile name from config (e.g. mesh-local, neo4j-local)
     #[arg(short, long)]
     profile: Option<String>,
 

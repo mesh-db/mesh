@@ -1,5 +1,4 @@
 pub mod bolt;
-pub mod falkor;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -18,10 +17,6 @@ pub async fn connect(profile: &Profile) -> Result<Box<dyn GraphBackend>> {
     match profile.kind {
         BackendKind::Mesh | BackendKind::Neo4j => {
             let b = bolt::BoltBackend::connect(profile).await?;
-            Ok(Box::new(b))
-        }
-        BackendKind::Falkor => {
-            let b = falkor::FalkorBackend::connect(profile).await?;
             Ok(Box::new(b))
         }
     }
