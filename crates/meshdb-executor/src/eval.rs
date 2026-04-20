@@ -3432,6 +3432,42 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
                 _ => Err(Error::TypeMismatch),
             }
         }
+        "tointegerornull" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            Ok(try_to_integer(&v)
+                .map_or(Value::Null, |i| Value::Property(Property::Int64(i))))
+        }
+        "tofloatornull" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            Ok(try_to_float(&v)
+                .map_or(Value::Null, |f| Value::Property(Property::Float64(f))))
+        }
+        "tobooleanornull" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            Ok(try_to_boolean(&v)
+                .map_or(Value::Null, |b| Value::Property(Property::Bool(b))))
+        }
+        "tostringornull" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            Ok(try_to_string(&v)
+                .map_or(Value::Null, |s| Value::Property(Property::String(s))))
+        }
+        "tointegerlist" => {
+            cast_list(name, arg_exprs, ctx, |v| try_to_integer(v).map(Property::Int64))
+        }
+        "tofloatlist" => {
+            cast_list(name, arg_exprs, ctx, |v| try_to_float(v).map(Property::Float64))
+        }
+        "tobooleanlist" => {
+            cast_list(name, arg_exprs, ctx, |v| try_to_boolean(v).map(Property::Bool))
+        }
+        "tostringlist" => {
+            cast_list(name, arg_exprs, ctx, |v| try_to_string(v).map(Property::String))
+        }
+        "valuetype" => {
+            let v = single_arg(name, arg_exprs, ctx)?;
+            Ok(Value::Property(Property::String(value_type_string(&v))))
+        }
 
         // --------------------------------------------------------
         // List scalar functions
@@ -5593,6 +5629,150 @@ fn single_arg(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Value> {
         )));
     }
     eval_expr(&args[0], ctx)
+}
+
+fn try_to_integer(v: &Value) -> Option<i64> {
+    match v {
+        Value::Property(Property::Int64(i)) => Some(*i),
+        Value::Property(Property::Float64(f)) if f.is_finite() => Some(*f as i64),
+        Value::Property(Property::String(s)) => {
+            let t = s.trim();
+            t.parse::<i64>().ok().or_else(|| {
+                t.parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(|f| f as i64)
+            })
+        }
+        Value::Property(Property::Bool(b)) => Some(if *b { 1 } else { 0 }),
+        _ => None,
+    }
+}
+
+fn try_to_float(v: &Value) -> Option<f64> {
+    match v {
+        Value::Property(Property::Float64(f)) => Some(*f),
+        Value::Property(Property::Int64(i)) => Some(*i as f64),
+        Value::Property(Property::String(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn try_to_boolean(v: &Value) -> Option<bool> {
+    match v {
+        Value::Property(Property::Bool(b)) => Some(*b),
+        Value::Property(Property::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn try_to_string(v: &Value) -> Option<String> {
+    let is_scalar = matches!(
+        v,
+        Value::Property(
+            Property::String(_)
+                | Property::Int64(_)
+                | Property::Float64(_)
+                | Property::Bool(_)
+                | Property::Date(_)
+                | Property::DateTime { .. }
+                | Property::LocalDateTime(_)
+                | Property::Time { .. }
+                | Property::Duration(_),
+        )
+    );
+    if !is_scalar {
+        return None;
+    }
+    match value_to_string(v.clone()) {
+        Value::Property(Property::String(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Shared driver for `toIntegerList` / `toFloatList` / `toBooleanList` /
+/// `toStringList` — requires a list input (or null), and maps the
+/// per-element cast across it, substituting `Null` where the cast fails.
+fn cast_list(
+    name: &str,
+    arg_exprs: &[Expr],
+    ctx: &EvalCtx,
+    cast: impl Fn(&Value) -> Option<Property>,
+) -> Result<Value> {
+    let v = single_arg(name, arg_exprs, ctx)?;
+    let items: Vec<Value> = match v {
+        Value::Null | Value::Property(Property::Null) => return Ok(Value::Null),
+        Value::List(items) => items,
+        Value::Property(Property::List(items)) => {
+            items.into_iter().map(Value::Property).collect()
+        }
+        _ => return Err(Error::TypeMismatch),
+    };
+    let out: Vec<Property> = items
+        .iter()
+        .map(|item| cast(item).unwrap_or(Property::Null))
+        .collect();
+    Ok(Value::Property(Property::List(out)))
+}
+
+/// Cypher type descriptor used by `valueType(x)`. Returns `"NULL"` for
+/// null, otherwise a `"<TYPE> NOT NULL"` string. Lists recurse on their
+/// element type — homogeneous lists produce `LIST<T NOT NULL> NOT NULL`,
+/// heterogeneous lists widen to `LIST<ANY NOT NULL> NOT NULL`, empty
+/// lists become `LIST<NOTHING NOT NULL> NOT NULL`, matching Neo4j.
+fn value_type_string(v: &Value) -> String {
+    match v {
+        Value::Null | Value::Property(Property::Null) => "NULL".to_string(),
+        Value::Node(_) => "NODE NOT NULL".to_string(),
+        Value::Edge(_) => "RELATIONSHIP NOT NULL".to_string(),
+        Value::Path { .. } => "PATH NOT NULL".to_string(),
+        Value::Map(_) | Value::Property(Property::Map(_)) => "MAP NOT NULL".to_string(),
+        Value::Property(Property::String(_)) => "STRING NOT NULL".to_string(),
+        Value::Property(Property::Int64(_)) => "INTEGER NOT NULL".to_string(),
+        Value::Property(Property::Float64(_)) => "FLOAT NOT NULL".to_string(),
+        Value::Property(Property::Bool(_)) => "BOOLEAN NOT NULL".to_string(),
+        Value::Property(Property::Date(_)) => "DATE NOT NULL".to_string(),
+        Value::Property(Property::DateTime { tz_offset_secs, .. }) => {
+            if tz_offset_secs.is_some() {
+                "ZONED DATETIME NOT NULL".to_string()
+            } else {
+                "LOCAL DATETIME NOT NULL".to_string()
+            }
+        }
+        Value::Property(Property::LocalDateTime(_)) => "LOCAL DATETIME NOT NULL".to_string(),
+        Value::Property(Property::Time { tz_offset_secs, .. }) => {
+            if tz_offset_secs.is_some() {
+                "ZONED TIME NOT NULL".to_string()
+            } else {
+                "LOCAL TIME NOT NULL".to_string()
+            }
+        }
+        Value::Property(Property::Duration(_)) => "DURATION NOT NULL".to_string(),
+        Value::List(items) => format!("LIST<{}> NOT NULL", list_element_type(items.iter())),
+        Value::Property(Property::List(items)) => {
+            let as_values: Vec<Value> = items.iter().cloned().map(Value::Property).collect();
+            format!("LIST<{}> NOT NULL", list_element_type(as_values.iter()))
+        }
+    }
+}
+
+fn list_element_type<'a>(items: impl Iterator<Item = &'a Value>) -> String {
+    let types: Vec<String> = items.map(value_type_string).collect();
+    match types.len() {
+        0 => "NOTHING NOT NULL".to_string(),
+        _ => {
+            let first = &types[0];
+            if types.iter().all(|t| t == first) {
+                first.clone()
+            } else {
+                "ANY NOT NULL".to_string()
+            }
+        }
+    }
 }
 
 fn value_to_string(v: Value) -> Value {
