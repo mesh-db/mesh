@@ -1,0 +1,8 @@
+# Single-node default config baked into the meshdb-server Docker image.
+# Listeners bind 0.0.0.0 so Docker's port mapping reaches them; data
+# lives under the /var/lib/meshdb volume so state survives restarts.
+# Override by bind-mounting a different file at /etc/meshdb/meshdb.toml.
+self_id = 1
+listen_address = "0.0.0.0:7001"
+bolt_address = "0.0.0.0:7687"
+data_dir = "/var/lib/meshdb/data"

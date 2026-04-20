@@ -1,0 +1,18 @@
+# Keep the Docker build context small. target/ is the big one; .git
+# and the vendored TCK feature files would otherwise balloon the
+# context by tens of MB and slow every `docker build` invocation.
+target
+.git
+.github
+.vscode
+.idea
+
+# Docs aren't needed in the builder image.
+*.md
+!crates/*/README.md
+
+# Test fixtures that aren't part of the release build.
+tck
+
+# macOS / editor noise.
+.DS_Store
