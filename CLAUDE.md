@@ -16,7 +16,10 @@ mesh/
 │   ├── meshdb-executor/      # Physical operators, iterator model
 │   ├── meshdb-cluster/       # Raft, partitioning, membership, replication
 │   ├── meshdb-rpc/           # tonic/gRPC service definitions + client
-│   └── meshdb-server/        # Binary: config, startup, bolt protocol listener
+│   ├── meshdb-bolt/          # Bolt v4.4–5.4 packstream, messages, framing
+│   ├── meshdb-client/        # In-process + Bolt client library
+│   ├── meshdb-tck/           # openCypher TCK harness (cucumber-driven)
+│   └── meshdb-server/        # Binary: config, startup, Bolt + gRPC listeners
 ```
 
 ## Architecture Decisions
@@ -30,25 +33,23 @@ mesh/
 
 ### Core Data Model (`meshdb-core`)
 - `NodeId` / `EdgeId` — 128-bit unique identifiers (UUID v7 or similar for ordering).
-- `Property` — enum supporting String, Int64, Float64, Bool, List, Map.
-- `Node` — id, labels (Vec<String>), properties (HashMap<String, Property>).
+- `Property` — enum covering: `Null`, `String`, `Int64`, `Float64`, `Bool`, `List`, `Map`, temporal (`DateTime`, `LocalDateTime`, `Date`, `Time`, `Duration`), and spatial (`Point` — Cartesian 2D/3D, WGS-84 2D/3D, EPSG-tagged).
+- `Node` — id, labels (`Vec<String>`), properties (`HashMap<String, Property>`).
 - `Edge` — id, edge_type (String), source NodeId, target NodeId, properties.
 
 ### Cypher Query Engine (`meshdb-cypher`)
-- Parser built with `pest` or `nom`.
-- **Initial Cypher subset to implement:**
-  - `MATCH` with single-hop and multi-hop patterns
-  - `WHERE` with equality, comparison, AND/OR/NOT, property access
-  - `CREATE` nodes and relationships
-  - `DELETE` / `DETACH DELETE`
-  - `RETURN` with aliases, `DISTINCT`
-  - `ORDER BY`, `LIMIT`, `SKIP`
-  - `SET` for property updates
-  - Variable-length paths: `()-[*1..3]->()`
-- **Deferred:** MERGE, CASE, list comprehensions, UNWIND, APOC procedures.
-- Parser emits a logical plan (tree of relational+graph operators).
-- Planner converts logical plan → physical plan.
+- Hand-rolled recursive-descent parser emitting a logical plan (tree of relational + graph operators). Planner converts logical → physical plan.
 - Key logical operators: NodeScan, EdgeExpand, Filter, Project, Aggregate, Sort, Limit.
+- **Implemented Cypher surface:**
+  - Read: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN` (with aliases, `DISTINCT`), `WITH` (re-projection + filter), `ORDER BY`, `LIMIT`, `SKIP`, `UNION` / `UNION ALL`.
+  - Write: `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET` (property, `+=` merge, label), `REMOVE` (property, label), `DELETE` / `DETACH DELETE`, `FOREACH`.
+  - Flow: `UNWIND`, `CASE ... WHEN ... ELSE ... END` (simple and generic), parameters (`$name`).
+  - Patterns: variable-length paths `()-[*1..3]->()`, `shortestPath(...)` (`allShortestPaths` parses but plan rejects).
+  - Expressions: list comprehensions, pattern comprehensions, `reduce`, quantifier predicates (`all`/`any`/`none`/`single`), `EXISTS { ... }` and `COUNT { ... }` subquery expressions.
+  - Procedures / subqueries: `CALL { ... }` (unit and returning), `CALL proc YIELD ...` against a runtime-extensible registry in `meshdb-executor`.
+  - Schema: `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on label+property pairs.
+  - Scalars: full openCypher scalar surface (string, math, temporal, spatial) plus the widely-expected Neo4j extensions (`*OrNull`, `*List`, `valueType`, `randomUUID`, `round` with precision+mode, `char_length`).
+- **Not yet implemented:** `COLLECT { ... }` subquery expressions; constraint management (`CREATE CONSTRAINT` / `SHOW CONSTRAINTS`); built-in `db.*` procedures (`db.labels()`, `db.relationshipTypes()`, `db.propertyKeys()`); quantified path patterns (`(a)-->+(b)`, Neo4j 5); APOC.
 
 ### Query Execution (`meshdb-executor`)
 - Volcano/iterator (pull-based) model — each operator implements `next() -> Option<Row>`.
@@ -56,13 +57,11 @@ mesh/
 - Later optimization: vectorized execution for analytical queries.
 
 ### Distribution / Clustering (`meshdb-cluster`)
-- **Partitioning:** Hash-partition nodes by NodeId across cluster members.
-  - Edges live on the partition that owns the source vertex.
-  - Ghost/stub copies on the target's partition for reverse traversal.
-- **Consensus:** Raft via `openraft` crate for metadata and write coordination.
-- **Reads:** Any node can serve a query; multi-partition traversals use scatter-gather.
-- **Writes:** Forwarded to the partition owner; single-partition transactions initially, distributed (2PC) later.
-- Start with hash partitioning; consider LDG streaming partitioner later.
+- **Partitioning:** FNV-1a hash over NodeId maps each node to a `PartitionId`. Edges live on the partition that owns the source vertex, with ghost/stub copies on the target's partition for reverse traversal.
+- **Consensus:** Raft via `openraft` 0.9 for metadata and write coordination — full `RaftStorage` impl, AppendEntries / Vote / InstallSnapshot wired up.
+- **Reads:** Any node can serve a query; multi-partition traversals scatter-gather through `meshdb-rpc::partitioned_reader`.
+- **Writes:** Forwarded to the partition owner. Single-partition transactions work today; distributed (2PC) writes are still to come.
+- **Future:** LDG streaming partitioner as an alternative to hash partitioning.
 
 ### Inter-Node Communication (`meshdb-rpc`)
 - **gRPC** via `tonic` crate.
@@ -75,41 +74,30 @@ mesh/
 
 ### Server (`meshdb-server`)
 - Binary entry point.
-- Config via TOML file (listen address, cluster peers, data directory, RocksDB tuning).
-- Eventually: Bolt protocol listener for Neo4j driver compatibility.
-- Initially: gRPC or simple TCP interface for queries.
+- Config via TOML file (listen address, cluster peers, data directory, RocksDB tuning), with common knobs also settable via CLI flags / env vars.
+- Bolt protocol listener (`meshdb-bolt`) supports handshake v4.4 through 5.4 — HELLO, RUN, PULL, BEGIN/COMMIT/ROLLBACK, RESET, GOODBYE, plus ROUTE for cluster-aware drivers. TLS is available for both Bolt and gRPC listeners via `tokio_rustls`.
+- Neo4j drivers can connect directly; the `meshdb-client` crate exposes the same surface in-process for embedded use.
 
 ## Key Crate Dependencies
 
 | Crate | Purpose |
 |-------|---------|
 | `rust-rocksdb` | Storage engine |
-| `pest` or `nom` | Cypher parser |
 | `tonic` / `prost` | gRPC framework |
-| `openraft` | Raft consensus |
+| `openraft` | Raft consensus (0.9) |
 | `tokio` | Async runtime |
+| `tokio-rustls` / `rustls` | TLS for Bolt + gRPC |
 | `serde` / `serde_json` | Serialization |
-| `uuid` | ID generation |
+| `uuid` | ID generation (v4 + v7) |
+| `chrono` / `chrono-tz` | Temporal types and IANA zone resolution |
 | `tracing` | Structured logging |
 | `clap` | CLI argument parsing |
 | `toml` | Config file parsing |
+| `cucumber` | openCypher TCK test driver |
 
-## Build Order / Implementation Phases
+## Implementation Status
 
-### Phase 1: Single-node graph store
-1. `meshdb-core` — data model types
-2. `meshdb-storage` — RocksDB CRUD, adjacency traversal, basic indexing
-
-### Phase 2: Query engine
-3. `meshdb-cypher` — parser for minimal Cypher subset, logical plan generation
-4. `meshdb-executor` — wire operators to storage, end-to-end query execution
-
-### Phase 3: Distribution
-5. `meshdb-rpc` — protobuf definitions, gRPC services
-6. `meshdb-cluster` — Raft, partitioning, membership, replication
-
-### Phase 4: Server
-7. `meshdb-server` — config, startup, query interface, Bolt protocol (stretch)
+The foundational phases are all shipping — single-node graph store, Cypher parser + executor, gRPC cluster RPCs, Raft-backed cluster membership, and a Bolt-speaking server. Current in-flight work lives at the Cypher-surface level (see the "Not yet implemented" list in the Cypher section above) and in hardening the distributed-write story (2PC across partitions, point / spatial indexes, edge indexes).
 
 ## Target System
 - AMD Ryzen 9 9900X (high core count — leverage for concurrent RocksDB operations)
