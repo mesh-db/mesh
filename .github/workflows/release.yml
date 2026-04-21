@@ -1,0 +1,134 @@
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version to release (e.g. 0.1.0-alpha.5). Must be a valid semver and greater than the current workspace version.'
+        required: true
+
+permissions:
+  contents: write
+
+# One release at a time. `cancel-in-progress: false` so a click never
+# interrupts an in-flight publish.
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        # rust-rocksdb's build.rs calls bindgen, which needs libclang.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$VERSION' is not a valid semver."
+            exit 1
+          fi
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump workspace version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          current=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -1)
+          if [[ "$current" == "$VERSION" ]]; then
+            echo "Workspace is already at $VERSION — skipping bump."
+            exit 0
+          fi
+          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version = .*/version = "'"$VERSION"'"/;}' Cargo.toml
+          # Sync Cargo.lock. `--workspace` updates only workspace members;
+          # transitive deps are left pinned.
+          cargo update --workspace --quiet
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release v$VERSION"
+          git push origin HEAD:main
+
+      - name: Create and push tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION already exists on origin — skipping."
+            exit 0
+          fi
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Each later crate depends only on crates earlier in this list,
+          # so crates.io propagation is in order. Update when adding or
+          # rewiring a crate. (meshdb-tck is `publish = false` and is
+          # intentionally absent.)
+          crates=(
+            meshdb-core
+            meshdb-bolt
+            meshdb-storage
+            meshdb-cluster
+            meshdb-cypher
+            meshdb-client
+            meshdb-executor
+            meshdb-rpc
+            meshdb-server
+          )
+          for crate in "${crates[@]}"; do
+            echo "::group::Publish $crate $VERSION"
+            # Idempotent retry: skip crates already on crates.io at this
+            # version. Lets a rerun pick up where a failure left off.
+            if curl -fsSL "https://crates.io/api/v1/crates/$crate/$VERSION" \
+                 -H 'User-Agent: mesh-publish-workflow/1.0' \
+                 >/dev/null 2>&1; then
+              echo "$crate $VERSION is already on crates.io — skipping."
+            else
+              cargo publish -p "$crate"
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "GitHub release v$VERSION already exists — skipping."
+            exit 0
+          fi
+          prev_tag=$(git describe --tags --abbrev=0 "v$VERSION^" 2>/dev/null || true)
+          if [[ -n "$prev_tag" ]]; then
+            body=$(git log --pretty=format:'- %s' "$prev_tag..v$VERSION")
+          else
+            body=$(git log --pretty=format:'- %s' "v$VERSION")
+          fi
+          prerelease=()
+          [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --notes "$body" \
+            "${prerelease[@]}"
