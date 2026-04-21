@@ -10,15 +10,16 @@ use crate::proto::mesh_write_server::{MeshWrite, MeshWriteServer};
 use crate::proto::{
     AllNodeIdsRequest, AllNodeIdsResponse, BatchPhase, BatchWriteRequest, BatchWriteResponse,
     ConstraintKind as ProtoConstraintKind, ConstraintScopeKind as ProtoConstraintScopeKind,
+    CreateEdgePropertyIndexRequest, CreateEdgePropertyIndexResponse,
     CreatePropertyConstraintRequest, CreatePropertyConstraintResponse, CreatePropertyIndexRequest,
     CreatePropertyIndexResponse, DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest,
-    DetachDeleteNodeResponse, DropPropertyConstraintRequest, DropPropertyConstraintResponse,
-    DropPropertyIndexRequest, DropPropertyIndexResponse, ExecuteCypherRequest,
-    ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse, GetNodeRequest, GetNodeResponse,
-    HealthRequest, HealthResponse, NeighborInfo, NeighborRequest, NeighborResponse,
-    NodesByLabelRequest, NodesByLabelResponse, NodesByPropertyRequest, NodesByPropertyResponse,
-    PropertyTypeKind as ProtoPropertyTypeKind, PutEdgeRequest, PutEdgeResponse, PutNodeRequest,
-    PutNodeResponse,
+    DetachDeleteNodeResponse, DropEdgePropertyIndexRequest, DropEdgePropertyIndexResponse,
+    DropPropertyConstraintRequest, DropPropertyConstraintResponse, DropPropertyIndexRequest,
+    DropPropertyIndexResponse, ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest,
+    GetEdgeResponse, GetNodeRequest, GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo,
+    NeighborRequest, NeighborResponse, NodesByLabelRequest, NodesByLabelResponse,
+    NodesByPropertyRequest, NodesByPropertyResponse, PropertyTypeKind as ProtoPropertyTypeKind,
+    PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
 };
 use crate::raft_applier::{storage_kind, storage_scope};
 use crate::routing::Routing;
@@ -856,6 +857,8 @@ pub(crate) fn flatten_commands(
             // batch.
             GraphCommand::CreateIndex { .. }
             | GraphCommand::DropIndex { .. }
+            | GraphCommand::CreateEdgeIndex { .. }
+            | GraphCommand::DropEdgeIndex { .. }
             | GraphCommand::CreateConstraint { .. }
             | GraphCommand::DropConstraint { .. } => {}
         }
@@ -929,6 +932,8 @@ fn count_index_seeks(plan: &meshdb_cypher::LogicalPlan) -> u64 {
         | P::LoadCsv { input: None, .. }
         | P::CreatePropertyIndex { .. }
         | P::DropPropertyIndex { .. }
+        | P::CreateEdgePropertyIndex { .. }
+        | P::DropEdgePropertyIndex { .. }
         | P::ShowPropertyIndexes
         | P::CreatePropertyConstraint { .. }
         | P::DropPropertyConstraint { .. }
@@ -947,6 +952,14 @@ fn apply_ddl_to_store(
             store.create_property_index(label, property)
         }
         GraphCommand::DropIndex { label, property } => store.drop_property_index(label, property),
+        GraphCommand::CreateEdgeIndex {
+            edge_type,
+            property,
+        } => store.create_edge_property_index(edge_type, property),
+        GraphCommand::DropEdgeIndex {
+            edge_type,
+            property,
+        } => store.drop_edge_property_index(edge_type, property),
         GraphCommand::CreateConstraint {
             name,
             scope,
@@ -983,6 +996,20 @@ fn invert_ddl(cmd: &GraphCommand) -> GraphCommand {
         },
         GraphCommand::DropIndex { label, property } => GraphCommand::CreateIndex {
             label: label.clone(),
+            property: property.clone(),
+        },
+        GraphCommand::CreateEdgeIndex {
+            edge_type,
+            property,
+        } => GraphCommand::DropEdgeIndex {
+            edge_type: edge_type.clone(),
+            property: property.clone(),
+        },
+        GraphCommand::DropEdgeIndex {
+            edge_type,
+            property,
+        } => GraphCommand::CreateEdgeIndex {
+            edge_type: edge_type.clone(),
             property: property.clone(),
         },
         GraphCommand::CreateConstraint {
@@ -1038,6 +1065,28 @@ async fn try_remote_ddl_on_peer(
                 client
                     .drop_property_index(DropPropertyIndexRequest {
                         label: label.clone(),
+                        property: property.clone(),
+                    })
+                    .await?;
+            }
+            GraphCommand::CreateEdgeIndex {
+                edge_type,
+                property,
+            } => {
+                client
+                    .create_edge_property_index(CreateEdgePropertyIndexRequest {
+                        edge_type: edge_type.clone(),
+                        property: property.clone(),
+                    })
+                    .await?;
+            }
+            GraphCommand::DropEdgeIndex {
+                edge_type,
+                property,
+            } => {
+                client
+                    .drop_edge_property_index(DropEdgePropertyIndexRequest {
+                        edge_type: edge_type.clone(),
                         property: property.clone(),
                     })
                     .await?;
@@ -1184,6 +1233,8 @@ pub(crate) fn split_ddl(cmds: Vec<GraphCommand>) -> (Vec<GraphCommand>, Vec<Grap
         match cmd {
             GraphCommand::CreateIndex { .. }
             | GraphCommand::DropIndex { .. }
+            | GraphCommand::CreateEdgeIndex { .. }
+            | GraphCommand::DropEdgeIndex { .. }
             | GraphCommand::CreateConstraint { .. }
             | GraphCommand::DropConstraint { .. } => ddl.push(cmd),
             GraphCommand::Batch(inner) => {
@@ -1213,6 +1264,18 @@ fn apply_ddl_commands(
             }
             GraphCommand::DropIndex { label, property } => {
                 store.drop_property_index(label, property)?;
+            }
+            GraphCommand::CreateEdgeIndex {
+                edge_type,
+                property,
+            } => {
+                store.create_edge_property_index(edge_type, property)?;
+            }
+            GraphCommand::DropEdgeIndex {
+                edge_type,
+                property,
+            } => {
+                store.drop_edge_property_index(edge_type, property)?;
             }
             GraphCommand::CreateConstraint {
                 name,
@@ -1908,6 +1971,33 @@ impl MeshWrite for MeshService {
             .drop_property_index(&req.label, &req.property)
             .map_err(internal)?;
         Ok(Response::new(DropPropertyIndexResponse {}))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "create_edge_property_index"))]
+    async fn create_edge_property_index(
+        &self,
+        request: Request<CreateEdgePropertyIndexRequest>,
+    ) -> Result<Response<CreateEdgePropertyIndexResponse>, Status> {
+        // Local-only: routing-mode fan-out calls this RPC on every
+        // peer after running its own local create. Raft mode
+        // replicates DDL via `propose_graph` instead.
+        let req = request.into_inner();
+        self.store
+            .create_edge_property_index(&req.edge_type, &req.property)
+            .map_err(internal)?;
+        Ok(Response::new(CreateEdgePropertyIndexResponse {}))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "drop_edge_property_index"))]
+    async fn drop_edge_property_index(
+        &self,
+        request: Request<DropEdgePropertyIndexRequest>,
+    ) -> Result<Response<DropEdgePropertyIndexResponse>, Status> {
+        let req = request.into_inner();
+        self.store
+            .drop_edge_property_index(&req.edge_type, &req.property)
+            .map_err(internal)?;
+        Ok(Response::new(DropEdgePropertyIndexResponse {}))
     }
 
     #[tracing::instrument(skip_all, fields(rpc = "create_property_constraint"))]

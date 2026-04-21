@@ -1033,7 +1033,7 @@ fn property_value_rejects_free_identifier() {
 fn create_index_parses() {
     match parse("CREATE INDEX FOR (p:Person) ON (p.name)").unwrap() {
         Statement::CreateIndex(ddl) => {
-            assert_eq!(ddl.label, "Person");
+            assert_eq!(ddl.scope, IndexScope::Node("Person".into()));
             assert_eq!(ddl.property, "name");
         }
         other => panic!("expected CreateIndex, got {:?}", other),
@@ -1044,7 +1044,7 @@ fn create_index_parses() {
 fn drop_index_parses() {
     match parse("DROP INDEX FOR (n:Person) ON (n.name)").unwrap() {
         Statement::DropIndex(ddl) => {
-            assert_eq!(ddl.label, "Person");
+            assert_eq!(ddl.scope, IndexScope::Node("Person".into()));
             assert_eq!(ddl.property, "name");
         }
         other => panic!("expected DropIndex, got {:?}", other),
@@ -1063,6 +1063,47 @@ fn show_indexes_parses() {
 fn create_index_rejects_missing_label() {
     // Grammar requires `(var:Label)` — omitting the label should fail.
     assert!(parse("CREATE INDEX FOR (p) ON (p.name)").is_err());
+}
+
+#[test]
+fn create_edge_index_parses() {
+    match parse("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)").unwrap() {
+        Statement::CreateIndex(ddl) => {
+            assert_eq!(ddl.scope, IndexScope::Relationship("KNOWS".into()));
+            assert_eq!(ddl.property, "since");
+        }
+        other => panic!("expected CreateIndex with rel scope, got {:?}", other),
+    }
+}
+
+#[test]
+fn drop_edge_index_parses() {
+    match parse("DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since)").unwrap() {
+        Statement::DropIndex(ddl) => {
+            assert_eq!(ddl.scope, IndexScope::Relationship("KNOWS".into()));
+            assert_eq!(ddl.property, "since");
+        }
+        other => panic!("expected DropIndex with rel scope, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_edge_index_accepts_directional_arrows() {
+    // Direction doesn't affect what the index covers (an edge of
+    // the type is indexed regardless of which endpoint you scan
+    // from), so the grammar accepts all three arrow shapes.
+    for src in [
+        "CREATE INDEX FOR ()-[r:LINK]->() ON (r.weight)",
+        "CREATE INDEX FOR ()<-[r:LINK]-() ON (r.weight)",
+        "CREATE INDEX FOR ()-[r:LINK]-() ON (r.weight)",
+    ] {
+        match parse(src).unwrap_or_else(|e| panic!("{src} failed to parse: {e}")) {
+            Statement::CreateIndex(ddl) => {
+                assert_eq!(ddl.scope, IndexScope::Relationship("LINK".into()));
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
 }
 
 #[test]

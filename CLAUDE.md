@@ -47,9 +47,9 @@ mesh/
   - Patterns: variable-length paths `()-[*1..3]->()`, `shortestPath(...)` (`allShortestPaths` parses but plan rejects).
   - Expressions: list comprehensions, pattern comprehensions, `reduce`, quantifier predicates (`all`/`any`/`none`/`single`), `EXISTS { ... }`, `COUNT { ... }`, and `COLLECT { ... }` subquery expressions.
   - Procedures / subqueries: `CALL { ... }` (unit and returning), `CALL proc YIELD ...` against a runtime-extensible registry in `meshdb-executor` with built-in `db.labels()` / `db.relationshipTypes()` / `db.propertyKeys()` installed by default.
-  - Schema: `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on label+property pairs; `CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for UNIQUE, NOT NULL, `IS :: <TYPE>` (STRING/INTEGER/FLOAT/BOOLEAN), and composite `IS NODE KEY` constraints — node scope `FOR (n:Label)` or relationship scope `FOR ()-[r:TYPE]-()` — with optional name + `IF [NOT] EXISTS`, replicated across Raft and routing clusters; built-in `db.constraints()` procedure.
+  - Schema: `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on node label+property pairs (`FOR (n:Label) ON (n.prop)`) *and* relationship type+property pairs (`FOR ()-[r:TYPE]-() ON (r.prop)`); `CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for UNIQUE, NOT NULL, `IS :: <TYPE>` (STRING/INTEGER/FLOAT/BOOLEAN), and composite `IS NODE KEY` constraints — node scope `FOR (n:Label)` or relationship scope `FOR ()-[r:TYPE]-()` — with optional name + `IF [NOT] EXISTS`, replicated across Raft and routing clusters; relationship UNIQUE constraints auto-provision a backing edge index so enforcement stays O(log N) per insert; built-in `db.constraints()` procedure.
   - Scalars: full openCypher scalar surface (string, math, temporal, spatial) plus the widely-expected Neo4j extensions (`*OrNull`, `*List`, `valueType`, `randomUUID`, `round` with precision+mode, `char_length`).
-- **Not yet implemented:** edge (relationship) indexes; composite / edge property indexes (constraints enforce via label / edge-type scans today); quantified path patterns (`(a)-->+(b)`, Neo4j 5); APOC.
+- **Not yet implemented:** composite indexes; query-plan-level edge IndexSeek inside `EdgeExpand` (the storage-level edge index exists and accelerates relationship UNIQUE enforcement, but the planner doesn't yet rewrite edge-property predicates into a seek); point / spatial indexes; quantified path patterns (`(a)-->+(b)`, Neo4j 5); APOC.
 
 ### Query Execution (`meshdb-executor`)
 - Volcano/iterator (pull-based) model — each operator implements `next() -> Option<Row>`.
@@ -97,7 +97,7 @@ mesh/
 
 ## Implementation Status
 
-The foundational phases are all shipping — single-node graph store, Cypher parser + executor, gRPC cluster RPCs, Raft-backed cluster membership, and a Bolt-speaking server. Current in-flight work lives at the Cypher-surface level (see the "Not yet implemented" list in the Cypher section above) and in hardening the distributed-write story (2PC across partitions, point / spatial indexes, edge indexes).
+The foundational phases are all shipping — single-node graph store, Cypher parser + executor, gRPC cluster RPCs, Raft-backed cluster membership, and a Bolt-speaking server. 2PC across partitions is wired with a durable coordinator log. Current in-flight work lives at the Cypher-surface level (see the "Not yet implemented" list in the Cypher section above) — query-plan-level edge IndexSeek, composite indexes, point / spatial indexes, and quantified path patterns are the natural next steps.
 
 ## Target System
 - AMD Ryzen 9 9900X (high core count — leverage for concurrent RocksDB operations)

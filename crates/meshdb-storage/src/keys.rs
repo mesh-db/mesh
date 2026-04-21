@@ -172,28 +172,7 @@ pub(crate) fn property_index_key(
     value_bytes: &[u8],
     node: NodeId,
 ) -> Vec<u8> {
-    let label_bytes = label.as_bytes();
-    let prop_bytes = prop_key.as_bytes();
-    let label_len = u16::try_from(label_bytes.len()).expect("label length fits in u16");
-    let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
-    let value_len = u32::try_from(value_bytes.len()).expect("value length fits in u32");
-    let mut key = Vec::with_capacity(
-        LEN_PREFIX
-            + label_bytes.len()
-            + LEN_PREFIX
-            + prop_bytes.len()
-            + 4
-            + value_bytes.len()
-            + ID_LEN,
-    );
-    key.extend_from_slice(&label_len.to_be_bytes());
-    key.extend_from_slice(label_bytes);
-    key.extend_from_slice(&prop_len.to_be_bytes());
-    key.extend_from_slice(prop_bytes);
-    key.extend_from_slice(&value_len.to_be_bytes());
-    key.extend_from_slice(value_bytes);
-    key.extend_from_slice(node.as_bytes());
-    key
+    build_property_index_key(label, prop_key, value_bytes, node.as_bytes())
 }
 
 /// Prefix that selects every index entry for a specific
@@ -204,37 +183,13 @@ pub(crate) fn property_index_value_prefix(
     prop_key: &str,
     value_bytes: &[u8],
 ) -> Vec<u8> {
-    let label_bytes = label.as_bytes();
-    let prop_bytes = prop_key.as_bytes();
-    let label_len = u16::try_from(label_bytes.len()).expect("label length fits in u16");
-    let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
-    let value_len = u32::try_from(value_bytes.len()).expect("value length fits in u32");
-    let mut key = Vec::with_capacity(
-        LEN_PREFIX + label_bytes.len() + LEN_PREFIX + prop_bytes.len() + 4 + value_bytes.len(),
-    );
-    key.extend_from_slice(&label_len.to_be_bytes());
-    key.extend_from_slice(label_bytes);
-    key.extend_from_slice(&prop_len.to_be_bytes());
-    key.extend_from_slice(prop_bytes);
-    key.extend_from_slice(&value_len.to_be_bytes());
-    key.extend_from_slice(value_bytes);
-    key
+    build_property_index_value_prefix(label, prop_key, value_bytes)
 }
 
 /// Prefix covering every entry for a specific `(label, prop)` index,
 /// across all values. Used by `drop_property_index` to sweep the CF.
 pub(crate) fn property_index_name_prefix(label: &str, prop_key: &str) -> Vec<u8> {
-    let label_bytes = label.as_bytes();
-    let prop_bytes = prop_key.as_bytes();
-    let label_len = u16::try_from(label_bytes.len()).expect("label length fits in u16");
-    let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
-    let mut key =
-        Vec::with_capacity(LEN_PREFIX + label_bytes.len() + LEN_PREFIX + prop_bytes.len());
-    key.extend_from_slice(&label_len.to_be_bytes());
-    key.extend_from_slice(label_bytes);
-    key.extend_from_slice(&prop_len.to_be_bytes());
-    key.extend_from_slice(prop_bytes);
-    key
+    build_property_index_name_prefix(label, prop_key)
 }
 
 /// Type tags for constraint-kind encoding in `CF_CONSTRAINT_META`.
@@ -469,4 +424,119 @@ pub(crate) fn node_id_from_property_index_key(
     let mut bytes = [0u8; ID_LEN];
     bytes.copy_from_slice(&key[prefix_len..]);
     Ok(bytes)
+}
+
+/// Full key format for an edge-property-index entry:
+///
+///   `[type_len:u16][edge_type][prop_len:u16][prop][value_len:u32][value][edge_id:16]`
+///
+/// Byte-identical to [`property_index_key`] modulo the trailing id
+/// interpretation. Lives in its own column family so the iterator
+/// range scans stay tight and the two index families can be dropped
+/// independently.
+pub(crate) fn edge_property_index_key(
+    edge_type: &str,
+    prop_key: &str,
+    value_bytes: &[u8],
+    edge: EdgeId,
+) -> Vec<u8> {
+    build_property_index_key(edge_type, prop_key, value_bytes, edge.as_bytes())
+}
+
+/// Prefix selecting every entry for a specific `(edge_type, prop, value)`
+/// triple. Used by `edges_by_property` to iterate the matching edge ids.
+pub(crate) fn edge_property_index_value_prefix(
+    edge_type: &str,
+    prop_key: &str,
+    value_bytes: &[u8],
+) -> Vec<u8> {
+    build_property_index_value_prefix(edge_type, prop_key, value_bytes)
+}
+
+/// Prefix covering every entry for a specific `(edge_type, prop)` edge
+/// index, across all values. Used by `drop_edge_property_index` to
+/// sweep the CF.
+pub(crate) fn edge_property_index_name_prefix(edge_type: &str, prop_key: &str) -> Vec<u8> {
+    build_property_index_name_prefix(edge_type, prop_key)
+}
+
+/// Extract the trailing edge id from an edge-property-index key whose
+/// prefix length is already known. Mirror of
+/// [`node_id_from_property_index_key`] for the relationship side.
+pub(crate) fn edge_id_from_property_index_key(
+    key: &[u8],
+    prefix_len: usize,
+) -> Result<[u8; ID_LEN]> {
+    let expected = prefix_len + ID_LEN;
+    if key.len() != expected {
+        return Err(Error::CorruptBytes {
+            cf: "edge_property_index",
+            expected,
+            actual: key.len(),
+        });
+    }
+    let mut bytes = [0u8; ID_LEN];
+    bytes.copy_from_slice(&key[prefix_len..]);
+    Ok(bytes)
+}
+
+fn build_property_index_key(
+    name: &str,
+    prop_key: &str,
+    value_bytes: &[u8],
+    id_bytes: &[u8; ID_LEN],
+) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let prop_bytes = prop_key.as_bytes();
+    let name_len = u16::try_from(name_bytes.len()).expect("label/type length fits in u16");
+    let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
+    let value_len = u32::try_from(value_bytes.len()).expect("value length fits in u32");
+    let mut key = Vec::with_capacity(
+        LEN_PREFIX
+            + name_bytes.len()
+            + LEN_PREFIX
+            + prop_bytes.len()
+            + 4
+            + value_bytes.len()
+            + ID_LEN,
+    );
+    key.extend_from_slice(&name_len.to_be_bytes());
+    key.extend_from_slice(name_bytes);
+    key.extend_from_slice(&prop_len.to_be_bytes());
+    key.extend_from_slice(prop_bytes);
+    key.extend_from_slice(&value_len.to_be_bytes());
+    key.extend_from_slice(value_bytes);
+    key.extend_from_slice(id_bytes);
+    key
+}
+
+fn build_property_index_value_prefix(name: &str, prop_key: &str, value_bytes: &[u8]) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let prop_bytes = prop_key.as_bytes();
+    let name_len = u16::try_from(name_bytes.len()).expect("label/type length fits in u16");
+    let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
+    let value_len = u32::try_from(value_bytes.len()).expect("value length fits in u32");
+    let mut key = Vec::with_capacity(
+        LEN_PREFIX + name_bytes.len() + LEN_PREFIX + prop_bytes.len() + 4 + value_bytes.len(),
+    );
+    key.extend_from_slice(&name_len.to_be_bytes());
+    key.extend_from_slice(name_bytes);
+    key.extend_from_slice(&prop_len.to_be_bytes());
+    key.extend_from_slice(prop_bytes);
+    key.extend_from_slice(&value_len.to_be_bytes());
+    key.extend_from_slice(value_bytes);
+    key
+}
+
+fn build_property_index_name_prefix(name: &str, prop_key: &str) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let prop_bytes = prop_key.as_bytes();
+    let name_len = u16::try_from(name_bytes.len()).expect("label/type length fits in u16");
+    let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
+    let mut key = Vec::with_capacity(LEN_PREFIX + name_bytes.len() + LEN_PREFIX + prop_bytes.len());
+    key.extend_from_slice(&name_len.to_be_bytes());
+    key.extend_from_slice(name_bytes);
+    key.extend_from_slice(&prop_len.to_be_bytes());
+    key.extend_from_slice(prop_bytes);
+    key
 }

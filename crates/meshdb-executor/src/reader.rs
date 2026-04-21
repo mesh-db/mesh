@@ -39,6 +39,13 @@ pub trait GraphReader: Send + Sync {
     fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
         Ok(Vec::new())
     }
+    /// Relationship-scope analogue of [`Self::list_property_indexes`].
+    /// Returns `(edge_type, property)` pairs for every registered
+    /// edge property index. Default impl returns empty; overlay
+    /// and partitioned readers delegate to their bases.
+    fn list_edge_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
     /// Snapshot every registered constraint visible through this
     /// reader, for `SHOW CONSTRAINTS` and `db.constraints()`. Default
     /// impl returns empty; storage-backed readers override.
@@ -95,6 +102,13 @@ impl<T: StorageEngine> GraphReader for T {
             .collect())
     }
 
+    fn list_edge_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(StorageEngine::list_edge_property_indexes(self)
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
+            .collect())
+    }
+
     fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
         Ok(StorageEngine::list_property_constraints(self))
     }
@@ -147,6 +161,15 @@ impl GraphReader for StorageReaderAdapter<'_> {
             .list_property_indexes()
             .into_iter()
             .map(|s| (s.label, s.property))
+            .collect())
+    }
+
+    fn list_edge_property_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .0
+            .list_edge_property_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
             .collect())
     }
 

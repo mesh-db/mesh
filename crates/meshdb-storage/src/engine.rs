@@ -35,6 +35,19 @@ pub struct PropertyIndexSpec {
     pub property: String,
 }
 
+/// Relationship-scope analogue of [`PropertyIndexSpec`] — a
+/// single-property equality index keyed on `(edge_type, property)`.
+/// Kept as a distinct type so the on-disk meta CF doesn't have to
+/// encode scope inline, and so call sites statically can't mix a
+/// node-scoped index spec with an edge-scoped one. Users don't name
+/// edge indexes either: `DROP INDEX FOR ()-[r:TYPE]-() ON (r.prop)`
+/// identifies them the same way `CREATE` does.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EdgePropertyIndexSpec {
+    pub edge_type: String,
+    pub property: String,
+}
+
 /// Kind of single-property constraint. `Unique` comes from
 /// `REQUIRE n.prop IS UNIQUE`, `NotNull` from `REQUIRE n.prop IS NOT
 /// NULL`, and `PropertyType(t)` from `REQUIRE n.prop IS :: <TYPE>`.
@@ -246,11 +259,36 @@ pub trait StorageEngine: Send + Sync {
         value: &Property,
     ) -> Result<Vec<NodeId>>;
 
+    /// Equality lookup through an edge property index. Mirrors
+    /// [`StorageEngine::nodes_by_property`] for the relationship side.
+    /// The caller is responsible for verifying the `(edge_type, property)`
+    /// index exists before dispatching — a missing index returns an
+    /// empty result (no entries maintained) rather than erroring so
+    /// the planner's race with a concurrent DROP stays safe.
+    fn edges_by_property(
+        &self,
+        edge_type: &str,
+        property: &str,
+        value: &Property,
+    ) -> Result<Vec<EdgeId>>;
+
     // --- Index DDL ---
 
     fn create_property_index(&self, label: &str, property: &str) -> Result<()>;
     fn drop_property_index(&self, label: &str, property: &str) -> Result<()>;
     fn list_property_indexes(&self) -> Vec<PropertyIndexSpec>;
+
+    /// Declare a new `(edge_type, property)` single-property equality
+    /// index and backfill it from every edge currently carrying the
+    /// type. Idempotent: re-creating an already-registered index is a
+    /// no-op. Matches [`StorageEngine::create_property_index`] for
+    /// node scope.
+    fn create_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()>;
+    /// Tear down an edge property index. Removes the meta entry and
+    /// every entry under the `(edge_type, prop)` prefix. Idempotent.
+    fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()>;
+    /// Snapshot the currently-registered edge property indexes.
+    fn list_edge_property_indexes(&self) -> Vec<EdgePropertyIndexSpec>;
 
     // --- Constraint DDL ---
 

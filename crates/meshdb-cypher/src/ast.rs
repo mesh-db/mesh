@@ -106,13 +106,24 @@ pub struct ReturnStmt {
     pub limit: Option<Expr>,
 }
 
+/// Scope of a property index. Mirrors [`ConstraintScope`] so DDL
+/// for both surfaces can use the same source shapes. `Node(label)`
+/// covers a per-label node index; `Relationship(edge_type)` covers
+/// a per-type edge index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexScope {
+    Node(String),
+    Relationship(String),
+}
+
 /// Declarative description of a property index for DDL statements.
 /// `CreateIndex` and `DropIndex` both use this shape because Mesh
-/// identifies indexes by their `(label, property)` pair — users don't
-/// assign names — and the two commands carry identical payloads.
+/// identifies indexes by their `(scope target, property)` pair —
+/// users don't assign names — and the two commands carry identical
+/// payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDdl {
-    pub label: String,
+    pub scope: IndexScope,
     pub property: String,
 }
 

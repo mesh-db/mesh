@@ -259,6 +259,8 @@ impl<'a> TxCoordinator<'a> {
                 // an internal bug rather than user-visible state.
                 GraphCommand::CreateIndex { .. }
                 | GraphCommand::DropIndex { .. }
+                | GraphCommand::CreateEdgeIndex { .. }
+                | GraphCommand::DropEdgeIndex { .. }
                 | GraphCommand::CreateConstraint { .. }
                 | GraphCommand::DropConstraint { .. } => {
                     debug_assert!(

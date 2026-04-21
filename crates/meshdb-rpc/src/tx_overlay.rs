@@ -104,6 +104,8 @@ impl TxOverlayState {
             // to pretend the index is already there mid-tx.
             GraphCommand::CreateIndex { .. }
             | GraphCommand::DropIndex { .. }
+            | GraphCommand::CreateEdgeIndex { .. }
+            | GraphCommand::DropEdgeIndex { .. }
             | GraphCommand::CreateConstraint { .. }
             | GraphCommand::DropConstraint { .. } => {}
         }
@@ -198,6 +200,13 @@ impl<'a> GraphReader for OverlayGraphReader<'a> {
         // Index DDL lives on the store, not in the per-tx overlay,
         // so read-through to the base is correct even mid-tx.
         self.base.list_property_indexes()
+    }
+
+    fn list_edge_property_indexes(&self) -> ExecResult<Vec<(String, String)>> {
+        // Same rationale as `list_property_indexes`: edge-index
+        // DDL is a store-level concern; the overlay never shadows
+        // it, so read-through is correct.
+        self.base.list_edge_property_indexes()
     }
 
     fn list_property_constraints(&self) -> ExecResult<Vec<meshdb_storage::PropertyConstraintSpec>> {

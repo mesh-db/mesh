@@ -118,6 +118,20 @@ impl GraphStateMachine for StoreGraphApplier {
                 .store
                 .drop_property_index(label, property)
                 .map_err(|e| e.to_string()),
+            GraphCommand::CreateEdgeIndex {
+                edge_type,
+                property,
+            } => self
+                .store
+                .create_edge_property_index(edge_type, property)
+                .map_err(|e| e.to_string()),
+            GraphCommand::DropEdgeIndex {
+                edge_type,
+                property,
+            } => self
+                .store
+                .drop_edge_property_index(edge_type, property)
+                .map_err(|e| e.to_string()),
             GraphCommand::CreateConstraint {
                 name,
                 scope,
@@ -438,6 +452,18 @@ fn apply_ddl_and_collect(
                 .map_err(|e| e.to_string())?,
             GraphCommand::DropIndex { label, property } => store
                 .drop_property_index(label, property)
+                .map_err(|e| e.to_string())?,
+            GraphCommand::CreateEdgeIndex {
+                edge_type,
+                property,
+            } => store
+                .create_edge_property_index(edge_type, property)
+                .map_err(|e| e.to_string())?,
+            GraphCommand::DropEdgeIndex {
+                edge_type,
+                property,
+            } => store
+                .drop_edge_property_index(edge_type, property)
                 .map_err(|e| e.to_string())?,
             GraphCommand::CreateConstraint {
                 name,

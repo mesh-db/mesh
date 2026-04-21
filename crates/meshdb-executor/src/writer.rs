@@ -4,6 +4,21 @@ use meshdb_storage::{
     ConstraintScope, PropertyConstraintKind, PropertyConstraintSpec, StorageEngine,
 };
 
+/// `(label, property)` pair identifying a node property index.
+/// Used by `GraphReader::list_property_indexes` and
+/// `GraphWriter::list_property_indexes` so the executor can enumerate
+/// node-scoped indexes without depending on the storage-layer
+/// `PropertyIndexSpec` struct directly. Type alias kept simple — a
+/// tuple is all the executor ever needed; the richer spec type lives
+/// one layer down.
+pub type NodeIndexSpec = (String, String);
+
+/// `(edge_type, property)` pair identifying an edge property index.
+/// Relationship-scope analogue of [`NodeIndexSpec`]. Kept as a
+/// tuple for consistency; SHOW INDEXES / DDL planning don't need the
+/// richer spec type.
+pub type EdgeIndexSpec = (String, String);
+
 /// Sink for mutating graph operations produced by the executor. Isolates
 /// write-side concerns from read-side traversal so we can plug in either a
 /// direct-to-storage writer (single-node mode) or a Raft-backed writer that
@@ -40,7 +55,33 @@ pub trait GraphWriter {
     /// `(label, property)` pairs for `SHOW INDEXES`. Default impl
     /// returns an empty list — remote writers will wire real
     /// fan-out in Phase C.
-    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+    fn list_property_indexes(&self) -> Result<Vec<NodeIndexSpec>> {
+        Ok(Vec::new())
+    }
+
+    /// Relationship-scope analogue of
+    /// [`Self::create_property_index`]. Default impl errors so remote
+    /// writers that haven't plumbed edge-index DDL yet surface the
+    /// limitation immediately; storage-backed writers override via
+    /// the blanket impl.
+    fn create_edge_property_index(&self, _edge_type: &str, _property: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "edge-property-index DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Tear down an edge property index. Mirrors
+    /// [`Self::create_edge_property_index`].
+    fn drop_edge_property_index(&self, _edge_type: &str, _property: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "edge-property-index DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Snapshot the currently-registered edge property indexes as
+    /// `(edge_type, property)` pairs. Default impl returns an empty
+    /// list.
+    fn list_edge_property_indexes(&self) -> Result<Vec<EdgeIndexSpec>> {
         Ok(Vec::new())
     }
 
@@ -115,10 +156,27 @@ impl<T: StorageEngine> GraphWriter for T {
         Ok(())
     }
 
-    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+    fn list_property_indexes(&self) -> Result<Vec<NodeIndexSpec>> {
         Ok(StorageEngine::list_property_indexes(self)
             .into_iter()
             .map(|s| (s.label, s.property))
+            .collect())
+    }
+
+    fn create_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        StorageEngine::create_edge_property_index(self, edge_type, property)?;
+        Ok(())
+    }
+
+    fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        StorageEngine::drop_edge_property_index(self, edge_type, property)?;
+        Ok(())
+    }
+
+    fn list_edge_property_indexes(&self) -> Result<Vec<EdgeIndexSpec>> {
+        Ok(StorageEngine::list_edge_property_indexes(self)
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
             .collect())
     }
 
@@ -187,12 +245,31 @@ impl GraphWriter for StorageWriterAdapter<'_> {
         Ok(())
     }
 
-    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+    fn list_property_indexes(&self) -> Result<Vec<NodeIndexSpec>> {
         Ok(self
             .0
             .list_property_indexes()
             .into_iter()
             .map(|s| (s.label, s.property))
+            .collect())
+    }
+
+    fn create_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        self.0.create_edge_property_index(edge_type, property)?;
+        Ok(())
+    }
+
+    fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        self.0.drop_edge_property_index(edge_type, property)?;
+        Ok(())
+    }
+
+    fn list_edge_property_indexes(&self) -> Result<Vec<EdgeIndexSpec>> {
+        Ok(self
+            .0
+            .list_edge_property_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
             .collect())
     }
 

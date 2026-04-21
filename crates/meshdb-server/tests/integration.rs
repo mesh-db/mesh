@@ -398,6 +398,65 @@ async fn cypher_create_index_replicates_through_routing_fan_out() {
     assert!(drop_rows.as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn cypher_create_edge_index_replicates_through_routing_fan_out() {
+    // Edge-index analogue of the node-index routing-mode test. Every
+    // replica must end up with the `(edge_type, property)` index so
+    // relationship-UNIQUE constraint enforcement and future edge-
+    // IndexSeek lookups see the same catalog regardless of which
+    // peer receives the read.
+    let (h_a, h_b) = spawn_two_peer_cluster().await;
+
+    let mut q_a = MeshQueryClient::connect(h_a.address.clone()).await.unwrap();
+    let mut q_b = MeshQueryClient::connect(h_b.address.clone()).await.unwrap();
+
+    q_a.execute_cypher(ExecuteCypherRequest {
+        query: "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)".into(),
+        params_json: vec![],
+    })
+    .await
+    .expect("CREATE edge INDEX in routing mode should fan out cleanly");
+
+    // Peer B observes the replicated registry entry.
+    let show_resp = q_b
+        .execute_cypher(ExecuteCypherRequest {
+            query: "SHOW INDEXES".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    let show_rows: serde_json::Value =
+        serde_json::from_slice(&show_resp.into_inner().rows_json).unwrap();
+    let arr = show_rows.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0]["scope"]["Property"]["value"].as_str().unwrap(),
+        "RELATIONSHIP"
+    );
+    assert_eq!(
+        arr[0]["edge_type"]["Property"]["value"].as_str().unwrap(),
+        "KNOWS"
+    );
+
+    // DROP edge INDEX also fans out.
+    q_a.execute_cypher(ExecuteCypherRequest {
+        query: "DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since)".into(),
+        params_json: vec![],
+    })
+    .await
+    .unwrap();
+    let after_drop = q_b
+        .execute_cypher(ExecuteCypherRequest {
+            query: "SHOW INDEXES".into(),
+            params_json: vec![],
+        })
+        .await
+        .unwrap();
+    let drop_rows: serde_json::Value =
+        serde_json::from_slice(&after_drop.into_inner().rows_json).unwrap();
+    assert!(drop_rows.as_array().unwrap().is_empty());
+}
+
 #[test]
 fn config_bootstrap_flag_defaults_to_false_and_parses_when_set() {
     let toml_no_bootstrap = r#"

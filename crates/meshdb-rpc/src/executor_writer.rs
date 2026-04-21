@@ -101,6 +101,20 @@ impl GraphWriter for RaftGraphWriter {
         })
     }
 
+    fn create_edge_property_index(&self, edge_type: &str, property: &str) -> ExecResult<()> {
+        self.propose(GraphCommand::CreateEdgeIndex {
+            edge_type: edge_type.to_string(),
+            property: property.to_string(),
+        })
+    }
+
+    fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> ExecResult<()> {
+        self.propose(GraphCommand::DropEdgeIndex {
+            edge_type: edge_type.to_string(),
+            property: property.to_string(),
+        })
+    }
+
     fn create_property_constraint(
         &self,
         name: Option<&str>,
@@ -226,6 +240,28 @@ impl GraphWriter for BufferingGraphWriter {
             label: label.to_string(),
             property: property.to_string(),
         });
+        Ok(())
+    }
+
+    fn create_edge_property_index(&self, edge_type: &str, property: &str) -> ExecResult<()> {
+        self.buffer
+            .lock()
+            .unwrap()
+            .push(GraphCommand::CreateEdgeIndex {
+                edge_type: edge_type.to_string(),
+                property: property.to_string(),
+            });
+        Ok(())
+    }
+
+    fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> ExecResult<()> {
+        self.buffer
+            .lock()
+            .unwrap()
+            .push(GraphCommand::DropEdgeIndex {
+                edge_type: edge_type.to_string(),
+                property: property.to_string(),
+            });
         Ok(())
     }
 

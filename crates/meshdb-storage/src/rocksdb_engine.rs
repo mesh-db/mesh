@@ -13,16 +13,17 @@
 
 use crate::{
     engine::{
-        ConstraintScope, GraphMutation, PropertyConstraintKind, PropertyConstraintSpec,
-        PropertyIndexSpec, PropertyType, StorageEngine,
+        ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PropertyConstraintKind,
+        PropertyConstraintSpec, PropertyIndexSpec, PropertyType, StorageEngine,
     },
     error::{Error, Result},
     keys::{
         adj_key, constraint_meta_decode, constraint_meta_encode, edge_from_adj_key,
-        encode_index_value, id_from_str_index_key, label_index_key, label_index_prefix,
-        node_from_adj_value, node_id_from_property_index_key, property_index_key,
-        property_index_name_prefix, property_index_value_prefix, type_index_key, type_index_prefix,
-        ID_LEN,
+        edge_id_from_property_index_key, edge_property_index_key, edge_property_index_name_prefix,
+        edge_property_index_value_prefix, encode_index_value, id_from_str_index_key,
+        label_index_key, label_index_prefix, node_from_adj_value, node_id_from_property_index_key,
+        property_index_key, property_index_name_prefix, property_index_value_prefix,
+        type_index_key, type_index_prefix, ID_LEN,
     },
 };
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
@@ -41,6 +42,8 @@ const CF_LABEL_INDEX: &str = "label_index";
 const CF_TYPE_INDEX: &str = "type_index";
 const CF_PROPERTY_INDEX: &str = "property_index";
 const CF_INDEX_META: &str = "index_meta";
+const CF_EDGE_PROPERTY_INDEX: &str = "edge_property_index";
+const CF_EDGE_INDEX_META: &str = "edge_index_meta";
 const CF_CONSTRAINT_META: &str = "constraint_meta";
 
 const ALL_CFS: &[&str] = &[
@@ -52,6 +55,8 @@ const ALL_CFS: &[&str] = &[
     CF_TYPE_INDEX,
     CF_PROPERTY_INDEX,
     CF_INDEX_META,
+    CF_EDGE_PROPERTY_INDEX,
+    CF_EDGE_INDEX_META,
     CF_CONSTRAINT_META,
 ];
 
@@ -95,6 +100,47 @@ fn index_meta_key_decode(key: &[u8]) -> Result<PropertyIndexSpec> {
     Ok(PropertyIndexSpec { label, property })
 }
 
+/// Encode an [`EdgePropertyIndexSpec`] as a stable `CF_EDGE_INDEX_META`
+/// key: `<edge_type>\0<property>`. Neither component can contain NUL
+/// (grammar restricts them to identifier characters) so the NUL
+/// separator is unambiguous on decode.
+fn edge_index_meta_key(spec: &EdgePropertyIndexSpec) -> Vec<u8> {
+    let mut k = Vec::with_capacity(spec.edge_type.len() + 1 + spec.property.len());
+    k.extend_from_slice(spec.edge_type.as_bytes());
+    k.push(0);
+    k.extend_from_slice(spec.property.as_bytes());
+    k
+}
+
+fn edge_index_meta_key_decode(key: &[u8]) -> Result<EdgePropertyIndexSpec> {
+    let sep = key
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or(Error::CorruptBytes {
+            cf: CF_EDGE_INDEX_META,
+            expected: 1,
+            actual: 0,
+        })?;
+    let edge_type = std::str::from_utf8(&key[..sep])
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_EDGE_INDEX_META,
+            expected: sep,
+            actual: sep,
+        })?
+        .to_string();
+    let property = std::str::from_utf8(&key[sep + 1..])
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_EDGE_INDEX_META,
+            expected: key.len() - sep - 1,
+            actual: key.len() - sep - 1,
+        })?
+        .to_string();
+    Ok(EdgePropertyIndexSpec {
+        edge_type,
+        property,
+    })
+}
+
 pub struct RocksDbStorageEngine {
     db: DB,
     /// In-memory view of the registered property indexes, populated
@@ -108,6 +154,15 @@ pub struct RocksDbStorageEngine {
     /// `RwLock` rather than `Mutex` because the common access pattern
     /// is many concurrent reads with only DDL-time writes.
     indexes: RwLock<Vec<PropertyIndexSpec>>,
+    /// Relationship-scope analogue of `indexes`. Populated from
+    /// [`CF_EDGE_INDEX_META`] at open time and kept in sync by
+    /// [`RocksDbStorageEngine::create_edge_property_index`] /
+    /// [`RocksDbStorageEngine::drop_edge_property_index`]. Consulted on
+    /// every edge write path (`append_put_edge`, `append_delete_edge`,
+    /// `append_detach_delete_node`) and by UNIQUE edge-constraint
+    /// enforcement, so the same "must not hit the DB on the hot path"
+    /// contract applies.
+    edge_indexes: RwLock<Vec<EdgePropertyIndexSpec>>,
     /// In-memory view of the registered property constraints,
     /// populated from [`CF_CONSTRAINT_META`] at open time and kept in
     /// sync by [`RocksDbStorageEngine::create_property_constraint`] and
@@ -134,10 +189,12 @@ impl RocksDbStorageEngine {
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)?;
         let indexes = load_index_meta(&db)?;
+        let edge_indexes = load_edge_index_meta(&db)?;
         let constraints = load_constraint_meta(&db)?;
         Ok(Self {
             db,
             indexes: RwLock::new(indexes),
+            edge_indexes: RwLock::new(edge_indexes),
             constraints: RwLock::new(constraints),
         })
     }
@@ -254,6 +311,7 @@ impl RocksDbStorageEngine {
         let out_cf = self.cf(CF_ADJ_OUT)?;
         let in_cf = self.cf(CF_ADJ_IN)?;
         let type_cf = self.cf(CF_TYPE_INDEX)?;
+        let edge_prop_cf = self.cf(CF_EDGE_PROPERTY_INDEX)?;
 
         // Relationship-scope constraint enforcement. Same short-
         // circuit pattern as `append_put_node` — if a constraint
@@ -271,6 +329,47 @@ impl RocksDbStorageEngine {
         );
         batch.put_cf(in_cf, adj_key(edge.target, edge.id), edge.source.as_bytes());
         batch.put_cf(type_cf, type_index_key(&edge.edge_type, edge.id), EMPTY);
+
+        // Edge-property-index maintenance: for each registered
+        // (edge_type, prop) index, delta the previous entry against
+        // the new one and emit the minimal set of put/delete
+        // operations. Mirrors the node path in `append_put_node`.
+        // An existing edge whose type doesn't match the registered
+        // index contributes no work — edges never change their type,
+        // so a type-mismatched entry can't exist to clean up.
+        let edge_indexes = self
+            .edge_indexes
+            .read()
+            .expect("edge_indexes lock poisoned");
+        for spec in edge_indexes.iter() {
+            if spec.edge_type != edge.edge_type {
+                continue;
+            }
+            let old_encoded = existing_edge
+                .as_ref()
+                .and_then(|e| e.properties.get(&spec.property))
+                .and_then(encode_index_value);
+            let new_encoded = edge
+                .properties
+                .get(&spec.property)
+                .and_then(encode_index_value);
+            if old_encoded == new_encoded {
+                continue;
+            }
+            if let Some(bytes) = &old_encoded {
+                batch.delete_cf(
+                    edge_prop_cf,
+                    edge_property_index_key(&spec.edge_type, &spec.property, bytes, edge.id),
+                );
+            }
+            if let Some(bytes) = &new_encoded {
+                batch.put_cf(
+                    edge_prop_cf,
+                    edge_property_index_key(&spec.edge_type, &spec.property, bytes, edge.id),
+                    EMPTY,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -295,11 +394,34 @@ impl RocksDbStorageEngine {
         let out_cf = self.cf(CF_ADJ_OUT)?;
         let in_cf = self.cf(CF_ADJ_IN)?;
         let type_cf = self.cf(CF_TYPE_INDEX)?;
+        let edge_prop_cf = self.cf(CF_EDGE_PROPERTY_INDEX)?;
 
         batch.delete_cf(edges_cf, id.as_bytes());
         batch.delete_cf(out_cf, adj_key(edge.source, id));
         batch.delete_cf(in_cf, adj_key(edge.target, id));
         batch.delete_cf(type_cf, type_index_key(&edge.edge_type, id));
+
+        // Remove any edge-property-index entries this edge owned.
+        // Mirrors the put path: for each registered index whose type
+        // matches, the encoded value (if any) pinned an index key we
+        // now need to delete.
+        let edge_indexes = self
+            .edge_indexes
+            .read()
+            .expect("edge_indexes lock poisoned");
+        for spec in edge_indexes.iter() {
+            if spec.edge_type != edge.edge_type {
+                continue;
+            }
+            if let Some(value) = edge.properties.get(&spec.property) {
+                if let Some(encoded) = encode_index_value(value) {
+                    batch.delete_cf(
+                        edge_prop_cf,
+                        edge_property_index_key(&spec.edge_type, &spec.property, &encoded, id),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -322,6 +444,7 @@ impl RocksDbStorageEngine {
         let label_cf = self.cf(CF_LABEL_INDEX)?;
         let type_cf = self.cf(CF_TYPE_INDEX)?;
         let prop_cf = self.cf(CF_PROPERTY_INDEX)?;
+        let edge_prop_cf = self.cf(CF_EDGE_PROPERTY_INDEX)?;
 
         if let Some(n) = &node {
             for label in &n.labels {
@@ -347,9 +470,36 @@ impl RocksDbStorageEngine {
             }
         }
 
+        // Edges detached by this delete also need their
+        // edge-property-index entries swept. Read the catalog once so
+        // the inner loop doesn't reacquire the lock per edge.
+        let edge_indexes_snapshot = self
+            .edge_indexes
+            .read()
+            .expect("edge_indexes lock poisoned")
+            .clone();
+
         for (edge_id, target) in &outgoing {
             if let Some(e) = self.get_edge(*edge_id)? {
                 batch.delete_cf(type_cf, type_index_key(&e.edge_type, *edge_id));
+                for spec in &edge_indexes_snapshot {
+                    if spec.edge_type != e.edge_type {
+                        continue;
+                    }
+                    if let Some(value) = e.properties.get(&spec.property) {
+                        if let Some(encoded) = encode_index_value(value) {
+                            batch.delete_cf(
+                                edge_prop_cf,
+                                edge_property_index_key(
+                                    &spec.edge_type,
+                                    &spec.property,
+                                    &encoded,
+                                    *edge_id,
+                                ),
+                            );
+                        }
+                    }
+                }
             }
             batch.delete_cf(edges_cf, edge_id.as_bytes());
             batch.delete_cf(out_cf, adj_key(id, *edge_id));
@@ -358,6 +508,24 @@ impl RocksDbStorageEngine {
         for (edge_id, source) in &incoming {
             if let Some(e) = self.get_edge(*edge_id)? {
                 batch.delete_cf(type_cf, type_index_key(&e.edge_type, *edge_id));
+                for spec in &edge_indexes_snapshot {
+                    if spec.edge_type != e.edge_type {
+                        continue;
+                    }
+                    if let Some(value) = e.properties.get(&spec.property) {
+                        if let Some(encoded) = encode_index_value(value) {
+                            batch.delete_cf(
+                                edge_prop_cf,
+                                edge_property_index_key(
+                                    &spec.edge_type,
+                                    &spec.property,
+                                    &encoded,
+                                    *edge_id,
+                                ),
+                            );
+                        }
+                    }
+                }
             }
             batch.delete_cf(edges_cf, edge_id.as_bytes());
             batch.delete_cf(out_cf, adj_key(*source, *edge_id));
@@ -623,15 +791,20 @@ impl RocksDbStorageEngine {
             }
         }
 
-        // UNIQUE on node scope needs a backing property index for
-        // enforcement; the call is idempotent. Relationship-scope
-        // UNIQUE has no backing edge-property index today, so we
-        // enforce via edges_by_type scan — O(E_type) per insert, same
-        // tradeoff as NodeKey. Composite / edge indexes are
-        // follow-ups.
+        // UNIQUE needs a backing single-property equality index on
+        // both scopes so enforcement stays O(log N) per insert. The
+        // create calls are idempotent, mirroring Neo4j's "a unique
+        // constraint also provides an index" contract. The backing
+        // index is not torn down on `DROP CONSTRAINT`; users who
+        // want it gone issue a separate `DROP INDEX`.
         if matches!(kind, PropertyConstraintKind::Unique) {
-            if let ConstraintScope::Node(label) = scope {
-                self.create_property_index(label, &properties[0])?;
+            match scope {
+                ConstraintScope::Node(label) => {
+                    self.create_property_index(label, &properties[0])?;
+                }
+                ConstraintScope::Relationship(edge_type) => {
+                    self.create_edge_property_index(edge_type, &properties[0])?;
+                }
             }
         }
 
@@ -899,36 +1072,43 @@ impl RocksDbStorageEngine {
                 }
                 PropertyConstraintKind::Unique => {
                     let Some(value) = edge.properties.get(primary) else {
+                        // No value → no uniqueness collision possible.
+                        // Matches the node path: UNIQUE alone allows
+                        // NULL / missing; combine with NOT NULL for
+                        // strict presence.
                         continue;
                     };
                     if matches!(value, Property::Null) {
                         continue;
                     }
-                    // No edge property index in v1, so we scan every
-                    // edge of the constrained type. O(E_type) per
-                    // insert. Future: add an edge-property index to
-                    // accelerate this path.
-                    for other_id in self.edges_by_type(edge_type)? {
+                    if encode_index_value(value).is_none() {
+                        // Value type doesn't support equality in the
+                        // index (Float, List, Map, etc.). Skip — the
+                        // node path makes the same call for
+                        // consistency, and the index can't help us
+                        // here anyway.
+                        continue;
+                    }
+                    // Probe the backing edge-property index (created
+                    // by `create_property_constraint` above) for
+                    // rival holders. O(log N) + O(matching edges)
+                    // vs. the previous O(E_type) per-insert scan.
+                    let holders = self.edges_by_property(edge_type, primary, value)?;
+                    for other_id in holders {
                         if other_id == edge.id {
                             continue;
                         }
-                        let other = match self.get_edge(other_id)? {
-                            Some(e) => e,
-                            None => continue,
-                        };
-                        if other.properties.get(primary) == Some(value) {
-                            let was_self = existing
-                                .and_then(|e| e.properties.get(primary))
-                                .is_some_and(|v| v == value);
-                            let _ = was_self;
-                            return Err(Error::ConstraintViolation {
-                                name: spec.name.clone(),
-                                kind: spec.kind.as_string(),
-                                label: edge_type.clone(),
-                                property: primary.to_string(),
-                                details: format!("value already held by edge {}", other_id),
-                            });
-                        }
+                        let was_self = existing
+                            .and_then(|e| e.properties.get(primary))
+                            .is_some_and(|v| v == value);
+                        let _ = was_self;
+                        return Err(Error::ConstraintViolation {
+                            name: spec.name.clone(),
+                            kind: spec.kind.as_string(),
+                            label: edge_type.clone(),
+                            property: primary.to_string(),
+                            details: format!("value already held by edge {}", other_id),
+                        });
                     }
                 }
                 PropertyConstraintKind::PropertyType(target) => {
@@ -998,6 +1178,137 @@ impl RocksDbStorageEngine {
         self.db.write(batch)?;
         guard.retain(|s| s != &spec);
         Ok(())
+    }
+
+    /// Snapshot the currently-registered edge property indexes.
+    /// Mirror of [`RocksDbStorageEngine::list_property_indexes`] for
+    /// relationship scope. Cheap clone — specs are tiny.
+    pub fn list_edge_property_indexes(&self) -> Vec<EdgePropertyIndexSpec> {
+        self.edge_indexes
+            .read()
+            .expect("edge_indexes lock poisoned")
+            .clone()
+    }
+
+    /// Declare a new `(edge_type, property)` edge property index and
+    /// backfill it by scanning every edge currently carrying
+    /// `edge_type`. Idempotent: re-creating an already-registered
+    /// index is a no-op. Mirror of
+    /// [`RocksDbStorageEngine::create_property_index`] for
+    /// relationship scope; the same "same WriteBatch" atomicity
+    /// guarantee applies — a crash mid-backfill leaves the store with
+    /// either zero entries or a fully-populated index, never a
+    /// partially-built one.
+    pub fn create_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        let spec = EdgePropertyIndexSpec {
+            edge_type: edge_type.to_string(),
+            property: property.to_string(),
+        };
+        let mut guard = self
+            .edge_indexes
+            .write()
+            .expect("edge_indexes lock poisoned");
+        if guard.contains(&spec) {
+            return Ok(());
+        }
+
+        let meta_cf = self.cf(CF_EDGE_INDEX_META)?;
+        let prop_cf = self.cf(CF_EDGE_PROPERTY_INDEX)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(meta_cf, edge_index_meta_key(&spec), EMPTY);
+
+        // Backfill from the type index. Edges missing the property
+        // (or carrying an unindexable type) contribute nothing.
+        for edge_id in self.edges_by_type(edge_type)? {
+            let edge = match self.get_edge(edge_id)? {
+                Some(e) => e,
+                None => continue,
+            };
+            if let Some(value) = edge.properties.get(property) {
+                if let Some(encoded) = encode_index_value(value) {
+                    batch.put_cf(
+                        prop_cf,
+                        edge_property_index_key(edge_type, property, &encoded, edge_id),
+                        EMPTY,
+                    );
+                }
+            }
+        }
+
+        self.db.write(batch)?;
+        guard.push(spec);
+        Ok(())
+    }
+
+    /// Tear down an edge property index: removes the meta entry and
+    /// every entry under the `(edge_type, prop)` prefix. Idempotent.
+    /// Atomic via one [`WriteBatch`].
+    pub fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        let spec = EdgePropertyIndexSpec {
+            edge_type: edge_type.to_string(),
+            property: property.to_string(),
+        };
+        let mut guard = self
+            .edge_indexes
+            .write()
+            .expect("edge_indexes lock poisoned");
+        if !guard.contains(&spec) {
+            return Ok(());
+        }
+
+        let meta_cf = self.cf(CF_EDGE_INDEX_META)?;
+        let prop_cf = self.cf(CF_EDGE_PROPERTY_INDEX)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(meta_cf, edge_index_meta_key(&spec));
+
+        let prefix = edge_property_index_name_prefix(edge_type, property);
+        let iter = self
+            .db
+            .iterator_cf(prop_cf, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            batch.delete_cf(prop_cf, key);
+        }
+
+        self.db.write(batch)?;
+        guard.retain(|s| s != &spec);
+        Ok(())
+    }
+
+    /// Look up edge ids for a `(edge_type, property, value)` equality
+    /// via the edge-property-index CF. Mirror of
+    /// [`RocksDbStorageEngine::nodes_by_property`] for relationship
+    /// scope; unindexable value types surface as
+    /// [`Error::UnindexableValue`] so callers can fall back to a
+    /// type-wide scan rather than silently returning empty.
+    pub fn edges_by_property(
+        &self,
+        edge_type: &str,
+        property: &str,
+        value: &Property,
+    ) -> Result<Vec<EdgeId>> {
+        let encoded = encode_index_value(value).ok_or_else(|| Error::UnindexableValue {
+            property: property.to_string(),
+            kind: value.type_name(),
+        })?;
+        let cf = self.cf(CF_EDGE_PROPERTY_INDEX)?;
+        let prefix = edge_property_index_value_prefix(edge_type, property, &encoded);
+        let mut results = Vec::new();
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let bytes = edge_id_from_property_index_key(&key, prefix.len())?;
+            results.push(EdgeId::from_bytes(bytes));
+        }
+        Ok(results)
     }
 
     /// Look up node ids for a `(label, property, value)` equality via
@@ -1408,6 +1719,21 @@ fn load_index_meta(db: &DB) -> Result<Vec<PropertyIndexSpec>> {
     Ok(specs)
 }
 
+/// Relationship-scope analogue of [`load_index_meta`]. Rehydrates the
+/// edge-property-index registry from [`CF_EDGE_INDEX_META`] at open
+/// time.
+fn load_edge_index_meta(db: &DB) -> Result<Vec<EdgePropertyIndexSpec>> {
+    let cf = db
+        .cf_handle(CF_EDGE_INDEX_META)
+        .ok_or(Error::MissingColumnFamily(CF_EDGE_INDEX_META))?;
+    let mut specs = Vec::new();
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, _) = item?;
+        specs.push(edge_index_meta_key_decode(&key)?);
+    }
+    Ok(specs)
+}
+
 impl StorageEngine for RocksDbStorageEngine {
     fn put_node(&self, node: &Node) -> Result<()> {
         RocksDbStorageEngine::put_node(self, node)
@@ -1474,6 +1800,15 @@ impl StorageEngine for RocksDbStorageEngine {
         RocksDbStorageEngine::nodes_by_property(self, label, property, value)
     }
 
+    fn edges_by_property(
+        &self,
+        edge_type: &str,
+        property: &str,
+        value: &Property,
+    ) -> Result<Vec<EdgeId>> {
+        RocksDbStorageEngine::edges_by_property(self, edge_type, property, value)
+    }
+
     fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
         RocksDbStorageEngine::create_property_index(self, label, property)
     }
@@ -1484,6 +1819,18 @@ impl StorageEngine for RocksDbStorageEngine {
 
     fn list_property_indexes(&self) -> Vec<PropertyIndexSpec> {
         RocksDbStorageEngine::list_property_indexes(self)
+    }
+
+    fn create_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        RocksDbStorageEngine::create_edge_property_index(self, edge_type, property)
+    }
+
+    fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        RocksDbStorageEngine::drop_edge_property_index(self, edge_type, property)
+    }
+
+    fn list_edge_property_indexes(&self) -> Vec<EdgePropertyIndexSpec> {
+        RocksDbStorageEngine::list_edge_property_indexes(self)
     }
 
     fn create_property_constraint(

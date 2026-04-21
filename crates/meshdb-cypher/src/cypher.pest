@@ -64,20 +64,46 @@ merge_on_create = @{ ^"create" ~ !id_cont }
 merge_on_match  = @{ ^"match" ~ !id_cont }
 
 // Schema DDL for property indexes. Uses the modern Neo4j 4.x+ form
-// (`CREATE INDEX FOR (n:Label) ON (n.prop)`) without the optional
-// index name — Mesh identifies indexes by their (label, property)
-// pair, which keeps DROP/SHOW behavior uniform across the executor
-// and the storage layer. Parens on both sides are mandatory so the
-// grammar unambiguously terminates.
-create_index_stmt = { kw_create ~ kw_index ~ kw_for ~ "(" ~ index_target ~ ")" ~ kw_on ~ "(" ~ index_property ~ ")" }
-drop_index_stmt   = { kw_drop ~ kw_index ~ kw_for ~ "(" ~ index_target ~ ")" ~ kw_on ~ "(" ~ index_property ~ ")" }
+// without the optional index name — Mesh identifies indexes by
+// their `(scope_target, property)` pair, which keeps DROP/SHOW
+// behavior uniform across the executor and the storage layer.
+// Supports both scope forms:
+//   `CREATE INDEX FOR (n:Label) ON (n.prop)`
+//   `CREATE INDEX FOR ()-[r:TYPE]-() ON (r.prop)`
+// The relationship form is listed first in the alternation so
+// PEG commits on the leading `()-`.
+create_index_stmt = {
+    kw_create ~ kw_index ~ kw_for ~
+    (index_rel_source | index_node_source) ~
+    kw_on ~ "(" ~ index_property ~ ")"
+}
+drop_index_stmt = {
+    kw_drop ~ kw_index ~ kw_for ~
+    (index_rel_source | index_node_source) ~
+    kw_on ~ "(" ~ index_property ~ ")"
+}
 show_indexes_stmt = { kw_show ~ kw_indexes }
+
+// Node source: `(var:Label)`. The variable is grammar-required but
+// discarded by the builder — the index is per-label, not
+// per-variable. Kept paren-wrapped so downstream parsing can tell
+// a node-scoped target from the rel form by the leading token.
+index_node_source = { "(" ~ index_target ~ ")" }
+
+// Relationship source: `()-[var:TYPE]-()`. Direction is not
+// significant for an index — edges of the type get indexed
+// regardless of which endpoint you scanned from — so we accept
+// the undirected form and both arrow shapes at the same
+// priority, matching `constraint_rel_source`.
+index_rel_source = {
+    "(" ~ ")" ~ rel_edge ~ "[" ~ identifier ~ ":" ~ identifier ~ "]" ~ rel_edge ~ "(" ~ ")"
+}
 
 // `n:Label` — the variable is required by the grammar but discarded
 // by the builder (the index is per-label, not per-variable).
 index_target = { identifier ~ ":" ~ identifier }
-// `n.prop` — same: variable is required to be syntactically valid
-// Cypher but ignored semantically.
+// `n.prop` / `r.prop` — same: variable is required to be
+// syntactically valid Cypher but ignored semantically.
 index_property = { identifier ~ "." ~ identifier }
 
 // Schema DDL for constraints. Neo4j 5.x form:

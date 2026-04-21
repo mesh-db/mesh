@@ -3881,11 +3881,13 @@ fn create_index_and_show_indexes_round_trip() {
     let create_rows = run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
     assert_eq!(create_rows.len(), 1);
     assert_eq!(str_prop(&create_rows[0], "state"), "created");
+    assert_eq!(str_prop(&create_rows[0], "scope"), "NODE");
     assert_eq!(str_prop(&create_rows[0], "label"), "Person");
     assert_eq!(str_prop(&create_rows[0], "property"), "name");
 
     let shown = run(&store, "SHOW INDEXES");
     assert_eq!(shown.len(), 1);
+    assert_eq!(str_prop(&shown[0], "scope"), "NODE");
     assert_eq!(str_prop(&shown[0], "label"), "Person");
     assert_eq!(str_prop(&shown[0], "property"), "name");
     assert_eq!(str_prop(&shown[0], "state"), "online");
@@ -3896,6 +3898,47 @@ fn drop_index_empties_show_indexes() {
     let (store, _d) = open_store();
     run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
     run(&store, "DROP INDEX FOR (p:Person) ON (p.name)");
+    assert!(run(&store, "SHOW INDEXES").is_empty());
+}
+
+#[test]
+fn create_edge_index_and_show_indexes_round_trip() {
+    let (store, _d) = open_store();
+    let create_rows = run(&store, "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)");
+    assert_eq!(create_rows.len(), 1);
+    assert_eq!(str_prop(&create_rows[0], "state"), "created");
+    assert_eq!(str_prop(&create_rows[0], "scope"), "RELATIONSHIP");
+    assert_eq!(str_prop(&create_rows[0], "edge_type"), "KNOWS");
+    assert_eq!(str_prop(&create_rows[0], "property"), "since");
+
+    let shown = run(&store, "SHOW INDEXES");
+    assert_eq!(shown.len(), 1);
+    assert_eq!(str_prop(&shown[0], "scope"), "RELATIONSHIP");
+    assert_eq!(str_prop(&shown[0], "edge_type"), "KNOWS");
+    assert_eq!(str_prop(&shown[0], "property"), "since");
+}
+
+#[test]
+fn show_indexes_merges_node_and_edge_scopes() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)");
+
+    let shown = run(&store, "SHOW INDEXES");
+    assert_eq!(shown.len(), 2);
+    let scopes: std::collections::HashSet<_> = shown
+        .iter()
+        .map(|r| str_prop(r, "scope").to_string())
+        .collect();
+    assert!(scopes.contains("NODE"));
+    assert!(scopes.contains("RELATIONSHIP"));
+}
+
+#[test]
+fn drop_edge_index_empties_show_indexes() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)");
+    run(&store, "DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since)");
     assert!(run(&store, "SHOW INDEXES").is_empty());
 }
 

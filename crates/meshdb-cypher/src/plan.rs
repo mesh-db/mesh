@@ -1,8 +1,8 @@
 use crate::ast::{
     BinaryOp, CallArgs, CompareOp, ConstraintKind, ConstraintScope, CreateConstraintStmt,
-    CreateStmt, Direction, DropConstraintStmt, Expr, IndexDdl, Literal, MatchStmt, NodePattern,
-    Pattern, ReturnItem, ReturnStmt, ShortestKind, SortItem, Statement, UnaryOp, UnionStmt,
-    UnwindStmt,
+    CreateStmt, Direction, DropConstraintStmt, Expr, IndexDdl, IndexScope, Literal, MatchStmt,
+    NodePattern, Pattern, ReturnItem, ReturnStmt, ShortestKind, SortItem, Statement, UnaryOp,
+    UnionStmt, UnwindStmt,
 };
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -419,23 +419,37 @@ pub enum LogicalPlan {
         property: String,
         value: Expr,
     },
-    /// Schema DDL — declare a new property index. Has no input and
-    /// produces no rows. The executor short-circuits this before
+    /// Schema DDL — declare a new node property index. Has no input
+    /// and produces no rows. The executor short-circuits this before
     /// constructing the operator pipeline, dispatching to
     /// `Store::create_property_index`.
     CreatePropertyIndex {
         label: String,
         property: String,
     },
-    /// Schema DDL — tear down a property index. Same dispatch
+    /// Schema DDL — tear down a node property index. Same dispatch
     /// pattern as [`LogicalPlan::CreatePropertyIndex`].
     DropPropertyIndex {
         label: String,
         property: String,
     },
+    /// Schema DDL — declare a new edge property index. Relationship-
+    /// scope analogue of [`LogicalPlan::CreatePropertyIndex`]; the
+    /// executor dispatches to `Store::create_edge_property_index`.
+    CreateEdgePropertyIndex {
+        edge_type: String,
+        property: String,
+    },
+    /// Schema DDL — tear down an edge property index. Mirror of
+    /// [`LogicalPlan::DropPropertyIndex`].
+    DropEdgePropertyIndex {
+        edge_type: String,
+        property: String,
+    },
     /// Schema DDL — emit one row per registered property index
-    /// describing `(label, property)`. The executor builds the rows
-    /// from `Store::list_property_indexes`.
+    /// describing `(scope, target, property)`. The executor merges
+    /// rows from both the node and edge index registries so a single
+    /// `SHOW INDEXES` surfaces everything.
     ShowPropertyIndexes,
     /// Schema DDL — declare a new property constraint. Same short-
     /// circuit dispatch pattern as [`LogicalPlan::CreatePropertyIndex`]:
@@ -634,13 +648,25 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
         Statement::Match(m) => plan_match(m, ctx)?,
         Statement::Unwind(u) => plan_unwind(u)?,
         Statement::Return(r) => plan_return_only(r)?,
-        Statement::CreateIndex(IndexDdl { label, property }) => LogicalPlan::CreatePropertyIndex {
-            label: label.clone(),
-            property: property.clone(),
+        Statement::CreateIndex(IndexDdl { scope, property }) => match scope {
+            IndexScope::Node(label) => LogicalPlan::CreatePropertyIndex {
+                label: label.clone(),
+                property: property.clone(),
+            },
+            IndexScope::Relationship(edge_type) => LogicalPlan::CreateEdgePropertyIndex {
+                edge_type: edge_type.clone(),
+                property: property.clone(),
+            },
         },
-        Statement::DropIndex(IndexDdl { label, property }) => LogicalPlan::DropPropertyIndex {
-            label: label.clone(),
-            property: property.clone(),
+        Statement::DropIndex(IndexDdl { scope, property }) => match scope {
+            IndexScope::Node(label) => LogicalPlan::DropPropertyIndex {
+                label: label.clone(),
+                property: property.clone(),
+            },
+            IndexScope::Relationship(edge_type) => LogicalPlan::DropEdgePropertyIndex {
+                edge_type: edge_type.clone(),
+                property: property.clone(),
+            },
         },
         Statement::ShowIndexes => LogicalPlan::ShowPropertyIndexes,
         Statement::CreateConstraint(CreateConstraintStmt {
@@ -970,6 +996,22 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         }
         LogicalPlan::DropPropertyIndex { label, property } => {
             buf.push_str(&format!("{indent}DropPropertyIndex({label}.{property})\n"));
+        }
+        LogicalPlan::CreateEdgePropertyIndex {
+            edge_type,
+            property,
+        } => {
+            buf.push_str(&format!(
+                "{indent}CreateEdgePropertyIndex(:{edge_type}.{property})\n"
+            ));
+        }
+        LogicalPlan::DropEdgePropertyIndex {
+            edge_type,
+            property,
+        } => {
+            buf.push_str(&format!(
+                "{indent}DropEdgePropertyIndex(:{edge_type}.{property})\n"
+            ));
         }
         LogicalPlan::ShowPropertyIndexes => {
             buf.push_str(&format!("{indent}ShowPropertyIndexes\n"));
@@ -1331,6 +1373,8 @@ where
         | LogicalPlan::LoadCsv { input: None, .. }
         | LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
+        | LogicalPlan::CreateEdgePropertyIndex { .. }
+        | LogicalPlan::DropEdgePropertyIndex { .. }
         | LogicalPlan::ShowPropertyIndexes
         | LogicalPlan::CreatePropertyConstraint { .. }
         | LogicalPlan::DropPropertyConstraint { .. }

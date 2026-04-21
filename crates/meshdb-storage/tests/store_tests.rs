@@ -1,5 +1,8 @@
 use meshdb_core::{Edge, Node, NodeId, Property};
-use meshdb_storage::{GraphMutation, PropertyIndexSpec, RocksDbStorageEngine as Store};
+use meshdb_storage::{
+    ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PropertyConstraintKind,
+    PropertyIndexSpec, RocksDbStorageEngine as Store,
+};
 use tempfile::TempDir;
 
 fn tmp_store() -> (Store, TempDir) {
@@ -599,4 +602,246 @@ fn property_index_string_int_same_value_do_not_alias() {
             .unwrap(),
         vec![b.id]
     );
+}
+
+#[test]
+fn edge_property_index_create_backfills_existing_edges() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    let e1 = Edge::new("KNOWS", a.id, b.id).with_property("since", 2020_i64);
+    let e2 = Edge::new("KNOWS", a.id, b.id).with_property("since", 2024_i64);
+    let e3 = Edge::new("WORKS_AT", a.id, b.id).with_property("since", 2020_i64);
+    store.put_edge(&e1).unwrap();
+    store.put_edge(&e2).unwrap();
+    store.put_edge(&e3).unwrap();
+
+    store.create_edge_property_index("KNOWS", "since").unwrap();
+
+    let hits = store
+        .edges_by_property("KNOWS", "since", &Property::Int64(2020))
+        .unwrap();
+    assert_eq!(hits, vec![e1.id]);
+    // Different type — backfill left it alone.
+    let ignored = store
+        .edges_by_property("KNOWS", "since", &Property::Int64(9999))
+        .unwrap();
+    assert!(ignored.is_empty());
+    // Different edge type entirely, no index entry exists.
+    let wrong_type = store
+        .edges_by_property("WORKS_AT", "since", &Property::Int64(2020))
+        .unwrap();
+    assert!(wrong_type.is_empty());
+}
+
+#[test]
+fn edge_property_index_tracks_puts_overwrites_and_deletes() {
+    let (store, _dir) = tmp_store();
+    store.create_edge_property_index("KNOWS", "since").unwrap();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+
+    let mut e = Edge::new("KNOWS", a.id, b.id).with_property("since", 2020_i64);
+    store.put_edge(&e).unwrap();
+    assert_eq!(
+        store
+            .edges_by_property("KNOWS", "since", &Property::Int64(2020))
+            .unwrap(),
+        vec![e.id]
+    );
+
+    // Overwrite with a new value — old entry should be swept.
+    e.properties.insert("since".into(), Property::Int64(2024));
+    store.put_edge(&e).unwrap();
+    assert!(store
+        .edges_by_property("KNOWS", "since", &Property::Int64(2020))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .edges_by_property("KNOWS", "since", &Property::Int64(2024))
+            .unwrap(),
+        vec![e.id]
+    );
+
+    // Delete drops the index entry.
+    store.delete_edge(e.id).unwrap();
+    assert!(store
+        .edges_by_property("KNOWS", "since", &Property::Int64(2024))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn edge_property_index_detach_delete_sweeps_incident_edges() {
+    // A DETACH DELETE on a node removes incident edges — the edge
+    // property index needs to drop the corresponding entries along
+    // with the edge row and its adjacency / type-index keys.
+    let (store, _dir) = tmp_store();
+    store.create_edge_property_index("KNOWS", "since").unwrap();
+    let a = Node::new();
+    let b = Node::new();
+    let c = Node::new();
+    for n in [&a, &b, &c] {
+        store.put_node(n).unwrap();
+    }
+    let e1 = Edge::new("KNOWS", a.id, b.id).with_property("since", 2020_i64);
+    let e2 = Edge::new("KNOWS", c.id, a.id).with_property("since", 2021_i64);
+    store.put_edge(&e1).unwrap();
+    store.put_edge(&e2).unwrap();
+
+    store.detach_delete_node(a.id).unwrap();
+
+    assert!(store
+        .edges_by_property("KNOWS", "since", &Property::Int64(2020))
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .edges_by_property("KNOWS", "since", &Property::Int64(2021))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn edge_property_index_drop_clears_entries_and_registry() {
+    let (store, _dir) = tmp_store();
+    store.create_edge_property_index("KNOWS", "since").unwrap();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    let e = Edge::new("KNOWS", a.id, b.id).with_property("since", 2020_i64);
+    store.put_edge(&e).unwrap();
+
+    store.drop_edge_property_index("KNOWS", "since").unwrap();
+    assert!(store.list_edge_property_indexes().is_empty());
+
+    // A fresh create rebuilds via backfill.
+    store.create_edge_property_index("KNOWS", "since").unwrap();
+    assert_eq!(
+        store
+            .edges_by_property("KNOWS", "since", &Property::Int64(2020))
+            .unwrap(),
+        vec![e.id]
+    );
+}
+
+#[test]
+fn edge_property_index_registry_survives_reopen() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = Store::open(dir.path()).unwrap();
+        store.create_edge_property_index("KNOWS", "since").unwrap();
+        let a = Node::new();
+        let b = Node::new();
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store
+            .put_edge(&Edge::new("KNOWS", a.id, b.id).with_property("since", 2020_i64))
+            .unwrap();
+    }
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store.list_edge_property_indexes(),
+        vec![EdgePropertyIndexSpec {
+            edge_type: "KNOWS".into(),
+            property: "since".into(),
+        }]
+    );
+    let hits = store
+        .edges_by_property("KNOWS", "since", &Property::Int64(2020))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn edge_property_index_rejects_float_values_at_query_time() {
+    let (store, _dir) = tmp_store();
+    store.create_edge_property_index("R", "weight").unwrap();
+    let err = store
+        .edges_by_property("R", "weight", &Property::Float64(1.5))
+        .unwrap_err();
+    assert!(err.to_string().contains("not indexable"));
+}
+
+#[test]
+fn relationship_unique_constraint_provisions_backing_edge_index() {
+    // Creating a UNIQUE constraint on a relationship type should
+    // implicitly provision a (edge_type, property) index so every
+    // subsequent put_edge routes through O(log N) enforcement
+    // instead of the O(E_type) scan that preceded edge indexes.
+    let (store, _dir) = tmp_store();
+    store
+        .create_property_constraint(
+            Some("u_knows_since"),
+            &ConstraintScope::Relationship("KNOWS".into()),
+            &["since".to_string()],
+            PropertyConstraintKind::Unique,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        store.list_edge_property_indexes(),
+        vec![EdgePropertyIndexSpec {
+            edge_type: "KNOWS".into(),
+            property: "since".into(),
+        }]
+    );
+}
+
+#[test]
+fn relationship_unique_detects_duplicate_on_insert() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    store
+        .create_property_constraint(
+            None,
+            &ConstraintScope::Relationship("KNOWS".into()),
+            &["since".to_string()],
+            PropertyConstraintKind::Unique,
+            false,
+        )
+        .unwrap();
+    store
+        .put_edge(&Edge::new("KNOWS", a.id, b.id).with_property("since", 2020_i64))
+        .unwrap();
+    let err = store
+        .put_edge(&Edge::new("KNOWS", a.id, b.id).with_property("since", 2020_i64))
+        .unwrap_err();
+    assert!(err.to_string().contains("value already held"), "{err}");
+}
+
+#[test]
+fn relationship_unique_allows_self_update_on_same_edge() {
+    // A second put_edge that carries the same id should be treated
+    // as an update — the existing holder is self, so no conflict.
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    store
+        .create_property_constraint(
+            None,
+            &ConstraintScope::Relationship("KNOWS".into()),
+            &["since".to_string()],
+            PropertyConstraintKind::Unique,
+            false,
+        )
+        .unwrap();
+    let e = Edge::new("KNOWS", a.id, b.id).with_property("since", 2020_i64);
+    store.put_edge(&e).unwrap();
+    // Same id + same value should be a no-op update.
+    let mut updated = e.clone();
+    updated
+        .properties
+        .insert("since".into(), Property::Int64(2020));
+    store.put_edge(&updated).unwrap();
 }

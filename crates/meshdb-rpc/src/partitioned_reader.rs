@@ -234,17 +234,27 @@ impl GraphReader for PartitionedGraphReader {
     }
 
     fn list_property_indexes(&self) -> ExecResult<Vec<(String, String)>> {
-        // Phase B: routing mode still rejects index DDL at the server
-        // layer, so every peer's index registry is empty in
-        // practice. Reading from the local store is consistent with
-        // what the server-layer DDL path will eventually produce
-        // once Phase C lands (each peer holds the full registry
-        // after fan-out).
+        // Index DDL replicates to every peer via routing-mode
+        // fan-out (see `replicate_index_ddl_routing`), so the local
+        // registry is an authoritative view and no scatter-gather
+        // is needed.
         Ok(self
             .local
             .list_property_indexes()
             .into_iter()
             .map(|s| (s.label, s.property))
+            .collect())
+    }
+
+    fn list_edge_property_indexes(&self) -> ExecResult<Vec<(String, String)>> {
+        // Relationship-scope analogue of `list_property_indexes`.
+        // Edge-index DDL fans out through the same replicate path
+        // so each peer's local registry is authoritative.
+        Ok(self
+            .local
+            .list_edge_property_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
             .collect())
     }
 

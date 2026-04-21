@@ -260,33 +260,47 @@ fn try_execute_ddl(
     match plan {
         LogicalPlan::CreatePropertyIndex { label, property } => {
             writer.create_property_index(label, property)?;
-            Ok(Some(vec![ddl_ack_row("created", label, property)]))
+            Ok(Some(vec![node_index_ddl_ack_row(
+                "created", label, property,
+            )]))
         }
         LogicalPlan::DropPropertyIndex { label, property } => {
             writer.drop_property_index(label, property)?;
-            Ok(Some(vec![ddl_ack_row("dropped", label, property)]))
+            Ok(Some(vec![node_index_ddl_ack_row(
+                "dropped", label, property,
+            )]))
+        }
+        LogicalPlan::CreateEdgePropertyIndex {
+            edge_type,
+            property,
+        } => {
+            writer.create_edge_property_index(edge_type, property)?;
+            Ok(Some(vec![edge_index_ddl_ack_row(
+                "created", edge_type, property,
+            )]))
+        }
+        LogicalPlan::DropEdgePropertyIndex {
+            edge_type,
+            property,
+        } => {
+            writer.drop_edge_property_index(edge_type, property)?;
+            Ok(Some(vec![edge_index_ddl_ack_row(
+                "dropped", edge_type, property,
+            )]))
         }
         LogicalPlan::ShowPropertyIndexes => {
             // SHOW is a pure read — source it from the reader so
             // overlay/partitioned readers deliver the right view
-            // without round-tripping through a writer.
-            let specs = reader.list_property_indexes()?;
-            let rows = specs
-                .into_iter()
-                .map(|(label, property)| {
-                    let mut row = Row::default();
-                    row.insert("label".into(), Value::Property(Property::String(label)));
-                    row.insert(
-                        "property".into(),
-                        Value::Property(Property::String(property)),
-                    );
-                    row.insert(
-                        "state".into(),
-                        Value::Property(Property::String("online".into())),
-                    );
-                    row
-                })
-                .collect();
+            // without round-tripping through a writer. Both
+            // node-scoped and edge-scoped indexes land in the same
+            // row stream, distinguished by the `scope` column.
+            let mut rows: Vec<Row> = Vec::new();
+            for (label, property) in reader.list_property_indexes()? {
+                rows.push(show_index_row("NODE", label, property));
+            }
+            for (edge_type, property) in reader.list_edge_property_indexes()? {
+                rows.push(show_index_row("RELATIONSHIP", edge_type, property));
+            }
             Ok(Some(rows))
         }
         LogicalPlan::CreatePropertyConstraint {
@@ -402,11 +416,21 @@ fn cypher_to_storage_property_type(t: CypherPropertyType) -> StoragePropertyType
     }
 }
 
-fn ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
+/// One-row acknowledgement emitted after `CREATE INDEX` /
+/// `DROP INDEX` on a node scope. Columns mirror the `SHOW INDEXES`
+/// shape (`scope`, `label`, `property`) so Bolt clients can format
+/// DDL responses uniformly with schema-read responses. `label` is
+/// kept as a column name for backwards-compat with pre-edge-index
+/// clients; the `scope` column disambiguates node from edge.
+fn node_index_ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
     let mut row = Row::default();
     row.insert(
         "state".into(),
         Value::Property(Property::String(state.into())),
+    );
+    row.insert(
+        "scope".into(),
+        Value::Property(Property::String("NODE".into())),
     );
     row.insert(
         "label".into(),
@@ -415,6 +439,69 @@ fn ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
     row.insert(
         "property".into(),
         Value::Property(Property::String(property.into())),
+    );
+    row
+}
+
+/// One-row acknowledgement emitted after `CREATE INDEX` /
+/// `DROP INDEX` on a relationship scope. Mirrors
+/// [`node_index_ddl_ack_row`] but the target lives under
+/// `edge_type` (and `label` carries the same string so existing
+/// driver code that read `label` still sees the target name).
+fn edge_index_ddl_ack_row(state: &str, edge_type: &str, property: &str) -> Row {
+    let mut row = Row::default();
+    row.insert(
+        "state".into(),
+        Value::Property(Property::String(state.into())),
+    );
+    row.insert(
+        "scope".into(),
+        Value::Property(Property::String("RELATIONSHIP".into())),
+    );
+    row.insert(
+        "label".into(),
+        Value::Property(Property::String(edge_type.into())),
+    );
+    row.insert(
+        "edge_type".into(),
+        Value::Property(Property::String(edge_type.into())),
+    );
+    row.insert(
+        "property".into(),
+        Value::Property(Property::String(property.into())),
+    );
+    row
+}
+
+/// Row shape for `SHOW INDEXES` output. Columns:
+/// `scope` ("NODE" / "RELATIONSHIP"), `label` (the scope target —
+/// label for node, edge type for relationship; kept for
+/// backwards-compat), `property`, and `state`. `label` and
+/// `edge_type` carry the same string when `scope == "RELATIONSHIP"`
+/// so clients can read either column.
+fn show_index_row(scope: &str, target: String, property: String) -> Row {
+    let mut row = Row::default();
+    row.insert(
+        "scope".into(),
+        Value::Property(Property::String(scope.into())),
+    );
+    row.insert(
+        "label".into(),
+        Value::Property(Property::String(target.clone())),
+    );
+    if scope == "RELATIONSHIP" {
+        row.insert(
+            "edge_type".into(),
+            Value::Property(Property::String(target)),
+        );
+    }
+    row.insert(
+        "property".into(),
+        Value::Property(Property::String(property)),
+    );
+    row.insert(
+        "state".into(),
+        Value::Property(Property::String("online".into())),
     );
     row
 }
@@ -711,6 +798,8 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
         )),
         LogicalPlan::CreatePropertyIndex { .. }
         | LogicalPlan::DropPropertyIndex { .. }
+        | LogicalPlan::CreateEdgePropertyIndex { .. }
+        | LogicalPlan::DropEdgePropertyIndex { .. }
         | LogicalPlan::ShowPropertyIndexes
         | LogicalPlan::CreatePropertyConstraint { .. }
         | LogicalPlan::DropPropertyConstraint { .. }

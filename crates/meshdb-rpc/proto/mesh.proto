@@ -240,6 +240,19 @@ service MeshWrite {
   // `CreatePropertyIndex`: used as both the user-initiated DROP
   // fan-out and the compensating rollback for a partial create.
   rpc DropPropertyIndex(DropPropertyIndexRequest) returns (DropPropertyIndexResponse);
+  // Relationship-scope analogue of `CreatePropertyIndex`. Installs
+  // a `(edge_type, property)` edge property index on this peer's
+  // local store. Fan-out and idempotency semantics match the node
+  // variant — each peer runs its own backfill against its local
+  // edges, so a partial create surfaces as a per-peer error that
+  // triggers rollback on the leader.
+  rpc CreateEdgePropertyIndex(CreateEdgePropertyIndexRequest)
+      returns (CreateEdgePropertyIndexResponse);
+  // Tear down an edge property index on this peer's local store.
+  // Mirrors `CreateEdgePropertyIndex` — used for both user-initiated
+  // DROP fan-out and the compensating rollback for a partial create.
+  rpc DropEdgePropertyIndex(DropEdgePropertyIndexRequest)
+      returns (DropEdgePropertyIndexResponse);
   // Apply a constraint creation to this peer's local store. Used by
   // the routing-mode DDL fan-out the same way `CreatePropertyIndex`
   // is — leader applies locally, then calls this RPC on every other
@@ -309,6 +322,18 @@ message DropPropertyIndexRequest {
   string property = 2;
 }
 message DropPropertyIndexResponse {}
+
+message CreateEdgePropertyIndexRequest {
+  string edge_type = 1;
+  string property = 2;
+}
+message CreateEdgePropertyIndexResponse {}
+
+message DropEdgePropertyIndexRequest {
+  string edge_type = 1;
+  string property = 2;
+}
+message DropEdgePropertyIndexResponse {}
 
 // Mirrors `meshdb_cluster::ConstraintKind`. New kinds land as
 // additional enum values so existing peers can reject unknown kinds

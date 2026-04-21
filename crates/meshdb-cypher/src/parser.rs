@@ -186,19 +186,56 @@ fn build_return_only(pair: Pair<Rule>) -> Result<crate::ast::ReturnStmt> {
 }
 
 /// Shared builder for the two DDL statements that carry a
-/// `(label, property)` payload (`CREATE INDEX`, `DROP INDEX`). The
-/// grammar puts `index_target` and `index_property` in a fixed order,
-/// so we extract them positionally and discard the required-but-
-/// ignored variable identifiers.
+/// `(scope target, property)` payload (`CREATE INDEX`, `DROP INDEX`).
+/// The grammar fixes the order: the scope source (node or rel) comes
+/// first, then the index property. We walk positionally and dispatch
+/// on which scope wrapper fired so the rel form lands as
+/// `IndexScope::Relationship(edge_type)` while the node form stays
+/// on `IndexScope::Node(label)`.
 fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
-    let mut label = None;
+    let mut scope: Option<crate::ast::IndexScope> = None;
     let mut property = None;
     for p in pair.into_inner() {
         match p.as_rule() {
+            Rule::index_node_source => {
+                // Wrapping rule; descend into `index_target`. The
+                // pattern variable inside is grammar-required but
+                // discarded because the index is per-label.
+                let target = p
+                    .into_inner()
+                    .find(|c| c.as_rule() == Rule::index_target)
+                    .ok_or_else(|| Error::Parse("index_node_source missing target".into()))?;
+                let mut inner = target.into_inner();
+                let _var = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("index target missing var".into()))?;
+                let lab = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("index target missing label".into()))?;
+                scope = Some(crate::ast::IndexScope::Node(parse_ident(lab.as_str())));
+            }
+            Rule::index_rel_source => {
+                // Layout: `()` `rel_edge` `[` var `:` edge_type `]`
+                // `rel_edge` `()`. Identifier children arrive in
+                // source order: [var, edge_type]. Direction doesn't
+                // matter for the index — an edge gets indexed
+                // regardless of traversal direction — so we skip the
+                // rel_edge children.
+                let mut idents = p.into_inner().filter(|c| c.as_rule() == Rule::identifier);
+                let _var = idents
+                    .next()
+                    .ok_or_else(|| Error::Parse("index rel source missing var".into()))?;
+                let et = idents
+                    .next()
+                    .ok_or_else(|| Error::Parse("index rel source missing edge type".into()))?;
+                scope = Some(crate::ast::IndexScope::Relationship(parse_ident(
+                    et.as_str(),
+                )));
+            }
             Rule::index_target => {
-                // `ident ":" ident` — the leading identifier is a
-                // pattern variable required by Cypher surface
-                // syntax but has no meaning at the index level.
+                // Fallback for hand-constructed pairs that skip the
+                // wrapper — keeps downstream tests that build pairs
+                // directly working.
                 let mut inner = p.into_inner();
                 let _var = inner
                     .next()
@@ -206,7 +243,7 @@ fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
                 let lab = inner
                     .next()
                     .ok_or_else(|| Error::Parse("index target missing label".into()))?;
-                label = Some(parse_ident(lab.as_str()));
+                scope = Some(crate::ast::IndexScope::Node(parse_ident(lab.as_str())));
             }
             Rule::index_property => {
                 let mut inner = p.into_inner();
@@ -222,7 +259,7 @@ fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
         }
     }
     Ok(crate::ast::IndexDdl {
-        label: label.ok_or_else(|| Error::Parse("index ddl missing label".into()))?,
+        scope: scope.ok_or_else(|| Error::Parse("index ddl missing scope".into()))?,
         property: property.ok_or_else(|| Error::Parse("index ddl missing property".into()))?,
     })
 }
