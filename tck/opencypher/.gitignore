@@ -2,6 +2,11 @@
 \#*
 *.bak
 *.html
+# demoForm.html and grammarLink.html are committed in the upstream
+# openCypher repo despite matching *.html above. Unignore them so
+# release-plz's clean-tree check doesn't flag them as "ignored but
+# tracked".
+!/tools/grammar-production-links/*.html
 .idea/
 *.iml
 cip/*.html
