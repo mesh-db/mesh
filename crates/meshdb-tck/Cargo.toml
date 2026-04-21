@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "openCypher TCK (Technology Compatibility Kit) runner for Mesh"
+publish = false
 
 [dependencies]
 meshdb-core = { workspace = true }

@@ -1,0 +1,67 @@
+# release-plz configuration.
+# Full reference: https://release-plz.dev/docs/config
+
+[workspace]
+# One git tag per release (e.g. "v0.2.0"), not per-crate tags.
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+pr_name = "chore: release v{{ version }}"
+# cargo-semver-checks is slow across a 10-crate workspace and we have
+# no API-stability promise pre-1.0. Re-enable after hitting 1.0.
+semver_check = false
+
+# Every publishable crate is in `version_group = "workspace"` so they
+# all bump to the same "next version" on each release.
+# Every crate shares CHANGELOG.md at the repo root.
+
+[[package]]
+name = "meshdb-core"
+version_group = "workspace"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "meshdb-storage"
+version_group = "workspace"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "meshdb-rpc"
+version_group = "workspace"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "meshdb-bolt"
+version_group = "workspace"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "meshdb-cypher"
+version_group = "workspace"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "meshdb-cluster"
+version_group = "workspace"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "meshdb-executor"
+version_group = "workspace"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "meshdb-client"
+version_group = "workspace"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "meshdb-server"
+version_group = "workspace"
+changelog_path = "CHANGELOG.md"
+
+# meshdb-tck is a test harness — don't publish to crates.io, but still
+# let release-plz bump its version in lockstep with everything else.
+[[package]]
+name = "meshdb-tck"
+publish = false
+release = false

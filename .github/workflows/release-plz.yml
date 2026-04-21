@@ -1,0 +1,82 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+  # Surfaces a "Run workflow" button in the Actions tab. Both jobs are
+  # idempotent — release-pr refreshes the Release PR, release publishes
+  # any crate versions not yet on crates.io. Safe to click whenever.
+  workflow_dispatch:
+
+# Never cancel an in-flight release — doing so mid-publish can leave
+# some crates on crates.io at the new version and others at the old.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Runs after the release PR merges. Tags the commit, creates the
+  # GitHub release, and runs `cargo publish` on every crate whose
+  # version is newer than what's on crates.io.
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install system dependencies
+        # rust-rocksdb's build script needs libclang via bindgen.
+        # protoc is vendored through protoc-bin-vendored in meshdb-rpc.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/[email protected]
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Runs on every push to main. Opens (or updates) a single Release PR
+  # with the next version bump and the changelog diff; merging that PR
+  # triggers the release job above.
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/[email protected]
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
