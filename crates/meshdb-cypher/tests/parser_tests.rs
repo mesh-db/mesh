@@ -1176,7 +1176,7 @@ fn create_index_parses() {
     match parse("CREATE INDEX FOR (p:Person) ON (p.name)").unwrap() {
         Statement::CreateIndex(ddl) => {
             assert_eq!(ddl.scope, IndexScope::Node("Person".into()));
-            assert_eq!(ddl.property, "name");
+            assert_eq!(ddl.properties, vec!["name".to_string()]);
         }
         other => panic!("expected CreateIndex, got {:?}", other),
     }
@@ -1187,7 +1187,7 @@ fn drop_index_parses() {
     match parse("DROP INDEX FOR (n:Person) ON (n.name)").unwrap() {
         Statement::DropIndex(ddl) => {
             assert_eq!(ddl.scope, IndexScope::Node("Person".into()));
-            assert_eq!(ddl.property, "name");
+            assert_eq!(ddl.properties, vec!["name".to_string()]);
         }
         other => panic!("expected DropIndex, got {:?}", other),
     }
@@ -1212,7 +1212,7 @@ fn create_edge_index_parses() {
     match parse("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)").unwrap() {
         Statement::CreateIndex(ddl) => {
             assert_eq!(ddl.scope, IndexScope::Relationship("KNOWS".into()));
-            assert_eq!(ddl.property, "since");
+            assert_eq!(ddl.properties, vec!["since".to_string()]);
         }
         other => panic!("expected CreateIndex with rel scope, got {:?}", other),
     }
@@ -1223,10 +1223,63 @@ fn drop_edge_index_parses() {
     match parse("DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since)").unwrap() {
         Statement::DropIndex(ddl) => {
             assert_eq!(ddl.scope, IndexScope::Relationship("KNOWS".into()));
-            assert_eq!(ddl.property, "since");
+            assert_eq!(ddl.properties, vec!["since".to_string()]);
         }
         other => panic!("expected DropIndex with rel scope, got {:?}", other),
     }
+}
+
+#[test]
+fn create_index_parses_composite_property_list() {
+    match parse("CREATE INDEX FOR (n:Person) ON (n.name, n.age, n.city)").unwrap() {
+        Statement::CreateIndex(ddl) => {
+            assert_eq!(ddl.scope, IndexScope::Node("Person".into()));
+            assert_eq!(
+                ddl.properties,
+                vec!["name".to_string(), "age".to_string(), "city".to_string()]
+            );
+        }
+        other => panic!("expected CreateIndex with composite, got {:?}", other),
+    }
+}
+
+#[test]
+fn drop_edge_index_parses_composite_property_list() {
+    match parse("DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since, r.weight)").unwrap() {
+        Statement::DropIndex(ddl) => {
+            assert_eq!(ddl.scope, IndexScope::Relationship("KNOWS".into()));
+            assert_eq!(
+                ddl.properties,
+                vec!["since".to_string(), "weight".to_string()]
+            );
+        }
+        other => panic!("expected DropIndex with composite, got {:?}", other),
+    }
+}
+
+#[test]
+fn create_index_composite_is_rejected_at_plan_time() {
+    // Grammar accepts composite DDL, but slice 2 leaves the storage
+    // tuple-key encoding for a follow-up — surface a clear error
+    // instead of silently coercing to single-property.
+    let stmt = parse("CREATE INDEX FOR (n:L) ON (n.a, n.b)").unwrap();
+    let err = plan_with_context(&stmt, &PlannerContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("composite") && msg.contains("not yet supported"),
+        "expected composite-not-supported error, got: {msg}"
+    );
+}
+
+#[test]
+fn drop_index_composite_is_rejected_at_plan_time() {
+    let stmt = parse("DROP INDEX FOR ()-[r:T]-() ON (r.a, r.b)").unwrap();
+    let err = plan_with_context(&stmt, &PlannerContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("composite") && msg.contains("not yet supported"),
+        "expected composite-not-supported error, got: {msg}"
+    );
 }
 
 #[test]

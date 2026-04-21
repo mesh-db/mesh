@@ -194,7 +194,7 @@ fn build_return_only(pair: Pair<Rule>) -> Result<crate::ast::ReturnStmt> {
 /// on `IndexScope::Node(label)`.
 fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
     let mut scope: Option<crate::ast::IndexScope> = None;
-    let mut property = None;
+    let mut properties: Vec<String> = Vec::new();
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::index_node_source => {
@@ -253,14 +253,17 @@ fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
                 let key = inner
                     .next()
                     .ok_or_else(|| Error::Parse("index property missing key".into()))?;
-                property = Some(parse_ident(key.as_str()));
+                properties.push(parse_ident(key.as_str()));
             }
             _ => {}
         }
     }
+    if properties.is_empty() {
+        return Err(Error::Parse("index ddl missing property".into()));
+    }
     Ok(crate::ast::IndexDdl {
         scope: scope.ok_or_else(|| Error::Parse("index ddl missing scope".into()))?,
-        property: property.ok_or_else(|| Error::Parse("index ddl missing property".into()))?,
+        properties,
     })
 }
 

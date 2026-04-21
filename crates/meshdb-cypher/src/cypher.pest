@@ -75,12 +75,12 @@ merge_on_match  = @{ ^"match" ~ !id_cont }
 create_index_stmt = {
     kw_create ~ kw_index ~ kw_for ~
     (index_rel_source | index_node_source) ~
-    kw_on ~ "(" ~ index_property ~ ")"
+    kw_on ~ "(" ~ index_property ~ ("," ~ index_property)* ~ ")"
 }
 drop_index_stmt = {
     kw_drop ~ kw_index ~ kw_for ~
     (index_rel_source | index_node_source) ~
-    kw_on ~ "(" ~ index_property ~ ")"
+    kw_on ~ "(" ~ index_property ~ ("," ~ index_property)* ~ ")"
 }
 show_indexes_stmt = { kw_show ~ kw_indexes }
 

@@ -118,13 +118,19 @@ pub enum IndexScope {
 
 /// Declarative description of a property index for DDL statements.
 /// `CreateIndex` and `DropIndex` both use this shape because Mesh
-/// identifies indexes by their `(scope target, property)` pair —
+/// identifies indexes by their `(scope target, properties)` pair —
 /// users don't assign names — and the two commands carry identical
 /// payloads.
+///
+/// `properties` is a `Vec<String>` so the composite form
+/// `CREATE INDEX FOR (n:L) ON (n.a, n.b)` fits the same shape as
+/// the single-property form. The storage layer only supports
+/// length-1 specs today; the planner rejects composite at plan
+/// time ahead of the storage-side tuple-encoding landing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDdl {
     pub scope: IndexScope,
-    pub property: String,
+    pub properties: Vec<String>,
 }
 
 /// Kind of property constraint. UNIQUE comes from

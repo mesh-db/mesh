@@ -677,6 +677,23 @@ pub fn plan(statement: &Statement) -> Result<LogicalPlan> {
 /// property indexes. `MATCH` rewrites pattern-property equality to
 /// [`LogicalPlan::IndexSeek`] when a matching index exists in `ctx`;
 /// `Statement::CreateIndex` / `DropIndex` / `ShowIndexes` lower
+/// Extract the single property name from a DDL `properties` list,
+/// returning `Error::Plan` when the user supplied a composite form.
+/// The grammar accepts `ON (a.x, a.y, ...)` for forward-compatibility
+/// but the storage layer doesn't write composite tuple keys yet —
+/// this rejection is temporary and goes away when the storage-side
+/// composite slice lands.
+fn reject_composite_for_now(properties: &[String], op: &str) -> Result<String> {
+    match properties.len() {
+        0 => Err(Error::Plan(format!("{op} requires at least one property"))),
+        1 => Ok(properties[0].clone()),
+        n => Err(Error::Plan(format!(
+            "{op} with {n}-property composite is not yet supported; \
+             single-property indexes only"
+        ))),
+    }
+}
+
 /// directly to the DDL plan variants.
 pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<LogicalPlan> {
     let plan = match statement {
@@ -684,26 +701,38 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
         Statement::Match(m) => plan_match(m, ctx)?,
         Statement::Unwind(u) => plan_unwind(u)?,
         Statement::Return(r) => plan_return_only(r)?,
-        Statement::CreateIndex(IndexDdl { scope, property }) => match scope {
-            IndexScope::Node(label) => LogicalPlan::CreatePropertyIndex {
-                label: label.clone(),
-                property: property.clone(),
-            },
-            IndexScope::Relationship(edge_type) => LogicalPlan::CreateEdgePropertyIndex {
-                edge_type: edge_type.clone(),
-                property: property.clone(),
-            },
-        },
-        Statement::DropIndex(IndexDdl { scope, property }) => match scope {
-            IndexScope::Node(label) => LogicalPlan::DropPropertyIndex {
-                label: label.clone(),
-                property: property.clone(),
-            },
-            IndexScope::Relationship(edge_type) => LogicalPlan::DropEdgePropertyIndex {
-                edge_type: edge_type.clone(),
-                property: property.clone(),
-            },
-        },
+        Statement::CreateIndex(IndexDdl { scope, properties }) => {
+            // Grammar accepts composite `ON (a.x, a.y, ...)` for the
+            // DDL surface, but the storage layer still only supports
+            // single-property index entries. Reject composite here with
+            // a clear error until the tuple-key encoding lands so a
+            // user who types composite DDL sees an actionable message
+            // instead of a silent truncation.
+            let property = reject_composite_for_now(properties, "CREATE INDEX")?;
+            match scope {
+                IndexScope::Node(label) => LogicalPlan::CreatePropertyIndex {
+                    label: label.clone(),
+                    property,
+                },
+                IndexScope::Relationship(edge_type) => LogicalPlan::CreateEdgePropertyIndex {
+                    edge_type: edge_type.clone(),
+                    property,
+                },
+            }
+        }
+        Statement::DropIndex(IndexDdl { scope, properties }) => {
+            let property = reject_composite_for_now(properties, "DROP INDEX")?;
+            match scope {
+                IndexScope::Node(label) => LogicalPlan::DropPropertyIndex {
+                    label: label.clone(),
+                    property,
+                },
+                IndexScope::Relationship(edge_type) => LogicalPlan::DropEdgePropertyIndex {
+                    edge_type: edge_type.clone(),
+                    property,
+                },
+            }
+        }
         Statement::ShowIndexes => LogicalPlan::ShowPropertyIndexes,
         Statement::CreateConstraint(CreateConstraintStmt {
             name,
