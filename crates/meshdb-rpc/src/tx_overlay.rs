@@ -248,6 +248,58 @@ impl<'a> GraphReader for OverlayGraphReader<'a> {
         Ok(result.into_iter().collect())
     }
 
+    fn edges_by_property(
+        &self,
+        edge_type: &str,
+        property: &str,
+        value: &meshdb_core::Property,
+    ) -> ExecResult<Vec<EdgeId>> {
+        // Relationship-scope analogue of `nodes_by_property`. Same
+        // three-step shape: read the base result, drop what the
+        // overlay has hidden or shadowed, then re-evaluate the
+        // overlay's put_edges to pick up in-tx writes that match.
+        // A deleted endpoint also hides the edge because detach-delete
+        // cascades — matches what `outgoing` / `incoming` do.
+        let mut result: HashSet<EdgeId> = self
+            .base
+            .edges_by_property(edge_type, property, value)?
+            .into_iter()
+            .collect();
+        for id in &self.overlay.deleted_edges {
+            result.remove(id);
+        }
+        result.retain(|id| {
+            // A base edge whose endpoint the overlay detached is no
+            // longer visible through any read. Fetch the edge to
+            // check endpoints; a base read that fails at this point
+            // is treated as "no endpoint info" and the edge drops.
+            match self.base.get_edge(*id) {
+                Ok(Some(edge)) => {
+                    !self.overlay.deleted_nodes.contains(&edge.source)
+                        && !self.overlay.deleted_nodes.contains(&edge.target)
+                }
+                _ => false,
+            }
+        });
+        for id in self.overlay.put_edges.keys() {
+            result.remove(id);
+        }
+        for (id, edge) in &self.overlay.put_edges {
+            if edge.edge_type != edge_type {
+                continue;
+            }
+            if self.overlay.deleted_nodes.contains(&edge.source)
+                || self.overlay.deleted_nodes.contains(&edge.target)
+            {
+                continue;
+            }
+            if edge.properties.get(property) == Some(value) {
+                result.insert(*id);
+            }
+        }
+        Ok(result.into_iter().collect())
+    }
+
     fn outgoing(&self, source: NodeId) -> ExecResult<Vec<(EdgeId, NodeId)>> {
         // A deleted source has no outgoing edges in the overlay view.
         if self.overlay.deleted_nodes.contains(&source) {
@@ -358,6 +410,22 @@ mod tests {
                 .filter(|n| n.labels.iter().any(|l| l == label))
                 .filter(|n| n.properties.get(property) == Some(value))
                 .map(|n| n.id)
+                .collect())
+        }
+        fn edges_by_property(
+            &self,
+            edge_type: &str,
+            property: &str,
+            value: &meshdb_core::Property,
+        ) -> ExecResult<Vec<EdgeId>> {
+            Ok(self
+                .edges
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|e| e.edge_type == edge_type)
+                .filter(|e| e.properties.get(property) == Some(value))
+                .map(|e| e.id)
                 .collect())
         }
         fn outgoing(&self, source: NodeId) -> ExecResult<Vec<(EdgeId, NodeId)>> {
@@ -553,5 +621,117 @@ mod tests {
         let mut expected = vec![a.id, b.id];
         expected.sort();
         assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn edges_by_property_surfaces_put_edges_matching_predicate() {
+        let src = Node::new().with_label("N");
+        let dst = Node::new().with_label("N");
+        let base = FakeBase::default()
+            .with_node(src.clone())
+            .with_node(dst.clone());
+        let edge = Edge::new("KNOWS", src.id, dst.id).with_property("since", 2020_i64);
+        let eid = edge.id;
+
+        let state = TxOverlayState::from_commands(&[GraphCommand::PutEdge(edge)]);
+        let reader = OverlayGraphReader::new(&base, &state);
+
+        let ids = reader
+            .edges_by_property("KNOWS", "since", &meshdb_core::Property::Int64(2020))
+            .unwrap();
+        assert_eq!(ids, vec![eid]);
+    }
+
+    #[test]
+    fn edges_by_property_filters_put_edges_with_non_matching_type_or_value() {
+        let src = Node::new().with_label("N");
+        let dst = Node::new().with_label("N");
+        let base = FakeBase::default()
+            .with_node(src.clone())
+            .with_node(dst.clone());
+        let wrong_type = Edge::new("LIKES", src.id, dst.id).with_property("since", 2020_i64);
+        let wrong_value = Edge::new("KNOWS", src.id, dst.id).with_property("since", 2019_i64);
+
+        let state = TxOverlayState::from_commands(&[
+            GraphCommand::PutEdge(wrong_type),
+            GraphCommand::PutEdge(wrong_value),
+        ]);
+        let reader = OverlayGraphReader::new(&base, &state);
+
+        let ids = reader
+            .edges_by_property("KNOWS", "since", &meshdb_core::Property::Int64(2020))
+            .unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn edges_by_property_hides_base_edge_when_deleted() {
+        let src = Node::new().with_label("N");
+        let dst = Node::new().with_label("N");
+        let edge = Edge::new("KNOWS", src.id, dst.id).with_property("since", 2020_i64);
+        let eid = edge.id;
+        let base = FakeBase::default()
+            .with_node(src.clone())
+            .with_node(dst.clone())
+            .with_edge(edge);
+
+        let state = TxOverlayState::from_commands(&[GraphCommand::DeleteEdge(eid)]);
+        let reader = OverlayGraphReader::new(&base, &state);
+
+        let ids = reader
+            .edges_by_property("KNOWS", "since", &meshdb_core::Property::Int64(2020))
+            .unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn edges_by_property_hides_base_edge_when_endpoint_detach_deleted() {
+        let src = Node::new().with_label("N");
+        let dst = Node::new().with_label("N");
+        let edge = Edge::new("KNOWS", src.id, dst.id).with_property("since", 2020_i64);
+        let base = FakeBase::default()
+            .with_node(src.clone())
+            .with_node(dst.clone())
+            .with_edge(edge);
+
+        // Detach-delete the source — the edge must drop from the
+        // index lookup even though the base still holds it.
+        let state = TxOverlayState::from_commands(&[GraphCommand::DetachDeleteNode(src.id)]);
+        let reader = OverlayGraphReader::new(&base, &state);
+
+        let ids = reader
+            .edges_by_property("KNOWS", "since", &meshdb_core::Property::Int64(2020))
+            .unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn edges_by_property_put_shadows_base_edge_with_same_id() {
+        // Base has an edge with since=2019; overlay puts the same
+        // id with since=2020. The lookup for 2020 must see one row
+        // (the overlay's) and the lookup for 2019 must not (shadowed).
+        let src = Node::new().with_label("N");
+        let dst = Node::new().with_label("N");
+        let base_edge = Edge::new("KNOWS", src.id, dst.id).with_property("since", 2019_i64);
+        let eid = base_edge.id;
+        let base = FakeBase::default()
+            .with_node(src.clone())
+            .with_node(dst.clone())
+            .with_edge(base_edge);
+
+        let mut updated = Edge::new("KNOWS", src.id, dst.id).with_property("since", 2020_i64);
+        updated.id = eid;
+        let state = TxOverlayState::from_commands(&[GraphCommand::PutEdge(updated)]);
+        let reader = OverlayGraphReader::new(&base, &state);
+
+        let matches_2020 = reader
+            .edges_by_property("KNOWS", "since", &meshdb_core::Property::Int64(2020))
+            .unwrap();
+        assert_eq!(matches_2020, vec![eid]);
+
+        let matches_2019 = reader
+            .edges_by_property("KNOWS", "since", &meshdb_core::Property::Int64(2019))
+            .unwrap();
+        assert!(matches_2019.is_empty());
     }
 }
