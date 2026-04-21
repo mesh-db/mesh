@@ -1017,6 +1017,76 @@ fn composite_edge_index_backfills_and_seeks() {
 }
 
 #[test]
+fn node_key_constraint_auto_provisions_composite_backing_index() {
+    // NODE KEY needs an O(log N) enforcement path, so creating the
+    // constraint auto-provisions a matching composite index on the
+    // same `(label, properties)` shape. Mirrors how UNIQUE provisions
+    // a single-property backing index.
+    let (store, _dir) = tmp_store();
+    store
+        .create_property_constraint(
+            Some("pk_person"),
+            &ConstraintScope::Node("Person".into()),
+            &["first".to_string(), "last".to_string()],
+            PropertyConstraintKind::NodeKey,
+            false,
+        )
+        .unwrap();
+
+    // Backing index must exist on the same property tuple, in order.
+    let indexes = store.list_property_indexes();
+    assert!(
+        indexes.iter().any(|s| s.label == "Person"
+            && s.properties == vec!["first".to_string(), "last".to_string()]),
+        "expected backing composite index on Person(first, last), got {indexes:?}",
+    );
+}
+
+#[test]
+fn node_key_constraint_backfilled_index_drives_duplicate_detection() {
+    // Insert data first, then declare the constraint. The backing
+    // index is populated via backfill during `create_property_index_composite`,
+    // and a subsequent duplicate insert hits the constraint through
+    // the seek rather than an O(N) scan.
+    let (store, _dir) = tmp_store();
+    let ada = Node::new()
+        .with_label("Person")
+        .with_property("first", "Ada")
+        .with_property("last", "Lovelace");
+    store.put_node(&ada).unwrap();
+
+    store
+        .create_property_constraint(
+            None,
+            &ConstraintScope::Node("Person".into()),
+            &["first".to_string(), "last".to_string()],
+            PropertyConstraintKind::NodeKey,
+            false,
+        )
+        .unwrap();
+
+    // Duplicate tuple — must be rejected by the constraint check.
+    let dup = Node::new()
+        .with_label("Person")
+        .with_property("first", "Ada")
+        .with_property("last", "Lovelace");
+    let err = store.put_node(&dup).unwrap_err();
+    assert!(err.to_string().contains("tuple already held"), "{err}");
+
+    // Self-update (same id, same tuple) must not false-positive on
+    // the seek: the seek returns the existing id and the enforcement
+    // loop skips it with `id != node.id`.
+    store.put_node(&ada).unwrap();
+
+    // A different tuple — allowed.
+    let grace = Node::new()
+        .with_label("Person")
+        .with_property("first", "Grace")
+        .with_property("last", "Hopper");
+    store.put_node(&grace).unwrap();
+}
+
+#[test]
 fn single_property_index_via_composite_api_matches_legacy_api() {
     // Length-1 call through the composite API must produce the same
     // seek results as the legacy single-property API. Pins the

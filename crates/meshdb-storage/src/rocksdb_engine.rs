@@ -851,16 +851,22 @@ impl RocksDbStorageEngine {
         // create calls are idempotent, mirroring Neo4j's "a unique
         // constraint also provides an index" contract. The backing
         // index is not torn down on `DROP CONSTRAINT`; users who
-        // want it gone issue a separate `DROP INDEX`.
-        if matches!(kind, PropertyConstraintKind::Unique) {
-            match scope {
-                ConstraintScope::Node(label) => {
-                    self.create_property_index(label, &properties[0])?;
-                }
-                ConstraintScope::Relationship(edge_type) => {
-                    self.create_edge_property_index(edge_type, &properties[0])?;
-                }
+        // want it gone issue a separate `DROP INDEX`. NODE KEY gets
+        // the same auto-provisioning against a composite tuple
+        // index so its uniqueness check is a single seek instead of
+        // an O(M * K) label walk.
+        match (kind, scope) {
+            (PropertyConstraintKind::Unique, ConstraintScope::Node(label)) => {
+                self.create_property_index(label, &properties[0])?;
             }
+            (PropertyConstraintKind::Unique, ConstraintScope::Relationship(edge_type)) => {
+                self.create_edge_property_index(edge_type, &properties[0])?;
+            }
+            (PropertyConstraintKind::NodeKey, ConstraintScope::Node(label)) => {
+                let prop_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+                self.create_property_index_composite(label, &prop_refs)?;
+            }
+            _ => {}
         }
 
         // Validate existing data against the new constraint before we
@@ -1022,21 +1028,15 @@ impl RocksDbStorageEngine {
                     }
                 }
                 PropertyConstraintKind::NodeKey => {
-                    // Two-part check: every property must be
-                    // present-and-non-null, and the tuple of their
-                    // values must be unique across other label
-                    // members. Presence fails fast — if any slot is
-                    // missing we stop before the O(N) uniqueness
-                    // scan. Uniqueness walks the label's nodes
-                    // because we don't have composite indexes yet;
-                    // complexity is O(M × K) per insert where M is
-                    // the label's cardinality and K is the tuple
-                    // length. Good enough for v1; a composite index
-                    // is a follow-up.
-                    let mut my_tuple: Vec<&Property> = Vec::with_capacity(spec.properties.len());
+                    // Presence check first: every property must be
+                    // present and non-null. Fails fast before the
+                    // seek so a missing-property error takes
+                    // precedence over a (potentially) conflicting
+                    // existing tuple.
+                    let mut my_tuple: Vec<Property> = Vec::with_capacity(spec.properties.len());
                     for prop in &spec.properties {
                         match node.properties.get(prop) {
-                            Some(v) if !matches!(v, Property::Null) => my_tuple.push(v),
+                            Some(v) if !matches!(v, Property::Null) => my_tuple.push(v.clone()),
                             _ => {
                                 return Err(Error::ConstraintViolation {
                                     name: spec.name.clone(),
@@ -1051,33 +1051,19 @@ impl RocksDbStorageEngine {
                             }
                         }
                     }
-                    for other_id in self.nodes_by_label(label)? {
-                        if other_id == node.id {
-                            continue;
-                        }
-                        let other = match self.get_node(other_id)? {
-                            Some(n) => n,
-                            None => continue,
-                        };
-                        let mut matches_all = true;
-                        for (prop, mine) in spec.properties.iter().zip(my_tuple.iter()) {
-                            match other.properties.get(prop) {
-                                Some(theirs) if theirs == *mine => continue,
-                                _ => {
-                                    matches_all = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if matches_all {
-                            return Err(Error::ConstraintViolation {
-                                name: spec.name.clone(),
-                                kind: spec.kind.as_string(),
-                                label: label.clone(),
-                                property: spec.properties.join(","),
-                                details: format!("tuple already held by node {}", other_id),
-                            });
-                        }
+                    // Uniqueness via the auto-provisioned composite
+                    // index (see `create_property_constraint`). O(log N)
+                    // per insert instead of the old O(M × K) label walk.
+                    let prop_refs: Vec<&str> = spec.properties.iter().map(String::as_str).collect();
+                    let hits = self.nodes_by_properties(label, &prop_refs, &my_tuple)?;
+                    if let Some(other_id) = hits.iter().find(|&&id| id != node.id) {
+                        return Err(Error::ConstraintViolation {
+                            name: spec.name.clone(),
+                            kind: spec.kind.as_string(),
+                            label: label.clone(),
+                            property: spec.properties.join(","),
+                            details: format!("tuple already held by node {}", other_id),
+                        });
                     }
                 }
             }
