@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.6](https://github.com/mesh-db/mesh/compare/v0.1.0-alpha.5...v0.1.0-alpha.6) - 2026-04-21
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.1.0-alpha.5](https://github.com/mesh-db/mesh/compare/v0.1.0-alpha.3...v0.1.0-alpha.5) - 2026-04-21
 
 ### Other
