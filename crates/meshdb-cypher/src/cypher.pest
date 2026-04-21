@@ -372,15 +372,22 @@ path_var_binding = { identifier ~ "=" }
 hop = { rel_pattern ~ node_pattern }
 
 rel_pattern = { rel_both_arrows | rel_right | rel_left | rel_both }
-rel_right = { "-" ~ rel_detail? ~ "->" }
-rel_left = { "<-" ~ rel_detail? ~ "-" }
+rel_right = { "-" ~ rel_detail? ~ "->" ~ rel_quantifier? }
+rel_left = { "<-" ~ rel_detail? ~ "-" ~ rel_quantifier? }
 // `<-[r]->` / `<-->` — undirected-with-both-arrows shorthand. Neo4j
 // treats this the same as `-[r]-` (unrestricted direction), so the
 // builder lowers it to `Direction::Both`. Must sit before `rel_left`
 // in the alternation because `rel_left` would otherwise commit on
 // seeing `<-` and leave the trailing `->` dangling.
-rel_both_arrows = { "<-" ~ rel_detail? ~ "->" }
-rel_both = { "-" ~ rel_detail? ~ "-" }
+rel_both_arrows = { "<-" ~ rel_detail? ~ "->" ~ rel_quantifier? }
+rel_both = { "-" ~ rel_detail? ~ "-" ~ rel_quantifier? }
+// Neo4j 5 quantified-relationship shorthand: `+` is "one or more"
+// (== `*1..`), `*` is "zero or more" (== `*0..`). Lives outside the
+// bracketed rel_detail and, when present, lowers to the same
+// `VarLength` that the inline `*min..max` form produces. The parser
+// rejects combining a trailing quantifier with an inline var_length
+// because they'd produce two conflicting hop ranges on the same rel.
+rel_quantifier = { "+" | "*" }
 rel_detail = { "[" ~ identifier? ~ rel_type_spec? ~ var_length? ~ properties? ~ "]" }
 rel_type_spec = { ":" ~ identifier ~ ("|" ~ ":"? ~ identifier)* }
 var_length = { "*" ~ var_length_range? }

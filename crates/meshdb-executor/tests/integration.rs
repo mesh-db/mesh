@@ -1352,6 +1352,47 @@ fn var_length_zero_hops_matches_self() {
 }
 
 #[test]
+fn trailing_plus_quantifier_is_one_or_more_hops() {
+    let (store, _d) = open_store();
+    build_chain(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (a:Link)-[:N]->+(b:Link) WHERE a.name = 'a' RETURN b.name AS b",
+    );
+    let names = sorted_names(&rows, "b");
+    // 1..unbounded over a->b->c->d reaches b, c, d from a.
+    assert_eq!(names, vec!["b", "c", "d"]);
+}
+
+#[test]
+fn trailing_star_quantifier_is_zero_or_more_hops() {
+    let (store, _d) = open_store();
+    build_chain(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (a:Link)-[:N]->*(b:Link) WHERE a.name = 'a' RETURN b.name AS b",
+    );
+    let names = sorted_names(&rows, "b");
+    // 0..unbounded adds the zero-hop self-match to the 1..unbounded set.
+    assert_eq!(names, vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn trailing_plus_on_bare_arrow_matches_all_outgoing() {
+    let (store, _d) = open_store();
+    build_chain(&store);
+
+    let rows = run(
+        &store,
+        "MATCH (a:Link)-->+(b:Link) WHERE a.name = 'a' RETURN b.name AS b",
+    );
+    let names = sorted_names(&rows, "b");
+    assert_eq!(names, vec!["b", "c", "d"]);
+}
+
+#[test]
 fn var_length_respects_edge_type_filter() {
     let (store, _d) = open_store();
     // Chain a-[:N]->b-[:N]->c-[:M]->d — M breaks the :N chain

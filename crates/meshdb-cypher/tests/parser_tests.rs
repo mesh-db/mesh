@@ -450,6 +450,74 @@ fn single_hop_has_no_var_length() {
 }
 
 #[test]
+fn trailing_plus_quantifier_is_one_or_more() {
+    let m = unwrap_match(parse("MATCH (a)-[:KNOWS]->+(b) RETURN b").unwrap());
+    let vl = first_match(&m).patterns[0].hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+    assert_eq!(vl.max, u64::MAX);
+}
+
+#[test]
+fn trailing_star_quantifier_is_zero_or_more() {
+    let m = unwrap_match(parse("MATCH (a)-[:KNOWS]->*(b) RETURN b").unwrap());
+    let vl = first_match(&m).patterns[0].hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 0);
+    assert_eq!(vl.max, u64::MAX);
+}
+
+#[test]
+fn trailing_plus_on_bare_arrow_without_rel_detail() {
+    let m = unwrap_match(parse("MATCH (a)-->+(b) RETURN b").unwrap());
+    let rel = &first_match(&m).patterns[0].hops[0].rel;
+    assert!(rel.edge_types.is_empty());
+    let vl = rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+    assert_eq!(vl.max, u64::MAX);
+}
+
+#[test]
+fn trailing_plus_on_incoming_direction() {
+    let m = unwrap_match(parse("MATCH (a)<-[:R]-+(b) RETURN b").unwrap());
+    let rel = &first_match(&m).patterns[0].hops[0].rel;
+    assert!(matches!(rel.direction, Direction::Incoming));
+    let vl = rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+    assert_eq!(vl.max, u64::MAX);
+}
+
+#[test]
+fn trailing_plus_on_undirected() {
+    let m = unwrap_match(parse("MATCH (a)-[:R]-+(b) RETURN b").unwrap());
+    let rel = &first_match(&m).patterns[0].hops[0].rel;
+    assert!(matches!(rel.direction, Direction::Both));
+    let vl = rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+    assert_eq!(vl.max, u64::MAX);
+}
+
+#[test]
+fn trailing_quantifier_carries_edge_var_and_type() {
+    let m = unwrap_match(parse("MATCH (a)-[r:KNOWS]->+(b) RETURN r").unwrap());
+    let rel = &first_match(&m).patterns[0].hops[0].rel;
+    assert_eq!(rel.var.as_deref(), Some("r"));
+    assert_eq!(rel.edge_types, vec!["KNOWS"]);
+    let vl = rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+}
+
+#[test]
+fn trailing_quantifier_rejects_combined_with_inline_range() {
+    // Inline `*1..3` and trailing `+` would express two conflicting
+    // hop ranges on the same rel. Parse-time error.
+    let err = parse("MATCH (a)-[:R*1..3]->+(b) RETURN b").unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cannot combine"),
+        "expected conflict error, got: {msg}"
+    );
+}
+
+#[test]
 fn create_path_with_relationship() {
     let c = unwrap_create(parse("CREATE (a:Person)-[:KNOWS]->(b:Person)").unwrap());
     assert_eq!(c.patterns[0].hops.len(), 1);

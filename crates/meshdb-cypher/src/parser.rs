@@ -1605,28 +1605,77 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
     let mut edge_types = Vec::new();
     let mut var_length = None;
     let mut properties = Vec::new();
+    let mut trailing_quantifier: Option<VarLength> = None;
     for p in inner.into_inner() {
-        if p.as_rule() == Rule::rel_detail {
-            for d in p.into_inner() {
-                match d.as_rule() {
-                    Rule::identifier => var = Some(parse_ident(d.as_str())),
-                    Rule::rel_type_spec => {
-                        for id in d.into_inner() {
-                            if id.as_rule() == Rule::identifier {
-                                edge_types.push(parse_ident(id.as_str()));
+        match p.as_rule() {
+            Rule::rel_detail => {
+                for d in p.into_inner() {
+                    match d.as_rule() {
+                        Rule::identifier => var = Some(parse_ident(d.as_str())),
+                        Rule::rel_type_spec => {
+                            for id in d.into_inner() {
+                                if id.as_rule() == Rule::identifier {
+                                    edge_types.push(parse_ident(id.as_str()));
+                                }
                             }
                         }
+                        Rule::var_length => {
+                            var_length = Some(build_var_length(d)?);
+                        }
+                        Rule::properties => {
+                            properties = build_properties(d)?;
+                        }
+                        r => {
+                            return Err(Error::Parse(format!(
+                                "unexpected rel detail rule: {:?}",
+                                r
+                            )))
+                        }
                     }
-                    Rule::var_length => {
-                        var_length = Some(build_var_length(d)?);
-                    }
-                    Rule::properties => {
-                        properties = build_properties(d)?;
-                    }
-                    r => return Err(Error::Parse(format!("unexpected rel detail rule: {:?}", r))),
                 }
             }
+            Rule::rel_quantifier => {
+                // Neo4j 5 shorthand. `+` is `*1..`, `*` is `*0..`.
+                // Everything else is a grammar bug.
+                let text = p.as_str();
+                let lowered = match text {
+                    "+" => VarLength {
+                        min: 1,
+                        max: u64::MAX,
+                    },
+                    "*" => VarLength {
+                        min: 0,
+                        max: u64::MAX,
+                    },
+                    other => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rel quantifier: {:?}",
+                            other
+                        )))
+                    }
+                };
+                trailing_quantifier = Some(lowered);
+            }
+            r => {
+                return Err(Error::Parse(format!(
+                    "unexpected rel pattern rule: {:?}",
+                    r
+                )))
+            }
         }
+    }
+
+    if let Some(q) = trailing_quantifier {
+        // Both forms present is a semantic conflict — two different
+        // hop ranges on the same relationship. Reject at parse time
+        // rather than silently discarding one.
+        if var_length.is_some() {
+            return Err(Error::Parse(
+                "cannot combine inline `*min..max` with trailing `+` / `*` quantifier on the same relationship"
+                    .into(),
+            ));
+        }
+        var_length = Some(q);
     }
 
     Ok(RelPattern {
