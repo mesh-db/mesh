@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4](https://github.com/mesh-db/mesh/compare/v0.1.0-alpha.2...v0.1.0-alpha.4) - 2026-04-21
+
+### Other
+
+- add Point type and openCypher point functions
+
 ## [0.1.0-alpha.3](https://github.com/mesh-db/mesh/compare/v0.1.0-alpha.2...v0.1.0-alpha.3) - 2026-04-21
 
 ### Other
