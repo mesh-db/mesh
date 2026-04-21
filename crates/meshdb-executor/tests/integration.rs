@@ -1393,6 +1393,35 @@ fn trailing_plus_on_bare_arrow_matches_all_outgoing() {
 }
 
 #[test]
+fn brace_range_quantifier_selects_hop_range() {
+    let (store, _d) = open_store();
+    build_chain(&store);
+
+    // 2..3 hops over a -> b -> c -> d: reaches c (2 hops) and d (3 hops).
+    let rows = run(
+        &store,
+        "MATCH (a:Link)-[:N]->{2,3}(b:Link) WHERE a.name = 'a' RETURN b.name AS b",
+    );
+    let names = sorted_names(&rows, "b");
+    assert_eq!(names, vec!["c", "d"]);
+}
+
+#[test]
+fn brace_max_only_quantifier_starts_from_zero_hops() {
+    let (store, _d) = open_store();
+    build_chain(&store);
+
+    // `{,2}` means min=0..max=2 — includes the zero-hop self-match,
+    // distinguishing it from the inline `*..2` form (min=1).
+    let rows = run(
+        &store,
+        "MATCH (a:Link)-[:N]->{,2}(b:Link) WHERE a.name = 'a' RETURN b.name AS b",
+    );
+    let names = sorted_names(&rows, "b");
+    assert_eq!(names, vec!["a", "b", "c"]);
+}
+
+#[test]
 fn var_length_respects_edge_type_filter() {
     let (store, _d) = open_store();
     // Chain a-[:N]->b-[:N]->c-[:M]->d — M breaks the :N chain

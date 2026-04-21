@@ -518,6 +518,80 @@ fn trailing_quantifier_rejects_combined_with_inline_range() {
 }
 
 #[test]
+fn brace_quantifier_exact_count() {
+    let m = unwrap_match(parse("MATCH (a)-[:R]->{3}(b) RETURN b").unwrap());
+    let vl = first_match(&m).patterns[0].hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 3);
+    assert_eq!(vl.max, 3);
+}
+
+#[test]
+fn brace_quantifier_bounded_range() {
+    let m = unwrap_match(parse("MATCH (a)-[:R]->{1,3}(b) RETURN b").unwrap());
+    let vl = first_match(&m).patterns[0].hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 1);
+    assert_eq!(vl.max, 3);
+}
+
+#[test]
+fn brace_quantifier_min_only_is_unbounded_above() {
+    let m = unwrap_match(parse("MATCH (a)-[:R]->{2,}(b) RETURN b").unwrap());
+    let vl = first_match(&m).patterns[0].hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 2);
+    assert_eq!(vl.max, u64::MAX);
+}
+
+#[test]
+fn brace_quantifier_max_only_starts_from_zero() {
+    // GQL / regex semantics: `{,m}` starts from zero, unlike the
+    // inline `*..m` form which defaults min=1. This test pins that
+    // divergence.
+    let m = unwrap_match(parse("MATCH (a)-[:R]->{,4}(b) RETURN b").unwrap());
+    let vl = first_match(&m).patterns[0].hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 0);
+    assert_eq!(vl.max, 4);
+}
+
+#[test]
+fn brace_quantifier_zero_exactly() {
+    let m = unwrap_match(parse("MATCH (a)-[:R]->{0}(b) RETURN b").unwrap());
+    let vl = first_match(&m).patterns[0].hops[0].rel.var_length.unwrap();
+    assert_eq!(vl.min, 0);
+    assert_eq!(vl.max, 0);
+}
+
+#[test]
+fn brace_quantifier_rejects_empty_bounds() {
+    // `{,}` — ambiguous shorthand; user should spell it as `*`.
+    let err = parse("MATCH (a)-[:R]->{,}(b) RETURN b").unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no bounds"),
+        "expected empty-bounds error, got: {msg}"
+    );
+}
+
+#[test]
+fn brace_quantifier_rejects_combined_with_inline_range() {
+    let err = parse("MATCH (a)-[:R*1..3]->{1,5}(b) RETURN b").unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cannot combine"),
+        "expected conflict error, got: {msg}"
+    );
+}
+
+#[test]
+fn brace_quantifier_on_bare_arrow() {
+    let m = unwrap_match(parse("MATCH (a)-->{2,3}(b) RETURN b").unwrap());
+    let rel = &first_match(&m).patterns[0].hops[0].rel;
+    assert!(rel.edge_types.is_empty());
+    let vl = rel.var_length.unwrap();
+    assert_eq!(vl.min, 2);
+    assert_eq!(vl.max, 3);
+}
+
+#[test]
 fn create_path_with_relationship() {
     let c = unwrap_create(parse("CREATE (a:Person)-[:KNOWS]->(b:Person)").unwrap());
     assert_eq!(c.patterns[0].hops.len(), 1);

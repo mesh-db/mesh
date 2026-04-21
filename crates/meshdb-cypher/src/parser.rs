@@ -1635,26 +1635,7 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
                 }
             }
             Rule::rel_quantifier => {
-                // Neo4j 5 shorthand. `+` is `*1..`, `*` is `*0..`.
-                // Everything else is a grammar bug.
-                let text = p.as_str();
-                let lowered = match text {
-                    "+" => VarLength {
-                        min: 1,
-                        max: u64::MAX,
-                    },
-                    "*" => VarLength {
-                        min: 0,
-                        max: u64::MAX,
-                    },
-                    other => {
-                        return Err(Error::Parse(format!(
-                            "unexpected rel quantifier: {:?}",
-                            other
-                        )))
-                    }
-                };
-                trailing_quantifier = Some(lowered);
+                trailing_quantifier = Some(build_rel_quantifier(p)?);
             }
             r => {
                 return Err(Error::Parse(format!(
@@ -1671,7 +1652,7 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
         // rather than silently discarding one.
         if var_length.is_some() {
             return Err(Error::Parse(
-                "cannot combine inline `*min..max` with trailing `+` / `*` quantifier on the same relationship"
+                "cannot combine inline `*min..max` with trailing `+` / `*` / `{...}` quantifier on the same relationship"
                     .into(),
             ));
         }
@@ -1685,6 +1666,103 @@ fn build_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern> {
         direction,
         var_length,
     })
+}
+
+/// Lower a `rel_quantifier` pair (`+`, `*`, or a brace form) to the
+/// `VarLength` range the executor consumes. Note the `{...}` forms
+/// use GQL / regex semantics for absent bounds (`{,m}` == `{0,m}`);
+/// this differs from the inline `*..m` form which defaults min=1,
+/// matching what Neo4j 5 specifies for each surface.
+fn build_rel_quantifier(pair: Pair<Rule>) -> Result<VarLength> {
+    debug_assert_eq!(pair.as_rule(), Rule::rel_quantifier);
+    // `+` and `*` match as literal string tokens; a brace form is
+    // an inner rule.
+    let text = pair.as_str();
+    if text == "+" {
+        return Ok(VarLength {
+            min: 1,
+            max: u64::MAX,
+        });
+    }
+    if text == "*" {
+        return Ok(VarLength {
+            min: 0,
+            max: u64::MAX,
+        });
+    }
+    let brace = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::brace_quantifier)
+        .ok_or_else(|| Error::Parse("malformed rel quantifier".into()))?;
+    build_brace_quantifier(brace)
+}
+
+fn build_brace_quantifier(pair: Pair<Rule>) -> Result<VarLength> {
+    debug_assert_eq!(pair.as_rule(), Rule::brace_quantifier);
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::Parse("empty brace quantifier".into()))?;
+    match inner.as_rule() {
+        Rule::brace_exact => {
+            let n_pair = inner
+                .into_inner()
+                .next()
+                .ok_or_else(|| Error::Parse("empty brace exact".into()))?;
+            let n = parse_u64(n_pair.as_str())?;
+            Ok(VarLength { min: n, max: n })
+        }
+        Rule::brace_range => {
+            // Defaults: absent lower bound is 0 (regex-style, GQL),
+            // absent upper bound is unbounded. This diverges from
+            // the inline `*..m` form (which defaults min=1) — the
+            // brace surface matches the Neo4j 5 spec.
+            let mut min: u64 = 0;
+            let mut max: u64 = u64::MAX;
+            let mut saw_min = false;
+            let mut saw_max = false;
+            for p in inner.into_inner() {
+                match p.as_rule() {
+                    Rule::brace_min => {
+                        let n_pair = p
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| Error::Parse("empty brace min".into()))?;
+                        min = parse_u64(n_pair.as_str())?;
+                        saw_min = true;
+                    }
+                    Rule::brace_max => {
+                        let n_pair = p
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| Error::Parse("empty brace max".into()))?;
+                        max = parse_u64(n_pair.as_str())?;
+                        saw_max = true;
+                    }
+                    r => {
+                        return Err(Error::Parse(format!(
+                            "unexpected rule in brace range: {:?}",
+                            r
+                        )))
+                    }
+                }
+            }
+            if !saw_min && !saw_max {
+                // `{,}` is ambiguous — `+` / `*` already cover open
+                // ranges with clearer intent, so reject this form
+                // rather than silently aliasing it to `*`.
+                return Err(Error::Parse(
+                    "quantifier `{,}` has no bounds; use `*` for zero-or-more or `+` for one-or-more"
+                        .into(),
+                ));
+            }
+            Ok(VarLength { min, max })
+        }
+        r => Err(Error::Parse(format!(
+            "unexpected rule in brace quantifier: {:?}",
+            r
+        ))),
+    }
 }
 
 fn build_var_length(pair: Pair<Rule>) -> Result<VarLength> {

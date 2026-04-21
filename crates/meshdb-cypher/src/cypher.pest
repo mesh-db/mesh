@@ -387,7 +387,17 @@ rel_both = { "-" ~ rel_detail? ~ "-" ~ rel_quantifier? }
 // `VarLength` that the inline `*min..max` form produces. The parser
 // rejects combining a trailing quantifier with an inline var_length
 // because they'd produce two conflicting hop ranges on the same rel.
-rel_quantifier = { "+" | "*" }
+//
+// `brace_quantifier` handles the GQL-style `{n}` / `{n,m}` /
+// `{n,}` / `{,m}` forms. Note: `{,m}` means min=0 (regex-style),
+// differing from the inline `*..m` form which defaults min=1 —
+// documented in `build_rel_pattern`.
+rel_quantifier = { "+" | "*" | brace_quantifier }
+brace_quantifier = { "{" ~ (brace_range | brace_exact) ~ "}" }
+brace_range = { brace_min? ~ "," ~ brace_max? }
+brace_min = { nn_integer }
+brace_max = { nn_integer }
+brace_exact = { nn_integer }
 rel_detail = { "[" ~ identifier? ~ rel_type_spec? ~ var_length? ~ properties? ~ "]" }
 rel_type_spec = { ":" ~ identifier ~ ("|" ~ ":"? ~ identifier)* }
 var_length = { "*" ~ var_length_range? }
