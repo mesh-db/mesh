@@ -15,11 +15,12 @@ use crate::proto::{
     CreatePropertyIndexResponse, DeleteEdgeRequest, DeleteEdgeResponse, DetachDeleteNodeRequest,
     DetachDeleteNodeResponse, DropEdgePropertyIndexRequest, DropEdgePropertyIndexResponse,
     DropPropertyConstraintRequest, DropPropertyConstraintResponse, DropPropertyIndexRequest,
-    DropPropertyIndexResponse, ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest,
-    GetEdgeResponse, GetNodeRequest, GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo,
-    NeighborRequest, NeighborResponse, NodesByLabelRequest, NodesByLabelResponse,
-    NodesByPropertyRequest, NodesByPropertyResponse, PropertyTypeKind as ProtoPropertyTypeKind,
-    PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
+    DropPropertyIndexResponse, EdgesByPropertyRequest, EdgesByPropertyResponse,
+    ExecuteCypherRequest, ExecuteCypherResponse, GetEdgeRequest, GetEdgeResponse, GetNodeRequest,
+    GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo, NeighborRequest,
+    NeighborResponse, NodesByLabelRequest, NodesByLabelResponse, NodesByPropertyRequest,
+    NodesByPropertyResponse, PropertyTypeKind as ProtoPropertyTypeKind, PutEdgeRequest,
+    PutEdgeResponse, PutNodeRequest, PutNodeResponse,
 };
 use crate::raft_applier::{storage_kind, storage_scope};
 use crate::routing::Routing;
@@ -1513,6 +1514,52 @@ impl MeshQuery for MeshService {
         }
 
         Ok(Response::new(NodesByPropertyResponse { ids }))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "edges_by_property"))]
+    async fn edges_by_property(
+        &self,
+        request: Request<EdgesByPropertyRequest>,
+    ) -> Result<Response<EdgesByPropertyResponse>, Status> {
+        let req = request.into_inner();
+        let edge_type = req.edge_type;
+        let property = req.property;
+        let local_only = req.local_only;
+        let value: meshdb_core::Property = serde_json::from_slice(&req.value_json)
+            .map_err(|e| Status::invalid_argument(format!("value_json: {e}")))?;
+
+        let mut ids: Vec<_> = self
+            .store
+            .edges_by_property(&edge_type, &property, &value)
+            .map_err(internal)?
+            .into_iter()
+            .map(|id| uuid_to_proto(id.as_uuid()))
+            .collect();
+
+        if !local_only {
+            if let Some(routing) = &self.routing {
+                let self_id = routing.cluster().self_id();
+                for peer_id in routing.cluster().membership().peer_ids() {
+                    if peer_id == self_id {
+                        continue;
+                    }
+                    let mut client = routing
+                        .query_client(peer_id)
+                        .ok_or_else(|| no_client(peer_id))?;
+                    let resp = client
+                        .edges_by_property(EdgesByPropertyRequest {
+                            edge_type: edge_type.clone(),
+                            property: property.clone(),
+                            value_json: req.value_json.clone(),
+                            local_only: true,
+                        })
+                        .await?;
+                    ids.extend(resp.into_inner().ids);
+                }
+            }
+        }
+
+        Ok(Response::new(EdgesByPropertyResponse { ids }))
     }
 
     #[tracing::instrument(skip_all, fields(rpc = "outgoing"))]

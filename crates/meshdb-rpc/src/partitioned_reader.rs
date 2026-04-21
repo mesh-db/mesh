@@ -1,9 +1,10 @@
 use crate::convert::{
-    edge_from_proto, node_from_proto, node_id_from_proto, uuid_from_proto, uuid_to_proto,
+    edge_from_proto, edge_id_from_proto, node_from_proto, node_id_from_proto, uuid_from_proto,
+    uuid_to_proto,
 };
 use crate::proto::{
-    AllNodeIdsRequest, GetEdgeRequest, GetNodeRequest, NeighborRequest, NodesByLabelRequest,
-    NodesByPropertyRequest,
+    AllNodeIdsRequest, EdgesByPropertyRequest, GetEdgeRequest, GetNodeRequest, NeighborRequest,
+    NodesByLabelRequest, NodesByPropertyRequest,
 };
 use crate::routing::Routing;
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
@@ -307,6 +308,59 @@ impl GraphReader for PartitionedGraphReader {
                     .map_err(Self::remote)?;
                 for id_proto in resp.into_inner().ids {
                     let id = node_id_from_proto(&id_proto).map_err(Self::remote)?;
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        });
+        for id in remote? {
+            seen.insert(id);
+        }
+        Ok(seen.into_iter().collect())
+    }
+
+    fn edges_by_property(
+        &self,
+        edge_type: &str,
+        property: &str,
+        value: &Property,
+    ) -> ExecResult<Vec<EdgeId>> {
+        // Relationship-scope analogue of `nodes_by_property`.
+        // Edges are stored on the source-owner's partition (with a
+        // reverse-adjacency ghost on the target-owner); each peer's
+        // local edge-property index CF only carries entries for
+        // edges it owns, so unioning across peers yields the full
+        // seek result without double-counting.
+        let value_json = serde_json::to_vec(value).map_err(Self::remote)?;
+        let mut seen: HashSet<EdgeId> = self
+            .local
+            .edges_by_property(edge_type, property, value)?
+            .into_iter()
+            .collect();
+        let edge_type = edge_type.to_string();
+        let property = property.to_string();
+        let routing = self.routing.clone();
+        let remote: ExecResult<Vec<EdgeId>> = self.block(async move {
+            let self_id = routing.cluster().self_id();
+            let mut out: Vec<EdgeId> = Vec::new();
+            for peer_id in routing.cluster().membership().peer_ids() {
+                if peer_id == self_id {
+                    continue;
+                }
+                let mut client = routing.query_client(peer_id).ok_or_else(|| {
+                    ExecError::Remote(format!("no client registered for peer {}", peer_id))
+                })?;
+                let resp = client
+                    .edges_by_property(EdgesByPropertyRequest {
+                        edge_type: edge_type.clone(),
+                        property: property.clone(),
+                        value_json: value_json.clone(),
+                        local_only: true,
+                    })
+                    .await
+                    .map_err(Self::remote)?;
+                for id_proto in resp.into_inner().ids {
+                    let id = edge_id_from_proto(&id_proto).map_err(Self::remote)?;
                     out.push(id);
                 }
             }

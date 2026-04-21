@@ -5,8 +5,8 @@ use meshdb_rpc::proto::mesh_query_client::MeshQueryClient;
 use meshdb_rpc::proto::mesh_write_client::MeshWriteClient;
 use meshdb_rpc::proto::{
     BatchPhase, BatchWriteRequest, DeleteEdgeRequest, DetachDeleteNodeRequest,
-    ExecuteCypherRequest, GetEdgeRequest, GetNodeRequest, HealthRequest, NeighborRequest,
-    NodesByLabelRequest, PutEdgeRequest, PutNodeRequest, UuidBytes,
+    EdgesByPropertyRequest, ExecuteCypherRequest, GetEdgeRequest, GetNodeRequest, HealthRequest,
+    NeighborRequest, NodesByLabelRequest, PutEdgeRequest, PutNodeRequest, UuidBytes,
 };
 use meshdb_rpc::{CoordinatorLog, MeshService, Routing, TxLogEntry};
 use meshdb_storage::{RocksDbStorageEngine as Store, StorageEngine};
@@ -457,6 +457,90 @@ async fn nodes_by_label_local_only_skips_remote() {
         .await
         .unwrap();
     assert_eq!(resp.into_inner().ids.len(), owned_by_a);
+}
+
+#[tokio::test]
+async fn edges_by_property_scatter_gathers_across_peers() {
+    // Cluster-mode edge seek: each peer's local edge-property index CF
+    // only carries entries for edges owned locally, so a scatter-gather
+    // is required to return the complete set. Seed edges whose source
+    // is owned by A and others whose source is owned by B, then query
+    // peer A with local_only=false and expect every matching edge back.
+    let h = spawn_two_peer().await;
+
+    // Register the edge property index on BOTH local stores. The test
+    // harness has no Raft/routing DDL replication so we backfill each
+    // store directly; production routing DDL lands the index on every
+    // peer via the same commit path.
+    h.store_a.create_edge_property_index("R", "k").unwrap();
+    h.store_b.create_edge_property_index("R", "k").unwrap();
+
+    // Build 20 edges, distributing sources across both peers so the
+    // union-across-peers path is actually exercised.
+    let mut owned_by_a = 0;
+    let mut owned_by_b = 0;
+    let mut edge_ids_with_k_42: Vec<_> = Vec::new();
+    for i in 0..20 {
+        let src = Node::new();
+        let dst = Node::new();
+        put_node_on_owner(&src, &h);
+        put_node_on_owner(&dst, &h);
+        // Half the edges carry k=42 (the seek target); the other half
+        // carry k=99 so we also confirm the filter is applied.
+        let k_val: i64 = if i % 2 == 0 { 42 } else { 99 };
+        let edge = Edge::new("R", src.id, dst.id).with_property("k", k_val);
+        // Edges live on the source-owner's partition.
+        match h.cluster_a.owner_of(src.id) {
+            PeerId(1) => {
+                h.store_a.put_edge(&edge).unwrap();
+                if k_val == 42 {
+                    owned_by_a += 1;
+                }
+            }
+            PeerId(2) => {
+                h.store_b.put_edge(&edge).unwrap();
+                if k_val == 42 {
+                    owned_by_b += 1;
+                }
+            }
+            other => panic!("unexpected owner {other:?}"),
+        }
+        if k_val == 42 {
+            edge_ids_with_k_42.push(edge.id);
+        }
+    }
+    assert!(
+        owned_by_a > 0 && owned_by_b > 0,
+        "edge distribution is too lopsided for the scatter-gather test: a={owned_by_a}, b={owned_by_b}"
+    );
+
+    let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
+    let value_json = serde_json::to_vec(&meshdb_core::Property::Int64(42)).unwrap();
+    let resp = client
+        .edges_by_property(EdgesByPropertyRequest {
+            edge_type: "R".into(),
+            property: "k".into(),
+            value_json: value_json.clone(),
+            local_only: false,
+        })
+        .await
+        .unwrap();
+    let got = resp.into_inner().ids.len();
+    assert_eq!(got, edge_ids_with_k_42.len(), "scatter-gather result size");
+
+    // local_only=true on peer A must omit peer B's edges.
+    let resp_local = client
+        .edges_by_property(EdgesByPropertyRequest {
+            edge_type: "R".into(),
+            property: "k".into(),
+            value_json,
+            local_only: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp_local.into_inner().ids.len(), owned_by_a);
 }
 
 #[tokio::test]

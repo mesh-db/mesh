@@ -127,6 +127,12 @@ service MeshQuery {
   // partitioned reader scatter-gathers this across every peer and
   // unions the results; each peer answers from its local index CF.
   rpc NodesByProperty(NodesByPropertyRequest) returns (NodesByPropertyResponse);
+  // Relationship-scope analogue of NodesByProperty. Scatter-gathered
+  // by the routing-mode partitioned reader the same way; each peer
+  // answers from its local edge-property index CF. Callers must
+  // verify the `(edge_type, property)` index is registered before
+  // dispatching — a missing index returns an empty result.
+  rpc EdgesByProperty(EdgesByPropertyRequest) returns (EdgesByPropertyResponse);
   rpc AllNodeIds(AllNodeIdsRequest) returns (AllNodeIdsResponse);
   rpc Outgoing(NeighborRequest) returns (NeighborResponse);
   rpc Incoming(NeighborRequest) returns (NeighborResponse);
@@ -186,6 +192,16 @@ message NodesByPropertyRequest {
   bool local_only = 4;
 }
 message NodesByPropertyResponse { repeated UuidBytes ids = 1; }
+
+message EdgesByPropertyRequest {
+  string edge_type = 1;
+  string property = 2;
+  // Same JSON-encoding trick as NodesByPropertyRequest.value_json —
+  // one encode per scatter, reused across every peer call.
+  bytes value_json = 3;
+  bool local_only = 4;
+}
+message EdgesByPropertyResponse { repeated UuidBytes ids = 1; }
 
 message NeighborRequest {
   UuidBytes node_id = 1;
