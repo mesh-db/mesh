@@ -19,11 +19,12 @@ use crate::{
     error::{Error, Result},
     keys::{
         adj_key, constraint_meta_decode, constraint_meta_encode, edge_from_adj_key,
-        edge_id_from_property_index_key, edge_property_index_key, edge_property_index_name_prefix,
-        edge_property_index_value_prefix, encode_index_value, id_from_str_index_key,
-        label_index_key, label_index_prefix, node_from_adj_value, node_id_from_property_index_key,
-        property_index_key, property_index_name_prefix, property_index_value_prefix,
-        type_index_key, type_index_prefix, ID_LEN,
+        edge_id_from_property_index_key, edge_property_index_composite_key,
+        edge_property_index_composite_name_prefix, edge_property_index_composite_value_prefix,
+        encode_index_tuple, encode_index_value, id_from_str_index_key, label_index_key,
+        label_index_prefix, node_from_adj_value, node_id_from_property_index_key,
+        property_index_composite_key, property_index_composite_name_prefix,
+        property_index_composite_value_prefix, type_index_key, type_index_prefix, ID_LEN,
     },
 };
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
@@ -283,40 +284,36 @@ impl RocksDbStorageEngine {
         // keeps steady-state writes free of index churn.
         let indexes = self.indexes.read().expect("indexes lock poisoned");
         for spec in indexes.iter() {
-            // Slice-1 invariant: every registered spec has exactly
-            // one property. Composite (tuple-key) write semantics
-            // are a follow-up — landing them will replace this
-            // single-property path with a tuple-encoding branch.
-            debug_assert_eq!(spec.properties.len(), 1);
-            let property = &spec.properties[0];
             let was_indexed = existing_labels.iter().any(|l| l == &spec.label);
             let now_indexed = node.labels.iter().any(|l| l == &spec.label);
             let old_encoded = if was_indexed {
                 existing
                     .as_ref()
-                    .and_then(|n| n.properties.get(property))
-                    .and_then(encode_index_value)
+                    .and_then(|n| encode_index_tuple(&n.properties, &spec.properties))
             } else {
                 None
             };
             let new_encoded = if now_indexed {
-                node.properties.get(property).and_then(encode_index_value)
+                encode_index_tuple(&node.properties, &spec.properties)
             } else {
                 None
             };
             if old_encoded == new_encoded {
                 continue;
             }
-            if let Some(bytes) = &old_encoded {
+            let prop_refs: Vec<&str> = spec.properties.iter().map(String::as_str).collect();
+            if let Some(values) = &old_encoded {
+                let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
                 batch.delete_cf(
                     prop_cf,
-                    property_index_key(&spec.label, property, bytes, node.id),
+                    property_index_composite_key(&spec.label, &prop_refs, &value_refs, node.id),
                 );
             }
-            if let Some(bytes) = &new_encoded {
+            if let Some(values) = &new_encoded {
+                let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
                 batch.put_cf(
                     prop_cf,
-                    property_index_key(&spec.label, property, bytes, node.id),
+                    property_index_composite_key(&spec.label, &prop_refs, &value_refs, node.id),
                     EMPTY,
                 );
             }
@@ -376,31 +373,39 @@ impl RocksDbStorageEngine {
             .read()
             .expect("edge_indexes lock poisoned");
         for spec in edge_indexes.iter() {
-            // Slice-1 invariant: single-property specs only (see the
-            // node-side loop for the full rationale).
-            debug_assert_eq!(spec.properties.len(), 1);
-            let property = &spec.properties[0];
             if spec.edge_type != edge.edge_type {
                 continue;
             }
             let old_encoded = existing_edge
                 .as_ref()
-                .and_then(|e| e.properties.get(property))
-                .and_then(encode_index_value);
-            let new_encoded = edge.properties.get(property).and_then(encode_index_value);
+                .and_then(|e| encode_index_tuple(&e.properties, &spec.properties));
+            let new_encoded = encode_index_tuple(&edge.properties, &spec.properties);
             if old_encoded == new_encoded {
                 continue;
             }
-            if let Some(bytes) = &old_encoded {
+            let prop_refs: Vec<&str> = spec.properties.iter().map(String::as_str).collect();
+            if let Some(values) = &old_encoded {
+                let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
                 batch.delete_cf(
                     edge_prop_cf,
-                    edge_property_index_key(&spec.edge_type, property, bytes, edge.id),
+                    edge_property_index_composite_key(
+                        &spec.edge_type,
+                        &prop_refs,
+                        &value_refs,
+                        edge.id,
+                    ),
                 );
             }
-            if let Some(bytes) = &new_encoded {
+            if let Some(values) = &new_encoded {
+                let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
                 batch.put_cf(
                     edge_prop_cf,
-                    edge_property_index_key(&spec.edge_type, property, bytes, edge.id),
+                    edge_property_index_composite_key(
+                        &spec.edge_type,
+                        &prop_refs,
+                        &value_refs,
+                        edge.id,
+                    ),
                     EMPTY,
                 );
             }
@@ -445,18 +450,16 @@ impl RocksDbStorageEngine {
             .read()
             .expect("edge_indexes lock poisoned");
         for spec in edge_indexes.iter() {
-            debug_assert_eq!(spec.properties.len(), 1);
-            let property = &spec.properties[0];
             if spec.edge_type != edge.edge_type {
                 continue;
             }
-            if let Some(value) = edge.properties.get(property) {
-                if let Some(encoded) = encode_index_value(value) {
-                    batch.delete_cf(
-                        edge_prop_cf,
-                        edge_property_index_key(&spec.edge_type, property, &encoded, id),
-                    );
-                }
+            if let Some(values) = encode_index_tuple(&edge.properties, &spec.properties) {
+                let prop_refs: Vec<&str> = spec.properties.iter().map(String::as_str).collect();
+                let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+                batch.delete_cf(
+                    edge_prop_cf,
+                    edge_property_index_composite_key(&spec.edge_type, &prop_refs, &value_refs, id),
+                );
             }
         }
         Ok(())
@@ -493,18 +496,16 @@ impl RocksDbStorageEngine {
             // value for the property, delete the corresponding entry.
             let indexes = self.indexes.read().expect("indexes lock poisoned");
             for spec in indexes.iter() {
-                debug_assert_eq!(spec.properties.len(), 1);
-                let property = &spec.properties[0];
                 if !n.labels.iter().any(|l| l == &spec.label) {
                     continue;
                 }
-                if let Some(value) = n.properties.get(property) {
-                    if let Some(encoded) = encode_index_value(value) {
-                        batch.delete_cf(
-                            prop_cf,
-                            property_index_key(&spec.label, property, &encoded, id),
-                        );
-                    }
+                if let Some(values) = encode_index_tuple(&n.properties, &spec.properties) {
+                    let prop_refs: Vec<&str> = spec.properties.iter().map(String::as_str).collect();
+                    let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+                    batch.delete_cf(
+                        prop_cf,
+                        property_index_composite_key(&spec.label, &prop_refs, &value_refs, id),
+                    );
                 }
             }
         }
@@ -522,23 +523,22 @@ impl RocksDbStorageEngine {
             if let Some(e) = self.get_edge(*edge_id)? {
                 batch.delete_cf(type_cf, type_index_key(&e.edge_type, *edge_id));
                 for spec in &edge_indexes_snapshot {
-                    debug_assert_eq!(spec.properties.len(), 1);
-                    let property = &spec.properties[0];
                     if spec.edge_type != e.edge_type {
                         continue;
                     }
-                    if let Some(value) = e.properties.get(property) {
-                        if let Some(encoded) = encode_index_value(value) {
-                            batch.delete_cf(
-                                edge_prop_cf,
-                                edge_property_index_key(
-                                    &spec.edge_type,
-                                    property,
-                                    &encoded,
-                                    *edge_id,
-                                ),
-                            );
-                        }
+                    if let Some(values) = encode_index_tuple(&e.properties, &spec.properties) {
+                        let prop_refs: Vec<&str> =
+                            spec.properties.iter().map(String::as_str).collect();
+                        let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+                        batch.delete_cf(
+                            edge_prop_cf,
+                            edge_property_index_composite_key(
+                                &spec.edge_type,
+                                &prop_refs,
+                                &value_refs,
+                                *edge_id,
+                            ),
+                        );
                     }
                 }
             }
@@ -550,23 +550,22 @@ impl RocksDbStorageEngine {
             if let Some(e) = self.get_edge(*edge_id)? {
                 batch.delete_cf(type_cf, type_index_key(&e.edge_type, *edge_id));
                 for spec in &edge_indexes_snapshot {
-                    debug_assert_eq!(spec.properties.len(), 1);
-                    let property = &spec.properties[0];
                     if spec.edge_type != e.edge_type {
                         continue;
                     }
-                    if let Some(value) = e.properties.get(property) {
-                        if let Some(encoded) = encode_index_value(value) {
-                            batch.delete_cf(
-                                edge_prop_cf,
-                                edge_property_index_key(
-                                    &spec.edge_type,
-                                    property,
-                                    &encoded,
-                                    *edge_id,
-                                ),
-                            );
-                        }
+                    if let Some(values) = encode_index_tuple(&e.properties, &spec.properties) {
+                        let prop_refs: Vec<&str> =
+                            spec.properties.iter().map(String::as_str).collect();
+                        let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+                        batch.delete_cf(
+                            edge_prop_cf,
+                            edge_property_index_composite_key(
+                                &spec.edge_type,
+                                &prop_refs,
+                                &value_refs,
+                                *edge_id,
+                            ),
+                        );
                     }
                 }
             }
@@ -708,9 +707,27 @@ impl RocksDbStorageEngine {
     /// entries (batch not yet written) or a fully-populated index
     /// (batch committed). No partial-build state is ever visible.
     pub fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
+        self.create_property_index_composite(label, &[property])
+    }
+
+    /// Composite form of [`create_property_index`]. Declares a
+    /// `(label, properties)` tuple index and backfills it by scanning
+    /// every node currently carrying `label`. A node that's missing
+    /// any of the properties, or carries an unindexable value for
+    /// any of them, contributes no entry — composite indexes are
+    /// all-or-nothing on the tuple.
+    ///
+    /// Single-property calls delegate here with a length-1 slice;
+    /// the on-disk key format is byte-identical to the pre-composite
+    /// layout in that case.
+    pub fn create_property_index_composite(&self, label: &str, properties: &[&str]) -> Result<()> {
+        assert!(
+            !properties.is_empty(),
+            "create_property_index_composite requires at least one property"
+        );
         let spec = PropertyIndexSpec {
             label: label.to_string(),
-            properties: vec![property.to_string()],
+            properties: properties.iter().map(|p| p.to_string()).collect(),
         };
         let mut guard = self.indexes.write().expect("indexes lock poisoned");
         if guard.contains(&spec) {
@@ -722,23 +739,18 @@ impl RocksDbStorageEngine {
         let mut batch = WriteBatch::default();
         batch.put_cf(meta_cf, index_meta_key(&spec), EMPTY);
 
-        // Backfill: walk the label index to find every current member
-        // and probe its node record for the property. Nodes missing
-        // the property (or carrying an unindexable type like Float)
-        // contribute nothing.
         for node_id in self.nodes_by_label(label)? {
             let node = match self.get_node(node_id)? {
                 Some(n) => n,
                 None => continue,
             };
-            if let Some(value) = node.properties.get(property) {
-                if let Some(encoded) = encode_index_value(value) {
-                    batch.put_cf(
-                        prop_cf,
-                        property_index_key(label, property, &encoded, node_id),
-                        EMPTY,
-                    );
-                }
+            if let Some(values) = encode_index_tuple(&node.properties, &spec.properties) {
+                let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+                batch.put_cf(
+                    prop_cf,
+                    property_index_composite_key(label, properties, &value_refs, node_id),
+                    EMPTY,
+                );
             }
         }
 
@@ -1192,9 +1204,17 @@ impl RocksDbStorageEngine {
     /// entry under the `(label, prop)` prefix. Idempotent: dropping a
     /// non-existent index is a no-op. Atomic via one [`WriteBatch`].
     pub fn drop_property_index(&self, label: &str, property: &str) -> Result<()> {
+        self.drop_property_index_composite(label, &[property])
+    }
+
+    pub fn drop_property_index_composite(&self, label: &str, properties: &[&str]) -> Result<()> {
+        assert!(
+            !properties.is_empty(),
+            "drop_property_index_composite requires at least one property"
+        );
         let spec = PropertyIndexSpec {
             label: label.to_string(),
-            properties: vec![property.to_string()],
+            properties: properties.iter().map(|p| p.to_string()).collect(),
         };
         let mut guard = self.indexes.write().expect("indexes lock poisoned");
         if !guard.contains(&spec) {
@@ -1206,7 +1226,7 @@ impl RocksDbStorageEngine {
         let mut batch = WriteBatch::default();
         batch.delete_cf(meta_cf, index_meta_key(&spec));
 
-        let prefix = property_index_name_prefix(label, property);
+        let prefix = property_index_composite_name_prefix(label, properties);
         let iter = self
             .db
             .iterator_cf(prop_cf, IteratorMode::From(&prefix, Direction::Forward));
@@ -1243,9 +1263,21 @@ impl RocksDbStorageEngine {
     /// either zero entries or a fully-populated index, never a
     /// partially-built one.
     pub fn create_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        self.create_edge_property_index_composite(edge_type, &[property])
+    }
+
+    pub fn create_edge_property_index_composite(
+        &self,
+        edge_type: &str,
+        properties: &[&str],
+    ) -> Result<()> {
+        assert!(
+            !properties.is_empty(),
+            "create_edge_property_index_composite requires at least one property"
+        );
         let spec = EdgePropertyIndexSpec {
             edge_type: edge_type.to_string(),
-            properties: vec![property.to_string()],
+            properties: properties.iter().map(|p| p.to_string()).collect(),
         };
         let mut guard = self
             .edge_indexes
@@ -1260,21 +1292,18 @@ impl RocksDbStorageEngine {
         let mut batch = WriteBatch::default();
         batch.put_cf(meta_cf, edge_index_meta_key(&spec), EMPTY);
 
-        // Backfill from the type index. Edges missing the property
-        // (or carrying an unindexable type) contribute nothing.
         for edge_id in self.edges_by_type(edge_type)? {
             let edge = match self.get_edge(edge_id)? {
                 Some(e) => e,
                 None => continue,
             };
-            if let Some(value) = edge.properties.get(property) {
-                if let Some(encoded) = encode_index_value(value) {
-                    batch.put_cf(
-                        prop_cf,
-                        edge_property_index_key(edge_type, property, &encoded, edge_id),
-                        EMPTY,
-                    );
-                }
+            if let Some(values) = encode_index_tuple(&edge.properties, &spec.properties) {
+                let value_refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+                batch.put_cf(
+                    prop_cf,
+                    edge_property_index_composite_key(edge_type, properties, &value_refs, edge_id),
+                    EMPTY,
+                );
             }
         }
 
@@ -1283,13 +1312,22 @@ impl RocksDbStorageEngine {
         Ok(())
     }
 
-    /// Tear down an edge property index: removes the meta entry and
-    /// every entry under the `(edge_type, prop)` prefix. Idempotent.
-    /// Atomic via one [`WriteBatch`].
     pub fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        self.drop_edge_property_index_composite(edge_type, &[property])
+    }
+
+    pub fn drop_edge_property_index_composite(
+        &self,
+        edge_type: &str,
+        properties: &[&str],
+    ) -> Result<()> {
+        assert!(
+            !properties.is_empty(),
+            "drop_edge_property_index_composite requires at least one property"
+        );
         let spec = EdgePropertyIndexSpec {
             edge_type: edge_type.to_string(),
-            properties: vec![property.to_string()],
+            properties: properties.iter().map(|p| p.to_string()).collect(),
         };
         let mut guard = self
             .edge_indexes
@@ -1304,7 +1342,7 @@ impl RocksDbStorageEngine {
         let mut batch = WriteBatch::default();
         batch.delete_cf(meta_cf, edge_index_meta_key(&spec));
 
-        let prefix = edge_property_index_name_prefix(edge_type, property);
+        let prefix = edge_property_index_composite_name_prefix(edge_type, properties);
         let iter = self
             .db
             .iterator_cf(prop_cf, IteratorMode::From(&prefix, Direction::Forward));
@@ -1333,12 +1371,35 @@ impl RocksDbStorageEngine {
         property: &str,
         value: &Property,
     ) -> Result<Vec<EdgeId>> {
-        let encoded = encode_index_value(value).ok_or_else(|| Error::UnindexableValue {
-            property: property.to_string(),
-            kind: value.type_name(),
-        })?;
+        self.edges_by_properties(edge_type, &[property], std::slice::from_ref(value))
+    }
+
+    /// Composite form of [`edges_by_property`]. Same contract as
+    /// [`RocksDbStorageEngine::nodes_by_properties`] on the
+    /// relationship side.
+    pub fn edges_by_properties(
+        &self,
+        edge_type: &str,
+        properties: &[&str],
+        values: &[Property],
+    ) -> Result<Vec<EdgeId>> {
+        assert_eq!(
+            properties.len(),
+            values.len(),
+            "composite edge seek: properties and values must have equal length"
+        );
+        let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(values.len());
+        for (p, v) in properties.iter().zip(values.iter()) {
+            let bytes = encode_index_value(v).ok_or_else(|| Error::UnindexableValue {
+                property: p.to_string(),
+                kind: v.type_name(),
+            })?;
+            encoded.push(bytes);
+        }
+        let encoded_refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
         let cf = self.cf(CF_EDGE_PROPERTY_INDEX)?;
-        let prefix = edge_property_index_value_prefix(edge_type, property, &encoded);
+        let prefix =
+            edge_property_index_composite_value_prefix(edge_type, properties, &encoded_refs);
         let mut results = Vec::new();
         let iter = self
             .db
@@ -1369,12 +1430,38 @@ impl RocksDbStorageEngine {
         property: &str,
         value: &Property,
     ) -> Result<Vec<NodeId>> {
-        let encoded = encode_index_value(value).ok_or_else(|| Error::UnindexableValue {
-            property: property.to_string(),
-            kind: value.type_name(),
-        })?;
+        self.nodes_by_properties(label, &[property], std::slice::from_ref(value))
+    }
+
+    /// Composite form of [`nodes_by_property`]. Seeks every node
+    /// whose `(label, property_i = value_i)` tuple matches in order.
+    /// The two slices must have equal length. Unindexable value
+    /// types surface as [`Error::UnindexableValue`] the same way
+    /// the single-property form does — composite indexes are
+    /// all-or-nothing and an unindexable slot can never match a
+    /// stored tuple.
+    pub fn nodes_by_properties(
+        &self,
+        label: &str,
+        properties: &[&str],
+        values: &[Property],
+    ) -> Result<Vec<NodeId>> {
+        assert_eq!(
+            properties.len(),
+            values.len(),
+            "composite seek: properties and values must have equal length"
+        );
+        let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(values.len());
+        for (p, v) in properties.iter().zip(values.iter()) {
+            let bytes = encode_index_value(v).ok_or_else(|| Error::UnindexableValue {
+                property: p.to_string(),
+                kind: v.type_name(),
+            })?;
+            encoded.push(bytes);
+        }
+        let encoded_refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
         let cf = self.cf(CF_PROPERTY_INDEX)?;
-        let prefix = property_index_value_prefix(label, property, &encoded);
+        let prefix = property_index_composite_value_prefix(label, properties, &encoded_refs);
         let mut results = Vec::new();
         let iter = self
             .db
