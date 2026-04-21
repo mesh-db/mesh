@@ -38,6 +38,11 @@ pub struct PlannerContext {
     /// a HashMap because N is small (single digits in practice) and
     /// iterating a Vec is faster than hashing for that size.
     pub indexes: Vec<(String, String)>,
+    /// `(edge_type, property)` pairs corresponding to active
+    /// relationship-scope property indexes. Relationship analogue of
+    /// `indexes`. Stored with the same flat-Vec shape for the same
+    /// reasons. Consumed by the unbound-endpoints `EdgeSeek` rewrite.
+    pub edge_indexes: Vec<(String, String)>,
     /// Variables bound in an enclosing query scope. Populated when
     /// planning the body of an `exists { ... }` / `count { ... }`
     /// subquery so that a first-clause `MATCH (n)-->(m)` where `n`
@@ -59,6 +64,12 @@ impl PlannerContext {
         self.indexes
             .iter()
             .any(|(l, p)| l == label && p == property)
+    }
+
+    pub fn has_edge_index(&self, edge_type: &str, property: &str) -> bool {
+        self.edge_indexes
+            .iter()
+            .any(|(t, p)| t == edge_type && p == property)
     }
 }
 
@@ -418,6 +429,31 @@ pub enum LogicalPlan {
         label: String,
         property: String,
         value: Expr,
+    },
+    /// Equality lookup through an edge property index. Relationship
+    /// analogue of [`LogicalPlan::IndexSeek`]. Emitted for
+    /// `MATCH ()-[r:T {p: v}]-()` when both endpoints are unbound
+    /// and a `(T, p)` edge index is registered. The executor calls
+    /// `reader.edges_by_property(edge_type, property, value)`, then
+    /// hydrates each matching edge and binds `edge_var`, `src_var`,
+    /// `dst_var` on the output row.
+    ///
+    /// `direction` preserves the pattern's arrow so a directed
+    /// pattern only yields edges where source/target alignment
+    /// matches; `Direction::Both` accepts either orientation.
+    /// `residual_properties` carries any non-indexed pattern
+    /// property equalities that still need evaluating per edge —
+    /// `MATCH ()-[r:T {indexed: 1, other: 'x'}]-()` seeks on
+    /// `indexed` and filters the returned edges by `other`.
+    EdgeSeek {
+        edge_var: String,
+        src_var: String,
+        dst_var: String,
+        edge_type: String,
+        property: String,
+        value: Expr,
+        direction: Direction,
+        residual_properties: Vec<(String, Expr)>,
     },
     /// Schema DDL — declare a new node property index. Has no input
     /// and produces no rows. The executor short-circuits this before
@@ -914,6 +950,25 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         } => {
             buf.push_str(&format!("{indent}IndexSeek({var}:{label}.{property})\n"));
         }
+        LogicalPlan::EdgeSeek {
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            property,
+            direction,
+            ..
+        } => {
+            let dir = format_dir(direction);
+            let dir_end = if matches!(direction, Direction::Incoming) {
+                ""
+            } else {
+                ">"
+            };
+            buf.push_str(&format!(
+                "{indent}EdgeSeek({src_var}){dir}[{edge_var}:{edge_type}.{property}]{dir_end}({dst_var})\n"
+            ));
+        }
         LogicalPlan::SeedRow => {
             buf.push_str(&format!("{indent}SeedRow\n"));
         }
@@ -1312,6 +1367,17 @@ where
             walk_plan_exprs(input, visit)
         }
         LogicalPlan::IndexSeek { value, .. } => visit(value),
+        LogicalPlan::EdgeSeek {
+            value,
+            residual_properties,
+            ..
+        } => {
+            visit(value)?;
+            for (_, e) in residual_properties {
+                visit(e)?;
+            }
+            Ok(())
+        }
         LogicalPlan::Unwind { expr, .. } => visit(expr),
         LogicalPlan::UnwindChain { input, expr, .. } => {
             visit(expr)?;
@@ -2412,6 +2478,120 @@ fn plan_pattern(
     ctx: &PlannerContext,
 ) -> Result<LogicalPlan> {
     plan_pattern_with_bound_edges(pattern, pattern_idx, ctx, &HashSet::new(), &HashSet::new())
+}
+
+/// Try to lower a single-hop `MATCH` pattern to an [`LogicalPlan::EdgeSeek`]
+/// when every precondition holds:
+///
+/// 1. Exactly one hop, no path variable, no `shortestPath`, no
+///    variable-length relationship.
+/// 2. Both endpoints are fresh (not bound in an outer scope) and carry
+///    no labels or pattern-property equalities — the MVP rewrite
+///    doesn't emit residual node filters yet.
+/// 3. The relationship has exactly one edge type, a fresh edge
+///    variable (not pre-bound in an outer clause), and at least one
+///    pattern-property equality matching a registered `(edge_type,
+///    property)` index in `ctx`.
+///
+/// `None` means "preconditions didn't match — fall back to the
+/// general `NodeScan + EdgeExpand` path". `Some(plan)` is the rewritten
+/// plan. Residual pattern-property equalities (non-indexed) ride along
+/// on the `EdgeSeek` as per-edge filters.
+fn try_plan_edge_seek(
+    pattern: &Pattern,
+    pattern_idx: usize,
+    ctx: &PlannerContext,
+    outer_bound_nodes: &HashSet<String>,
+    outer_bound_edges: &HashSet<String>,
+) -> Result<Option<LogicalPlan>> {
+    if pattern.hops.len() != 1 {
+        return Ok(None);
+    }
+    if pattern.path_var.is_some() || pattern.shortest.is_some() {
+        return Ok(None);
+    }
+    let hop = &pattern.hops[0];
+    if hop.rel.var_length.is_some() {
+        return Ok(None);
+    }
+    // Start endpoint must be label-less and property-less; if it
+    // has a name, that name must not be bound in an outer scope.
+    if !pattern.start.labels.is_empty() || !pattern.start.properties.is_empty() {
+        return Ok(None);
+    }
+    if let Some(v) = &pattern.start.var {
+        if outer_bound_nodes.contains(v) {
+            return Ok(None);
+        }
+    }
+    // Target endpoint: same constraints.
+    if !hop.target.labels.is_empty() || !hop.target.properties.is_empty() {
+        return Ok(None);
+    }
+    if let Some(v) = &hop.target.var {
+        if outer_bound_nodes.contains(v) {
+            return Ok(None);
+        }
+    }
+    // Rel must have a single, fresh edge type and a fresh edge var.
+    if hop.rel.edge_types.len() != 1 {
+        return Ok(None);
+    }
+    if let Some(v) = &hop.rel.var {
+        if outer_bound_edges.contains(v) {
+            return Ok(None);
+        }
+    }
+    let edge_type = &hop.rel.edge_types[0];
+    // Pick the first pattern-property equality whose key is indexed
+    // as the seek key; every other equality becomes a residual
+    // filter evaluated per edge.
+    let seek_idx = hop
+        .rel
+        .properties
+        .iter()
+        .position(|(k, _)| ctx.has_edge_index(edge_type, k));
+    let Some(seek_idx) = seek_idx else {
+        return Ok(None);
+    };
+    // Synthesize names for anonymous endpoints / edge var. Mirrors
+    // the naming convention used elsewhere in the planner so a
+    // downstream clause referencing a named endpoint finds the
+    // same key either way.
+    let src_var = pattern
+        .start
+        .var
+        .clone()
+        .unwrap_or_else(|| format!("__p{pattern_idx}_a0"));
+    let dst_var = hop
+        .target
+        .var
+        .clone()
+        .unwrap_or_else(|| format!("__p{pattern_idx}_a1"));
+    let edge_var = hop
+        .rel
+        .var
+        .clone()
+        .unwrap_or_else(|| format!("__p{pattern_idx}_e1"));
+    let (seek_key, seek_value) = hop.rel.properties[seek_idx].clone();
+    let residual_properties: Vec<(String, Expr)> = hop
+        .rel
+        .properties
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != seek_idx)
+        .map(|(_, p)| p.clone())
+        .collect();
+    Ok(Some(LogicalPlan::EdgeSeek {
+        edge_var,
+        src_var,
+        dst_var,
+        edge_type: edge_type.clone(),
+        property: seek_key,
+        value: seek_value,
+        direction: hop.rel.direction,
+        residual_properties,
+    }))
 }
 
 /// Same as [`plan_pattern`] but honours sets of edge / edge-list
@@ -3658,6 +3838,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         // list becomes a list replay.
                         let mut outer_edges: HashSet<String> = HashSet::new();
                         let mut outer_edge_lists: HashSet<String> = HashSet::new();
+                        let mut outer_nodes: HashSet<String> = HashSet::new();
                         for (k, v) in &bound_vars {
                             match v {
                                 VarType::Edge => {
@@ -3666,16 +3847,35 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                                 VarType::NonNode => {
                                     outer_edge_lists.insert(k.clone());
                                 }
+                                VarType::Node => {
+                                    outer_nodes.insert(k.clone());
+                                }
                                 _ => {}
                             }
                         }
-                        let rhs = plan_pattern_with_bound_edges(
+                        // Try to lower `MATCH ()-[r:T {p: v}]-()` with
+                        // both endpoints unbound + an indexed edge
+                        // property to an `EdgeSeek` that skips the
+                        // start-node scan entirely. Falls through to
+                        // the general `plan_pattern_with_bound_edges`
+                        // path when preconditions don't hold.
+                        let rhs = if let Some(seek) = try_plan_edge_seek(
                             pattern,
                             pattern_offset,
                             ctx,
+                            &outer_nodes,
                             &outer_edges,
-                            &outer_edge_lists,
-                        )?;
+                        )? {
+                            seek
+                        } else {
+                            plan_pattern_with_bound_edges(
+                                pattern,
+                                pattern_offset,
+                                ctx,
+                                &outer_edges,
+                                &outer_edge_lists,
+                            )?
+                        };
                         Some(match plan.take() {
                             None => rhs,
                             Some(lhs) => LogicalPlan::CartesianProduct {

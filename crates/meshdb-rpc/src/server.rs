@@ -295,6 +295,12 @@ impl MeshService {
                 .into_iter()
                 .map(|s| (s.label, s.property))
                 .collect(),
+            edge_indexes: self
+                .store
+                .list_edge_property_indexes()
+                .into_iter()
+                .map(|s| (s.edge_type, s.property))
+                .collect(),
         };
         let plan =
             meshdb_cypher::plan_with_context(&statement, &planner_ctx).map_err(bad_request)?;
@@ -895,7 +901,7 @@ pub(crate) fn apply_prepared_batch(
 fn count_index_seeks(plan: &meshdb_cypher::LogicalPlan) -> u64 {
     use meshdb_cypher::LogicalPlan as P;
     match plan {
-        P::IndexSeek { .. } => 1,
+        P::IndexSeek { .. } | P::EdgeSeek { .. } => 1,
         P::Filter { input, .. }
         | P::Project { input, .. }
         | P::Aggregate { input, .. }

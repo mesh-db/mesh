@@ -31,6 +31,21 @@ pub trait GraphReader: Send + Sync {
         property: &str,
         value: &Property,
     ) -> Result<Vec<NodeId>>;
+    /// Relationship-scope analogue of [`Self::nodes_by_property`].
+    /// The planner only emits an `EdgeSeek` after confirming a
+    /// `(edge_type, property)` index is registered via
+    /// [`Self::list_edge_property_indexes`]. Default impl returns
+    /// empty so readers that haven't wired a native seek path
+    /// degrade to no-results rather than mis-answering; the
+    /// storage-backed blanket overrides with a real lookup.
+    fn edges_by_property(
+        &self,
+        _edge_type: &str,
+        _property: &str,
+        _value: &Property,
+    ) -> Result<Vec<EdgeId>> {
+        Ok(Vec::new())
+    }
     /// Snapshot the `(label, property)` pairs of every property
     /// index visible through this reader. Used by `SHOW INDEXES`.
     /// Default impl returns empty — the storage-backed reader
@@ -95,6 +110,17 @@ impl<T: StorageEngine> GraphReader for T {
         )?)
     }
 
+    fn edges_by_property(
+        &self,
+        edge_type: &str,
+        property: &str,
+        value: &Property,
+    ) -> Result<Vec<EdgeId>> {
+        Ok(StorageEngine::edges_by_property(
+            self, edge_type, property, value,
+        )?)
+    }
+
     fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
         Ok(StorageEngine::list_property_indexes(self)
             .into_iter()
@@ -153,6 +179,15 @@ impl GraphReader for StorageReaderAdapter<'_> {
         value: &Property,
     ) -> Result<Vec<NodeId>> {
         Ok(self.0.nodes_by_property(label, property, value)?)
+    }
+
+    fn edges_by_property(
+        &self,
+        edge_type: &str,
+        property: &str,
+        value: &Property,
+    ) -> Result<Vec<EdgeId>> {
+        Ok(self.0.edges_by_property(edge_type, property, value)?)
     }
 
     fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {

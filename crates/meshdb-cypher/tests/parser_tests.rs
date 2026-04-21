@@ -1319,6 +1319,7 @@ fn create_node_key_preserves_property_order() {
 fn ctx_with_index(label: &str, prop: &str) -> PlannerContext {
     PlannerContext {
         indexes: vec![(label.into(), prop.into())],
+        edge_indexes: Vec::new(),
         outer_bindings: Vec::new(),
     }
 }
@@ -1466,6 +1467,112 @@ fn where_eq_with_no_matching_index_does_not_rewrite() {
         panic!("expected Project");
     };
     assert!(matches!(*input, LogicalPlan::Filter { .. }));
+}
+
+// ---------------------------------------------------------------
+// Edge IndexSeek rewrite: planner-level assertions.
+// ---------------------------------------------------------------
+
+fn ctx_with_edge_index(edge_type: &str, prop: &str) -> PlannerContext {
+    PlannerContext {
+        indexes: Vec::new(),
+        edge_indexes: vec![(edge_type.into(), prop.into())],
+        outer_bindings: Vec::new(),
+    }
+}
+
+#[test]
+fn unbound_endpoints_indexed_edge_rewrites_to_edge_seek() {
+    let ctx = ctx_with_edge_index("KNOWS", "since");
+    let p = plan_with("MATCH ()-[r:KNOWS {since: 2020}]-() RETURN r.since", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project at top, got {p:?}");
+    };
+    let LogicalPlan::EdgeSeek {
+        edge_type,
+        property,
+        residual_properties,
+        ..
+    } = *input
+    else {
+        panic!("expected EdgeSeek under Project");
+    };
+    assert_eq!(edge_type, "KNOWS");
+    assert_eq!(property, "since");
+    assert!(residual_properties.is_empty());
+}
+
+#[test]
+fn edge_seek_lifts_one_indexed_property_and_keeps_rest_residual() {
+    let ctx = ctx_with_edge_index("KNOWS", "since");
+    let p = plan_with(
+        "MATCH ()-[r:KNOWS {since: 2020, tag: 'x'}]-() RETURN r",
+        &ctx,
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::EdgeSeek {
+        property,
+        residual_properties,
+        ..
+    } = *input
+    else {
+        panic!("expected EdgeSeek, got {input:?}");
+    };
+    assert_eq!(property, "since");
+    assert_eq!(residual_properties.len(), 1);
+    assert_eq!(residual_properties[0].0, "tag");
+}
+
+#[test]
+fn edge_seek_with_parameter_value_rewrites() {
+    let ctx = ctx_with_edge_index("KNOWS", "since");
+    let p = plan_with("MATCH ()-[r:KNOWS {since: $y}]-() RETURN r", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::EdgeSeek { value, .. } = *input else {
+        panic!("expected EdgeSeek");
+    };
+    assert!(matches!(value, Expr::Parameter(ref s) if s == "y"));
+}
+
+#[test]
+fn edge_seek_rewrite_skipped_when_endpoint_has_label() {
+    let ctx = ctx_with_edge_index("KNOWS", "since");
+    let p = plan_with(
+        "MATCH (a:Person)-[r:KNOWS {since: 2020}]-(b) RETURN r",
+        &ctx,
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    // Falls back to NodeScan + EdgeExpand; no EdgeSeek.
+    assert!(!matches!(*input, LogicalPlan::EdgeSeek { .. }));
+}
+
+#[test]
+fn edge_seek_rewrite_skipped_without_matching_edge_index() {
+    // Planner context has no edge indexes at all.
+    let p = plan_with(
+        "MATCH ()-[r:KNOWS {since: 2020}]-() RETURN r",
+        &PlannerContext::default(),
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    assert!(!matches!(*input, LogicalPlan::EdgeSeek { .. }));
+}
+
+#[test]
+fn edge_seek_rewrite_skipped_for_var_length_relationship() {
+    let ctx = ctx_with_edge_index("KNOWS", "since");
+    let p = plan_with("MATCH ()-[r:KNOWS*1..3 {since: 2020}]-() RETURN r", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    assert!(!matches!(*input, LogicalPlan::EdgeSeek { .. }));
 }
 
 #[test]

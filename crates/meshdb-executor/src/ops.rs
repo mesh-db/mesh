@@ -758,6 +758,25 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             property.clone(),
             value.clone(),
         )),
+        LogicalPlan::EdgeSeek {
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            property,
+            value,
+            direction,
+            residual_properties,
+        } => Box::new(EdgeSeekOp::new(
+            edge_var.clone(),
+            src_var.clone(),
+            dst_var.clone(),
+            edge_type.clone(),
+            property.clone(),
+            value.clone(),
+            *direction,
+            residual_properties.clone(),
+        )),
         // DDL plans are handled by `try_execute_ddl` before the
         // operator pipeline is built, so they should never reach
         // this point. An assertion here catches any future
@@ -2371,6 +2390,153 @@ impl Operator for IndexSeekOp {
             }
         }
         Ok(None)
+    }
+}
+
+/// Relationship-scope analogue of [`IndexSeekOp`]. Seeks edges
+/// through the `(edge_type, property)` index, hydrates each one,
+/// and emits a row per matching edge binding `edge_var`, `src_var`,
+/// `dst_var`. For `Direction::Both` each edge emits two rows — one
+/// per orientation — so an undirected pattern surfaces both
+/// endpoint assignments. `residual_properties` carries any
+/// non-indexed pattern-property equalities that still need
+/// per-edge filtering.
+struct EdgeSeekOp {
+    edge_var: String,
+    src_var: String,
+    dst_var: String,
+    edge_type: String,
+    property: String,
+    value_expr: Expr,
+    direction: Direction,
+    residual_properties: Vec<(String, Expr)>,
+    /// Pre-materialized output rows. Built lazily on the first
+    /// `next()` call so the seek + endpoint fetches run once.
+    results: Option<Vec<Row>>,
+    cursor: usize,
+}
+
+impl EdgeSeekOp {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        edge_var: String,
+        src_var: String,
+        dst_var: String,
+        edge_type: String,
+        property: String,
+        value_expr: Expr,
+        direction: Direction,
+        residual_properties: Vec<(String, Expr)>,
+    ) -> Self {
+        Self {
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            property,
+            value_expr,
+            direction,
+            residual_properties,
+            results: None,
+            cursor: 0,
+        }
+    }
+}
+
+impl Operator for EdgeSeekOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.results.is_none() {
+            let empty = Row::new();
+            let seek_value = eval_expr(&self.value_expr, &ctx.eval_ctx(&empty))?;
+            let property = match seek_value {
+                Value::Property(p) => p,
+                Value::Null => Property::Null,
+                Value::Node(_)
+                | Value::Edge(_)
+                | Value::List(_)
+                | Value::Map(_)
+                | Value::Path { .. } => {
+                    return Err(Error::InvalidSetValue);
+                }
+            };
+            let ids = ctx
+                .store
+                .edges_by_property(&self.edge_type, &self.property, &property)?;
+            let mut rows: Vec<Row> = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(edge) = ctx.store.get_edge(id)? else {
+                    continue;
+                };
+                // Residual pattern-property equality filters — same
+                // shape as `EdgeExpandOp`'s inline edge-properties
+                // check. Uses an empty row for expr evaluation since
+                // an EdgeSeek has no upstream input and the seek's
+                // own bindings aren't visible to its own filters.
+                let mut residuals_ok = true;
+                for (key, expr) in &self.residual_properties {
+                    let wanted = eval_expr(expr, &ctx.eval_ctx(&empty))?;
+                    let Some(stored) = edge.properties.get(key) else {
+                        residuals_ok = false;
+                        break;
+                    };
+                    if !values_equal(&Value::Property(stored.clone()), &wanted) {
+                        residuals_ok = false;
+                        break;
+                    }
+                }
+                if !residuals_ok {
+                    continue;
+                }
+                // Hydrate both endpoints so downstream operators
+                // can read labels / properties off the bound vars.
+                // A deleted endpoint drops the whole row (same as
+                // `IndexSeekOp` when `get_node` returns None).
+                let Some(src_node) = ctx.store.get_node(edge.source)? else {
+                    continue;
+                };
+                let Some(dst_node) = ctx.store.get_node(edge.target)? else {
+                    continue;
+                };
+                // Emit output rows per direction. Outgoing / Incoming
+                // bind a single orientation; Both yields two rows —
+                // the `-[r]-` pattern in openCypher matches edges in
+                // either orientation and binds endpoints accordingly.
+                match self.direction {
+                    Direction::Outgoing => {
+                        rows.push(self.make_row(&edge, &src_node, &dst_node));
+                    }
+                    Direction::Incoming => {
+                        rows.push(self.make_row(&edge, &dst_node, &src_node));
+                    }
+                    Direction::Both => {
+                        rows.push(self.make_row(&edge, &src_node, &dst_node));
+                        // Self-loops still only surface once — the
+                        // second orientation is the same row.
+                        if edge.source != edge.target {
+                            rows.push(self.make_row(&edge, &dst_node, &src_node));
+                        }
+                    }
+                }
+            }
+            self.results = Some(rows);
+        }
+        let rows = self.results.as_ref().unwrap();
+        if self.cursor < rows.len() {
+            let row = rows[self.cursor].clone();
+            self.cursor += 1;
+            return Ok(Some(row));
+        }
+        Ok(None)
+    }
+}
+
+impl EdgeSeekOp {
+    fn make_row(&self, edge: &Edge, src: &Node, dst: &Node) -> Row {
+        let mut row = Row::new();
+        row.insert(self.edge_var.clone(), Value::Edge(edge.clone()));
+        row.insert(self.src_var.clone(), Value::Node(src.clone()));
+        row.insert(self.dst_var.clone(), Value::Node(dst.clone()));
+        row
     }
 }
 

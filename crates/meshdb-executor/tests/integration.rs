@@ -3832,6 +3832,11 @@ fn run_with_ctx(store: &Store, q: &str) -> Vec<Row> {
             .into_iter()
             .map(|s| (s.label, s.property))
             .collect(),
+        edge_indexes: store
+            .list_edge_property_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
+            .collect(),
     };
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
     let plan = plan_with_context(&stmt, &ctx).unwrap_or_else(|e| panic!("plan {q}: {e}"));
@@ -3854,6 +3859,11 @@ fn run_with_ctx_params(store: &Store, q: &str, params: &ParamMap) -> Vec<Row> {
             .list_property_indexes()
             .into_iter()
             .map(|s| (s.label, s.property))
+            .collect(),
+        edge_indexes: store
+            .list_edge_property_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
             .collect(),
     };
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
@@ -3932,6 +3942,228 @@ fn drop_edge_index_empties_show_indexes() {
     run(&store, "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)");
     run(&store, "DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since)");
     assert!(run(&store, "SHOW INDEXES").is_empty());
+}
+
+#[test]
+fn edge_seek_anonymous_endpoints_finds_indexed_edges() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(&store, "CREATE (:Person {name: 'Cid'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Bob'}), (b:Person {name: 'Cid'}) \
+         CREATE (a)-[:KNOWS {since: 2021}]->(b)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH ()-[r:KNOWS {since: 2020}]-() RETURN r.since AS s",
+    );
+    // Undirected pattern over a directed edge binds both orientations,
+    // so one stored edge surfaces as two rows.
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| int_prop(r, "s") == 2020));
+}
+
+#[test]
+fn edge_seek_directed_binds_single_orientation() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'a'})");
+    run(&store, "CREATE (:P {name: 'b'})");
+    run(
+        &store,
+        "MATCH (x:P {name: 'a'}), (y:P {name: 'b'}) \
+         CREATE (x)-[:R {k: 1}]->(y)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:R]-() ON (r.k)");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (src)-[r:R {k: 1}]->(dst) RETURN src.name AS s, dst.name AS d",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "s"), "a");
+    assert_eq!(str_prop(&rows[0], "d"), "b");
+}
+
+#[test]
+fn edge_seek_incoming_inverts_endpoints() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'a'})");
+    run(&store, "CREATE (:P {name: 'b'})");
+    run(
+        &store,
+        "MATCH (x:P {name: 'a'}), (y:P {name: 'b'}) \
+         CREATE (x)-[:R {k: 1}]->(y)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:R]-() ON (r.k)");
+
+    // `<-` means src_var binds to the edge's TARGET.
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (src)<-[r:R {k: 1}]-(dst) RETURN src.name AS s, dst.name AS d",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "s"), "b");
+    assert_eq!(str_prop(&rows[0], "d"), "a");
+}
+
+#[test]
+fn edge_seek_undirected_emits_both_orientations() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'a'})");
+    run(&store, "CREATE (:P {name: 'b'})");
+    run(
+        &store,
+        "MATCH (x:P {name: 'a'}), (y:P {name: 'b'}) \
+         CREATE (x)-[:R {k: 1}]->(y)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:R]-() ON (r.k)");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (src)-[r:R {k: 1}]-(dst) RETURN src.name AS s, dst.name AS d ORDER BY s",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(str_prop(&rows[0], "s"), "a");
+    assert_eq!(str_prop(&rows[0], "d"), "b");
+    assert_eq!(str_prop(&rows[1], "s"), "b");
+    assert_eq!(str_prop(&rows[1], "d"), "a");
+}
+
+#[test]
+fn edge_seek_residual_property_filter_narrows_matches() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'a'})");
+    run(&store, "CREATE (:P {name: 'b'})");
+    run(&store, "CREATE (:P {name: 'c'})");
+    run(&store, "CREATE (:P {name: 'd'})");
+    run(
+        &store,
+        "MATCH (x:P {name: 'a'}), (y:P {name: 'b'}) \
+         CREATE (x)-[:R {k: 1, tag: 'keep'}]->(y)",
+    );
+    run(
+        &store,
+        "MATCH (x:P {name: 'c'}), (y:P {name: 'd'}) \
+         CREATE (x)-[:R {k: 1, tag: 'drop'}]->(y)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:R]-() ON (r.k)");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (src)-[r:R {k: 1, tag: 'keep'}]->(dst) RETURN src.name AS s, dst.name AS d",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "s"), "a");
+    assert_eq!(str_prop(&rows[0], "d"), "b");
+}
+
+#[test]
+fn edge_seek_returns_empty_when_no_edge_matches() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'a'})");
+    run(&store, "CREATE (:P {name: 'b'})");
+    run(
+        &store,
+        "MATCH (x:P {name: 'a'}), (y:P {name: 'b'}) \
+         CREATE (x)-[:R {k: 1}]->(y)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:R]-() ON (r.k)");
+
+    let rows = run_with_ctx(&store, "MATCH ()-[r:R {k: 999}]-() RETURN r");
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn edge_seek_backfill_sees_edges_created_before_index() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'a'})");
+    run(&store, "CREATE (:P {name: 'b'})");
+    // Insert the edge *before* the index — the backfill must surface it.
+    run(
+        &store,
+        "MATCH (x:P {name: 'a'}), (y:P {name: 'b'}) \
+         CREATE (x)-[:R {k: 7}]->(y)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:R]-() ON (r.k)");
+
+    let rows = run_with_ctx(&store, "MATCH ()-[r:R {k: 7}]->() RETURN r.k AS k");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "k"), 7);
+}
+
+#[test]
+fn edge_seek_parameterized_value() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'a'})");
+    run(&store, "CREATE (:P {name: 'b'})");
+    run(
+        &store,
+        "MATCH (x:P {name: 'a'}), (y:P {name: 'b'}) \
+         CREATE (x)-[:R {k: 42}]->(y)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:R]-() ON (r.k)");
+
+    let mut params = ParamMap::new();
+    params.insert("v".into(), Value::Property(Property::Int64(42)));
+    let rows = run_with_ctx_params(
+        &store,
+        "MATCH ()-[r:R {k: $v}]->() RETURN r.k AS k",
+        &params,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "k"), 42);
+}
+
+#[test]
+fn edge_seek_falls_back_when_endpoint_has_label() {
+    // Endpoint labels disqualify the MVP rewrite — the planner must
+    // fall through to NodeScan + EdgeExpand and still return correct
+    // rows.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Person {name: 'Ada'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (a:Person)-[r:KNOWS {since: 2020}]->(b:Person) \
+         RETURN a.name AS s, b.name AS d",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "s"), "Ada");
+    assert_eq!(str_prop(&rows[0], "d"), "Bob");
+}
+
+#[test]
+fn edge_seek_unregistered_index_falls_back_to_scan() {
+    // With no index on (R, k), the planner must not emit EdgeSeek —
+    // the query still returns the right rows via the fallback path.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'a'})");
+    run(&store, "CREATE (:P {name: 'b'})");
+    run(
+        &store,
+        "MATCH (x:P {name: 'a'}), (y:P {name: 'b'}) \
+         CREATE (x)-[:R {k: 1}]->(y)",
+    );
+    // Note: no CREATE INDEX here.
+    let rows = run_with_ctx(&store, "MATCH ()-[r:R {k: 1}]->() RETURN r.k AS k");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "k"), 1);
 }
 
 #[test]
