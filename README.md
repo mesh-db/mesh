@@ -29,19 +29,21 @@ It runs in three modes:
 
 ## Quick start
 
-### 1. Build
+### 1. Get the binary
+
+Install from crates.io (pre-1.0, so the version must be explicit):
 
 ```sh
-cargo build -p meshdb-server
+cargo install meshdb-server --version 0.1.0-alpha.3
 ```
 
-Or for an optimized binary:
+Or build from source:
 
 ```sh
 cargo build -p meshdb-server --release
 ```
 
-The build needs `clang` / `libclang-dev` on Linux because `rust-rocksdb`
+Either path needs `clang` / `libclang-dev` on Linux because `rust-rocksdb`
 generates bindings at compile time. `protoc` is **not** required —
 `meshdb-rpc/build.rs` uses a vendored binary.
 
@@ -63,8 +65,11 @@ standard Neo4j Bolt port (every driver defaults to it).
 ### 3. Run the server
 
 ```sh
-RUST_LOG=info ./target/debug/meshdb-server --config /tmp/mesh.toml
+RUST_LOG=info meshdb-server --config /tmp/mesh.toml
 ```
+
+(If you built from source, the binary is at `./target/debug/meshdb-server`
+or `./target/release/meshdb-server`.)
 
 You should see something like:
 
@@ -176,29 +181,67 @@ and `UNWIND $list` — the full driver-facing surface as of today.
 
 ### Cypher subset
 
-- `MATCH` with single-hop and multi-hop patterns
-- Variable-length paths `()-[*1..3]->()`
-- `WHERE` with `=`, `<>`, `<`, `<=`, `>`, `>=`, `=~` (regex), `AND`, `OR`,
-  `NOT`, property access, function calls
-- `CREATE` for nodes and relationships
-- `MERGE` (match-or-create)
-- `DELETE` and `DETACH DELETE`
-- `SET` for property updates, label additions, replace (`=`) and merge (`+=`)
-  property maps
-- `RETURN` with aliases and `DISTINCT`
-- `WITH` for chained query pipelines (multi-stage `MATCH ... WITH ... MATCH`)
-- `CALL` procedures (pluggable registry; no APOC library ships by default)
-- `ORDER BY`, `LIMIT`, `SKIP`
-- Aggregates: `count`, `sum`, `avg`, `min`, `max`, `collect` (with `DISTINCT`)
-- Scalar functions: `size`, `length`, `labels`, `keys`, `type`, `tolower`,
-  `toupper`, `tostring`, `tointeger`, `coalesce`
-- Temporal functions: `datetime`, `localdatetime`, `date`, `time`,
-  `localtime`, `duration`
-- `CASE` (both simple and generic forms)
-- `UNWIND`
-- List literals and list comprehensions `[x IN list WHERE pred | proj]`
-- Parameters: `$name` and positional `$0`, in WHERE / RETURN / SET / pattern
-  property positions / UNWIND source
+**Read:** `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN` (with aliases,
+`DISTINCT`), `WITH` (re-projection + filter), `ORDER BY`, `LIMIT`, `SKIP`,
+`UNION` / `UNION ALL`.
+
+**Write:** `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET`
+(property, `+=` merge, label), `REMOVE` (property, label), `DELETE` /
+`DETACH DELETE`, `FOREACH`, `LOAD CSV [WITH HEADERS]`.
+
+**Flow:** `UNWIND`, `CASE ... WHEN ... ELSE ... END` (simple and generic),
+parameters (`$name` and positional `$0`).
+
+**Patterns:** variable-length paths `()-[*1..3]->()`, `shortestPath(...)`
+and `allShortestPaths(...)`.
+
+**Expressions:** list literals, list comprehensions
+`[x IN list WHERE pred | proj]`, pattern comprehensions, `reduce`,
+quantifier predicates (`all` / `any` / `none` / `single`),
+`EXISTS { ... }`, `COUNT { ... }`, and `COLLECT { ... }` subquery
+expressions.
+
+**Procedures / subqueries:** `CALL { ... }` (unit and returning form),
+`CALL proc YIELD ...` against a runtime-extensible registry. Built-in
+procedures: `db.labels()`, `db.relationshipTypes()`, `db.propertyKeys()`,
+`db.constraints()`. No APOC library ships by default.
+
+**Schema:** `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on label+property
+pairs; `CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for
+`UNIQUE`, `NOT NULL`, `IS :: <TYPE>` (STRING/INTEGER/FLOAT/BOOLEAN), and
+composite `IS NODE KEY` constraints — node scope `FOR (n:Label)` or
+relationship scope `FOR ()-[r:TYPE]-()` — with optional name and
+`IF [NOT] EXISTS`. Constraint DDL replicates across Raft and routing
+clusters.
+
+**Aggregates:** `count`, `sum`, `avg`, `min`, `max`, `collect` (all with
+`DISTINCT`), `stdev`, `stdevp`, `percentileDisc`, `percentileCont`.
+
+**Scalar functions** — the full openCypher surface plus the widely-expected
+Neo4j extensions:
+
+- *String:* `upper`, `lower`, `trim`, `ltrim`, `rtrim`, `length`,
+  `char_length`, `substring`, `left`, `right`, `split`, `replace`,
+  `reverse`
+- *Math:* `abs`, `sqrt`, `floor`, `ceil`, `round` (with precision + mode),
+  `sign`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `cot`, `haversin`,
+  `exp`, `log`, `ln`, `degrees`, `radians`, `pi`, `e`, `rand`
+- *Temporal:* `date`, `datetime`, `localdatetime`, `time`, `localtime`,
+  `duration`, `timestamp`, plus component accessors (`year`, `month`,
+  `day`, `hour`, ...)
+- *Spatial:* `point`, `distance`, `cartesian`, `latitude`, `longitude`,
+  `x`, `y`, `z`, `srid`, `crs`
+- *Type coercion:* `toString`, `toInteger`, `toFloat`, `toBoolean`, plus
+  `*OrNull` and `*List` variants, and `valueType`
+- *Graph:* `id`, `elementid`, `type`, `keys`, `labels`, `properties`,
+  `nodes`, `relationships`, `startnode`, `endnode`
+- *Other:* `coalesce`, `head`, `last`, `tail`, `range`, `exists`,
+  `randomUUID`, `isNaN`, `isEmpty`
+
+**Data types:** openCypher scalars (string, int, float, bool, null), list,
+map, temporal (`DateTime`, `LocalDateTime`, `Date`, `Time`, `LocalTime`,
+`Duration` — with IANA zone resolution via the `[Region/City]` suffix),
+and spatial `Point` (Cartesian 2D/3D, WGS-84 2D/3D, EPSG-tagged).
 
 ### Distribution
 
@@ -362,6 +405,13 @@ pair, `ca_path` to the shared CA bundle.
 - **No built-in APOC procedure library.** The `CALL` procedure framework
   and an extensible `ProcedureRegistry` are in place, but no APOC-compatible
   procedures ship with Mesh.
+- **No edge / relationship indexes.** Only node indexes (label + property)
+  are implemented. Constraints on relationships still work, but enforcement
+  falls back to an edge-type scan.
+- **No composite or edge-property indexes.** Same constraint: composite
+  `NODE KEY` constraints enforce via label scan rather than a composite
+  index.
+- **No quantified path patterns** (`(a)-->+(b)`, Neo4j 5 GPM syntax).
 
 ---
 
@@ -381,7 +431,8 @@ mesh/
 │   ├── meshdb-tck/         # openCypher TCK (Technology Compatibility Kit) runner
 │   └── meshdb-server/      # Binary: config, startup, gRPC listener, Bolt listener
 └── .github/workflows/
-    └── ci.yml            # Build + test + fmt check on push and PR
+    ├── ci.yml             # Build + test + fmt check on push and PR
+    └── release-plz.yml    # Release PR + crates.io publish automation
 ```
 
 Each crate has its own `Error` type via `thiserror` and its own `tests/`
@@ -542,6 +593,15 @@ RUSTFLAGS="-D warnings" cargo build --workspace --all-targets
 The `.github/workflows/ci.yml` workflow runs all three on every push and
 pull request, against Ubuntu + stable Rust, with `Swatinem/rust-cache` for
 fast incremental rebuilds.
+
+Releases are managed by `release-plz` (`.github/workflows/release-plz.yml`).
+On each push to `main` it opens (or updates) a single Release PR that bumps
+the shared workspace version in `Cargo.toml` and updates `CHANGELOG.md`.
+Merging that PR tags `v{version}`, cuts a GitHub Release, and publishes
+every crate to crates.io in dependency order. Use **"Create a merge commit"**
+(not "Squash and merge") when merging Release PRs — release-plz's tag
+creation has a [known bug](https://github.com/release-plz/release-plz/issues/2759)
+with squash merges.
 
 ---
 
