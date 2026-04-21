@@ -192,8 +192,9 @@ and `UNWIND $list` — the full driver-facing surface as of today.
 **Flow:** `UNWIND`, `CASE ... WHEN ... ELSE ... END` (simple and generic),
 parameters (`$name` and positional `$0`).
 
-**Patterns:** variable-length paths `()-[*1..3]->()`, `shortestPath(...)`
-and `allShortestPaths(...)`.
+**Patterns:** variable-length paths `()-[*1..3]->()`, Neo4j 5 quantifier
+shorthand (`->+` = `*1..`, `->*` = `*0..`, `->{n}` / `->{n,m}` /
+`->{n,}` / `->{,m}`), `shortestPath(...)` and `allShortestPaths(...)`.
 
 **Expressions:** list literals, list comprehensions
 `[x IN list WHERE pred | proj]`, pattern comprehensions, `reduce`,
@@ -206,13 +207,19 @@ expressions.
 procedures: `db.labels()`, `db.relationshipTypes()`, `db.propertyKeys()`,
 `db.constraints()`. No APOC library ships by default.
 
-**Schema:** `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on label+property
-pairs; `CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for
-`UNIQUE`, `NOT NULL`, `IS :: <TYPE>` (STRING/INTEGER/FLOAT/BOOLEAN), and
-composite `IS NODE KEY` constraints — node scope `FOR (n:Label)` or
-relationship scope `FOR ()-[r:TYPE]-()` — with optional name and
-`IF [NOT] EXISTS`. Constraint DDL replicates across Raft and routing
-clusters.
+**Schema:** `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on single-property
+or composite tuples, for both node (`FOR (n:Label) ON (n.a, n.b, ...)`) and
+relationship (`FOR ()-[r:TYPE]-() ON (r.p)`) scopes. The planner rewrites
+pattern-property equalities and `WHERE` conjuncts to composite `IndexSeek`
+when a covering prefix exists; unbound-endpoint patterns with an indexed
+edge property (`MATCH (a)-[r:T {p: v}]->(b)`) lower to `EdgeSeek`.
+`CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for `UNIQUE`,
+`NOT NULL`, `IS :: <TYPE>` (STRING/INTEGER/FLOAT/BOOLEAN), and composite
+`IS NODE KEY` — node scope `FOR (n:Label)` or relationship scope
+`FOR ()-[r:TYPE]-()` — with optional name and `IF [NOT] EXISTS`.
+`UNIQUE` and `NODE KEY` auto-provision a backing index (single-property
+or composite, respectively) so enforcement stays O(log N) per insert.
+Index + constraint DDL replicates across Raft and routing clusters.
 
 **Aggregates:** `count`, `sum`, `avg`, `min`, `max`, `collect` (all with
 `DISTINCT`), `stdev`, `stdevp`, `percentileDisc`, `percentileCont`.
@@ -405,13 +412,13 @@ pair, `ca_path` to the shared CA bundle.
 - **No built-in APOC procedure library.** The `CALL` procedure framework
   and an extensible `ProcedureRegistry` are in place, but no APOC-compatible
   procedures ship with Mesh.
-- **No edge / relationship indexes.** Only node indexes (label + property)
-  are implemented. Constraints on relationships still work, but enforcement
-  falls back to an edge-type scan.
-- **No composite or edge-property indexes.** Same constraint: composite
-  `NODE KEY` constraints enforce via label scan rather than a composite
-  index.
-- **No quantified path patterns** (`(a)-->+(b)`, Neo4j 5 GPM syntax).
+- **No point / spatial indexes.** `Property::Point` round-trips correctly
+  and spatial scalars (`point`, `distance`, `cartesian`, `x`, `y`, `z`,
+  `latitude`, `longitude`, `srid`, `crs`) all work, but there's no R-tree
+  or spatial acceleration — spatial predicates fall back to a full scan.
+- **GQL quantified path patterns** — parenthesized-subpath form like
+  `((a)-[:T]-(b))+` — aren't parsed. The Neo4j 5 relationship-level
+  shorthand (`->+`, `->*`, `->{n,m}`) is fully supported.
 
 ---
 

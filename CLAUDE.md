@@ -44,16 +44,16 @@ mesh/
   - Read: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN` (with aliases, `DISTINCT`), `WITH` (re-projection + filter), `ORDER BY`, `LIMIT`, `SKIP`, `UNION` / `UNION ALL`.
   - Write: `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET` (property, `+=` merge, label), `REMOVE` (property, label), `DELETE` / `DETACH DELETE`, `FOREACH`.
   - Flow: `UNWIND`, `CASE ... WHEN ... ELSE ... END` (simple and generic), parameters (`$name`).
-  - Patterns: variable-length paths `()-[*1..3]->()`, `shortestPath(...)` (`allShortestPaths` parses but plan rejects).
+  - Patterns: variable-length paths `()-[*1..3]->()`, Neo4j 5 quantifier shorthand (`->+` = `*1..`, `->*` = `*0..`, `->{n}` / `->{n,m}` / `->{n,}` / `->{,m}`), `shortestPath(...)` (`allShortestPaths` parses but plan rejects).
   - Expressions: list comprehensions, pattern comprehensions, `reduce`, quantifier predicates (`all`/`any`/`none`/`single`), `EXISTS { ... }`, `COUNT { ... }`, and `COLLECT { ... }` subquery expressions.
   - Procedures / subqueries: `CALL { ... }` (unit and returning), `CALL proc YIELD ...` against a runtime-extensible registry in `meshdb-executor` with built-in `db.labels()` / `db.relationshipTypes()` / `db.propertyKeys()` installed by default.
-  - Schema: `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on node label+property pairs (`FOR (n:Label) ON (n.prop)`) *and* relationship type+property pairs (`FOR ()-[r:TYPE]-() ON (r.prop)`); `CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for UNIQUE, NOT NULL, `IS :: <TYPE>` (STRING/INTEGER/FLOAT/BOOLEAN), and composite `IS NODE KEY` constraints — node scope `FOR (n:Label)` or relationship scope `FOR ()-[r:TYPE]-()` — with optional name + `IF [NOT] EXISTS`, replicated across Raft and routing clusters; relationship UNIQUE constraints auto-provision a backing edge index so enforcement stays O(log N) per insert; built-in `db.constraints()` procedure.
+  - Schema: `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on node label+property tuples (`FOR (n:Label) ON (n.prop)` or composite `ON (n.a, n.b, ...)`) *and* relationship type+property tuples (`FOR ()-[r:TYPE]-() ON (r.prop)` or composite); the planner uses composite indexes for prefix-matched equality seeks (`MATCH (n:L {a: 1, b: 2})` or WHERE conjuncts). Edge property predicates with both endpoints unbound lower to `EdgeSeek` through the edge index. `CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for UNIQUE, NOT NULL, `IS :: <TYPE>` (STRING/INTEGER/FLOAT/BOOLEAN), and composite `IS NODE KEY` — node scope `FOR (n:Label)` or relationship scope `FOR ()-[r:TYPE]-()` — with optional name + `IF [NOT] EXISTS`, replicated across Raft and routing clusters; UNIQUE and NODE KEY both auto-provision a backing property index (composite for NODE KEY) so enforcement stays O(log N) per insert; built-in `db.constraints()` procedure.
   - Scalars: full openCypher scalar surface (string, math, temporal, spatial) plus the widely-expected Neo4j extensions (`*OrNull`, `*List`, `valueType`, `randomUUID`, `round` with precision+mode, `char_length`).
-- **Not yet implemented:** composite indexes; query-plan-level edge IndexSeek inside `EdgeExpand` (the storage-level edge index exists and accelerates relationship UNIQUE enforcement, but the planner doesn't yet rewrite edge-property predicates into a seek); point / spatial indexes; quantified path patterns (`(a)-->+(b)`, Neo4j 5); APOC.
+- **Not yet implemented:** point / spatial indexes; APOC procedure library.
 
 ### Query Execution (`meshdb-executor`)
 - Volcano/iterator (pull-based) model — each operator implements `next() -> Option<Row>`.
-- Operators: Scan, IndexSeek, Expand, Filter, Project, Aggregate, Sort, Limit, CreateNode, CreateEdge, Delete.
+- Operators: Scan, IndexSeek (composite-capable — tuple prefix seeks on the index CF), EdgeSeek (relationship-scope analogue for unbound-endpoints patterns), Expand, Filter, Project, Aggregate, Sort, Limit, CreateNode, CreateEdge, Delete.
 - Later optimization: vectorized execution for analytical queries.
 
 ### Distribution / Clustering (`meshdb-cluster`)
@@ -97,7 +97,7 @@ mesh/
 
 ## Implementation Status
 
-The foundational phases are all shipping — single-node graph store, Cypher parser + executor, gRPC cluster RPCs, Raft-backed cluster membership, and a Bolt-speaking server. 2PC across partitions is wired with a durable coordinator log. Current in-flight work lives at the Cypher-surface level (see the "Not yet implemented" list in the Cypher section above) — query-plan-level edge IndexSeek, composite indexes, point / spatial indexes, and quantified path patterns are the natural next steps.
+The foundational phases are all shipping — single-node graph store, Cypher parser + executor, gRPC cluster RPCs, Raft-backed cluster membership, and a Bolt-speaking server. 2PC across partitions is wired with a durable coordinator log. The planner-side index work is caught up: composite property indexes (DDL + storage tuple encoding + prefix-matched seeks), edge IndexSeek for unbound-endpoint patterns (single-node, in-tx overlay, and cluster-routing scatter-gather), and Neo4j 5 quantifier shorthand all shipped. The remaining Cypher-surface gaps (see the "Not yet implemented" list above) are point / spatial indexes and the APOC procedure library.
 
 ## Target System
 - AMD Ryzen 9 9900X (high core count — leverage for concurrent RocksDB operations)
