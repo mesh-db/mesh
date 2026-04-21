@@ -1947,6 +1947,14 @@ impl StorageEngine for RocksDbStorageEngine {
         RocksDbStorageEngine::drop_property_index(self, label, property)
     }
 
+    fn create_property_index_composite(&self, label: &str, properties: &[&str]) -> Result<()> {
+        RocksDbStorageEngine::create_property_index_composite(self, label, properties)
+    }
+
+    fn drop_property_index_composite(&self, label: &str, properties: &[&str]) -> Result<()> {
+        RocksDbStorageEngine::drop_property_index_composite(self, label, properties)
+    }
+
     fn list_property_indexes(&self) -> Vec<PropertyIndexSpec> {
         RocksDbStorageEngine::list_property_indexes(self)
     }
@@ -1957,6 +1965,22 @@ impl StorageEngine for RocksDbStorageEngine {
 
     fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
         RocksDbStorageEngine::drop_edge_property_index(self, edge_type, property)
+    }
+
+    fn create_edge_property_index_composite(
+        &self,
+        edge_type: &str,
+        properties: &[&str],
+    ) -> Result<()> {
+        RocksDbStorageEngine::create_edge_property_index_composite(self, edge_type, properties)
+    }
+
+    fn drop_edge_property_index_composite(
+        &self,
+        edge_type: &str,
+        properties: &[&str],
+    ) -> Result<()> {
+        RocksDbStorageEngine::drop_edge_property_index_composite(self, edge_type, properties)
     }
 
     fn list_edge_property_indexes(&self) -> Vec<EdgePropertyIndexSpec> {

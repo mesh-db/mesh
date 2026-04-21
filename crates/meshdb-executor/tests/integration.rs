@@ -4267,6 +4267,62 @@ fn edge_seek_unregistered_index_falls_back_to_scan() {
 }
 
 #[test]
+fn composite_create_index_end_to_end_and_show_indexes() {
+    // Composite DDL via Cypher + pre-existing data backfill + SHOW
+    // INDEXES listing + DROP. Exercises the full plumbing: parser
+    // accepts `ON (a.x, a.y)`, plan lowers with properties Vec,
+    // executor dispatches to the composite storage method, storage
+    // backfills tuple entries, and the list / show paths surface
+    // entries for every component property.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {first: 'Ada', last: 'Lovelace'})");
+    run(&store, "CREATE (:P {first: 'Bob', last: 'Smith'})");
+    // Backfill covers the pre-existing nodes.
+    run(&store, "CREATE INDEX FOR (n:P) ON (n.first, n.last)");
+
+    // SHOW INDEXES must list the composite — the underlying registry
+    // renders one row per component property for compat.
+    let shown = run(&store, "SHOW INDEXES");
+    let composite_rows: Vec<_> = shown
+        .iter()
+        .filter(|r| str_prop(r, "scope") == "NODE")
+        .filter(|r| str_prop(r, "label") == "P")
+        .collect();
+    assert!(
+        !composite_rows.is_empty(),
+        "SHOW INDEXES missed the composite spec: {shown:?}"
+    );
+
+    // Drop via composite DDL removes the spec completely.
+    run(&store, "DROP INDEX FOR (n:P) ON (n.first, n.last)");
+    let shown_after = run(&store, "SHOW INDEXES");
+    assert!(shown_after.is_empty());
+}
+
+#[test]
+fn composite_edge_index_end_to_end() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:N {n: 'a'})");
+    run(&store, "CREATE (:N {n: 'b'})");
+    run(
+        &store,
+        "MATCH (a:N {n: 'a'}), (b:N {n: 'b'}) \
+         CREATE (a)-[:KNOWS {since: 2020, weight: 5}]->(b)",
+    );
+    run(
+        &store,
+        "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since, r.weight)",
+    );
+    let shown = run(&store, "SHOW INDEXES");
+    assert!(
+        shown
+            .iter()
+            .any(|r| str_prop(r, "scope") == "RELATIONSHIP" && str_prop(r, "edge_type") == "KNOWS"),
+        "SHOW INDEXES missed the composite edge spec: {shown:?}"
+    );
+}
+
+#[test]
 fn match_with_pattern_property_uses_index() {
     let (store, _d) = open_store();
     run(&store, "CREATE (:Person {name: 'Ada', age: 37})");

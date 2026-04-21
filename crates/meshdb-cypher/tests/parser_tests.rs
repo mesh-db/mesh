@@ -1258,28 +1258,31 @@ fn drop_edge_index_parses_composite_property_list() {
 }
 
 #[test]
-fn create_index_composite_is_rejected_at_plan_time() {
-    // Grammar accepts composite DDL, but slice 2 leaves the storage
-    // tuple-key encoding for a follow-up — surface a clear error
-    // instead of silently coercing to single-property.
+fn create_index_composite_lowers_to_vec_properties() {
+    // The grammar + planner now support composite end-to-end; the
+    // resulting LogicalPlan carries the full properties list in order.
     let stmt = parse("CREATE INDEX FOR (n:L) ON (n.a, n.b)").unwrap();
-    let err = plan_with_context(&stmt, &PlannerContext::default()).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("composite") && msg.contains("not yet supported"),
-        "expected composite-not-supported error, got: {msg}"
-    );
+    let plan = plan_with_context(&stmt, &PlannerContext::default()).unwrap();
+    let LogicalPlan::CreatePropertyIndex { label, properties } = plan else {
+        panic!("expected CreatePropertyIndex, got {plan:?}");
+    };
+    assert_eq!(label, "L");
+    assert_eq!(properties, vec!["a".to_string(), "b".to_string()]);
 }
 
 #[test]
-fn drop_index_composite_is_rejected_at_plan_time() {
+fn drop_edge_index_composite_lowers_to_vec_properties() {
     let stmt = parse("DROP INDEX FOR ()-[r:T]-() ON (r.a, r.b)").unwrap();
-    let err = plan_with_context(&stmt, &PlannerContext::default()).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("composite") && msg.contains("not yet supported"),
-        "expected composite-not-supported error, got: {msg}"
-    );
+    let plan = plan_with_context(&stmt, &PlannerContext::default()).unwrap();
+    let LogicalPlan::DropEdgePropertyIndex {
+        edge_type,
+        properties,
+    } = plan
+    else {
+        panic!("expected DropEdgePropertyIndex, got {plan:?}");
+    };
+    assert_eq!(edge_type, "T");
+    assert_eq!(properties, vec!["a".to_string(), "b".to_string()]);
 }
 
 #[test]

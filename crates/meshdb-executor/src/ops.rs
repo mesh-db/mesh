@@ -258,34 +258,38 @@ fn try_execute_ddl(
     writer: &dyn GraphWriter,
 ) -> Result<Option<Vec<Row>>> {
     match plan {
-        LogicalPlan::CreatePropertyIndex { label, property } => {
-            writer.create_property_index(label, property)?;
+        LogicalPlan::CreatePropertyIndex { label, properties } => {
+            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+            writer.create_property_index(label, &refs)?;
             Ok(Some(vec![node_index_ddl_ack_row(
-                "created", label, property,
+                "created", label, properties,
             )]))
         }
-        LogicalPlan::DropPropertyIndex { label, property } => {
-            writer.drop_property_index(label, property)?;
+        LogicalPlan::DropPropertyIndex { label, properties } => {
+            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+            writer.drop_property_index(label, &refs)?;
             Ok(Some(vec![node_index_ddl_ack_row(
-                "dropped", label, property,
+                "dropped", label, properties,
             )]))
         }
         LogicalPlan::CreateEdgePropertyIndex {
             edge_type,
-            property,
+            properties,
         } => {
-            writer.create_edge_property_index(edge_type, property)?;
+            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+            writer.create_edge_property_index(edge_type, &refs)?;
             Ok(Some(vec![edge_index_ddl_ack_row(
-                "created", edge_type, property,
+                "created", edge_type, properties,
             )]))
         }
         LogicalPlan::DropEdgePropertyIndex {
             edge_type,
-            property,
+            properties,
         } => {
-            writer.drop_edge_property_index(edge_type, property)?;
+            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+            writer.drop_edge_property_index(edge_type, &refs)?;
             Ok(Some(vec![edge_index_ddl_ack_row(
-                "dropped", edge_type, property,
+                "dropped", edge_type, properties,
             )]))
         }
         LogicalPlan::ShowPropertyIndexes => {
@@ -422,7 +426,7 @@ fn cypher_to_storage_property_type(t: CypherPropertyType) -> StoragePropertyType
 /// DDL responses uniformly with schema-read responses. `label` is
 /// kept as a column name for backwards-compat with pre-edge-index
 /// clients; the `scope` column disambiguates node from edge.
-fn node_index_ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
+fn node_index_ddl_ack_row(state: &str, label: &str, properties: &[String]) -> Row {
     let mut row = Row::default();
     row.insert(
         "state".into(),
@@ -436,10 +440,15 @@ fn node_index_ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
         "label".into(),
         Value::Property(Property::String(label.into())),
     );
+    // `property` stays a single string for backward compat with
+    // drivers that read it directly. Composite specs render as a
+    // comma-joined preview; the `properties` column carries the
+    // authoritative list.
     row.insert(
         "property".into(),
-        Value::Property(Property::String(property.into())),
+        Value::Property(Property::String(properties.join(","))),
     );
+    row.insert("properties".into(), properties_list_value(properties));
     row
 }
 
@@ -448,7 +457,7 @@ fn node_index_ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
 /// [`node_index_ddl_ack_row`] but the target lives under
 /// `edge_type` (and `label` carries the same string so existing
 /// driver code that read `label` still sees the target name).
-fn edge_index_ddl_ack_row(state: &str, edge_type: &str, property: &str) -> Row {
+fn edge_index_ddl_ack_row(state: &str, edge_type: &str, properties: &[String]) -> Row {
     let mut row = Row::default();
     row.insert(
         "state".into(),
@@ -468,9 +477,19 @@ fn edge_index_ddl_ack_row(state: &str, edge_type: &str, property: &str) -> Row {
     );
     row.insert(
         "property".into(),
-        Value::Property(Property::String(property.into())),
+        Value::Property(Property::String(properties.join(","))),
     );
+    row.insert("properties".into(), properties_list_value(properties));
     row
+}
+
+fn properties_list_value(properties: &[String]) -> Value {
+    Value::List(
+        properties
+            .iter()
+            .map(|p| Value::Property(Property::String(p.clone())))
+            .collect(),
+    )
 }
 
 /// Row shape for `SHOW INDEXES` output. Columns:

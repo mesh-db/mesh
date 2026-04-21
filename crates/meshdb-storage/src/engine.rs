@@ -32,9 +32,9 @@ use std::path::Path;
 ///
 /// `properties` is a `Vec<String>` so composite indexes (tuple keys
 /// over multiple properties, `CREATE INDEX FOR (n:Label) ON (n.a, n.b)`)
-/// fit the same shape as the single-property form. In this slice
-/// the storage layer only populates length-1 specs; composite
-/// write/seek support and the composite DDL surface are follow-ups.
+/// fit the same shape as the single-property form. Single-property
+/// specs encode byte-identically to the pre-composite layout on
+/// disk, so existing data is readable after upgrade.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PropertyIndexSpec {
     pub label: String,
@@ -42,20 +42,19 @@ pub struct PropertyIndexSpec {
 }
 
 impl PropertyIndexSpec {
-    /// Convenience accessor for the first property. In the current
-    /// slice every registered spec has exactly one property, so
-    /// this stands in for the old `.property` field. A follow-up
-    /// slice that populates composite specs will update callers to
-    /// iterate `properties` instead.
+    /// Convenience accessor for the first property. Useful for
+    /// tuple-based external APIs (like `SHOW INDEXES`) that predate
+    /// composite support and still expect a single string per row.
+    /// Panics on an empty spec — the storage layer never constructs
+    /// one, so an empty spec would indicate a corrupt on-disk entry.
     pub fn first_property(&self) -> &str {
         &self.properties[0]
     }
 }
 
 /// Relationship-scope analogue of [`PropertyIndexSpec`]. Same
-/// shape: `properties` is a `Vec<String>` so a future composite
-/// form fits, but today the storage layer only populates
-/// length-1 specs.
+/// `properties: Vec<String>` shape, same composite semantics, same
+/// byte-level on-disk compatibility for length-1 entries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EdgePropertyIndexSpec {
     pub edge_type: String,
@@ -63,8 +62,7 @@ pub struct EdgePropertyIndexSpec {
 }
 
 impl EdgePropertyIndexSpec {
-    /// See [`PropertyIndexSpec::first_property`]. Same slice-1
-    /// invariant applies.
+    /// See [`PropertyIndexSpec::first_property`].
     pub fn first_property(&self) -> &str {
         &self.properties[0]
     }
@@ -298,6 +296,13 @@ pub trait StorageEngine: Send + Sync {
 
     fn create_property_index(&self, label: &str, property: &str) -> Result<()>;
     fn drop_property_index(&self, label: &str, property: &str) -> Result<()>;
+    /// Composite form of [`Self::create_property_index`] — declares
+    /// a tuple index over `(label, properties...)`. Single-property
+    /// callers should use [`Self::create_property_index`] which
+    /// delegates here with a length-1 slice.
+    fn create_property_index_composite(&self, label: &str, properties: &[&str]) -> Result<()>;
+    /// Composite form of [`Self::drop_property_index`].
+    fn drop_property_index_composite(&self, label: &str, properties: &[&str]) -> Result<()>;
     fn list_property_indexes(&self) -> Vec<PropertyIndexSpec>;
 
     /// Declare a new `(edge_type, property)` single-property equality
@@ -309,6 +314,18 @@ pub trait StorageEngine: Send + Sync {
     /// Tear down an edge property index. Removes the meta entry and
     /// every entry under the `(edge_type, prop)` prefix. Idempotent.
     fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()>;
+    /// Composite form of [`Self::create_edge_property_index`].
+    fn create_edge_property_index_composite(
+        &self,
+        edge_type: &str,
+        properties: &[&str],
+    ) -> Result<()>;
+    /// Composite form of [`Self::drop_edge_property_index`].
+    fn drop_edge_property_index_composite(
+        &self,
+        edge_type: &str,
+        properties: &[&str],
+    ) -> Result<()>;
     /// Snapshot the currently-registered edge property indexes.
     fn list_edge_property_indexes(&self) -> Vec<EdgePropertyIndexSpec>;
 

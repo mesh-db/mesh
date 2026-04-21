@@ -34,18 +34,20 @@ pub trait GraphWriter {
     fn delete_edge(&self, id: EdgeId) -> Result<()>;
     fn detach_delete_node(&self, id: NodeId) -> Result<()>;
 
-    /// Declare a new property index. Default impl errors so remote
-    /// writers (Raft, routing) that don't yet support cluster-aware
-    /// DDL surface the limitation immediately. Storage-backed writers
-    /// override this via the blanket impl.
-    fn create_property_index(&self, _label: &str, _property: &str) -> Result<()> {
+    /// Declare a new property index. `properties` is a slice so the
+    /// composite form (`CREATE INDEX FOR (n:L) ON (n.a, n.b)`) fits
+    /// the same surface as single-property. Default impl errors so
+    /// remote writers that don't yet support cluster-aware DDL
+    /// surface the limitation immediately; storage-backed writers
+    /// override via the blanket impl.
+    fn create_property_index(&self, _label: &str, _properties: &[&str]) -> Result<()> {
         Err(crate::error::Error::Unsupported(
             "property-index DDL is not supported by this writer".into(),
         ))
     }
 
     /// Tear down a property index. Mirrors [`Self::create_property_index`].
-    fn drop_property_index(&self, _label: &str, _property: &str) -> Result<()> {
+    fn drop_property_index(&self, _label: &str, _properties: &[&str]) -> Result<()> {
         Err(crate::error::Error::Unsupported(
             "property-index DDL is not supported by this writer".into(),
         ))
@@ -60,11 +62,8 @@ pub trait GraphWriter {
     }
 
     /// Relationship-scope analogue of
-    /// [`Self::create_property_index`]. Default impl errors so remote
-    /// writers that haven't plumbed edge-index DDL yet surface the
-    /// limitation immediately; storage-backed writers override via
-    /// the blanket impl.
-    fn create_edge_property_index(&self, _edge_type: &str, _property: &str) -> Result<()> {
+    /// [`Self::create_property_index`].
+    fn create_edge_property_index(&self, _edge_type: &str, _properties: &[&str]) -> Result<()> {
         Err(crate::error::Error::Unsupported(
             "edge-property-index DDL is not supported by this writer".into(),
         ))
@@ -72,7 +71,7 @@ pub trait GraphWriter {
 
     /// Tear down an edge property index. Mirrors
     /// [`Self::create_edge_property_index`].
-    fn drop_edge_property_index(&self, _edge_type: &str, _property: &str) -> Result<()> {
+    fn drop_edge_property_index(&self, _edge_type: &str, _properties: &[&str]) -> Result<()> {
         Err(crate::error::Error::Unsupported(
             "edge-property-index DDL is not supported by this writer".into(),
         ))
@@ -146,13 +145,13 @@ impl<T: StorageEngine> GraphWriter for T {
         Ok(())
     }
 
-    fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
-        StorageEngine::create_property_index(self, label, property)?;
+    fn create_property_index(&self, label: &str, properties: &[&str]) -> Result<()> {
+        StorageEngine::create_property_index_composite(self, label, properties)?;
         Ok(())
     }
 
-    fn drop_property_index(&self, label: &str, property: &str) -> Result<()> {
-        StorageEngine::drop_property_index(self, label, property)?;
+    fn drop_property_index(&self, label: &str, properties: &[&str]) -> Result<()> {
+        StorageEngine::drop_property_index_composite(self, label, properties)?;
         Ok(())
     }
 
@@ -163,13 +162,13 @@ impl<T: StorageEngine> GraphWriter for T {
             .collect())
     }
 
-    fn create_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
-        StorageEngine::create_edge_property_index(self, edge_type, property)?;
+    fn create_edge_property_index(&self, edge_type: &str, properties: &[&str]) -> Result<()> {
+        StorageEngine::create_edge_property_index_composite(self, edge_type, properties)?;
         Ok(())
     }
 
-    fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
-        StorageEngine::drop_edge_property_index(self, edge_type, property)?;
+    fn drop_edge_property_index(&self, edge_type: &str, properties: &[&str]) -> Result<()> {
+        StorageEngine::drop_edge_property_index_composite(self, edge_type, properties)?;
         Ok(())
     }
 
@@ -235,13 +234,13 @@ impl GraphWriter for StorageWriterAdapter<'_> {
         Ok(())
     }
 
-    fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
-        self.0.create_property_index(label, property)?;
+    fn create_property_index(&self, label: &str, properties: &[&str]) -> Result<()> {
+        self.0.create_property_index_composite(label, properties)?;
         Ok(())
     }
 
-    fn drop_property_index(&self, label: &str, property: &str) -> Result<()> {
-        self.0.drop_property_index(label, property)?;
+    fn drop_property_index(&self, label: &str, properties: &[&str]) -> Result<()> {
+        self.0.drop_property_index_composite(label, properties)?;
         Ok(())
     }
 
@@ -254,13 +253,15 @@ impl GraphWriter for StorageWriterAdapter<'_> {
             .collect())
     }
 
-    fn create_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
-        self.0.create_edge_property_index(edge_type, property)?;
+    fn create_edge_property_index(&self, edge_type: &str, properties: &[&str]) -> Result<()> {
+        self.0
+            .create_edge_property_index_composite(edge_type, properties)?;
         Ok(())
     }
 
-    fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
-        self.0.drop_edge_property_index(edge_type, property)?;
+    fn drop_edge_property_index(&self, edge_type: &str, properties: &[&str]) -> Result<()> {
+        self.0
+            .drop_edge_property_index_composite(edge_type, properties)?;
         Ok(())
     }
 

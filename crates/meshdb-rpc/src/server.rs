@@ -950,23 +950,53 @@ fn count_index_seeks(plan: &meshdb_cypher::LogicalPlan) -> u64 {
 
 /// Apply a single DDL [`GraphCommand`] directly to `store`. Non-DDL
 /// variants are a no-op — the caller filters them out beforehand.
+/// Resolve the `(property, properties)` wire pair in a *PropertyIndex
+/// request to a single canonical property list. New clients populate
+/// `properties` and leave `property` empty; older clients fall back to
+/// the single-property slot. An empty list from both sides is rejected
+/// — the storage layer requires at least one property.
+fn decoded_index_properties(
+    repeated: &[String],
+    legacy_single: &str,
+) -> std::result::Result<Vec<String>, Status> {
+    if !repeated.is_empty() {
+        return Ok(repeated.to_vec());
+    }
+    if !legacy_single.is_empty() {
+        return Ok(vec![legacy_single.to_string()]);
+    }
+    Err(Status::invalid_argument(
+        "property index request must specify at least one property",
+    ))
+}
+
 fn apply_ddl_to_store(
     cmd: &GraphCommand,
     store: &dyn StorageEngine,
 ) -> std::result::Result<(), meshdb_storage::Error> {
     match cmd {
-        GraphCommand::CreateIndex { label, property } => {
-            store.create_property_index(label, property)
+        GraphCommand::CreateIndex { label, properties } => {
+            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+            store.create_property_index_composite(label, &refs)
         }
-        GraphCommand::DropIndex { label, property } => store.drop_property_index(label, property),
+        GraphCommand::DropIndex { label, properties } => {
+            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+            store.drop_property_index_composite(label, &refs)
+        }
         GraphCommand::CreateEdgeIndex {
             edge_type,
-            property,
-        } => store.create_edge_property_index(edge_type, property),
+            properties,
+        } => {
+            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+            store.create_edge_property_index_composite(edge_type, &refs)
+        }
         GraphCommand::DropEdgeIndex {
             edge_type,
-            property,
-        } => store.drop_edge_property_index(edge_type, property),
+            properties,
+        } => {
+            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+            store.drop_edge_property_index_composite(edge_type, &refs)
+        }
         GraphCommand::CreateConstraint {
             name,
             scope,
@@ -997,27 +1027,27 @@ fn apply_ddl_to_store(
 /// expected here — callers only pass DDL.
 fn invert_ddl(cmd: &GraphCommand) -> GraphCommand {
     match cmd {
-        GraphCommand::CreateIndex { label, property } => GraphCommand::DropIndex {
+        GraphCommand::CreateIndex { label, properties } => GraphCommand::DropIndex {
             label: label.clone(),
-            property: property.clone(),
+            properties: properties.clone(),
         },
-        GraphCommand::DropIndex { label, property } => GraphCommand::CreateIndex {
+        GraphCommand::DropIndex { label, properties } => GraphCommand::CreateIndex {
             label: label.clone(),
-            property: property.clone(),
+            properties: properties.clone(),
         },
         GraphCommand::CreateEdgeIndex {
             edge_type,
-            property,
+            properties,
         } => GraphCommand::DropEdgeIndex {
             edge_type: edge_type.clone(),
-            property: property.clone(),
+            properties: properties.clone(),
         },
         GraphCommand::DropEdgeIndex {
             edge_type,
-            property,
+            properties,
         } => GraphCommand::CreateEdgeIndex {
             edge_type: edge_type.clone(),
-            property: property.clone(),
+            properties: properties.clone(),
         },
         GraphCommand::CreateConstraint {
             name,
@@ -1060,41 +1090,45 @@ async fn try_remote_ddl_on_peer(
 ) -> std::result::Result<(), Status> {
     for cmd in ddl {
         match cmd {
-            GraphCommand::CreateIndex { label, property } => {
+            GraphCommand::CreateIndex { label, properties } => {
                 client
                     .create_property_index(CreatePropertyIndexRequest {
                         label: label.clone(),
-                        property: property.clone(),
+                        property: String::new(),
+                        properties: properties.clone(),
                     })
                     .await?;
             }
-            GraphCommand::DropIndex { label, property } => {
+            GraphCommand::DropIndex { label, properties } => {
                 client
                     .drop_property_index(DropPropertyIndexRequest {
                         label: label.clone(),
-                        property: property.clone(),
+                        property: String::new(),
+                        properties: properties.clone(),
                     })
                     .await?;
             }
             GraphCommand::CreateEdgeIndex {
                 edge_type,
-                property,
+                properties,
             } => {
                 client
                     .create_edge_property_index(CreateEdgePropertyIndexRequest {
                         edge_type: edge_type.clone(),
-                        property: property.clone(),
+                        property: String::new(),
+                        properties: properties.clone(),
                     })
                     .await?;
             }
             GraphCommand::DropEdgeIndex {
                 edge_type,
-                property,
+                properties,
             } => {
                 client
                     .drop_edge_property_index(DropEdgePropertyIndexRequest {
                         edge_type: edge_type.clone(),
-                        property: property.clone(),
+                        property: String::new(),
+                        properties: properties.clone(),
                     })
                     .await?;
             }
@@ -1266,23 +1300,27 @@ fn apply_ddl_commands(
 ) -> std::result::Result<(), meshdb_storage::Error> {
     for cmd in cmds {
         match cmd {
-            GraphCommand::CreateIndex { label, property } => {
-                store.create_property_index(label, property)?;
+            GraphCommand::CreateIndex { label, properties } => {
+                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+                store.create_property_index_composite(label, &refs)?;
             }
-            GraphCommand::DropIndex { label, property } => {
-                store.drop_property_index(label, property)?;
+            GraphCommand::DropIndex { label, properties } => {
+                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+                store.drop_property_index_composite(label, &refs)?;
             }
             GraphCommand::CreateEdgeIndex {
                 edge_type,
-                property,
+                properties,
             } => {
-                store.create_edge_property_index(edge_type, property)?;
+                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+                store.create_edge_property_index_composite(edge_type, &refs)?;
             }
             GraphCommand::DropEdgeIndex {
                 edge_type,
-                property,
+                properties,
             } => {
-                store.drop_edge_property_index(edge_type, property)?;
+                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+                store.drop_edge_property_index_composite(edge_type, &refs)?;
             }
             GraphCommand::CreateConstraint {
                 name,
@@ -2008,8 +2046,10 @@ impl MeshWrite for MeshService {
         // for calling this RPC on every peer. In Raft mode it's
         // unused — DDL replicates via `propose_graph` instead.
         let req = request.into_inner();
+        let props = decoded_index_properties(&req.properties, &req.property)?;
+        let refs: Vec<&str> = props.iter().map(String::as_str).collect();
         self.store
-            .create_property_index(&req.label, &req.property)
+            .create_property_index_composite(&req.label, &refs)
             .map_err(internal)?;
         Ok(Response::new(CreatePropertyIndexResponse {}))
     }
@@ -2020,8 +2060,10 @@ impl MeshWrite for MeshService {
         request: Request<DropPropertyIndexRequest>,
     ) -> Result<Response<DropPropertyIndexResponse>, Status> {
         let req = request.into_inner();
+        let props = decoded_index_properties(&req.properties, &req.property)?;
+        let refs: Vec<&str> = props.iter().map(String::as_str).collect();
         self.store
-            .drop_property_index(&req.label, &req.property)
+            .drop_property_index_composite(&req.label, &refs)
             .map_err(internal)?;
         Ok(Response::new(DropPropertyIndexResponse {}))
     }
@@ -2031,12 +2073,11 @@ impl MeshWrite for MeshService {
         &self,
         request: Request<CreateEdgePropertyIndexRequest>,
     ) -> Result<Response<CreateEdgePropertyIndexResponse>, Status> {
-        // Local-only: routing-mode fan-out calls this RPC on every
-        // peer after running its own local create. Raft mode
-        // replicates DDL via `propose_graph` instead.
         let req = request.into_inner();
+        let props = decoded_index_properties(&req.properties, &req.property)?;
+        let refs: Vec<&str> = props.iter().map(String::as_str).collect();
         self.store
-            .create_edge_property_index(&req.edge_type, &req.property)
+            .create_edge_property_index_composite(&req.edge_type, &refs)
             .map_err(internal)?;
         Ok(Response::new(CreateEdgePropertyIndexResponse {}))
     }
@@ -2047,8 +2088,10 @@ impl MeshWrite for MeshService {
         request: Request<DropEdgePropertyIndexRequest>,
     ) -> Result<Response<DropEdgePropertyIndexResponse>, Status> {
         let req = request.into_inner();
+        let props = decoded_index_properties(&req.properties, &req.property)?;
+        let refs: Vec<&str> = props.iter().map(String::as_str).collect();
         self.store
-            .drop_edge_property_index(&req.edge_type, &req.property)
+            .drop_edge_property_index_composite(&req.edge_type, &refs)
             .map_err(internal)?;
         Ok(Response::new(DropEdgePropertyIndexResponse {}))
     }

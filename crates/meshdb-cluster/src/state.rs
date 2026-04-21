@@ -48,38 +48,39 @@ pub enum GraphCommand {
     DeleteEdge(EdgeId),
     DetachDeleteNode(NodeId),
     Batch(Vec<GraphCommand>),
-    /// Declare a node property index on every replica. Reaches every
-    /// peer through the Raft log, so the resulting `(label, property)`
-    /// index is consistent across the cluster and each peer's
+    /// Declare a node property index on every replica. `properties`
+    /// carries the ordered list from the DDL surface — length 1 is
+    /// single-property, length > 1 is a composite tuple index. Reaches
+    /// every peer through the Raft log, so the resulting index is
+    /// consistent across the cluster and each peer's
     /// `StoreGraphApplier` runs its own backfill against the local
     /// graph copy.
     CreateIndex {
         label: String,
-        property: String,
+        properties: Vec<String>,
     },
     /// Tear down a node property index across every replica. Mirrors
     /// `CreateIndex` — idempotent when the index doesn't exist.
     DropIndex {
         label: String,
-        property: String,
+        properties: Vec<String>,
     },
     /// Relationship-scope analogue of `CreateIndex`. Declares a
-    /// `(edge_type, property)` edge property index on every replica
-    /// and triggers a per-peer backfill against the local edge
-    /// catalog. Added as a new variant rather than reusing
+    /// `(edge_type, properties)` edge property index on every
+    /// replica and triggers a per-peer backfill against the local
+    /// edge catalog. Added as a new variant rather than reusing
     /// `CreateIndex` so pre-edge-index replicas can still replay a
-    /// Raft log written before this variant existed (node-only
-    /// entries remain untouched; edge entries are new).
+    /// Raft log written before this variant existed.
     CreateEdgeIndex {
         edge_type: String,
-        property: String,
+        properties: Vec<String>,
     },
     /// Tear down an edge property index across every replica.
     /// Mirrors `CreateEdgeIndex` — idempotent when the index doesn't
     /// exist.
     DropEdgeIndex {
         edge_type: String,
-        property: String,
+        properties: Vec<String>,
     },
     /// Declare a property constraint on every replica. Reaches every
     /// peer through the Raft log / routing-mode fan-out, so the

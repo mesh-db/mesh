@@ -329,25 +329,32 @@ message DetachDeleteNodeResponse {}
 
 message CreatePropertyIndexRequest {
   string label = 1;
+  // Legacy single-property field. New clients should populate
+  // `properties` instead; the server reads `properties` when
+  // non-empty, otherwise falls back to the single-property slot.
   string property = 2;
+  repeated string properties = 3;
 }
 message CreatePropertyIndexResponse {}
 
 message DropPropertyIndexRequest {
   string label = 1;
   string property = 2;
+  repeated string properties = 3;
 }
 message DropPropertyIndexResponse {}
 
 message CreateEdgePropertyIndexRequest {
   string edge_type = 1;
   string property = 2;
+  repeated string properties = 3;
 }
 message CreateEdgePropertyIndexResponse {}
 
 message DropEdgePropertyIndexRequest {
   string edge_type = 1;
   string property = 2;
+  repeated string properties = 3;
 }
 message DropEdgePropertyIndexResponse {}
 
