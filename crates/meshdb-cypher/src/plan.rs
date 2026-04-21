@@ -1626,6 +1626,81 @@ fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
     }
 }
 
+/// Columns a `CALL { ... }` subquery body publishes to the outer
+/// scope. `Some(names)` is an explicit RETURN item list (in order).
+/// `Some(vec![])` is a unit body with no RETURN (e.g.
+/// `CALL { CREATE (n) }` — legal, but contributes no new bindings).
+/// `None` means the body's projection is `RETURN *` or an untyped
+/// CALL without YIELD — the outer scope extension is skipped because
+/// the column set can't be derived from the AST alone.
+fn call_subquery_output_columns(stmt: &Statement) -> Result<Option<Vec<String>>> {
+    match stmt {
+        Statement::Match(m) => {
+            if m.terminal.star {
+                return Ok(None);
+            }
+            Ok(Some(
+                m.terminal
+                    .return_items
+                    .iter()
+                    .map(return_item_column_name)
+                    .collect(),
+            ))
+        }
+        Statement::Unwind(u) => {
+            if u.star {
+                return Ok(None);
+            }
+            Ok(Some(
+                u.return_items.iter().map(return_item_column_name).collect(),
+            ))
+        }
+        Statement::Return(r) => {
+            if r.star {
+                return Ok(None);
+            }
+            Ok(Some(
+                r.return_items.iter().map(return_item_column_name).collect(),
+            ))
+        }
+        Statement::Create(c) => {
+            if c.star {
+                return Ok(None);
+            }
+            Ok(Some(
+                c.return_items.iter().map(return_item_column_name).collect(),
+            ))
+        }
+        Statement::Union(u) => u
+            .branches
+            .first()
+            .map(call_subquery_output_columns)
+            .unwrap_or_else(|| Err(Error::Plan("empty nested UNION".into()))),
+        Statement::Explain(inner) | Statement::Profile(inner) => {
+            call_subquery_output_columns(inner)
+        }
+        Statement::CallProcedure(pc) => match &pc.yield_spec {
+            Some(crate::ast::YieldSpec::Items(items)) => Ok(Some(
+                items
+                    .iter()
+                    .map(|y| y.alias.clone().unwrap_or_else(|| y.column.clone()))
+                    .collect(),
+            )),
+            // `YIELD *` or missing YIELD — columns come from the
+            // procedure registry at execute time, not from the AST.
+            Some(crate::ast::YieldSpec::Star) | None => Ok(None),
+        },
+        Statement::CreateIndex(_)
+        | Statement::DropIndex(_)
+        | Statement::ShowIndexes
+        | Statement::CreateConstraint(_)
+        | Statement::DropConstraint(_)
+        | Statement::ShowConstraints => Err(Error::Plan(
+            "CALL { ... } body must be a read query; DDL is not allowed".into(),
+        )),
+    }
+}
+
 /// Canonical column name for a `RETURN` item. Uses the explicit
 /// alias when present, otherwise falls back to a stable rendering
 /// of the expression — matching what the executor's `ProjectOp`
@@ -3971,6 +4046,20 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     input: Box::new(current),
                     body: Box::new(body_plan),
                 });
+                // Publish the body's RETURN columns into the outer
+                // scope so a subsequent clause (or the terminal
+                // RETURN) can reference them. `None` means the body
+                // projected `RETURN *` — we don't derive names
+                // statically in that case, so the outer scope stays
+                // unchanged.
+                if let Some(cols) = call_subquery_output_columns(body_stmt)? {
+                    for name in cols {
+                        if bound_vars.contains_key(&name) {
+                            return Err(Error::Plan(format!("variable '{name}' already defined")));
+                        }
+                        bound_vars.insert(name, VarType::Scalar);
+                    }
+                }
             }
             ReadingClause::CallProcedure(pc) => {
                 // Embedded CALL — reaches this arm only when the

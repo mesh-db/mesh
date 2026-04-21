@@ -3340,13 +3340,7 @@ fn db_property_keys_includes_node_and_edge_keys() {
 
 // --- CALL { } subquery --------------------------------------------------
 
-// TODO: planner doesn't yet propagate a CALL subquery's RETURN
-// columns into the outer scope (see plan.rs:3517 — the
-// `LogicalPlan::CallSubquery` arm doesn't extend `bound_vars` with
-// the body's output bindings), so the outer RETURN can't reference
-// `total` / `friend` / `v`. Re-enable once that's wired up.
 #[test]
-#[ignore]
 fn call_subquery_uncorrelated() {
     let (store, _d) = open_store();
     run(&store, "CREATE (:Person {name: 'Ada'})");
@@ -3365,7 +3359,6 @@ fn call_subquery_uncorrelated() {
 }
 
 #[test]
-#[ignore] // see TODO on call_subquery_uncorrelated
 fn call_subquery_correlated_with_importing_with() {
     let (store, _d) = open_store();
     run(&store, "CREATE (:Person {name: 'Ada'})");
@@ -3406,7 +3399,6 @@ fn call_subquery_no_body_results_drops_outer_row() {
 }
 
 #[test]
-#[ignore] // see TODO on call_subquery_uncorrelated
 fn call_subquery_with_union_body() {
     let (store, _d) = open_store();
     run(&store, "CREATE (:A {name: 'x'})");
