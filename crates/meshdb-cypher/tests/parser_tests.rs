@@ -1681,7 +1681,7 @@ fn edge_seek_with_parameter_value_rewrites() {
 }
 
 #[test]
-fn edge_seek_rewrite_skipped_when_endpoint_has_label() {
+fn edge_seek_rewrite_wraps_endpoint_label_as_has_labels_filter() {
     let ctx = ctx_with_edge_index("KNOWS", "since");
     let p = plan_with(
         "MATCH (a:Person)-[r:KNOWS {since: 2020}]-(b) RETURN r",
@@ -1690,8 +1690,73 @@ fn edge_seek_rewrite_skipped_when_endpoint_has_label() {
     let LogicalPlan::Project { input, .. } = p else {
         panic!("expected Project");
     };
-    // Falls back to NodeScan + EdgeExpand; no EdgeSeek.
-    assert!(!matches!(*input, LogicalPlan::EdgeSeek { .. }));
+    // Widened rewrite: endpoint label lowers to `Filter(HasLabels(a))`
+    // wrapping the EdgeSeek.
+    let LogicalPlan::Filter {
+        input: seek,
+        predicate,
+    } = *input
+    else {
+        panic!("expected Filter wrapping EdgeSeek, got {input:?}");
+    };
+    assert!(matches!(*seek, LogicalPlan::EdgeSeek { .. }));
+    let Expr::HasLabels { expr, labels } = predicate else {
+        panic!("expected HasLabels predicate");
+    };
+    assert!(matches!(*expr, Expr::Identifier(ref v) if v == "a"));
+    assert_eq!(labels, vec!["Person".to_string()]);
+}
+
+#[test]
+fn edge_seek_rewrite_wraps_endpoint_pattern_properties() {
+    let ctx = ctx_with_edge_index("R", "k");
+    let p = plan_with("MATCH (a {name: 'Ada'})-[r:R {k: 1}]->(b) RETURN r", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    // Endpoint pattern property `{name: 'Ada'}` → `Filter(a.name = 'Ada')`.
+    let LogicalPlan::Filter {
+        input: seek,
+        predicate,
+    } = *input
+    else {
+        panic!("expected Filter wrapping EdgeSeek, got {input:?}");
+    };
+    assert!(matches!(*seek, LogicalPlan::EdgeSeek { .. }));
+    let Expr::Compare { op, left, .. } = predicate else {
+        panic!("expected Compare predicate");
+    };
+    assert!(matches!(op, CompareOp::Eq));
+    let Expr::Property { var, key } = *left else {
+        panic!("expected Property access");
+    };
+    assert_eq!(var, "a");
+    assert_eq!(key, "name");
+}
+
+#[test]
+fn edge_seek_rewrite_wraps_both_endpoints_with_filters() {
+    let ctx = ctx_with_edge_index("R", "k");
+    let p = plan_with("MATCH (a:P)-[r:R {k: 1}]->(b:Q) RETURN r", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    // Two endpoint labels produce two stacked Filters, which the
+    // post-plan index-seek rewrite pass then collapses into a
+    // single Filter with an AND predicate over EdgeSeek.
+    let LogicalPlan::Filter {
+        input: seek,
+        predicate,
+    } = *input
+    else {
+        panic!("expected Filter over EdgeSeek, got {input:?}");
+    };
+    assert!(matches!(*seek, LogicalPlan::EdgeSeek { .. }));
+    let Expr::And(left, right) = predicate else {
+        panic!("expected And predicate over two HasLabels, got non-And");
+    };
+    assert!(matches!(*left, Expr::HasLabels { .. }));
+    assert!(matches!(*right, Expr::HasLabels { .. }));
 }
 
 #[test]

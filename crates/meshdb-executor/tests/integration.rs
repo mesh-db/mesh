@@ -4194,10 +4194,10 @@ fn edge_seek_parameterized_value() {
 }
 
 #[test]
-fn edge_seek_falls_back_when_endpoint_has_label() {
-    // Endpoint labels disqualify the MVP rewrite — the planner must
-    // fall through to NodeScan + EdgeExpand and still return correct
-    // rows.
+fn edge_seek_with_labeled_endpoints_filters_via_has_labels_residual() {
+    // Endpoint labels now ride along as residual `HasLabels` filters
+    // over the seek output. Rows whose seek-hydrated endpoints don't
+    // carry the required labels drop; rows that do pass through.
     let (store, _d) = open_store();
     run(&store, "CREATE (:Person {name: 'Ada'})");
     run(&store, "CREATE (:Person {name: 'Bob'})");
@@ -4206,6 +4206,10 @@ fn edge_seek_falls_back_when_endpoint_has_label() {
         "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
          CREATE (a)-[:KNOWS {since: 2020}]->(b)",
     );
+    // A same-type edge between two non-Person nodes exercises the
+    // residual label filter — it must drop since the endpoints
+    // fail the label check.
+    run(&store, "CREATE (:Other)-[:KNOWS {since: 2020}]->(:Other)");
     run(&store, "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)");
 
     let rows = run_with_ctx(
@@ -4216,6 +4220,32 @@ fn edge_seek_falls_back_when_endpoint_has_label() {
     assert_eq!(rows.len(), 1);
     assert_eq!(str_prop(&rows[0], "s"), "Ada");
     assert_eq!(str_prop(&rows[0], "d"), "Bob");
+}
+
+#[test]
+fn edge_seek_with_endpoint_pattern_property_narrows() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {name: 'keep'})");
+    run(&store, "CREATE (:P {name: 'drop'})");
+    run(&store, "CREATE (:P {name: 'target'})");
+    run(
+        &store,
+        "MATCH (x:P {name: 'keep'}), (y:P {name: 'target'}) \
+         CREATE (x)-[:R {k: 1}]->(y)",
+    );
+    run(
+        &store,
+        "MATCH (x:P {name: 'drop'}), (y:P {name: 'target'}) \
+         CREATE (x)-[:R {k: 1}]->(y)",
+    );
+    run(&store, "CREATE INDEX FOR ()-[r:R]-() ON (r.k)");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (a {name: 'keep'})-[r:R {k: 1}]->(b) RETURN b.name AS n",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "n"), "target");
 }
 
 #[test]

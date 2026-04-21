@@ -2485,9 +2485,10 @@ fn plan_pattern(
 ///
 /// 1. Exactly one hop, no path variable, no `shortestPath`, no
 ///    variable-length relationship.
-/// 2. Both endpoints are fresh (not bound in an outer scope) and carry
-///    no labels or pattern-property equalities — the MVP rewrite
-///    doesn't emit residual node filters yet.
+/// 2. Neither endpoint is bound in an outer scope. Endpoint labels
+///    and pattern-property equalities are allowed — the rewrite
+///    wraps the seek in residual `HasLabels` / property-equality
+///    `Filter`s so the output still honours them.
 /// 3. The relationship has exactly one edge type, a fresh edge
 ///    variable (not pre-bound in an outer clause), and at least one
 ///    pattern-property equality matching a registered `(edge_type,
@@ -2495,8 +2496,9 @@ fn plan_pattern(
 ///
 /// `None` means "preconditions didn't match — fall back to the
 /// general `NodeScan + EdgeExpand` path". `Some(plan)` is the rewritten
-/// plan. Residual pattern-property equalities (non-indexed) ride along
-/// on the `EdgeSeek` as per-edge filters.
+/// plan. Residual edge-property equalities (non-indexed) ride along
+/// on the `EdgeSeek` as per-edge filters; endpoint residuals wrap
+/// the seek as a standard `Filter` stack.
 fn try_plan_edge_seek(
     pattern: &Pattern,
     pattern_idx: usize,
@@ -2514,19 +2516,16 @@ fn try_plan_edge_seek(
     if hop.rel.var_length.is_some() {
         return Ok(None);
     }
-    // Start endpoint must be label-less and property-less; if it
-    // has a name, that name must not be bound in an outer scope.
-    if !pattern.start.labels.is_empty() || !pattern.start.properties.is_empty() {
-        return Ok(None);
-    }
+    // Endpoints must not already be bound in an outer scope — the
+    // rewrite skips the cross-product handshake that rebind would
+    // normally go through. Labels and pattern properties are fine
+    // (we wrap them as residuals below), but an outer binding
+    // means the fresh-scan path needs to do more work than a bare
+    // seek can express.
     if let Some(v) = &pattern.start.var {
         if outer_bound_nodes.contains(v) {
             return Ok(None);
         }
-    }
-    // Target endpoint: same constraints.
-    if !hop.target.labels.is_empty() || !hop.target.properties.is_empty() {
-        return Ok(None);
     }
     if let Some(v) = &hop.target.var {
         if outer_bound_nodes.contains(v) {
@@ -2582,16 +2581,40 @@ fn try_plan_edge_seek(
         .filter(|(i, _)| *i != seek_idx)
         .map(|(_, p)| p.clone())
         .collect();
-    Ok(Some(LogicalPlan::EdgeSeek {
+    let mut plan = LogicalPlan::EdgeSeek {
         edge_var,
-        src_var,
-        dst_var,
+        src_var: src_var.clone(),
+        dst_var: dst_var.clone(),
         edge_type: edge_type.clone(),
         property: seek_key,
         value: seek_value,
         direction: hop.rel.direction,
         residual_properties,
-    }))
+    };
+    // Endpoint residuals. Apply labels first so a mis-labelled row
+    // drops before the per-property comparisons run.
+    plan = wrap_with_label_filter(plan, &src_var, &pattern.start.labels);
+    plan = wrap_with_label_filter(plan, &dst_var, &hop.target.labels);
+    plan = wrap_with_pattern_prop_filter(plan, &src_var, &pattern.start.properties);
+    plan = wrap_with_pattern_prop_filter(plan, &dst_var, &hop.target.properties);
+    Ok(Some(plan))
+}
+
+/// Wrap `plan` in a `Filter` that asserts the value bound to `var`
+/// has every label in `labels`. No-op when `labels` is empty. Used
+/// by the edge-seek rewrite to enforce `(a:Label)` endpoint
+/// constraints as a residual filter over the seek's output.
+fn wrap_with_label_filter(plan: LogicalPlan, var: &str, labels: &[String]) -> LogicalPlan {
+    if labels.is_empty() {
+        return plan;
+    }
+    LogicalPlan::Filter {
+        input: Box::new(plan),
+        predicate: Expr::HasLabels {
+            expr: Box::new(Expr::Identifier(var.to_string())),
+            labels: labels.to_vec(),
+        },
+    }
 }
 
 /// Same as [`plan_pattern`] but honours sets of edge / edge-list
