@@ -37,12 +37,16 @@ jobs:
 
       - name: Validate version
         env:
-          VERSION: ${{ inputs.version }}
+          RAW_VERSION: ${{ inputs.version }}
         run: |
+          # Accept the input with or without a leading 'v' so typing the
+          # tag name as it appears in `git tag` also works.
+          VERSION="${RAW_VERSION#v}"
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::'$VERSION' is not a valid semver."
+            echo "::error::'$RAW_VERSION' is not a valid semver."
             exit 1
           fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Configure git identity
         run: |
@@ -50,8 +54,6 @@ jobs:
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Bump workspace version
-        env:
-          VERSION: ${{ inputs.version }}
         run: |
           current=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -1)
           if [[ "$current" == "$VERSION" ]]; then
@@ -67,8 +69,6 @@ jobs:
           git push origin HEAD:main
 
       - name: Create and push tag
-        env:
-          VERSION: ${{ inputs.version }}
         run: |
           if git ls-remote --exit-code --tags origin "v$VERSION" >/dev/null 2>&1; then
             echo "Tag v$VERSION already exists on origin — skipping."
@@ -80,7 +80,6 @@ jobs:
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          VERSION: ${{ inputs.version }}
         run: |
           # Each later crate depends only on crates earlier in this list,
           # so crates.io propagation is in order. Update when adding or
@@ -114,7 +113,6 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
         run: |
           if gh release view "v$VERSION" >/dev/null 2>&1; then
             echo "GitHub release v$VERSION already exists — skipping."
