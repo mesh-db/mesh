@@ -769,13 +769,13 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
         LogicalPlan::IndexSeek {
             var,
             label,
-            property,
-            value,
+            properties,
+            values,
         } => Box::new(IndexSeekOp::new(
             var.clone(),
             label.clone(),
-            property.clone(),
-            value.clone(),
+            properties.clone(),
+            values.clone(),
         )),
         LogicalPlan::EdgeSeek {
             edge_var,
@@ -2358,19 +2358,24 @@ fn has_all_labels(node: &Node, labels: &[String]) -> bool {
 struct IndexSeekOp {
     var: String,
     label: String,
-    property: String,
-    value_expr: Expr,
+    properties: Vec<String>,
+    value_exprs: Vec<Expr>,
     results: Option<Vec<NodeId>>,
     cursor: usize,
 }
 
 impl IndexSeekOp {
-    fn new(var: String, label: String, property: String, value_expr: Expr) -> Self {
+    fn new(var: String, label: String, properties: Vec<String>, value_exprs: Vec<Expr>) -> Self {
+        assert_eq!(
+            properties.len(),
+            value_exprs.len(),
+            "IndexSeekOp: properties and values must have equal length"
+        );
         Self {
             var,
             label,
-            property,
-            value_expr,
+            properties,
+            value_exprs,
             results: None,
             cursor: 0,
         }
@@ -2381,21 +2386,26 @@ impl Operator for IndexSeekOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         if self.results.is_none() {
             let empty = Row::new();
-            let value = eval_expr(&self.value_expr, &ctx.eval_ctx(&empty))?;
-            let property = match value {
-                Value::Property(p) => p,
-                Value::Null => Property::Null,
-                Value::Node(_)
-                | Value::Edge(_)
-                | Value::List(_)
-                | Value::Map(_)
-                | Value::Path { .. } => {
-                    return Err(Error::InvalidSetValue);
-                }
-            };
+            let mut values: Vec<Property> = Vec::with_capacity(self.value_exprs.len());
+            for expr in &self.value_exprs {
+                let value = eval_expr(expr, &ctx.eval_ctx(&empty))?;
+                let property = match value {
+                    Value::Property(p) => p,
+                    Value::Null => Property::Null,
+                    Value::Node(_)
+                    | Value::Edge(_)
+                    | Value::List(_)
+                    | Value::Map(_)
+                    | Value::Path { .. } => {
+                        return Err(Error::InvalidSetValue);
+                    }
+                };
+                values.push(property);
+            }
+            let prop_refs: Vec<&str> = self.properties.iter().map(String::as_str).collect();
             let ids = ctx
                 .store
-                .nodes_by_property(&self.label, &self.property, &property)?;
+                .nodes_by_properties(&self.label, &prop_refs, &values)?;
             self.results = Some(ids);
         }
         let ids = self.results.as_ref().unwrap();

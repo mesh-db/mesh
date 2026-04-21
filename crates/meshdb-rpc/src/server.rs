@@ -294,13 +294,13 @@ impl MeshService {
                 .store
                 .list_property_indexes()
                 .into_iter()
-                .map(|mut s| (s.label, s.properties.remove(0)))
+                .map(|s| (s.label, s.properties))
                 .collect(),
             edge_indexes: self
                 .store
                 .list_edge_property_indexes()
                 .into_iter()
-                .map(|mut s| (s.edge_type, s.properties.remove(0)))
+                .map(|s| (s.edge_type, s.properties))
                 .collect(),
         };
         let plan =

@@ -33,16 +33,20 @@ enum VarType {
 /// fields as new optimizations need catalog data.
 #[derive(Debug, Default, Clone)]
 pub struct PlannerContext {
-    /// `(label, property)` pairs corresponding to active property
-    /// indexes in the backing store. Stored as a flat Vec rather than
-    /// a HashMap because N is small (single digits in practice) and
-    /// iterating a Vec is faster than hashing for that size.
-    pub indexes: Vec<(String, String)>,
-    /// `(edge_type, property)` pairs corresponding to active
+    /// `(label, properties)` pairs corresponding to active property
+    /// indexes in the backing store. `properties` is a `Vec<String>`
+    /// so single-property and composite indexes share one shape.
+    /// Stored as a flat Vec rather than a HashMap because N is small
+    /// (single digits in practice) and iterating a Vec is faster than
+    /// hashing for that size.
+    pub indexes: Vec<(String, Vec<String>)>,
+    /// `(edge_type, properties)` pairs corresponding to active
     /// relationship-scope property indexes. Relationship analogue of
-    /// `indexes`. Stored with the same flat-Vec shape for the same
-    /// reasons. Consumed by the unbound-endpoints `EdgeSeek` rewrite.
-    pub edge_indexes: Vec<(String, String)>,
+    /// `indexes`. Consumed by the unbound-endpoints `EdgeSeek`
+    /// rewrite. The rewrite currently treats edge indexes as
+    /// single-property on the seek key; composite edge seeks are a
+    /// follow-up.
+    pub edge_indexes: Vec<(String, Vec<String>)>,
     /// Variables bound in an enclosing query scope. Populated when
     /// planning the body of an `exists { ... }` / `count { ... }`
     /// subquery so that a first-clause `MATCH (n)-->(m)` where `n`
@@ -60,16 +64,70 @@ pub enum OuterBindingKind {
 }
 
 impl PlannerContext {
+    /// True when a single-property index exists on `(label, property)`.
+    /// Kept for callers that still dispatch on "there is *an* index on
+    /// this single property". Composite-aware callers should use
+    /// [`PlannerContext::best_index_prefix`] instead.
     pub fn has_index(&self, label: &str, property: &str) -> bool {
         self.indexes
             .iter()
-            .any(|(l, p)| l == label && p == property)
+            .any(|(l, props)| l == label && props.len() == 1 && props[0] == property)
     }
 
+    /// True when a single-property edge index exists on
+    /// `(edge_type, property)`. See [`PlannerContext::has_index`] for
+    /// the composite-aware equivalent.
     pub fn has_edge_index(&self, edge_type: &str, property: &str) -> bool {
         self.edge_indexes
             .iter()
-            .any(|(t, p)| t == edge_type && p == property)
+            .any(|(t, props)| t == edge_type && props.len() == 1 && props[0] == property)
+    }
+
+    /// Pick the best composite index on `label` covered by the equality
+    /// set `available`. Returns the matched index's properties in order
+    /// (a *prefix* of the index's declared property list), or `None`
+    /// when no index has even a one-property prefix covered by
+    /// `available`.
+    ///
+    /// Scoring: longest matched prefix wins; ties broken by total
+    /// index length (prefer the more specific index so single-property
+    /// calls keep using the dedicated single-property index). The
+    /// returned prefix determines which properties the seek consumes;
+    /// every remaining equality in `available` becomes a residual
+    /// filter the caller wraps around the seek.
+    pub fn best_index_prefix(&self, label: &str, available: &[String]) -> Option<Vec<String>> {
+        let avail: std::collections::HashSet<&str> = available.iter().map(String::as_str).collect();
+        let mut best: Option<Vec<String>> = None;
+        let mut best_idx_len = 0;
+        for (idx_label, idx_props) in &self.indexes {
+            if idx_label != label {
+                continue;
+            }
+            let mut prefix: Vec<String> = Vec::new();
+            for p in idx_props {
+                if avail.contains(p.as_str()) {
+                    prefix.push(p.clone());
+                } else {
+                    break;
+                }
+            }
+            if prefix.is_empty() {
+                continue;
+            }
+            let cand_len = prefix.len();
+            let update = match &best {
+                None => true,
+                Some(current) => {
+                    cand_len > current.len()
+                        || (cand_len == current.len() && idx_props.len() > best_idx_len)
+                }
+            };
+            if update {
+                best = Some(prefix);
+                best_idx_len = idx_props.len();
+            }
+        }
+        best
     }
 }
 
@@ -417,18 +475,21 @@ pub enum LogicalPlan {
         var: String,
         expr: Expr,
     },
-    /// Equality lookup through a property index. The executor evaluates
-    /// `value` (which may be a literal or a parameter) at run time,
-    /// converts it to a concrete [`meshdb_core::Property`], then calls
-    /// `reader.nodes_by_property(label, property, value)`. Emitted
-    /// only when the planner context confirms the `(label, property)`
-    /// index exists; otherwise the planner falls back to a
-    /// `NodeScanByLabels` + `Filter`.
+    /// Equality lookup through a property index. The executor
+    /// evaluates each `value` (literals or parameters) at run time,
+    /// converts to concrete [`meshdb_core::Property`]s, then calls
+    /// `reader.nodes_by_properties(label, properties, values)`.
+    /// `properties` / `values` are parallel slices of equal length —
+    /// length 1 is the classic single-property seek; length > 1 is a
+    /// composite seek whose tuple must match the stored index's
+    /// declared prefix in the same order. Emitted only when the
+    /// planner context confirms a matching index exists; otherwise
+    /// the planner falls back to `NodeScanByLabels` + `Filter`.
     IndexSeek {
         var: String,
         label: String,
-        property: String,
-        value: Expr,
+        properties: Vec<String>,
+        values: Vec<Expr>,
     },
     /// Equality lookup through an edge property index. Relationship
     /// analogue of [`LogicalPlan::IndexSeek`]. Emitted for
@@ -961,10 +1022,13 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         LogicalPlan::IndexSeek {
             var,
             label,
-            property,
+            properties,
             ..
         } => {
-            buf.push_str(&format!("{indent}IndexSeek({var}:{label}.{property})\n"));
+            buf.push_str(&format!(
+                "{indent}IndexSeek({var}:{label}.{})\n",
+                properties.join(",")
+            ));
         }
         LogicalPlan::EdgeSeek {
             edge_var,
@@ -1388,7 +1452,12 @@ where
             }
             walk_plan_exprs(input, visit)
         }
-        LogicalPlan::IndexSeek { value, .. } => visit(value),
+        LogicalPlan::IndexSeek { values, .. } => {
+            for v in values {
+                visit(v)?;
+            }
+            Ok(())
+        }
         LogicalPlan::EdgeSeek {
             value,
             residual_properties,
@@ -3246,16 +3315,16 @@ fn chain_hops_with_bound(
 }
 
 /// Decide how to scan the start node of a pattern. When the node has
-/// exactly one label and at least one pattern property covered by a
-/// registered index, emit [`LogicalPlan::IndexSeek`] for that property
-/// and return the rest as a residual filter. Otherwise fall back to
-/// the existing `NodeScanAll` / `NodeScanByLabels` path with all
-/// pattern properties as residuals.
+/// exactly one label and a registered index on that label covers a
+/// prefix of the pattern's properties, emit [`LogicalPlan::IndexSeek`]
+/// on that prefix. Everything left over becomes a residual filter
+/// the caller wraps around the seek. Otherwise fall back to the
+/// `NodeScanAll` / `NodeScanByLabels` path.
 ///
-/// Only the *first* covered property is picked — a node pattern with
-/// two indexed properties uses the first one as the seek key and the
-/// second as a residual filter. Richer multi-predicate seek costing
-/// can replace this later without changing the IndexSeek variant.
+/// Prefix matching (not "any covered property") is what makes a
+/// composite index `(a, b, c)` usable for patterns that bind `a`
+/// alone or `(a, b)`; patterns that bind only `b` / `c` don't hit
+/// this index. See [`PlannerContext::best_index_prefix`].
 fn plan_start_node(
     var: &str,
     labels: &[String],
@@ -3264,20 +3333,38 @@ fn plan_start_node(
 ) -> (LogicalPlan, Vec<(String, Expr)>) {
     if labels.len() == 1 && !properties.is_empty() {
         let label = &labels[0];
-        if let Some(seek_idx) = properties.iter().position(|(k, _)| ctx.has_index(label, k)) {
-            let (key, value_expr) = &properties[seek_idx];
+        let available: Vec<String> = properties.iter().map(|(k, _)| k.clone()).collect();
+        if let Some(prefix) = ctx.best_index_prefix(label, &available) {
+            // Materialize the seek keys / values in index order so the
+            // tuple lines up with the stored key. Properties not in
+            // the prefix ride along as residuals — wrapped as a
+            // pattern-property filter by the caller.
+            let mut seek_props: Vec<String> = Vec::with_capacity(prefix.len());
+            let mut seek_values: Vec<Expr> = Vec::with_capacity(prefix.len());
+            let mut residual: Vec<(String, Expr)> = Vec::new();
+            let prefix_set: std::collections::HashSet<&str> =
+                prefix.iter().map(String::as_str).collect();
+            for (k, v) in properties {
+                if prefix_set.contains(k.as_str()) {
+                    // Push in prefix order below, not in pattern order.
+                    continue;
+                }
+                residual.push((k.clone(), v.clone()));
+            }
+            for p in &prefix {
+                let (_, value_expr) = properties
+                    .iter()
+                    .find(|(k, _)| k == p)
+                    .expect("prefix came from the property list");
+                seek_props.push(p.clone());
+                seek_values.push(value_expr.clone());
+            }
             let seek = LogicalPlan::IndexSeek {
                 var: var.to_string(),
                 label: label.clone(),
-                property: key.clone(),
-                value: value_expr.clone(),
+                properties: seek_props,
+                values: seek_values,
             };
-            let residual: Vec<(String, Expr)> = properties
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != seek_idx)
-                .map(|(_, kv)| kv.clone())
-                .collect();
             return (seek, residual);
         }
     }
@@ -3365,29 +3452,86 @@ fn optimize_filter_chain_to_index_seek(plan: LogicalPlan, ctx: &PlannerContext) 
         _ => return rebuild_filter_chain(current, conjuncts),
     };
 
-    let seek_idx = conjuncts
-        .iter()
-        .position(|c| extract_indexed_eq(c, &scan_var, &scan_label, ctx).is_some());
-    let Some(seek_idx) = seek_idx else {
+    // Classify conjuncts: those that are row-independent
+    // `scan_var.prop = value` equalities go into `eq_map` keyed by
+    // property; everything else (including duplicate equalities on
+    // the same property — only the first one is usable as a seek key)
+    // stays in `residual_idxs` as filter material.
+    let mut eq_map: std::collections::HashMap<String, (usize, Expr)> =
+        std::collections::HashMap::new();
+    let mut residual_idxs: Vec<usize> = Vec::new();
+    for (i, c) in conjuncts.iter().enumerate() {
+        match extract_property_eq(c, &scan_var) {
+            Some((key, value)) if !eq_map.contains_key(&key) => {
+                eq_map.insert(key, (i, value));
+            }
+            _ => residual_idxs.push(i),
+        }
+    }
+
+    let available: Vec<String> = eq_map.keys().cloned().collect();
+    let Some(prefix) = ctx.best_index_prefix(&scan_label, &available) else {
         return rebuild_filter_chain(current, conjuncts);
     };
-    let (seek_key, seek_value) =
-        extract_indexed_eq(&conjuncts[seek_idx], &scan_var, &scan_label, ctx)
-            .expect("position above just confirmed match");
+
+    // Pull seek keys + values in prefix order. Every prefix entry
+    // was proven to be in `eq_map` by `best_index_prefix`.
+    let mut seek_props: Vec<String> = Vec::with_capacity(prefix.len());
+    let mut seek_values: Vec<Expr> = Vec::with_capacity(prefix.len());
+    let mut consumed_idxs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for p in &prefix {
+        let (idx, value) = eq_map
+            .remove(p)
+            .expect("best_index_prefix returned a property not in eq_map");
+        consumed_idxs.insert(idx);
+        seek_props.push(p.clone());
+        seek_values.push(value);
+    }
+    // Equalities on non-prefix properties go back into residual.
+    for (_, (idx, _)) in eq_map {
+        residual_idxs.push(idx);
+    }
+    residual_idxs.sort_unstable();
 
     let seek = LogicalPlan::IndexSeek {
         var: scan_var,
         label: scan_label,
-        property: seek_key,
-        value: seek_value,
+        properties: seek_props,
+        values: seek_values,
     };
     let residual: Vec<Expr> = conjuncts
         .into_iter()
         .enumerate()
-        .filter(|(i, _)| *i != seek_idx)
+        .filter(|(i, _)| !consumed_idxs.contains(i))
         .map(|(_, c)| c)
         .collect();
     rebuild_filter_chain(seek, residual)
+}
+
+/// Extract `(key, value)` from a conjunct that's a row-independent
+/// equality on `scan_var.key`, in either argument order. `None` for
+/// anything else — that includes equalities whose value side isn't
+/// row-independent (e.g. references another variable) and non-`Eq`
+/// comparisons. Index lookup is equality-only.
+fn extract_property_eq(c: &Expr, scan_var: &str) -> Option<(String, Expr)> {
+    use crate::ast::CompareOp;
+    let Expr::Compare { op, left, right } = c else {
+        return None;
+    };
+    if *op != CompareOp::Eq {
+        return None;
+    }
+    if let Some((key, value)) = match_property_eq(left, right, scan_var) {
+        if expr_is_row_independent(&value) {
+            return Some((key, value));
+        }
+    }
+    if let Some((key, value)) = match_property_eq(right, left, scan_var) {
+        if expr_is_row_independent(&value) {
+            return Some((key, value));
+        }
+    }
+    None
 }
 
 /// Decompose `e` into a flat list of conjuncts. `Expr::And` is
@@ -3436,32 +3580,6 @@ fn rebuild_filter_chain(leaf: LogicalPlan, mut conjuncts: Vec<Expr>) -> LogicalP
 /// parameter — anything else (e.g., `n.name = m.name`) can't be
 /// hoisted into a seek because the value isn't known when the
 /// scan starts.
-fn extract_indexed_eq(
-    c: &Expr,
-    scan_var: &str,
-    scan_label: &str,
-    ctx: &PlannerContext,
-) -> Option<(String, Expr)> {
-    use crate::ast::CompareOp;
-    let Expr::Compare { op, left, right } = c else {
-        return None;
-    };
-    if *op != CompareOp::Eq {
-        return None;
-    }
-    if let Some((key, value)) = match_property_eq(left, right, scan_var) {
-        if ctx.has_index(scan_label, &key) && expr_is_row_independent(&value) {
-            return Some((key, value));
-        }
-    }
-    if let Some((key, value)) = match_property_eq(right, left, scan_var) {
-        if ctx.has_index(scan_label, &key) && expr_is_row_independent(&value) {
-            return Some((key, value));
-        }
-    }
-    None
-}
-
 fn match_property_eq(maybe_prop: &Expr, value: &Expr, scan_var: &str) -> Option<(String, Expr)> {
     if let Expr::Property { var, key } = maybe_prop {
         if var == scan_var {

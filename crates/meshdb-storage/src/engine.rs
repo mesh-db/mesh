@@ -278,6 +278,17 @@ pub trait StorageEngine: Send + Sync {
         property: &str,
         value: &Property,
     ) -> Result<Vec<NodeId>>;
+    /// Composite form of [`Self::nodes_by_property`]. `properties`
+    /// and `values` are parallel slices of equal length — the tuple
+    /// must match an equivalent stored index entry. Single-property
+    /// callers should use [`Self::nodes_by_property`] which delegates
+    /// here with length-1 slices.
+    fn nodes_by_properties(
+        &self,
+        label: &str,
+        properties: &[&str],
+        values: &[Property],
+    ) -> Result<Vec<NodeId>>;
 
     /// Equality lookup through an edge property index. Mirrors
     /// [`StorageEngine::nodes_by_property`] for the relationship side.

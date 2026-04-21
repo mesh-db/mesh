@@ -3900,12 +3900,12 @@ fn run_with_ctx(store: &Store, q: &str) -> Vec<Row> {
         indexes: store
             .list_property_indexes()
             .into_iter()
-            .map(|mut s| (s.label, s.properties.remove(0)))
+            .map(|s| (s.label, s.properties))
             .collect(),
         edge_indexes: store
             .list_edge_property_indexes()
             .into_iter()
-            .map(|mut s| (s.edge_type, s.properties.remove(0)))
+            .map(|s| (s.edge_type, s.properties))
             .collect(),
     };
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
@@ -3928,12 +3928,12 @@ fn run_with_ctx_params(store: &Store, q: &str, params: &ParamMap) -> Vec<Row> {
         indexes: store
             .list_property_indexes()
             .into_iter()
-            .map(|mut s| (s.label, s.properties.remove(0)))
+            .map(|s| (s.label, s.properties))
             .collect(),
         edge_indexes: store
             .list_edge_property_indexes()
             .into_iter()
-            .map(|mut s| (s.edge_type, s.properties.remove(0)))
+            .map(|s| (s.edge_type, s.properties))
             .collect(),
     };
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
@@ -4297,6 +4297,59 @@ fn composite_create_index_end_to_end_and_show_indexes() {
     run(&store, "DROP INDEX FOR (n:P) ON (n.first, n.last)");
     let shown_after = run(&store, "SHOW INDEXES");
     assert!(shown_after.is_empty());
+}
+
+#[test]
+fn composite_index_seek_returns_matching_tuple_row() {
+    // Composite index seek through the full planner → executor
+    // pipeline. Only the node whose (first, last) tuple matches
+    // both pattern equalities surfaces.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {first: 'Ada', last: 'Lovelace'})");
+    run(&store, "CREATE (:P {first: 'Ada', last: 'Smith'})");
+    run(&store, "CREATE (:P {first: 'Bob', last: 'Lovelace'})");
+    run(&store, "CREATE INDEX FOR (n:P) ON (n.first, n.last)");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (n:P {first: 'Ada', last: 'Lovelace'}) RETURN n.first AS f, n.last AS l",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "f"), "Ada");
+    assert_eq!(str_prop(&rows[0], "l"), "Lovelace");
+}
+
+#[test]
+fn composite_index_prefix_seek_returns_all_prefix_matches() {
+    // Query binds only the first property of a (first, last) composite.
+    // Seeks the prefix; both "Ada" rows come back regardless of last.
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {first: 'Ada', last: 'Lovelace'})");
+    run(&store, "CREATE (:P {first: 'Ada', last: 'Smith'})");
+    run(&store, "CREATE (:P {first: 'Bob', last: 'Lovelace'})");
+    run(&store, "CREATE INDEX FOR (n:P) ON (n.first, n.last)");
+
+    let rows = run_with_ctx(&store, "MATCH (n:P {first: 'Ada'}) RETURN n.last AS l");
+    assert_eq!(rows.len(), 2);
+    let mut lasts: Vec<String> = rows.iter().map(|r| str_prop(r, "l").to_string()).collect();
+    lasts.sort();
+    assert_eq!(lasts, vec!["Lovelace".to_string(), "Smith".to_string()]);
+}
+
+#[test]
+fn composite_index_where_form_seeks_correctly() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:P {first: 'Ada', last: 'Lovelace'})");
+    run(&store, "CREATE (:P {first: 'Bob', last: 'Smith'})");
+    run(&store, "CREATE INDEX FOR (n:P) ON (n.first, n.last)");
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (n:P) WHERE n.first = 'Ada' AND n.last = 'Lovelace' \
+         RETURN n.first AS f",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "f"), "Ada");
 }
 
 #[test]

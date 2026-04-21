@@ -177,14 +177,16 @@ pub(crate) fn encode_index_tuple(
     Some(values)
 }
 
-/// Full key format for a property-index entry:
+/// Full key format for a property-index entry. Property names and
+/// values interleave so a partial-tuple value-prefix is a real byte
+/// prefix of the full key:
 ///
-///   `[label_len:u16][label]([prop_len:u16][prop])^N([value_len:u32][value])^N[node_id:16]`
+///   `[label_len:u16][label]([prop_len:u16][prop][value_len:u32][value])^N[node_id:16]`
 ///
-/// Length-1 `prop_keys` / `value_bytes_list` encodes byte-identically
-/// to the pre-composite layout, so existing on-disk entries survive
-/// the upgrade. The label + property-list prefix lets `nodes_by_properties`
-/// seek the matching tuple in a single scan.
+/// Length-1 inputs produce byte-identical output to the
+/// pre-composite layout. Partial-prefix seeks (a length-K prefix of
+/// a length-N index) use `property_index_composite_value_prefix`
+/// against the same interleaved encoding.
 pub(crate) fn property_index_composite_key(
     label: &str,
     prop_keys: &[&str],
@@ -203,13 +205,6 @@ pub(crate) fn property_index_composite_value_prefix(
     value_bytes_list: &[&[u8]],
 ) -> Vec<u8> {
     build_property_index_composite_value_prefix(label, prop_keys, value_bytes_list)
-}
-
-/// Prefix covering every entry for a specific `(label, properties)`
-/// index across all values. Used by `drop_property_index_composite`
-/// to sweep the CF.
-pub(crate) fn property_index_composite_name_prefix(label: &str, prop_keys: &[&str]) -> Vec<u8> {
-    build_property_index_composite_name_prefix(label, prop_keys)
 }
 
 /// Type tags for constraint-kind encoding in `CF_CONSTRAINT_META`.
@@ -426,23 +421,27 @@ fn read_len_prefixed_string(cf: &'static str, bytes: &[u8], cursor: &mut usize) 
     Ok(s)
 }
 
-/// Extract the trailing node id from a property-index key whose
-/// prefix length (label+prop+value) is already known. Used by the
-/// `nodes_by_property` scan path.
+/// Extract the trailing node id from a property-index key. The id
+/// is always the last `ID_LEN` bytes regardless of how much of the
+/// key the matching prefix consumed — a partial-prefix seek on a
+/// composite index leaves extra `[prop][value]` pairs between the
+/// seek prefix and the id, and the tail-based extraction handles
+/// that naturally. `prefix_len` is retained in the error path so
+/// callers can still report the expected shape when a stored key
+/// is too short to contain an id at all.
 pub(crate) fn node_id_from_property_index_key(
     key: &[u8],
     prefix_len: usize,
 ) -> Result<[u8; ID_LEN]> {
-    let expected = prefix_len + ID_LEN;
-    if key.len() != expected {
+    if key.len() < prefix_len + ID_LEN {
         return Err(Error::CorruptBytes {
             cf: "property_index",
-            expected,
+            expected: prefix_len + ID_LEN,
             actual: key.len(),
         });
     }
     let mut bytes = [0u8; ID_LEN];
-    bytes.copy_from_slice(&key[prefix_len..]);
+    bytes.copy_from_slice(&key[key.len() - ID_LEN..]);
     Ok(bytes)
 }
 
@@ -466,41 +465,37 @@ pub(crate) fn edge_property_index_composite_value_prefix(
     build_property_index_composite_value_prefix(edge_type, prop_keys, value_bytes_list)
 }
 
-pub(crate) fn edge_property_index_composite_name_prefix(
-    edge_type: &str,
-    prop_keys: &[&str],
-) -> Vec<u8> {
-    build_property_index_composite_name_prefix(edge_type, prop_keys)
-}
-
 /// Extract the trailing edge id from an edge-property-index key whose
 /// prefix length is already known. Mirror of
 /// [`node_id_from_property_index_key`] for the relationship side.
+/// Uses the same tail-based extraction so partial-prefix seeks work
+/// for composite edge indexes (once the edge-scoped planner learns
+/// to emit them).
 pub(crate) fn edge_id_from_property_index_key(
     key: &[u8],
     prefix_len: usize,
 ) -> Result<[u8; ID_LEN]> {
-    let expected = prefix_len + ID_LEN;
-    if key.len() != expected {
+    if key.len() < prefix_len + ID_LEN {
         return Err(Error::CorruptBytes {
             cf: "edge_property_index",
-            expected,
+            expected: prefix_len + ID_LEN,
             actual: key.len(),
         });
     }
     let mut bytes = [0u8; ID_LEN];
-    bytes.copy_from_slice(&key[prefix_len..]);
+    bytes.copy_from_slice(&key[key.len() - ID_LEN..]);
     Ok(bytes)
 }
 
 /// Composite key layout used by both node and edge property
-/// indexes:
+/// indexes. Property names and values interleave so a partial-tuple
+/// value-prefix is a real byte prefix of the full key:
 ///
-///   `[name_len:u16][name]([prop_len:u16][prop])^N([value_len:u32][value])^N[id]`
+///   `[name_len:u16][name]([prop_len:u16][prop][value_len:u32][value])^N[id]`
 ///
 /// Length-1 inputs produce byte-identical output to the
-/// single-property form, so existing on-disk entries round-trip
-/// through this function unchanged.
+/// pre-composite layout — the interleaved form is equivalent to
+/// the old `[name][prop][value][id]` when N=1.
 fn build_property_index_composite_key(
     name: &str,
     prop_keys: &[&str],
@@ -527,13 +522,11 @@ fn build_property_index_composite_key(
     );
     key.extend_from_slice(&name_len.to_be_bytes());
     key.extend_from_slice(name_bytes);
-    for prop in prop_keys {
+    for (prop, value) in prop_keys.iter().zip(value_bytes_list.iter()) {
         let prop_bytes = prop.as_bytes();
         let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
         key.extend_from_slice(&prop_len.to_be_bytes());
         key.extend_from_slice(prop_bytes);
-    }
-    for value in value_bytes_list {
         let value_len = u32::try_from(value.len()).expect("value length fits in u32");
         key.extend_from_slice(&value_len.to_be_bytes());
         key.extend_from_slice(value);
@@ -542,6 +535,11 @@ fn build_property_index_composite_key(
     key
 }
 
+/// Prefix selecting every index entry that matches
+/// `[name][prop1][val1]...[propK][valK]` where `K` equals the input
+/// slice lengths. A length-K prefix of a composite index's property
+/// list is a real byte prefix of the full key, so partial-tuple
+/// seeks use this directly with `iterator_cf(From(prefix, Forward))`.
 fn build_property_index_composite_value_prefix(
     name: &str,
     prop_keys: &[&str],
@@ -562,13 +560,11 @@ fn build_property_index_composite_value_prefix(
     );
     key.extend_from_slice(&name_len.to_be_bytes());
     key.extend_from_slice(name_bytes);
-    for prop in prop_keys {
+    for (prop, value) in prop_keys.iter().zip(value_bytes_list.iter()) {
         let prop_bytes = prop.as_bytes();
         let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
         key.extend_from_slice(&prop_len.to_be_bytes());
         key.extend_from_slice(prop_bytes);
-    }
-    for value in value_bytes_list {
         let value_len = u32::try_from(value.len()).expect("value length fits in u32");
         key.extend_from_slice(&value_len.to_be_bytes());
         key.extend_from_slice(value);
@@ -576,20 +572,69 @@ fn build_property_index_composite_value_prefix(
     key
 }
 
-fn build_property_index_composite_name_prefix(name: &str, prop_keys: &[&str]) -> Vec<u8> {
+/// Prefix covering every property-index entry scoped to `name`
+/// (label for node indexes, edge type for edge indexes), across all
+/// properties and values. Used by `DROP INDEX` to sweep every entry
+/// whose parsed spec matches — with the interleaved key layout a
+/// single-property name-prefix like `[name][prop1]` could collide
+/// with composite indexes whose first property is `prop1`, so DROP
+/// iterates the broader `[name]` prefix and filters by spec.
+pub(crate) fn property_index_label_prefix(name: &str) -> Vec<u8> {
     let name_bytes = name.as_bytes();
     let name_len = u16::try_from(name_bytes.len()).expect("label/type length fits in u16");
-    let props_total: usize = prop_keys.iter().map(|p| p.len()).sum();
-    let mut key = Vec::with_capacity(
-        LEN_PREFIX + name_bytes.len() + LEN_PREFIX * prop_keys.len() + props_total,
-    );
+    let mut key = Vec::with_capacity(LEN_PREFIX + name_bytes.len());
     key.extend_from_slice(&name_len.to_be_bytes());
     key.extend_from_slice(name_bytes);
-    for prop in prop_keys {
-        let prop_bytes = prop.as_bytes();
-        let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
-        key.extend_from_slice(&prop_len.to_be_bytes());
-        key.extend_from_slice(prop_bytes);
-    }
     key
+}
+
+/// Parse the property-name sequence from an index-CF entry so
+/// callers can decide whether the entry was produced by a given
+/// spec. Returns `Some(props)` when the key decodes cleanly, or
+/// `None` when the bytes don't look like a well-formed entry —
+/// the DROP path treats undecodable entries as "not my spec" and
+/// leaves them alone rather than aborting.
+pub(crate) fn parse_property_index_entry_props(key: &[u8]) -> Option<Vec<String>> {
+    if key.len() < LEN_PREFIX + ID_LEN {
+        return None;
+    }
+    let name_len = u16::from_be_bytes([key[0], key[1]]) as usize;
+    let mut cursor = LEN_PREFIX + name_len;
+    if cursor + ID_LEN > key.len() {
+        return None;
+    }
+    let payload_end = key.len() - ID_LEN;
+    let mut props: Vec<String> = Vec::new();
+    while cursor < payload_end {
+        if cursor + LEN_PREFIX > payload_end {
+            return None;
+        }
+        let prop_len = u16::from_be_bytes([key[cursor], key[cursor + 1]]) as usize;
+        cursor += LEN_PREFIX;
+        if cursor + prop_len > payload_end {
+            return None;
+        }
+        let prop = std::str::from_utf8(&key[cursor..cursor + prop_len]).ok()?;
+        props.push(prop.to_string());
+        cursor += prop_len;
+        // Skip over the value segment: [value_len:u32][value_bytes].
+        if cursor + 4 > payload_end {
+            return None;
+        }
+        let value_len = u32::from_be_bytes([
+            key[cursor],
+            key[cursor + 1],
+            key[cursor + 2],
+            key[cursor + 3],
+        ]) as usize;
+        cursor += 4;
+        if cursor + value_len > payload_end {
+            return None;
+        }
+        cursor += value_len;
+    }
+    if cursor != payload_end {
+        return None;
+    }
+    Some(props)
 }

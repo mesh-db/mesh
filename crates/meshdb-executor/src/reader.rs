@@ -31,6 +31,25 @@ pub trait GraphReader: Send + Sync {
         property: &str,
         value: &Property,
     ) -> Result<Vec<NodeId>>;
+    /// Composite form of [`Self::nodes_by_property`]. `properties`
+    /// and `values` are parallel slices of equal length — every
+    /// slot must be present for the call to land a match. The
+    /// default impl delegates to `nodes_by_property` for length-1
+    /// slices and returns empty otherwise, so readers that haven't
+    /// wired a native composite seek degrade to no-results rather
+    /// than mis-answering. The storage-backed blanket overrides
+    /// with a real composite lookup.
+    fn nodes_by_properties(
+        &self,
+        label: &str,
+        properties: &[&str],
+        values: &[Property],
+    ) -> Result<Vec<NodeId>> {
+        if properties.len() == 1 && values.len() == 1 {
+            return self.nodes_by_property(label, properties[0], &values[0]);
+        }
+        Ok(Vec::new())
+    }
     /// Relationship-scope analogue of [`Self::nodes_by_property`].
     /// The planner only emits an `EdgeSeek` after confirming a
     /// `(edge_type, property)` index is registered via
@@ -107,6 +126,17 @@ impl<T: StorageEngine> GraphReader for T {
     ) -> Result<Vec<NodeId>> {
         Ok(StorageEngine::nodes_by_property(
             self, label, property, value,
+        )?)
+    }
+
+    fn nodes_by_properties(
+        &self,
+        label: &str,
+        properties: &[&str],
+        values: &[Property],
+    ) -> Result<Vec<NodeId>> {
+        Ok(StorageEngine::nodes_by_properties(
+            self, label, properties, values,
         )?)
     }
 

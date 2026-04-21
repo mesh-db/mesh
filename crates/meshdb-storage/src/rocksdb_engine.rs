@@ -20,11 +20,11 @@ use crate::{
     keys::{
         adj_key, constraint_meta_decode, constraint_meta_encode, edge_from_adj_key,
         edge_id_from_property_index_key, edge_property_index_composite_key,
-        edge_property_index_composite_name_prefix, edge_property_index_composite_value_prefix,
-        encode_index_tuple, encode_index_value, id_from_str_index_key, label_index_key,
-        label_index_prefix, node_from_adj_value, node_id_from_property_index_key,
-        property_index_composite_key, property_index_composite_name_prefix,
-        property_index_composite_value_prefix, type_index_key, type_index_prefix, ID_LEN,
+        edge_property_index_composite_value_prefix, encode_index_tuple, encode_index_value,
+        id_from_str_index_key, label_index_key, label_index_prefix, node_from_adj_value,
+        node_id_from_property_index_key, parse_property_index_entry_props,
+        property_index_composite_key, property_index_composite_value_prefix,
+        property_index_label_prefix, type_index_key, type_index_prefix, ID_LEN,
     },
 };
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
@@ -1226,16 +1226,30 @@ impl RocksDbStorageEngine {
         let mut batch = WriteBatch::default();
         batch.delete_cf(meta_cf, index_meta_key(&spec));
 
-        let prefix = property_index_composite_name_prefix(label, properties);
-        let iter = self
-            .db
-            .iterator_cf(prop_cf, IteratorMode::From(&prefix, Direction::Forward));
+        // Interleaved key layout means no clean `[label][props...]`
+        // byte-prefix scopes a composite index's entries on its own —
+        // an index `(a, b)` would share a `[label][a]` prefix with
+        // single-property index `(a)`. Iterate by the label-only
+        // prefix and parse each entry's property sequence, deleting
+        // those that exactly match this spec's list.
+        let label_prefix = property_index_label_prefix(label);
+        let iter = self.db.iterator_cf(
+            prop_cf,
+            IteratorMode::From(&label_prefix, Direction::Forward),
+        );
         for item in iter {
             let (key, _) = item?;
-            if !key.starts_with(&prefix) {
+            if !key.starts_with(&label_prefix) {
                 break;
             }
-            batch.delete_cf(prop_cf, key);
+            let Some(parsed) = parse_property_index_entry_props(&key) else {
+                continue;
+            };
+            if parsed.len() == properties.len()
+                && parsed.iter().zip(properties.iter()).all(|(a, b)| a == b)
+            {
+                batch.delete_cf(prop_cf, key);
+            }
         }
 
         self.db.write(batch)?;
@@ -1342,16 +1356,26 @@ impl RocksDbStorageEngine {
         let mut batch = WriteBatch::default();
         batch.delete_cf(meta_cf, edge_index_meta_key(&spec));
 
-        let prefix = edge_property_index_composite_name_prefix(edge_type, properties);
-        let iter = self
-            .db
-            .iterator_cf(prop_cf, IteratorMode::From(&prefix, Direction::Forward));
+        // See the node-side drop for why DROP parses entries rather
+        // than scoping with a property-name byte prefix.
+        let label_prefix = property_index_label_prefix(edge_type);
+        let iter = self.db.iterator_cf(
+            prop_cf,
+            IteratorMode::From(&label_prefix, Direction::Forward),
+        );
         for item in iter {
             let (key, _) = item?;
-            if !key.starts_with(&prefix) {
+            if !key.starts_with(&label_prefix) {
                 break;
             }
-            batch.delete_cf(prop_cf, key);
+            let Some(parsed) = parse_property_index_entry_props(&key) else {
+                continue;
+            };
+            if parsed.len() == properties.len()
+                && parsed.iter().zip(properties.iter()).all(|(a, b)| a == b)
+            {
+                batch.delete_cf(prop_cf, key);
+            }
         }
 
         self.db.write(batch)?;
@@ -1928,6 +1952,15 @@ impl StorageEngine for RocksDbStorageEngine {
         value: &Property,
     ) -> Result<Vec<NodeId>> {
         RocksDbStorageEngine::nodes_by_property(self, label, property, value)
+    }
+
+    fn nodes_by_properties(
+        &self,
+        label: &str,
+        properties: &[&str],
+        values: &[Property],
+    ) -> Result<Vec<NodeId>> {
+        RocksDbStorageEngine::nodes_by_properties(self, label, properties, values)
     }
 
     fn edges_by_property(

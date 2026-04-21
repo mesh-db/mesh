@@ -1516,10 +1516,127 @@ fn create_node_key_preserves_property_order() {
 
 fn ctx_with_index(label: &str, prop: &str) -> PlannerContext {
     PlannerContext {
-        indexes: vec![(label.into(), prop.into())],
+        indexes: vec![(label.into(), vec![prop.into()])],
         edge_indexes: Vec::new(),
         outer_bindings: Vec::new(),
     }
+}
+
+fn ctx_with_composite_index(label: &str, props: &[&str]) -> PlannerContext {
+    PlannerContext {
+        indexes: vec![(
+            label.into(),
+            props.iter().map(|s| (*s).to_string()).collect(),
+        )],
+        edge_indexes: Vec::new(),
+        outer_bindings: Vec::new(),
+    }
+}
+
+#[test]
+fn composite_index_rewrites_pattern_props_to_index_seek() {
+    let ctx = ctx_with_composite_index("Person", &["first", "last"]);
+    let p = plan_with(
+        "MATCH (n:Person {first: 'Ada', last: 'Lovelace'}) RETURN n",
+        &ctx,
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project, got {p:?}");
+    };
+    let LogicalPlan::IndexSeek {
+        label,
+        properties,
+        values,
+        ..
+    } = *input
+    else {
+        panic!("expected IndexSeek, got non-seek");
+    };
+    assert_eq!(label, "Person");
+    assert_eq!(
+        properties,
+        vec!["first".to_string(), "last".to_string()],
+        "expected seek keys in index order"
+    );
+    assert_eq!(values.len(), 2);
+}
+
+#[test]
+fn composite_index_rewrites_where_clause_to_tuple_seek() {
+    let ctx = ctx_with_composite_index("Person", &["first", "last"]);
+    let p = plan_with(
+        "MATCH (n:Person) WHERE n.first = 'Ada' AND n.last = 'Lovelace' RETURN n",
+        &ctx,
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::IndexSeek {
+        properties, values, ..
+    } = *input
+    else {
+        panic!("expected IndexSeek");
+    };
+    assert_eq!(properties, vec!["first".to_string(), "last".to_string()]);
+    assert_eq!(values.len(), 2);
+}
+
+#[test]
+fn composite_index_prefix_match_seeks_on_prefix_residual_filter_on_rest() {
+    // Index (a, b, c); query equalities on a, b, d.
+    // Expect: seek on (a, b), residual filter on d.
+    let ctx = ctx_with_composite_index("L", &["a", "b", "c"]);
+    let p = plan_with(
+        "MATCH (n:L) WHERE n.a = 1 AND n.b = 2 AND n.d = 3 RETURN n",
+        &ctx,
+    );
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::Filter {
+        input: seek,
+        predicate,
+    } = *input
+    else {
+        panic!("expected Filter residual over IndexSeek, got non-filter");
+    };
+    let LogicalPlan::IndexSeek { properties, .. } = *seek else {
+        panic!("expected IndexSeek under residual Filter");
+    };
+    assert_eq!(properties, vec!["a".to_string(), "b".to_string()]);
+    // Residual predicate references `d`.
+    let Expr::Compare { left, .. } = predicate else {
+        panic!("expected compare residual");
+    };
+    assert!(matches!(*left, Expr::Property { ref key, .. } if key == "d"));
+}
+
+#[test]
+fn composite_index_requires_prefix_match_not_just_any_covered_property() {
+    // Index (a, b); query only binds b. Must NOT rewrite — composite
+    // indexes require a prefix match starting from the first
+    // property, and an index `(a, b)` can't answer a `b = v` query.
+    let ctx = ctx_with_composite_index("L", &["a", "b"]);
+    let p = plan_with("MATCH (n:L) WHERE n.b = 2 RETURN n", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    // Falls back to NodeScan + Filter.
+    assert!(!matches!(*input, LogicalPlan::IndexSeek { .. }));
+}
+
+#[test]
+fn single_property_prefix_of_composite_index_still_seeks() {
+    // Index (a, b); query binds only a. Seek on (a) — proper prefix.
+    let ctx = ctx_with_composite_index("L", &["a", "b"]);
+    let p = plan_with("MATCH (n:L {a: 1}) RETURN n", &ctx);
+    let LogicalPlan::Project { input, .. } = p else {
+        panic!("expected Project");
+    };
+    let LogicalPlan::IndexSeek { properties, .. } = *input else {
+        panic!("expected IndexSeek");
+    };
+    assert_eq!(properties, vec!["a".to_string()]);
 }
 
 fn plan_with(query: &str, ctx: &PlannerContext) -> LogicalPlan {
@@ -1535,13 +1652,13 @@ fn where_eq_on_indexed_property_rewrites_to_index_seek() {
         panic!("expected Project at top, got {p:?}");
     };
     let LogicalPlan::IndexSeek {
-        label, property, ..
+        label, properties, ..
     } = *input
     else {
         panic!("expected IndexSeek under Project");
     };
     assert_eq!(label, "Person");
-    assert_eq!(property, "name");
+    assert_eq!(properties, vec!["name".to_string()]);
 }
 
 #[test]
@@ -1561,10 +1678,11 @@ fn where_eq_with_parameter_rewrites_to_index_seek() {
     let LogicalPlan::Project { input, .. } = p else {
         panic!("expected Project");
     };
-    let LogicalPlan::IndexSeek { value, .. } = *input else {
+    let LogicalPlan::IndexSeek { values, .. } = *input else {
         panic!("expected IndexSeek");
     };
-    assert!(matches!(value, Expr::Parameter(ref s) if s == "who"));
+    assert_eq!(values.len(), 1);
+    assert!(matches!(values[0], Expr::Parameter(ref s) if s == "who"));
 }
 
 #[test]
@@ -1674,7 +1792,7 @@ fn where_eq_with_no_matching_index_does_not_rewrite() {
 fn ctx_with_edge_index(edge_type: &str, prop: &str) -> PlannerContext {
     PlannerContext {
         indexes: Vec::new(),
-        edge_indexes: vec![(edge_type.into(), prop.into())],
+        edge_indexes: vec![(edge_type.into(), vec![prop.into()])],
         outer_bindings: Vec::new(),
     }
 }
