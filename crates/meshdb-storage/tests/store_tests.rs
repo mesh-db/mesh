@@ -501,7 +501,7 @@ fn property_index_registry_survives_reopen() {
         store.list_property_indexes(),
         vec![PropertyIndexSpec {
             label: "Person".into(),
-            property: "name".into(),
+            properties: vec!["name".into()],
         }]
     );
     let hits = store
@@ -749,7 +749,7 @@ fn edge_property_index_registry_survives_reopen() {
         store.list_edge_property_indexes(),
         vec![EdgePropertyIndexSpec {
             edge_type: "KNOWS".into(),
-            property: "since".into(),
+            properties: vec!["since".into()],
         }]
     );
     let hits = store
@@ -788,7 +788,7 @@ fn relationship_unique_constraint_provisions_backing_edge_index() {
         store.list_edge_property_indexes(),
         vec![EdgePropertyIndexSpec {
             edge_type: "KNOWS".into(),
-            property: "since".into(),
+            properties: vec!["since".into()],
         }]
     );
 }

@@ -25,27 +25,49 @@ use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
 use std::path::Path;
 
 /// Declarative spec for a single-property equality index. An index is
-/// uniquely identified by its `(label, property)` pair — users don't
+/// uniquely identified by its `(label, properties)` pair — users don't
 /// name them, which keeps DROP/SHOW behavior simple and matches the
 /// way the planner looks them up when deciding whether to emit
 /// `IndexSeek`.
+///
+/// `properties` is a `Vec<String>` so composite indexes (tuple keys
+/// over multiple properties, `CREATE INDEX FOR (n:Label) ON (n.a, n.b)`)
+/// fit the same shape as the single-property form. In this slice
+/// the storage layer only populates length-1 specs; composite
+/// write/seek support and the composite DDL surface are follow-ups.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PropertyIndexSpec {
     pub label: String,
-    pub property: String,
+    pub properties: Vec<String>,
 }
 
-/// Relationship-scope analogue of [`PropertyIndexSpec`] — a
-/// single-property equality index keyed on `(edge_type, property)`.
-/// Kept as a distinct type so the on-disk meta CF doesn't have to
-/// encode scope inline, and so call sites statically can't mix a
-/// node-scoped index spec with an edge-scoped one. Users don't name
-/// edge indexes either: `DROP INDEX FOR ()-[r:TYPE]-() ON (r.prop)`
-/// identifies them the same way `CREATE` does.
+impl PropertyIndexSpec {
+    /// Convenience accessor for the first property. In the current
+    /// slice every registered spec has exactly one property, so
+    /// this stands in for the old `.property` field. A follow-up
+    /// slice that populates composite specs will update callers to
+    /// iterate `properties` instead.
+    pub fn first_property(&self) -> &str {
+        &self.properties[0]
+    }
+}
+
+/// Relationship-scope analogue of [`PropertyIndexSpec`]. Same
+/// shape: `properties` is a `Vec<String>` so a future composite
+/// form fits, but today the storage layer only populates
+/// length-1 specs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EdgePropertyIndexSpec {
     pub edge_type: String,
-    pub property: String,
+    pub properties: Vec<String>,
+}
+
+impl EdgePropertyIndexSpec {
+    /// See [`PropertyIndexSpec::first_property`]. Same slice-1
+    /// invariant applies.
+    pub fn first_property(&self) -> &str {
+        &self.properties[0]
+    }
 }
 
 /// Kind of single-property constraint. `Unique` comes from

@@ -63,81 +63,111 @@ const ALL_CFS: &[&str] = &[
 const EMPTY: &[u8] = &[];
 
 /// Encode a [`PropertyIndexSpec`] as a stable `CF_INDEX_META` key:
-/// `<label>\0<property>`. Neither label nor property key can contain a
-/// NUL byte (the grammar restricts them to identifier characters), so
-/// the NUL separator is unambiguous on decode.
+/// `<label>\0<prop1>\0<prop2>\0...\0<propN>`. No component can contain
+/// a NUL (identifier-only grammar), so splitting on NUL decodes
+/// unambiguously. Length-1 specs encode byte-identically to the
+/// pre-composite-refactor format (`<label>\0<prop>`), so existing
+/// on-disk data survives the upgrade.
 fn index_meta_key(spec: &PropertyIndexSpec) -> Vec<u8> {
-    let mut k = Vec::with_capacity(spec.label.len() + 1 + spec.property.len());
+    let cap = spec.label.len()
+        + spec.properties.iter().map(|p| p.len()).sum::<usize>()
+        + spec.properties.len();
+    let mut k = Vec::with_capacity(cap);
     k.extend_from_slice(spec.label.as_bytes());
-    k.push(0);
-    k.extend_from_slice(spec.property.as_bytes());
+    for p in &spec.properties {
+        k.push(0);
+        k.extend_from_slice(p.as_bytes());
+    }
     k
 }
 
 fn index_meta_key_decode(key: &[u8]) -> Result<PropertyIndexSpec> {
-    let sep = key
-        .iter()
-        .position(|b| *b == 0)
-        .ok_or(Error::CorruptBytes {
+    let mut parts = key.split(|b| *b == 0);
+    let label_bytes = parts.next().ok_or(Error::CorruptBytes {
+        cf: CF_INDEX_META,
+        expected: 1,
+        actual: 0,
+    })?;
+    let label = std::str::from_utf8(label_bytes)
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_INDEX_META,
+            expected: label_bytes.len(),
+            actual: label_bytes.len(),
+        })?
+        .to_string();
+    let mut properties: Vec<String> = Vec::new();
+    for part in parts {
+        let s = std::str::from_utf8(part)
+            .map_err(|_| Error::CorruptBytes {
+                cf: CF_INDEX_META,
+                expected: part.len(),
+                actual: part.len(),
+            })?
+            .to_string();
+        properties.push(s);
+    }
+    if properties.is_empty() {
+        return Err(Error::CorruptBytes {
             cf: CF_INDEX_META,
             expected: 1,
             actual: 0,
-        })?;
-    let label = std::str::from_utf8(&key[..sep])
-        .map_err(|_| Error::CorruptBytes {
-            cf: CF_INDEX_META,
-            expected: sep,
-            actual: sep,
-        })?
-        .to_string();
-    let property = std::str::from_utf8(&key[sep + 1..])
-        .map_err(|_| Error::CorruptBytes {
-            cf: CF_INDEX_META,
-            expected: key.len() - sep - 1,
-            actual: key.len() - sep - 1,
-        })?
-        .to_string();
-    Ok(PropertyIndexSpec { label, property })
+        });
+    }
+    Ok(PropertyIndexSpec { label, properties })
 }
 
 /// Encode an [`EdgePropertyIndexSpec`] as a stable `CF_EDGE_INDEX_META`
-/// key: `<edge_type>\0<property>`. Neither component can contain NUL
-/// (grammar restricts them to identifier characters) so the NUL
-/// separator is unambiguous on decode.
+/// key: `<edge_type>\0<prop1>\0<prop2>\0...\0<propN>`. Same NUL-split
+/// shape as the node form, same backward-compat guarantee for
+/// length-1 specs.
 fn edge_index_meta_key(spec: &EdgePropertyIndexSpec) -> Vec<u8> {
-    let mut k = Vec::with_capacity(spec.edge_type.len() + 1 + spec.property.len());
+    let cap = spec.edge_type.len()
+        + spec.properties.iter().map(|p| p.len()).sum::<usize>()
+        + spec.properties.len();
+    let mut k = Vec::with_capacity(cap);
     k.extend_from_slice(spec.edge_type.as_bytes());
-    k.push(0);
-    k.extend_from_slice(spec.property.as_bytes());
+    for p in &spec.properties {
+        k.push(0);
+        k.extend_from_slice(p.as_bytes());
+    }
     k
 }
 
 fn edge_index_meta_key_decode(key: &[u8]) -> Result<EdgePropertyIndexSpec> {
-    let sep = key
-        .iter()
-        .position(|b| *b == 0)
-        .ok_or(Error::CorruptBytes {
+    let mut parts = key.split(|b| *b == 0);
+    let type_bytes = parts.next().ok_or(Error::CorruptBytes {
+        cf: CF_EDGE_INDEX_META,
+        expected: 1,
+        actual: 0,
+    })?;
+    let edge_type = std::str::from_utf8(type_bytes)
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_EDGE_INDEX_META,
+            expected: type_bytes.len(),
+            actual: type_bytes.len(),
+        })?
+        .to_string();
+    let mut properties: Vec<String> = Vec::new();
+    for part in parts {
+        let s = std::str::from_utf8(part)
+            .map_err(|_| Error::CorruptBytes {
+                cf: CF_EDGE_INDEX_META,
+                expected: part.len(),
+                actual: part.len(),
+            })?
+            .to_string();
+        properties.push(s);
+    }
+    if properties.is_empty() {
+        return Err(Error::CorruptBytes {
             cf: CF_EDGE_INDEX_META,
             expected: 1,
             actual: 0,
-        })?;
-    let edge_type = std::str::from_utf8(&key[..sep])
-        .map_err(|_| Error::CorruptBytes {
-            cf: CF_EDGE_INDEX_META,
-            expected: sep,
-            actual: sep,
-        })?
-        .to_string();
-    let property = std::str::from_utf8(&key[sep + 1..])
-        .map_err(|_| Error::CorruptBytes {
-            cf: CF_EDGE_INDEX_META,
-            expected: key.len() - sep - 1,
-            actual: key.len() - sep - 1,
-        })?
-        .to_string();
+        });
+    }
     Ok(EdgePropertyIndexSpec {
         edge_type,
-        property,
+        properties,
     })
 }
 
@@ -253,20 +283,24 @@ impl RocksDbStorageEngine {
         // keeps steady-state writes free of index churn.
         let indexes = self.indexes.read().expect("indexes lock poisoned");
         for spec in indexes.iter() {
+            // Slice-1 invariant: every registered spec has exactly
+            // one property. Composite (tuple-key) write semantics
+            // are a follow-up — landing them will replace this
+            // single-property path with a tuple-encoding branch.
+            debug_assert_eq!(spec.properties.len(), 1);
+            let property = &spec.properties[0];
             let was_indexed = existing_labels.iter().any(|l| l == &spec.label);
             let now_indexed = node.labels.iter().any(|l| l == &spec.label);
             let old_encoded = if was_indexed {
                 existing
                     .as_ref()
-                    .and_then(|n| n.properties.get(&spec.property))
+                    .and_then(|n| n.properties.get(property))
                     .and_then(encode_index_value)
             } else {
                 None
             };
             let new_encoded = if now_indexed {
-                node.properties
-                    .get(&spec.property)
-                    .and_then(encode_index_value)
+                node.properties.get(property).and_then(encode_index_value)
             } else {
                 None
             };
@@ -276,13 +310,13 @@ impl RocksDbStorageEngine {
             if let Some(bytes) = &old_encoded {
                 batch.delete_cf(
                     prop_cf,
-                    property_index_key(&spec.label, &spec.property, bytes, node.id),
+                    property_index_key(&spec.label, property, bytes, node.id),
                 );
             }
             if let Some(bytes) = &new_encoded {
                 batch.put_cf(
                     prop_cf,
-                    property_index_key(&spec.label, &spec.property, bytes, node.id),
+                    property_index_key(&spec.label, property, bytes, node.id),
                     EMPTY,
                 );
             }
@@ -342,30 +376,31 @@ impl RocksDbStorageEngine {
             .read()
             .expect("edge_indexes lock poisoned");
         for spec in edge_indexes.iter() {
+            // Slice-1 invariant: single-property specs only (see the
+            // node-side loop for the full rationale).
+            debug_assert_eq!(spec.properties.len(), 1);
+            let property = &spec.properties[0];
             if spec.edge_type != edge.edge_type {
                 continue;
             }
             let old_encoded = existing_edge
                 .as_ref()
-                .and_then(|e| e.properties.get(&spec.property))
+                .and_then(|e| e.properties.get(property))
                 .and_then(encode_index_value);
-            let new_encoded = edge
-                .properties
-                .get(&spec.property)
-                .and_then(encode_index_value);
+            let new_encoded = edge.properties.get(property).and_then(encode_index_value);
             if old_encoded == new_encoded {
                 continue;
             }
             if let Some(bytes) = &old_encoded {
                 batch.delete_cf(
                     edge_prop_cf,
-                    edge_property_index_key(&spec.edge_type, &spec.property, bytes, edge.id),
+                    edge_property_index_key(&spec.edge_type, property, bytes, edge.id),
                 );
             }
             if let Some(bytes) = &new_encoded {
                 batch.put_cf(
                     edge_prop_cf,
-                    edge_property_index_key(&spec.edge_type, &spec.property, bytes, edge.id),
+                    edge_property_index_key(&spec.edge_type, property, bytes, edge.id),
                     EMPTY,
                 );
             }
@@ -410,14 +445,16 @@ impl RocksDbStorageEngine {
             .read()
             .expect("edge_indexes lock poisoned");
         for spec in edge_indexes.iter() {
+            debug_assert_eq!(spec.properties.len(), 1);
+            let property = &spec.properties[0];
             if spec.edge_type != edge.edge_type {
                 continue;
             }
-            if let Some(value) = edge.properties.get(&spec.property) {
+            if let Some(value) = edge.properties.get(property) {
                 if let Some(encoded) = encode_index_value(value) {
                     batch.delete_cf(
                         edge_prop_cf,
-                        edge_property_index_key(&spec.edge_type, &spec.property, &encoded, id),
+                        edge_property_index_key(&spec.edge_type, property, &encoded, id),
                     );
                 }
             }
@@ -456,14 +493,16 @@ impl RocksDbStorageEngine {
             // value for the property, delete the corresponding entry.
             let indexes = self.indexes.read().expect("indexes lock poisoned");
             for spec in indexes.iter() {
+                debug_assert_eq!(spec.properties.len(), 1);
+                let property = &spec.properties[0];
                 if !n.labels.iter().any(|l| l == &spec.label) {
                     continue;
                 }
-                if let Some(value) = n.properties.get(&spec.property) {
+                if let Some(value) = n.properties.get(property) {
                     if let Some(encoded) = encode_index_value(value) {
                         batch.delete_cf(
                             prop_cf,
-                            property_index_key(&spec.label, &spec.property, &encoded, id),
+                            property_index_key(&spec.label, property, &encoded, id),
                         );
                     }
                 }
@@ -483,16 +522,18 @@ impl RocksDbStorageEngine {
             if let Some(e) = self.get_edge(*edge_id)? {
                 batch.delete_cf(type_cf, type_index_key(&e.edge_type, *edge_id));
                 for spec in &edge_indexes_snapshot {
+                    debug_assert_eq!(spec.properties.len(), 1);
+                    let property = &spec.properties[0];
                     if spec.edge_type != e.edge_type {
                         continue;
                     }
-                    if let Some(value) = e.properties.get(&spec.property) {
+                    if let Some(value) = e.properties.get(property) {
                         if let Some(encoded) = encode_index_value(value) {
                             batch.delete_cf(
                                 edge_prop_cf,
                                 edge_property_index_key(
                                     &spec.edge_type,
-                                    &spec.property,
+                                    property,
                                     &encoded,
                                     *edge_id,
                                 ),
@@ -509,16 +550,18 @@ impl RocksDbStorageEngine {
             if let Some(e) = self.get_edge(*edge_id)? {
                 batch.delete_cf(type_cf, type_index_key(&e.edge_type, *edge_id));
                 for spec in &edge_indexes_snapshot {
+                    debug_assert_eq!(spec.properties.len(), 1);
+                    let property = &spec.properties[0];
                     if spec.edge_type != e.edge_type {
                         continue;
                     }
-                    if let Some(value) = e.properties.get(&spec.property) {
+                    if let Some(value) = e.properties.get(property) {
                         if let Some(encoded) = encode_index_value(value) {
                             batch.delete_cf(
                                 edge_prop_cf,
                                 edge_property_index_key(
                                     &spec.edge_type,
-                                    &spec.property,
+                                    property,
                                     &encoded,
                                     *edge_id,
                                 ),
@@ -667,7 +710,7 @@ impl RocksDbStorageEngine {
     pub fn create_property_index(&self, label: &str, property: &str) -> Result<()> {
         let spec = PropertyIndexSpec {
             label: label.to_string(),
-            property: property.to_string(),
+            properties: vec![property.to_string()],
         };
         let mut guard = self.indexes.write().expect("indexes lock poisoned");
         if guard.contains(&spec) {
@@ -1151,7 +1194,7 @@ impl RocksDbStorageEngine {
     pub fn drop_property_index(&self, label: &str, property: &str) -> Result<()> {
         let spec = PropertyIndexSpec {
             label: label.to_string(),
-            property: property.to_string(),
+            properties: vec![property.to_string()],
         };
         let mut guard = self.indexes.write().expect("indexes lock poisoned");
         if !guard.contains(&spec) {
@@ -1202,7 +1245,7 @@ impl RocksDbStorageEngine {
     pub fn create_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
         let spec = EdgePropertyIndexSpec {
             edge_type: edge_type.to_string(),
-            property: property.to_string(),
+            properties: vec![property.to_string()],
         };
         let mut guard = self
             .edge_indexes
@@ -1246,7 +1289,7 @@ impl RocksDbStorageEngine {
     pub fn drop_edge_property_index(&self, edge_type: &str, property: &str) -> Result<()> {
         let spec = EdgePropertyIndexSpec {
             edge_type: edge_type.to_string(),
-            property: property.to_string(),
+            properties: vec![property.to_string()],
         };
         let mut guard = self
             .edge_indexes

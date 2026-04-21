@@ -159,7 +159,7 @@ impl<T: StorageEngine> GraphWriter for T {
     fn list_property_indexes(&self) -> Result<Vec<NodeIndexSpec>> {
         Ok(StorageEngine::list_property_indexes(self)
             .into_iter()
-            .map(|s| (s.label, s.property))
+            .map(|mut s| (s.label, s.properties.remove(0)))
             .collect())
     }
 
@@ -176,7 +176,7 @@ impl<T: StorageEngine> GraphWriter for T {
     fn list_edge_property_indexes(&self) -> Result<Vec<EdgeIndexSpec>> {
         Ok(StorageEngine::list_edge_property_indexes(self)
             .into_iter()
-            .map(|s| (s.edge_type, s.property))
+            .map(|mut s| (s.edge_type, s.properties.remove(0)))
             .collect())
     }
 
@@ -250,7 +250,7 @@ impl GraphWriter for StorageWriterAdapter<'_> {
             .0
             .list_property_indexes()
             .into_iter()
-            .map(|s| (s.label, s.property))
+            .map(|mut s| (s.label, s.properties.remove(0)))
             .collect())
     }
 
@@ -269,7 +269,7 @@ impl GraphWriter for StorageWriterAdapter<'_> {
             .0
             .list_edge_property_indexes()
             .into_iter()
-            .map(|s| (s.edge_type, s.property))
+            .map(|mut s| (s.edge_type, s.properties.remove(0)))
             .collect())
     }
 

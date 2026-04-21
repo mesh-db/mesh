@@ -124,14 +124,14 @@ impl<T: StorageEngine> GraphReader for T {
     fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
         Ok(StorageEngine::list_property_indexes(self)
             .into_iter()
-            .map(|s| (s.label, s.property))
+            .map(|mut s| (s.label, s.properties.remove(0)))
             .collect())
     }
 
     fn list_edge_property_indexes(&self) -> Result<Vec<(String, String)>> {
         Ok(StorageEngine::list_edge_property_indexes(self)
             .into_iter()
-            .map(|s| (s.edge_type, s.property))
+            .map(|mut s| (s.edge_type, s.properties.remove(0)))
             .collect())
     }
 
@@ -195,7 +195,7 @@ impl GraphReader for StorageReaderAdapter<'_> {
             .0
             .list_property_indexes()
             .into_iter()
-            .map(|s| (s.label, s.property))
+            .map(|mut s| (s.label, s.properties.remove(0)))
             .collect())
     }
 
@@ -204,7 +204,7 @@ impl GraphReader for StorageReaderAdapter<'_> {
             .0
             .list_edge_property_indexes()
             .into_iter()
-            .map(|s| (s.edge_type, s.property))
+            .map(|mut s| (s.edge_type, s.properties.remove(0)))
             .collect())
     }
 
