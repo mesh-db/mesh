@@ -46,11 +46,36 @@ struct StagedEntry {
     staged_at: Instant,
 }
 
+/// Terminal outcome of a 2PC transaction on this peer. Cached for a
+/// bounded window after COMMIT / ABORT so a duplicate RPC can be
+/// answered idempotently — committed-then-committed returns OK,
+/// aborted-then-committed returns `failed_precondition`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalOutcome {
+    Committed,
+    Aborted,
+}
+
+#[derive(Debug)]
+struct OutcomeEntry {
+    outcome: TerminalOutcome,
+    at: Instant,
+}
+
 /// Per-service in-memory 2PC participant staging. Safe to share across
 /// tasks via `Arc`; all mutating methods take `&self`.
+///
+/// Holds two maps:
+/// - `entries`: staged PREPARE payloads waiting for a COMMIT / ABORT.
+/// - `outcomes`: the terminal outcome of recently-finalized txids,
+///   consulted when a duplicate COMMIT / ABORT arrives after the
+///   staged entry has already been drained. Both share the same TTL
+///   so the retention window is consistent across pre- and
+///   post-decision state.
 #[derive(Debug)]
 pub struct ParticipantStaging {
     entries: Mutex<HashMap<String, StagedEntry>>,
+    outcomes: Mutex<HashMap<String, OutcomeEntry>>,
     ttl: Duration,
 }
 
@@ -61,6 +86,7 @@ impl ParticipantStaging {
     pub fn new(ttl: Duration) -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
+            outcomes: Mutex::new(HashMap::new()),
             ttl,
         })
     }
@@ -112,19 +138,69 @@ impl ParticipantStaging {
         self.entries.lock().unwrap().len()
     }
 
-    /// Walk the map and drop every entry whose `staged_at` is older
-    /// than the configured TTL. Returns the number of entries
-    /// dropped so the caller can log meaningfully when the sweeper
-    /// actually fires — a healthy cluster sweeps zero entries 99% of
-    /// the time and a non-zero count is a signal to investigate.
-    pub fn sweep_expired(&self) -> usize {
+    /// Rehydrate a staged entry at startup replay, ignoring the
+    /// duplicate-insert check that `try_insert` enforces during
+    /// normal RPC handling. Used by
+    /// [`crate::MeshService::recover_participant_staging`] to
+    /// populate staging from the participant log before any gRPC
+    /// handlers run. Overwrites an existing entry rather than
+    /// erroring — at startup only one source is writing.
+    pub fn rehydrate(&self, txid: String, commands: Vec<GraphCommand>) {
         let mut map = self.entries.lock().unwrap();
-        let before = map.len();
+        map.insert(
+            txid,
+            StagedEntry {
+                commands,
+                staged_at: Instant::now(),
+            },
+        );
+        crate::metrics::PENDING_2PC_STAGED.set(map.len() as i64);
+    }
+
+    /// Record a terminal outcome for `txid`. Called after the
+    /// handler's apply (for COMMIT) or drop (for ABORT) so a
+    /// subsequent duplicate RPC finds a cached answer and doesn't
+    /// mistake "already finalized" for "never prepared".
+    pub fn finalize(&self, txid: String, outcome: TerminalOutcome) {
+        let mut map = self.outcomes.lock().unwrap();
+        map.insert(
+            txid,
+            OutcomeEntry {
+                outcome,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// Look up the terminal outcome for `txid`. `Some(...)` means the
+    /// txid reached a decision within the retention window;
+    /// a duplicate RPC can short-circuit. `None` means either no
+    /// decision was made or the retention TTL has elapsed.
+    pub fn terminal_outcome(&self, txid: &str) -> Option<TerminalOutcome> {
+        self.outcomes.lock().unwrap().get(txid).map(|e| e.outcome)
+    }
+
+    /// Walk both the staging and outcomes maps, dropping every entry
+    /// whose age exceeds the configured TTL. Returns the number of
+    /// staging entries dropped — a non-zero count means a prepared
+    /// transaction expired without a decision and is the signal an
+    /// operator cares about. Outcome-map expiry is routine cleanup
+    /// and doesn't surface in the return value.
+    pub fn sweep_expired(&self) -> usize {
         let now = Instant::now();
         let ttl = self.ttl;
-        map.retain(|_, entry| now.saturating_duration_since(entry.staged_at) < ttl);
-        crate::metrics::PENDING_2PC_STAGED.set(map.len() as i64);
-        before - map.len()
+        let before = {
+            let mut map = self.entries.lock().unwrap();
+            let before = map.len();
+            map.retain(|_, entry| now.saturating_duration_since(entry.staged_at) < ttl);
+            crate::metrics::PENDING_2PC_STAGED.set(map.len() as i64);
+            before - map.len()
+        };
+        {
+            let mut map = self.outcomes.lock().unwrap();
+            map.retain(|_, entry| now.saturating_duration_since(entry.at) < ttl);
+        }
+        before
     }
 
     /// Spawn a tokio task that calls [`Self::sweep_expired`] every

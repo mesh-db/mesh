@@ -57,6 +57,13 @@ pub struct MeshService {
     /// Durable 2PC coordinator log. Only populated in routing mode,
     /// where multi-peer transactions need a crash-recovery record.
     coordinator_log: Option<Arc<crate::CoordinatorLog>>,
+    /// Durable 2PC participant log. Every PREPARE / COMMIT / ABORT
+    /// that reaches this peer gets an fsync'd entry here before the
+    /// RPC ACKs, so a crash between PREPARE ACK and COMMIT doesn't
+    /// lose the staged commands. `None` falls back to the in-memory-
+    /// only behaviour — acceptable for single-node tests but not for
+    /// a production routing cluster.
+    participant_log: Option<Arc<crate::ParticipantLog>>,
     /// Client TLS config used when this service builds ad-hoc gRPC
     /// endpoints (leader forwarding in Raft mode, for example). `None`
     /// means inter-peer gRPC traffic is plaintext. The `Routing` /
@@ -75,6 +82,7 @@ impl MeshService {
             raft: None,
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
+            participant_log: None,
             client_tls: None,
         }
     }
@@ -100,8 +108,18 @@ impl MeshService {
             raft: None,
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log,
+            participant_log: None,
             client_tls: None,
         }
+    }
+
+    /// Attach a [`ParticipantLog`] so PREPARE / COMMIT / ABORT
+    /// transitions are fsync'd before the RPC ACKs. Required for
+    /// durable participant-side 2PC in routing mode; omit (or pass
+    /// `None`) for local-only services that don't run the 2PC path.
+    pub fn with_participant_log(mut self, log: Option<Arc<crate::ParticipantLog>>) -> Self {
+        self.participant_log = log;
+        self
     }
 
     /// Raft-backed service: writes go through `RaftCluster::propose_graph`
@@ -115,6 +133,7 @@ impl MeshService {
             raft: Some(raft),
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
+            participant_log: None,
             client_tls: None,
         }
     }
@@ -609,6 +628,67 @@ impl MeshService {
     /// entry on an unreachable peer is the participant's problem to
     /// resolve on *its* restart (the staging is in-memory and dies
     /// with the process).
+    /// Rehydrate participant-side 2PC state from the durable log at
+    /// startup. Must be called before the `BatchWrite` RPC becomes
+    /// reachable, otherwise an inbound COMMIT can race ahead of the
+    /// replay and observe empty staging for a txid that actually
+    /// survived the crash. Synchronous — the log is tiny and the
+    /// replay is cheap.
+    ///
+    /// Walks the participant log end-to-end:
+    /// - Every `Prepared` whose last entry is still `Prepared` gets
+    ///   its commands re-inserted into staging, so a late COMMIT
+    ///   finds them.
+    /// - Every `Committed` / `Aborted` populates the outcomes cache,
+    ///   so a duplicate COMMIT / ABORT short-circuits with the right
+    ///   answer instead of `failed_precondition`.
+    ///
+    /// No-op when the service has no participant log configured
+    /// (single-node services, Raft mode).
+    pub fn recover_participant_staging(&self) -> std::result::Result<(), Status> {
+        let Some(log) = self.participant_log.clone() else {
+            return Ok(());
+        };
+        let entries = log
+            .read_all()
+            .map_err(|e| Status::internal(format!("reading participant log: {e}")))?;
+        let in_doubt = crate::replay_in_doubt_commands(&entries);
+        let outcomes = crate::replay_outcomes(&entries);
+
+        let in_doubt_count = in_doubt.len();
+        for (txid, commands) in in_doubt {
+            self.pending_batches.rehydrate(txid, commands);
+        }
+        let mut committed_count = 0usize;
+        let mut aborted_count = 0usize;
+        for (txid, outcome) in outcomes {
+            match outcome {
+                crate::ParticipantOutcome::Committed => {
+                    self.pending_batches
+                        .finalize(txid, crate::staging::TerminalOutcome::Committed);
+                    committed_count += 1;
+                }
+                crate::ParticipantOutcome::Aborted => {
+                    self.pending_batches
+                        .finalize(txid, crate::staging::TerminalOutcome::Aborted);
+                    aborted_count += 1;
+                }
+                crate::ParticipantOutcome::Prepared => {
+                    // Already handled via the in_doubt rehydration above.
+                }
+            }
+        }
+        if in_doubt_count + committed_count + aborted_count > 0 {
+            tracing::info!(
+                in_doubt = in_doubt_count,
+                committed = committed_count,
+                aborted = aborted_count,
+                "recovered participant 2PC state from log",
+            );
+        }
+        Ok(())
+    }
+
     pub async fn recover_pending_transactions(&self) -> std::result::Result<(), Status> {
         let Some(log) = self.coordinator_log.clone() else {
             return Ok(());
@@ -2090,6 +2170,19 @@ impl MeshWrite for MeshService {
             BatchPhase::Prepare => {
                 let commands: Vec<GraphCommand> =
                     serde_json::from_slice(&req.commands_json).map_err(bad_request)?;
+                // Durable first, staging second. If the fsync succeeds
+                // but the in-memory insert somehow fails (only path
+                // today is a duplicate txid), the log entry is
+                // harmless — startup replay ignores txids whose most
+                // recent log entry is a Prepared AND whose commands
+                // are already in staging.
+                if let Some(log) = &self.participant_log {
+                    log.append(&crate::ParticipantLogEntry::Prepared {
+                        txid: txid.clone(),
+                        commands: commands.clone(),
+                    })
+                    .map_err(internal)?;
+                }
                 self.pending_batches
                     .try_insert(txid.clone(), commands)
                     .map_err(|()| {
@@ -2098,17 +2191,59 @@ impl MeshWrite for MeshService {
                 Ok(Response::new(BatchWriteResponse {}))
             }
             BatchPhase::Commit => {
-                let cmds = self.pending_batches.take(&txid).ok_or_else(|| {
-                    Status::failed_precondition(format!("txid {} not prepared on this peer", txid))
-                })?;
-                apply_prepared_batch(self.store.as_ref(), &cmds).map_err(internal)?;
-                Ok(Response::new(BatchWriteResponse {}))
+                // Three cases on receiving COMMIT:
+                // 1. Staging has the entry: normal path — apply, log,
+                //    mark outcome.
+                // 2. Staging is empty but the outcomes cache says we
+                //    already committed: duplicate RPC, return OK.
+                // 3. Staging is empty and no cached outcome (or the
+                //    cached outcome is Aborted): the peer never
+                //    received PREPARE, or its staging expired, or the
+                //    coordinator is sending COMMIT against the wrong
+                //    decision. Fail the RPC so the coordinator's
+                //    recovery path can re-PREPARE.
+                match self.pending_batches.take(&txid) {
+                    Some(cmds) => {
+                        apply_prepared_batch(self.store.as_ref(), &cmds).map_err(internal)?;
+                        if let Some(log) = &self.participant_log {
+                            log.append(&crate::ParticipantLogEntry::Committed {
+                                txid: txid.clone(),
+                            })
+                            .map_err(internal)?;
+                        }
+                        self.pending_batches
+                            .finalize(txid, crate::staging::TerminalOutcome::Committed);
+                        Ok(Response::new(BatchWriteResponse {}))
+                    }
+                    None => match self.pending_batches.terminal_outcome(&txid) {
+                        Some(crate::staging::TerminalOutcome::Committed) => {
+                            Ok(Response::new(BatchWriteResponse {}))
+                        }
+                        Some(crate::staging::TerminalOutcome::Aborted) => {
+                            Err(Status::failed_precondition(format!(
+                                "txid {} was aborted on this peer",
+                                txid
+                            )))
+                        }
+                        None => Err(Status::failed_precondition(format!(
+                            "txid {} not prepared on this peer",
+                            txid
+                        ))),
+                    },
+                }
             }
             BatchPhase::Abort => {
-                // Abort is always idempotent: dropping the staged entry is
-                // safe even if PREPARE never arrived (e.g., coordinator
-                // sends ABORT defensively on a partial failure).
+                // ABORT is idempotent by design. Drop the staged
+                // entry if present; log the outcome so a later COMMIT
+                // for the same txid can be rejected with a meaningful
+                // error rather than the generic "not prepared".
                 let _ = self.pending_batches.take(&txid);
+                if let Some(log) = &self.participant_log {
+                    log.append(&crate::ParticipantLogEntry::Aborted { txid: txid.clone() })
+                        .map_err(internal)?;
+                }
+                self.pending_batches
+                    .finalize(txid, crate::staging::TerminalOutcome::Aborted);
                 Ok(Response::new(BatchWriteResponse {}))
             }
         }

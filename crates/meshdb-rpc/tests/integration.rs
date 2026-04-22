@@ -8,7 +8,7 @@ use meshdb_rpc::proto::{
     EdgesByPropertyRequest, ExecuteCypherRequest, GetEdgeRequest, GetNodeRequest, HealthRequest,
     NeighborRequest, NodesByLabelRequest, PutEdgeRequest, PutNodeRequest, UuidBytes,
 };
-use meshdb_rpc::{CoordinatorLog, MeshService, Routing, TxLogEntry};
+use meshdb_rpc::{CoordinatorLog, MeshService, ParticipantLog, Routing, TxLogEntry};
 use meshdb_storage::{RocksDbStorageEngine as Store, StorageEngine};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1979,4 +1979,236 @@ async fn routing_mode_create_constraint_fans_out() {
         .unwrap();
     assert!(h.store_a.list_property_constraints().is_empty());
     assert!(h.store_b.list_property_constraints().is_empty());
+}
+
+// ---------------------------------------------------------------
+// Participant-side durability (2PC hardening).
+//
+// Crash-simulates a peer that ACKed PREPARE by dropping its
+// in-memory service and opening a fresh one against the same
+// storage + log. Confirms that a subsequent COMMIT finds the
+// staged batch and applies it — without the participant log, the
+// second service would surface `failed_precondition` because
+// staging is purely in-memory.
+// ---------------------------------------------------------------
+
+/// Harness for single-peer participant-durability tests. Holds the
+/// on-disk paths that outlive any `MeshService` the test builds on
+/// top of them. The `store` field is an `Option` so `.take()` drops
+/// it cleanly — rocksdb's per-process directory lock won't let a
+/// second `Store::open()` run until every handle on the first is
+/// dropped.
+struct ParticipantHarness {
+    store: Option<Arc<dyn StorageEngine>>,
+    log_path: std::path::PathBuf,
+    store_dir: TempDir,
+    _log_dir: TempDir,
+}
+
+fn new_participant_harness() -> ParticipantHarness {
+    let store_dir = TempDir::new().unwrap();
+    let log_dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(store_dir.path()).unwrap());
+    let log_path = log_dir.path().join("participant-log.jsonl");
+    ParticipantHarness {
+        store: Some(store),
+        log_path,
+        store_dir,
+        _log_dir: log_dir,
+    }
+}
+
+impl ParticipantHarness {
+    /// Borrow the currently-open store. Panics after [`Self::restart`]
+    /// replaces it — call `.service()` or peek through a fresh
+    /// `Store::open()` instead.
+    fn store(&self) -> &Arc<dyn StorageEngine> {
+        self.store.as_ref().expect("store dropped; call restart")
+    }
+
+    /// Build a fresh `MeshService` atop the currently-open store and
+    /// log. Each call produces an independent service instance —
+    /// tests that want to simulate a service restart should drop the
+    /// previous service before calling [`Self::restart`].
+    fn service(&self) -> MeshService {
+        let log = Arc::new(ParticipantLog::open(&self.log_path).unwrap());
+        MeshService::new(self.store().clone()).with_participant_log(Some(log))
+    }
+
+    /// Simulate a peer crash + restart. Drops the store and every
+    /// outstanding handle through it (including the caller's service,
+    /// which must be dropped first), opens a fresh store against the
+    /// same data dir, and hands back a new `MeshService` whose
+    /// participant staging has been rehydrated from the on-disk log.
+    fn restart(&mut self) -> MeshService {
+        // Drop the store Arc so rocksdb's LOCK releases. Tests must
+        // have already dropped their service handle — any live clone
+        // keeps the Arc alive and `Store::open()` below will fail
+        // with "lock hold by current process".
+        self.store = None;
+        let store: Arc<dyn StorageEngine> = Arc::new(Store::open(self.store_dir.path()).unwrap());
+        self.store = Some(store.clone());
+        let log = Arc::new(ParticipantLog::open(&self.log_path).unwrap());
+        let service = MeshService::new(store).with_participant_log(Some(log));
+        service.recover_participant_staging().unwrap();
+        service
+    }
+}
+
+fn prepare_request(txid: &str, commands: &[meshdb_cluster::GraphCommand]) -> BatchWriteRequest {
+    BatchWriteRequest {
+        txid: txid.to_string(),
+        phase: BatchPhase::Prepare as i32,
+        commands_json: serde_json::to_vec(commands).unwrap(),
+    }
+}
+
+fn commit_request(txid: &str) -> BatchWriteRequest {
+    BatchWriteRequest {
+        txid: txid.to_string(),
+        phase: BatchPhase::Commit as i32,
+        commands_json: Vec::new(),
+    }
+}
+
+fn abort_request(txid: &str) -> BatchWriteRequest {
+    BatchWriteRequest {
+        txid: txid.to_string(),
+        phase: BatchPhase::Abort as i32,
+        commands_json: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn participant_log_rehydrates_prepare_across_restart() {
+    use meshdb_rpc::proto::mesh_write_server::MeshWrite;
+
+    let mut h = new_participant_harness();
+    let node = Node::new().with_label("Survives");
+    let node_id = node.id;
+    let commands = vec![meshdb_cluster::GraphCommand::PutNode(node)];
+
+    // PREPARE on the first service instance, then drop it without a
+    // COMMIT. Staging is in-memory only, so the only thing preserving
+    // the prepared batch is the on-disk participant log.
+    {
+        let service = h.service();
+        service
+            .batch_write(tonic::Request::new(prepare_request("t-survive", &commands)))
+            .await
+            .unwrap();
+    }
+
+    // Before COMMIT, the store must still be untouched.
+    assert!(h.store().get_node(node_id).unwrap().is_none());
+
+    // Restart: fresh service with empty staging, replay from the log.
+    let recovered = h.restart();
+
+    // COMMIT arrives on the new service — must find the rehydrated
+    // staging and apply the batch.
+    recovered
+        .batch_write(tonic::Request::new(commit_request("t-survive")))
+        .await
+        .unwrap();
+
+    assert!(
+        h.store().get_node(node_id).unwrap().is_some(),
+        "rehydrated PREPARE must apply on the replacement service",
+    );
+}
+
+#[tokio::test]
+async fn participant_log_makes_duplicate_commit_idempotent() {
+    use meshdb_rpc::proto::mesh_write_server::MeshWrite;
+
+    let h = new_participant_harness();
+    let node = Node::new().with_label("OnlyOnce");
+    let node_id = node.id;
+    let commands = vec![meshdb_cluster::GraphCommand::PutNode(node)];
+
+    let service = h.service();
+    service
+        .batch_write(tonic::Request::new(prepare_request("t-dup", &commands)))
+        .await
+        .unwrap();
+    service
+        .batch_write(tonic::Request::new(commit_request("t-dup")))
+        .await
+        .unwrap();
+
+    // Second COMMIT — previously returned `failed_precondition`
+    // ("txid not prepared") because staging was drained. With the
+    // outcomes cache populated, it short-circuits to success.
+    service
+        .batch_write(tonic::Request::new(commit_request("t-dup")))
+        .await
+        .expect("duplicate COMMIT should be idempotent");
+
+    assert!(h.store().get_node(node_id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn participant_log_commit_after_abort_is_rejected() {
+    use meshdb_rpc::proto::mesh_write_server::MeshWrite;
+
+    let h = new_participant_harness();
+    let commands = vec![meshdb_cluster::GraphCommand::PutNode(
+        Node::new().with_label("Abandoned"),
+    )];
+
+    let service = h.service();
+    service
+        .batch_write(tonic::Request::new(prepare_request("t-abort", &commands)))
+        .await
+        .unwrap();
+    service
+        .batch_write(tonic::Request::new(abort_request("t-abort")))
+        .await
+        .unwrap();
+
+    // COMMIT against an aborted txid must fail — the outcomes cache
+    // holds Aborted, which is a different failure than "never
+    // prepared" and callers can use the message to diagnose
+    // coordinator bugs.
+    let err = service
+        .batch_write(tonic::Request::new(commit_request("t-abort")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("aborted"),
+        "error should name the aborted state, got: {}",
+        err.message(),
+    );
+}
+
+#[tokio::test]
+async fn participant_log_replay_preserves_committed_outcome() {
+    use meshdb_rpc::proto::mesh_write_server::MeshWrite;
+
+    let mut h = new_participant_harness();
+    let commands = vec![meshdb_cluster::GraphCommand::PutNode(
+        Node::new().with_label("Done"),
+    )];
+
+    {
+        let service = h.service();
+        service
+            .batch_write(tonic::Request::new(prepare_request("t-done", &commands)))
+            .await
+            .unwrap();
+        service
+            .batch_write(tonic::Request::new(commit_request("t-done")))
+            .await
+            .unwrap();
+    }
+
+    // Restart the peer. The committed outcome in the log must rehydrate
+    // the outcomes cache so a late duplicate COMMIT still short-circuits.
+    let recovered = h.restart();
+    recovered
+        .batch_write(tonic::Request::new(commit_request("t-done")))
+        .await
+        .expect("late COMMIT after restart must be idempotent against the logged outcome");
 }

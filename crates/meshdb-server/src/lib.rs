@@ -8,7 +8,8 @@ use config::{ClusterMode, ServerConfig};
 use meshdb_cluster::raft::{BasicNode, GraphStateMachine, RaftCluster};
 use meshdb_cluster::{Cluster, ClusterState, Membership, PartitionMap, Peer, PeerId};
 use meshdb_rpc::{
-    CoordinatorLog, GrpcNetwork, MeshRaftService, MeshService, Routing, StoreGraphApplier,
+    CoordinatorLog, GrpcNetwork, MeshRaftService, MeshService, ParticipantLog, Routing,
+    StoreGraphApplier,
 };
 use meshdb_storage::{RocksDbStorageEngine, StorageEngine};
 use std::collections::BTreeMap;
@@ -78,7 +79,13 @@ fn build_routing_service(
         CoordinatorLog::open(coordinator_log_path(&config.data_dir))
             .context("opening coordinator log")?,
     );
-    Ok(MeshService::with_routing_and_log(store, routing, Some(log)).with_client_tls(client_tls))
+    let participant_log = Arc::new(
+        ParticipantLog::open(participant_log_path(&config.data_dir))
+            .context("opening participant log")?,
+    );
+    Ok(MeshService::with_routing_and_log(store, routing, Some(log))
+        .with_participant_log(Some(participant_log))
+        .with_client_tls(client_tls))
 }
 
 /// Build the [`tonic::transport::ClientTlsConfig`] used for outgoing
@@ -102,6 +109,14 @@ fn build_grpc_client_tls(
 /// at the same file during integration tests.
 pub fn coordinator_log_path(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("coordinator-log.jsonl")
+}
+
+/// Path of the participant recovery log inside the configured data
+/// directory. Sibling to the coordinator log; records every
+/// `BatchWrite` phase this peer receives so a crash after PREPARE
+/// ACK doesn't lose the staged batch.
+pub fn participant_log_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("participant-log.jsonl")
 }
 
 /// Build the full [`ServerComponents`] bundle. Switches on
@@ -234,6 +249,17 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         raft: _,
         raft_service,
     } = components;
+
+    // Rehydrate 2PC participant-side state from the on-disk log
+    // BEFORE the gRPC server accepts new traffic. Without this step,
+    // a COMMIT arriving immediately after restart would see empty
+    // staging for a txid that crashed mid-PREPARE and fail with
+    // `failed_precondition` instead of succeeding. No-op in
+    // single-node / Raft modes where the participant log isn't
+    // configured.
+    if let Err(e) = service.recover_participant_staging() {
+        tracing::warn!(error = %e, "participant staging recovery failed; continuing");
+    }
 
     // Reconcile any transactions left unfinished by a prior crash
     // before we start accepting new traffic. In single-node and Raft

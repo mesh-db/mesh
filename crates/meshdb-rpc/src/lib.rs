@@ -7,6 +7,7 @@ mod coordinator_log;
 mod error;
 mod executor_writer;
 pub mod metrics;
+mod participant_log;
 mod partitioned_reader;
 mod raft_applier;
 mod raft_network;
@@ -25,6 +26,10 @@ pub use coordinator_log::{
 };
 pub use error::ConvertError;
 pub use executor_writer::{BufferingGraphWriter, RaftGraphWriter};
+pub use participant_log::{
+    replay_in_doubt_commands, replay_outcomes, ParticipantLog, ParticipantLogEntry,
+    ParticipantOutcome, PARTICIPANT_LOG_MIN_TERMINAL, PARTICIPANT_LOG_ROTATION_INTERVAL,
+};
 pub use partitioned_reader::PartitionedGraphReader;
 pub use raft_applier::StoreGraphApplier;
 pub use raft_network::{GrpcNetwork, GrpcNetworkError};
@@ -32,5 +37,7 @@ pub use raft_service::MeshRaftService;
 pub use routing::{Routing, RoutingError};
 pub use routing_writer::RoutingGraphWriter;
 pub use server::MeshService;
-pub use staging::{ParticipantStaging, DEFAULT_STAGING_TTL, DEFAULT_SWEEP_INTERVAL};
+pub use staging::{
+    ParticipantStaging, TerminalOutcome, DEFAULT_STAGING_TTL, DEFAULT_SWEEP_INTERVAL,
+};
 pub use tx_overlay::{OverlayGraphReader, TxOverlayState};
