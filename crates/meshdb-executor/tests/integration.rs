@@ -9485,3 +9485,69 @@ mod apoc_convert {
         ));
     }
 }
+
+#[cfg(feature = "apoc-date")]
+mod apoc_date {
+    use super::*;
+
+    #[test]
+    fn apoc_date_current_timestamp_is_positive() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.date.currentTimestamp() AS t");
+        // Any post-2020 wall clock should yield a positive i64 > 1.5e12 ms.
+        assert!(int_prop(&rows[0], "t") > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn apoc_date_to_iso8601_known_instant() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.date.toISO8601(1700000000000) AS s");
+        assert_eq!(str_prop(&rows[0], "s"), "2023-11-14T22:13:20.000Z");
+    }
+
+    #[test]
+    fn apoc_date_iso8601_round_trip() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.date.fromISO8601(apoc.date.toISO8601(1700000000456)) AS ms",
+        );
+        assert_eq!(int_prop(&rows[0], "ms"), 1_700_000_000_456);
+    }
+
+    #[test]
+    fn apoc_date_convert_units() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.date.convert(1, 'h', 'ms') AS hours_to_ms, \
+                    apoc.date.convert(3600000, 'ms', 'h') AS ms_to_hours, \
+                    apoc.date.convert(1, 'week', 'days') AS week_to_days",
+        );
+        assert_eq!(int_prop(&rows[0], "hours_to_ms"), 3_600_000);
+        assert_eq!(int_prop(&rows[0], "ms_to_hours"), 1);
+        assert_eq!(int_prop(&rows[0], "week_to_days"), 7);
+    }
+
+    #[test]
+    fn apoc_date_add_cross_unit() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.date.add(5, 'min', 1, 'h') AS m, \
+                    apoc.date.add(1000, 'ms', 2, 's') AS ms",
+        );
+        assert_eq!(int_prop(&rows[0], "m"), 65);
+        assert_eq!(int_prop(&rows[0], "ms"), 3000);
+    }
+
+    #[test]
+    fn apoc_date_null_propagates() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.date.toISO8601(null) AS s");
+        assert!(matches!(
+            rows[0].get("s"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+}

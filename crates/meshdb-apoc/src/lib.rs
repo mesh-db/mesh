@@ -21,6 +21,7 @@
 //! | `map`     | `apoc.map.*` map transforms |
 //! | `util`    | `apoc.util.*` cryptographic digests |
 //! | `convert` | `apoc.convert.*` JSON serialization |
+//! | `date`    | `apoc.date.*` epoch-millis helpers |
 //! | `full`    | Every shipped namespace (convenience umbrella) |
 //!
 //! More namespaces will add their own feature flags when they
@@ -50,6 +51,9 @@ pub mod util;
 
 #[cfg(feature = "convert")]
 pub mod convert;
+
+#[cfg(feature = "date")]
+pub mod date;
 
 /// Errors the APOC dispatcher surfaces back to the caller. All
 /// variants are recoverable in the sense that the executor can
@@ -118,6 +122,11 @@ pub fn call_scalar(name: &str, args: &[Property]) -> Result<Property, ApocError>
     #[cfg(feature = "convert")]
     if let Some(suffix) = _lc.strip_prefix("apoc.convert.") {
         return convert::call(suffix, args);
+    }
+
+    #[cfg(feature = "date")]
+    if let Some(suffix) = _lc.strip_prefix("apoc.date.") {
+        return date::call(suffix, args);
     }
 
     let _ = args;
