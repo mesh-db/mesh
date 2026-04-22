@@ -10,6 +10,9 @@ description = "APOC-compatible procedures and scalar functions for Mesh Cypher"
 meshdb-core = { workspace = true }
 thiserror.workspace = true
 regex = { version = "1", optional = true }
+md-5 = { version = "0.10", optional = true }
+sha1 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [features]
 # Per-namespace opt-in. Each feature gates the module that
@@ -35,7 +38,13 @@ text = ["dep:regex"]
 # Pure HashMap transforms, no extra deps.
 map = []
 
+# `apoc.util.*` — cryptographic digest helpers: md5 / sha1 /
+# sha256 / sha384 / sha512. Each function hashes its String
+# argument and returns the lower-case hex digest. Pulls in the
+# RustCrypto `md-5` / `sha1` / `sha2` crates only when enabled.
+util = ["dep:md-5", "dep:sha1", "dep:sha2"]
+
 # Umbrella convenience: everything we ship today. Add new
 # namespace features to this list as they land so
 # `--features full` keeps its "turn on everything" meaning.
-full = ["coll", "text", "map"]
+full = ["coll", "text", "map", "util"]
