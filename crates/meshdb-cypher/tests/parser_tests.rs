@@ -1311,7 +1311,7 @@ fn withinbbox_with_registered_point_index_rewrites_to_seek() {
     let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
     let rendered = format_plan(&plan);
     assert!(
-        rendered.contains("PointIndexSeek(c:City.loc)"),
+        rendered.contains("PointIndexSeek(c:City.loc, bbox)"),
         "plan should use PointIndexSeek, got:\n{rendered}",
     );
     // The withinbbox conjunct must be gone from the residual —
@@ -1369,7 +1369,104 @@ fn withinbbox_with_parameterized_corners_rewrites() {
     // $lo / $hi are row-independent so the rewrite should still fire.
     let stmt = parse("MATCH (c:City) WHERE point.withinbbox(c.loc, $lo, $hi) RETURN c").unwrap();
     let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
-    assert!(format_plan(&plan).contains("PointIndexSeek(c:City.loc)"));
+    assert!(format_plan(&plan).contains("PointIndexSeek(c:City.loc, bbox)"));
+}
+
+#[test]
+fn distance_lt_radius_rewrites_to_radius_seek() {
+    let stmt = parse(
+        "MATCH (c:City) \
+         WHERE point.distance(c.loc, point({x: 0.0, y: 0.0})) < 5.0 \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(
+        rendered.contains("PointIndexSeek(c:City.loc, radius)"),
+        "plan should use radius seek, got:\n{rendered}",
+    );
+    // The distance conjunct MUST stay in the residual — the
+    // enclosing bbox is a superset of the circle, so the Filter
+    // above the seek is what culls the corner overshoot.
+    assert!(
+        rendered.contains("Filter") && rendered.contains("point.distance"),
+        "distance predicate must survive as a residual Filter:\n{rendered}",
+    );
+}
+
+#[test]
+fn distance_flipped_comparison_rewrites() {
+    // `5.0 > point.distance(c.loc, ref)` should match too — the
+    // extractor flips the sides.
+    let stmt = parse(
+        "MATCH (c:City) \
+         WHERE 5.0 > point.distance(c.loc, point({x: 0.0, y: 0.0})) \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
+    assert!(format_plan(&plan).contains("PointIndexSeek(c:City.loc, radius)"));
+}
+
+#[test]
+fn distance_le_radius_rewrites() {
+    // `<=` works the same as `<` at the seek level — the
+    // open/closed distinction is preserved by the residual filter.
+    let stmt = parse(
+        "MATCH (c:City) \
+         WHERE point.distance(c.loc, point({x: 0.0, y: 0.0})) <= $r \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
+    assert!(format_plan(&plan).contains("PointIndexSeek(c:City.loc, radius)"));
+}
+
+#[test]
+fn distance_alias_also_rewrites() {
+    // The unqualified `distance(...)` alias maps to the same
+    // semantics at eval time; the rewrite should pick it up too.
+    let stmt = parse(
+        "MATCH (c:City) \
+         WHERE distance(c.loc, point({x: 0.0, y: 0.0})) < 5.0 \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
+    assert!(format_plan(&plan).contains("PointIndexSeek(c:City.loc, radius)"));
+}
+
+#[test]
+fn distance_without_point_index_stays_as_filter() {
+    let stmt = parse(
+        "MATCH (c:City) \
+         WHERE point.distance(c.loc, point({x: 0.0, y: 0.0})) < 5.0 \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &PlannerContext::default()).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(!rendered.contains("PointIndexSeek"));
+    assert!(rendered.contains("NodeScanByLabels"));
+}
+
+#[test]
+fn distance_rewrite_preserves_sibling_conjuncts() {
+    let stmt = parse(
+        "MATCH (c:City) \
+         WHERE point.distance(c.loc, point({x: 0.0, y: 0.0})) < 10.0 \
+           AND c.population > 1000 \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(rendered.contains("PointIndexSeek"));
+    assert!(
+        rendered.contains("population"),
+        "sibling conjunct must survive:\n{rendered}",
+    );
 }
 
 #[test]

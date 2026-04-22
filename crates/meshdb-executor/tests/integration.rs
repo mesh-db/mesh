@@ -4157,6 +4157,162 @@ fn withinbbox_residual_conjunct_still_applies() {
     assert_eq!(str_prop(&rows[0], "name"), "B");
 }
 
+// ---------------------------------------------------------------
+// point.distance(...) < r → PointIndexSeek (slice 4).
+//
+// Exercises the enclosing-bbox rewrite: storage returns all points
+// in a bbox superset of the circle, then the residual Filter culls
+// the corner overshoot. Must agree with the non-indexed scan.
+// ---------------------------------------------------------------
+
+#[test]
+fn distance_query_returns_points_within_radius_cartesian() {
+    let (store, _d) = open_store();
+    run_with_ctx(&store, "CREATE POINT INDEX FOR (p:Spot) ON (p.pos)");
+    // Inside the radius.
+    run_with_ctx(
+        &store,
+        "CREATE (:Spot {name: 'inside', pos: point({x: 1.0, y: 1.0, srid: 7203})})",
+    );
+    // Inside the enclosing bbox but OUTSIDE the circle — corner of the square.
+    // Distance to origin = sqrt(4.5² + 4.5²) ≈ 6.36, > 5.0.
+    run_with_ctx(
+        &store,
+        "CREATE (:Spot {name: 'corner', pos: point({x: 4.5, y: 4.5, srid: 7203})})",
+    );
+    // Far away.
+    run_with_ctx(
+        &store,
+        "CREATE (:Spot {name: 'far', pos: point({x: 20.0, y: 20.0, srid: 7203})})",
+    );
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (p:Spot) \
+         WHERE point.distance(p.pos, point({x: 0.0, y: 0.0, srid: 7203})) < 5.0 \
+         RETURN p.name AS name",
+    );
+    let mut names: Vec<String> = rows.iter().map(|r| str_prop(r, "name")).collect();
+    names.sort();
+    assert_eq!(names, vec!["inside".to_string()]);
+}
+
+#[test]
+fn distance_query_matches_scan_result_cartesian() {
+    // Parity with the non-rewritten fallback: same dataset, same
+    // query, two stores — one indexed (rewrite fires), one not.
+    let (indexed, _d1) = open_store();
+    let (scan_only, _d2) = open_store();
+    for store in [&indexed, &scan_only] {
+        run_with_ctx(
+            store,
+            "CREATE (:Spot {name: 'A', pos: point({x: 0.5, y: 0.5, srid: 7203})})",
+        );
+        run_with_ctx(
+            store,
+            "CREATE (:Spot {name: 'B', pos: point({x: 3.0, y: 4.0, srid: 7203})})",
+        );
+        run_with_ctx(
+            store,
+            "CREATE (:Spot {name: 'C', pos: point({x: 4.5, y: 4.5, srid: 7203})})",
+        );
+        run_with_ctx(
+            store,
+            "CREATE (:Spot {name: 'D', pos: point({x: 100.0, y: 0.0, srid: 7203})})",
+        );
+    }
+    run_with_ctx(&indexed, "CREATE POINT INDEX FOR (p:Spot) ON (p.pos)");
+
+    let q = "MATCH (p:Spot) \
+             WHERE point.distance(p.pos, point({x: 0.0, y: 0.0, srid: 7203})) <= 5.0 \
+             RETURN p.name AS name";
+    let mut with_idx: Vec<String> = run_with_ctx(&indexed, q)
+        .iter()
+        .map(|r| str_prop(r, "name"))
+        .collect();
+    let mut without_idx: Vec<String> = run_with_ctx(&scan_only, q)
+        .iter()
+        .map(|r| str_prop(r, "name"))
+        .collect();
+    with_idx.sort();
+    without_idx.sort();
+    assert_eq!(with_idx, without_idx);
+    assert_eq!(with_idx, vec!["A".to_string(), "B".to_string()]);
+}
+
+#[test]
+fn distance_query_matches_scan_result_wgs84() {
+    // WGS-84 round-trip: the operator's dlat/dlon-per-metre
+    // approximation must still produce a superset, so the result
+    // set matches the non-rewritten scan. Short distances (a few
+    // km) near the equator are the safe regime.
+    let (indexed, _d1) = open_store();
+    let (scan_only, _d2) = open_store();
+    for store in [&indexed, &scan_only] {
+        // Reference: (0, 0). Three points at varying distances.
+        run_with_ctx(
+            store,
+            "CREATE (:City {name: 'near', loc: point({latitude: 0.001, longitude: 0.0})})",
+        );
+        run_with_ctx(
+            store,
+            "CREATE (:City {name: 'medium', loc: point({latitude: 0.05, longitude: 0.0})})",
+        );
+        run_with_ctx(
+            store,
+            "CREATE (:City {name: 'far', loc: point({latitude: 1.0, longitude: 0.0})})",
+        );
+    }
+    run_with_ctx(&indexed, "CREATE POINT INDEX FOR (c:City) ON (c.loc)");
+
+    // Reference at equator, ~1 km radius. `near` (~111 m) qualifies;
+    // `medium` (~5.5 km) and `far` (~111 km) don't.
+    let q = "MATCH (c:City) \
+             WHERE point.distance(c.loc, point({latitude: 0.0, longitude: 0.0})) < 1000.0 \
+             RETURN c.name AS name";
+    let mut with_idx: Vec<String> = run_with_ctx(&indexed, q)
+        .iter()
+        .map(|r| str_prop(r, "name"))
+        .collect();
+    let mut without_idx: Vec<String> = run_with_ctx(&scan_only, q)
+        .iter()
+        .map(|r| str_prop(r, "name"))
+        .collect();
+    with_idx.sort();
+    without_idx.sort();
+    assert_eq!(
+        with_idx, without_idx,
+        "rewrite must agree with scan fallback",
+    );
+    assert_eq!(with_idx, vec!["near".to_string()]);
+}
+
+#[test]
+fn distance_query_with_parameterized_radius() {
+    let (store, _d) = open_store();
+    run_with_ctx(&store, "CREATE POINT INDEX FOR (p:Spot) ON (p.pos)");
+    run_with_ctx(
+        &store,
+        "CREATE (:Spot {pos: point({x: 1.0, y: 1.0, srid: 7203})})",
+    );
+    run_with_ctx(
+        &store,
+        "CREATE (:Spot {pos: point({x: 100.0, y: 100.0, srid: 7203})})",
+    );
+    let mut params = ParamMap::new();
+    params.insert(
+        "r".into(),
+        meshdb_executor::Value::Property(meshdb_core::Property::Float64(5.0)),
+    );
+    let rows = run_with_ctx_params(
+        &store,
+        "MATCH (p:Spot) \
+         WHERE point.distance(p.pos, point({x: 0.0, y: 0.0, srid: 7203})) < $r \
+         RETURN p.pos AS pos",
+        &params,
+    );
+    assert_eq!(rows.len(), 1);
+}
+
 #[test]
 fn point_index_and_property_index_shows_are_independent() {
     // Point DDL must not surface in `SHOW INDEXES` and vice versa —

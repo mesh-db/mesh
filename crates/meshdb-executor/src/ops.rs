@@ -10,8 +10,8 @@ use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
 use meshdb_cypher::{
     AggregateArg, AggregateFn, AggregateSpec, BinaryOp, CallArgs, CompareOp, ConstraintKind,
     ConstraintScope as CypherConstraintScope, CreateEdgeSpec, CreateNodeSpec, Direction, Expr,
-    Literal, LogicalPlan, PropertyType as CypherPropertyType, RemoveSpec, ReturnItem,
-    SetAssignment, SortItem, UnaryOp, YieldSpec,
+    Literal, LogicalPlan, PointSeekBounds, PropertyType as CypherPropertyType, RemoveSpec,
+    ReturnItem, SetAssignment, SortItem, UnaryOp, YieldSpec,
 };
 use meshdb_storage::{
     ConstraintScope as StorageConstraintScope, PropertyConstraintKind,
@@ -859,14 +859,12 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             var,
             label,
             property,
-            lo,
-            hi,
+            bounds,
         } => Box::new(PointIndexSeekOp::new(
             var.clone(),
             label.clone(),
             property.clone(),
-            lo.clone(),
-            hi.clone(),
+            bounds.clone(),
         )),
         LogicalPlan::EdgeSeek {
             edge_var,
@@ -2516,33 +2514,39 @@ impl Operator for IndexSeekOp {
 }
 
 /// Physical operator for [`LogicalPlan::PointIndexSeek`]. Evaluates
-/// the two corner expressions once on first `next()`, extracts the
-/// `(srid, x, y)` from each, and drives
-/// `reader.nodes_in_bbox(label, property, srid, xlo, ylo, xhi, yhi)`.
+/// its bounds once on first `next()` and drives
+/// `reader.nodes_in_bbox(...)`.
 ///
-/// SRID mismatch between the two corners short-circuits to empty —
-/// the unoptimized `point.withinbbox(n.p, lo, hi)` returns null on a
-/// corner SRID mismatch, which excludes the row from a filter, and
-/// "no rows" is the same observable outcome. Non-Point or null
-/// corners fall into the same bucket, same reason.
+/// For [`PointSeekBounds::Corners`] the operator passes the corners
+/// through as-is and short-circuits on SRID mismatch / null / non-Point
+/// corners — `point.withinbbox` returns null in those cases, which
+/// excludes the row from a filter, so "no rows" is the same
+/// observable outcome.
+///
+/// For [`PointSeekBounds::Radius`] the operator derives the enclosing
+/// bbox from the center's SRID: Cartesian gets a `(cx ± r, cy ± r)`
+/// square; WGS-84 converts `r` metres to lat/lon spans using the
+/// `cos(lat)` factor for longitude. The enclosing bbox is always a
+/// *superset* of the circle, so the planner keeps the original
+/// distance predicate as a residual `Filter` above the seek — the
+/// corners of the square that fall outside the circle are culled
+/// there.
 struct PointIndexSeekOp {
     var: String,
     label: String,
     property: String,
-    lo_expr: Expr,
-    hi_expr: Expr,
+    bounds: PointSeekBounds,
     results: Option<Vec<NodeId>>,
     cursor: usize,
 }
 
 impl PointIndexSeekOp {
-    fn new(var: String, label: String, property: String, lo_expr: Expr, hi_expr: Expr) -> Self {
+    fn new(var: String, label: String, property: String, bounds: PointSeekBounds) -> Self {
         Self {
             var,
             label,
             property,
-            lo_expr,
-            hi_expr,
+            bounds,
             results: None,
             cursor: 0,
         }
@@ -2553,22 +2557,44 @@ impl Operator for PointIndexSeekOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         if self.results.is_none() {
             let empty = Row::new();
-            let lo_val = eval_expr(&self.lo_expr, &ctx.eval_ctx(&empty))?;
-            let hi_val = eval_expr(&self.hi_expr, &ctx.eval_ctx(&empty))?;
-            let lo_pt = extract_point(&lo_val);
-            let hi_pt = extract_point(&hi_val);
-            let ids = match (lo_pt, hi_pt) {
-                (Some(lo), Some(hi)) if lo.srid == hi.srid => ctx.store.nodes_in_bbox(
-                    &self.label,
-                    &self.property,
-                    lo.srid,
-                    lo.x,
-                    lo.y,
-                    hi.x,
-                    hi.y,
-                )?,
-                // Any null / non-point / SRID mismatch → no rows.
-                _ => Vec::new(),
+            let ectx = ctx.eval_ctx(&empty);
+            let ids = match &self.bounds {
+                PointSeekBounds::Corners { lo, hi } => {
+                    let lo_pt = extract_point(&eval_expr(lo, &ectx)?);
+                    let hi_pt = extract_point(&eval_expr(hi, &ectx)?);
+                    match (lo_pt, hi_pt) {
+                        (Some(lo), Some(hi)) if lo.srid == hi.srid => ctx.store.nodes_in_bbox(
+                            &self.label,
+                            &self.property,
+                            lo.srid,
+                            lo.x,
+                            lo.y,
+                            hi.x,
+                            hi.y,
+                        )?,
+                        _ => Vec::new(),
+                    }
+                }
+                PointSeekBounds::Radius { center, radius } => {
+                    let center_pt = extract_point(&eval_expr(center, &ectx)?);
+                    let radius_val = extract_f64(&eval_expr(radius, &ectx)?);
+                    match (center_pt, radius_val) {
+                        (Some(c), Some(r)) if r.is_finite() && r >= 0.0 => {
+                            let (xlo, ylo, xhi, yhi) = enclosing_bbox(&c, r);
+                            ctx.store.nodes_in_bbox(
+                                &self.label,
+                                &self.property,
+                                c.srid,
+                                xlo,
+                                ylo,
+                                xhi,
+                                yhi,
+                            )?
+                        }
+                        // Null / non-point center or null / negative / NaN radius → no rows.
+                        _ => Vec::new(),
+                    }
+                }
             };
             self.results = Some(ids);
         }
@@ -2590,6 +2616,46 @@ fn extract_point(v: &Value) -> Option<meshdb_core::Point> {
     match v {
         Value::Property(Property::Point(p)) => Some(*p),
         _ => None,
+    }
+}
+
+fn extract_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Property(Property::Float64(f)) => Some(*f),
+        Value::Property(Property::Int64(i)) => Some(*i as f64),
+        _ => None,
+    }
+}
+
+/// Enclosing axis-aligned bbox for a circle of radius `r` around
+/// `center`. Always a superset of the circle, so callers must still
+/// apply a precision filter on distance. Cartesian SRIDs use a
+/// straight `center ± r` square in the CRS's own units. Geographic
+/// SRIDs (WGS-84, SRID 4326 / 4979) convert `r` metres to lat/lon
+/// spans via the standard flat-earth approximation with a `cos(lat)`
+/// longitude-span correction; the factor is clamped away from zero
+/// so near-pole circles don't collapse into a zero-width bbox (the
+/// pathological case falls back to the full longitude range).
+fn enclosing_bbox(center: &meshdb_core::Point, r: f64) -> (f64, f64, f64, f64) {
+    if center.is_geographic() {
+        // One degree of latitude ≈ 111_320 metres on a spherical
+        // Earth. One degree of longitude shrinks by cos(latitude).
+        const METRES_PER_DEG: f64 = 111_320.0;
+        let dlat = r / METRES_PER_DEG;
+        let cos_lat = center.y.to_radians().cos().abs();
+        // `cos(lat)` goes to 0 at the poles; clamp so a polar
+        // circle maps to a wide-but-finite longitude span rather
+        // than a divide-by-zero.
+        let cos_lat_floor = cos_lat.max(1.0e-6);
+        let dlon = r / (METRES_PER_DEG * cos_lat_floor);
+        (
+            center.x - dlon,
+            center.y - dlat,
+            center.x + dlon,
+            center.y + dlat,
+        )
+    } else {
+        (center.x - r, center.y - r, center.x + r, center.y + r)
     }
 }
 

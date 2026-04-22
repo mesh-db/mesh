@@ -70,6 +70,27 @@ pub enum OuterBindingKind {
     Scalar,
 }
 
+/// Shape of the bbox a [`LogicalPlan::PointIndexSeek`] should drive
+/// `nodes_in_bbox` with at open-time.
+///
+/// `Corners` carries the two corner expressions verbatim from a
+/// `point.withinbbox(n.p, lo, hi)` predicate — the operator evals
+/// them once, extracts SRIDs, and hands the reader a literal bbox.
+///
+/// `Radius` carries a center point + scalar radius from a
+/// `point.distance(n.p, center) {<, <=} radius` predicate. The
+/// operator derives the enclosing bbox at open-time, SRID-aware:
+/// Cartesian gets a simple `center ± radius` square, geographic
+/// (WGS-84) converts metres to lat/lon spans with a `cos(lat)`
+/// factor. The planner keeps the distance predicate as a residual
+/// `Filter` above the seek so the circle-vs-square overshoot gets
+/// culled at emission time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointSeekBounds {
+    Corners { lo: Expr, hi: Expr },
+    Radius { center: Expr, radius: Expr },
+}
+
 impl PlannerContext {
     /// True when a single-property index exists on `(label, property)`.
     /// Kept for callers that still dispatch on "there is *an* index on
@@ -509,24 +530,22 @@ pub enum LogicalPlan {
         values: Vec<Expr>,
     },
     /// Axis-aligned bbox range query through a point / spatial
-    /// index. Emitted when a WHERE conjunct matches
-    /// `point.withinbbox(var.property, lo, hi)` and a point index is
-    /// registered on `(label, property)` — both corners must be
-    /// row-independent (literal or parameter) so they can be evaluated
-    /// once at operator open. The executor calls
-    /// `reader.nodes_in_bbox(label, property, srid, xlo, ylo, xhi, yhi)`
-    /// after evaluating the corners and extracting the SRID.
-    ///
-    /// SRID mismatch between corners short-circuits to an empty result
-    /// — `point.withinbbox` returns null in that case, which excludes
-    /// the row from a filter, so emitting no rows matches the
-    /// pre-rewrite semantics.
+    /// index. Emitted when a WHERE conjunct matches a bbox or
+    /// distance-radius predicate on an indexed `(label, property)`
+    /// pair. The operator evaluates the bounds at open-time and
+    /// drives `reader.nodes_in_bbox(label, property, srid, ...)`.
+    /// The bbox the operator feeds to the reader is always a *super*
+    /// set of the query shape — a circle maps to its enclosing
+    /// square — so any predicate whose shape is tighter than the
+    /// enclosing bbox (the distance-radius case) stays in a residual
+    /// Filter above the seek to cull the overshoot. The `withinbbox`
+    /// case doesn't need that Filter because the storage-layer bbox
+    /// check is exact.
     PointIndexSeek {
         var: String,
         label: String,
         property: String,
-        lo: Expr,
-        hi: Expr,
+        bounds: PointSeekBounds,
     },
     /// Equality lookup through an edge property index. Relationship
     /// analogue of [`LogicalPlan::IndexSeek`]. Emitted for
@@ -1099,10 +1118,14 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             var,
             label,
             property,
-            ..
+            bounds,
         } => {
+            let shape = match bounds {
+                PointSeekBounds::Corners { .. } => "bbox",
+                PointSeekBounds::Radius { .. } => "radius",
+            };
             buf.push_str(&format!(
-                "{indent}PointIndexSeek({var}:{label}.{property})\n"
+                "{indent}PointIndexSeek({var}:{label}.{property}, {shape})\n"
             ));
         }
         LogicalPlan::EdgeSeek {
@@ -1542,9 +1565,17 @@ where
             }
             Ok(())
         }
-        LogicalPlan::PointIndexSeek { lo, hi, .. } => {
-            visit(lo)?;
-            visit(hi)?;
+        LogicalPlan::PointIndexSeek { bounds, .. } => {
+            match bounds {
+                PointSeekBounds::Corners { lo, hi } => {
+                    visit(lo)?;
+                    visit(hi)?;
+                }
+                PointSeekBounds::Radius { center, radius } => {
+                    visit(center)?;
+                    visit(radius)?;
+                }
+            }
             Ok(())
         }
         LogicalPlan::EdgeSeek {
@@ -3657,24 +3688,43 @@ fn optimize_filter_chain_to_point_index_seek(
         }
     }
 
-    let Some((idx, property, lo, hi)) = consumed else {
-        return rebuild_filter_chain(current, conjuncts);
-    };
+    if let Some((idx, property, lo, hi)) = consumed {
+        let seek = LogicalPlan::PointIndexSeek {
+            var: scan_var,
+            label: scan_label,
+            property,
+            bounds: PointSeekBounds::Corners { lo, hi },
+        };
+        let residual: Vec<Expr> = conjuncts
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, c)| c)
+            .collect();
+        return rebuild_filter_chain(seek, residual);
+    }
 
-    let seek = LogicalPlan::PointIndexSeek {
-        var: scan_var,
-        label: scan_label,
-        property,
-        lo,
-        hi,
-    };
-    let residual: Vec<Expr> = conjuncts
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| *i != idx)
-        .map(|(_, c)| c)
-        .collect();
-    rebuild_filter_chain(seek, residual)
+    // Distance-radius rewrite: `point.distance(scan_var.p, ref) {<,<=} r`
+    // or the flipped form. The conjunct stays in the residual filter
+    // — the operator's enclosing bbox is a superset of the circle,
+    // so the distance predicate culls the corner overshoot.
+    for c in &conjuncts {
+        let Some((property, center, radius)) = extract_point_distance_bound(c, &scan_var) else {
+            continue;
+        };
+        if !ctx.has_point_index(&scan_label, &property) {
+            continue;
+        }
+        let seek = LogicalPlan::PointIndexSeek {
+            var: scan_var,
+            label: scan_label,
+            property,
+            bounds: PointSeekBounds::Radius { center, radius },
+        };
+        return rebuild_filter_chain(seek, conjuncts);
+    }
+
+    rebuild_filter_chain(current, conjuncts)
 }
 
 /// Recognize `point.withinbbox(scan_var.prop, lo, hi)` as a
@@ -3713,6 +3763,54 @@ fn extract_point_withinbbox(c: &Expr, scan_var: &str) -> Option<(String, Expr, E
         return None;
     }
     Some((prop, args[1].clone(), args[2].clone()))
+}
+
+/// Recognize `point.distance(scan_var.prop, center) {<,<=} radius`
+/// (or the flipped `radius {>,>=} point.distance(...)` form) as a
+/// candidate for a radius-based `PointIndexSeek`. The shorthand
+/// `distance(...)` alias is accepted. Returns
+/// `(property_name, center_expr, radius_expr)` or `None`.
+///
+/// Strict `<` / `<=` semantics both reduce to the same bbox at the
+/// planner level — the enclosing bbox is computed from the radius
+/// alone, and the comparison-op's exact cutoff (open vs closed
+/// interval) is preserved by the unchanged residual filter. Caller
+/// keeps the original conjunct in the plan so the filter still
+/// enforces the right open/closed boundary.
+fn extract_point_distance_bound(c: &Expr, scan_var: &str) -> Option<(String, Expr, Expr)> {
+    use crate::ast::{CallArgs, CompareOp};
+    let Expr::Compare { op, left, right } = c else {
+        return None;
+    };
+    let (distance_call, radius) = match op {
+        CompareOp::Lt | CompareOp::Le => (left.as_ref(), right.as_ref()),
+        CompareOp::Gt | CompareOp::Ge => (right.as_ref(), left.as_ref()),
+        _ => return None,
+    };
+    let Expr::Call { name, args } = distance_call else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("point.distance") && !name.eq_ignore_ascii_case("distance") {
+        return None;
+    }
+    let CallArgs::Exprs(call_args) = args else {
+        return None;
+    };
+    if call_args.len() != 2 {
+        return None;
+    }
+    // Either arg may be `scan_var.prop`; the other is the reference
+    // point. Both orientations show up in real queries — Neo4j's
+    // `point.distance` is symmetric.
+    let (prop, reference) = match (&call_args[0], &call_args[1]) {
+        (Expr::Property { var, key }, other) if var == scan_var => (key.clone(), other.clone()),
+        (other, Expr::Property { var, key }) if var == scan_var => (key.clone(), other.clone()),
+        _ => return None,
+    };
+    if expr_references_row_state(&reference) || expr_references_row_state(radius) {
+        return None;
+    }
+    Some((prop, reference, radius.clone()))
 }
 
 /// `true` when `e` could read values from the currently-streaming
