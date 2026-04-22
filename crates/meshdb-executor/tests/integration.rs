@@ -9389,3 +9389,99 @@ mod apoc_util {
         ));
     }
 }
+
+#[cfg(feature = "apoc-convert")]
+mod apoc_convert {
+    use super::*;
+
+    fn as_map<'a>(row: &'a Row, key: &str) -> &'a std::collections::HashMap<String, Property> {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::Map(m)) => m,
+            other => panic!("expected Property::Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_convert_to_json_on_primitives() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.toJson(42) AS n, \
+                    apoc.convert.toJson('hi') AS s, \
+                    apoc.convert.toJson(true) AS b, \
+                    apoc.convert.toJson(null) AS nil",
+        );
+        assert_eq!(str_prop(&rows[0], "n"), "42");
+        assert_eq!(str_prop(&rows[0], "s"), "\"hi\"");
+        assert_eq!(str_prop(&rows[0], "b"), "true");
+        assert_eq!(str_prop(&rows[0], "nil"), "null");
+    }
+
+    #[test]
+    fn apoc_convert_to_json_list() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.convert.toJson([1, 2, 'x', null]) AS j");
+        assert_eq!(str_prop(&rows[0], "j"), "[1,2,\"x\",null]");
+    }
+
+    #[test]
+    fn apoc_convert_from_json_map_parses_object() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.fromJsonMap('{\"n\": 1, \"s\": \"x\"}') AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("n"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("s"), Some(Property::String(v)) if v == "x"));
+    }
+
+    #[test]
+    fn apoc_convert_from_json_list_parses_array() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.fromJsonList('[1, 2.5, \"x\", null]') AS xs",
+        );
+        match rows[0].get("xs").unwrap() {
+            Value::Property(Property::List(items)) => {
+                assert_eq!(items.len(), 4);
+                assert!(matches!(items[0], Property::Int64(1)));
+                assert!(matches!(items[1], Property::Float64(f) if f == 2.5));
+                assert!(matches!(&items[2], Property::String(v) if v == "x"));
+                assert!(matches!(items[3], Property::Null));
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_convert_round_trip_through_json() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.fromJsonMap(apoc.convert.toJson({a: 1, b: 'hi'})) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("b"), Some(Property::String(v)) if v == "hi"));
+    }
+
+    #[test]
+    fn apoc_convert_null_input_passes_through() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.fromJsonMap(null) AS m, \
+                    apoc.convert.fromJsonList(null) AS xs",
+        );
+        assert!(matches!(
+            rows[0].get("m"),
+            Some(Value::Property(Property::Null))
+        ));
+        assert!(matches!(
+            rows[0].get("xs"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+}

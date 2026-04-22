@@ -41,7 +41,8 @@ apoc-coll = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/coll"]
 apoc-text = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/text"]
 apoc-map = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/map"]
 apoc-util = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/util"]
+apoc-convert = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/convert"]
 
 # Umbrella: every shipped namespace. Add new sub-features here as
 # they land so `--features apoc` keeps meaning "everything".
-apoc = ["apoc-coll", "apoc-text", "apoc-map", "apoc-util"]
+apoc = ["apoc-coll", "apoc-text", "apoc-map", "apoc-util", "apoc-convert"]

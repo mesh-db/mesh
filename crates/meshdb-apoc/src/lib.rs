@@ -18,12 +18,13 @@
 //! |---------|---------|
 //! | `coll`  | `apoc.coll.*` collection helpers |
 //! | `text`  | `apoc.text.*` string manipulation |
-//! | `map`   | `apoc.map.*` map transforms |
-//! | `util`  | `apoc.util.*` cryptographic digests |
-//! | `full`  | Every shipped namespace (convenience umbrella) |
+//! | `map`     | `apoc.map.*` map transforms |
+//! | `util`    | `apoc.util.*` cryptographic digests |
+//! | `convert` | `apoc.convert.*` JSON serialization |
+//! | `full`    | Every shipped namespace (convenience umbrella) |
 //!
-//! More namespaces (`convert`, etc.) will add their own feature
-//! flags when they land; the umbrella `full` auto-picks them up.
+//! More namespaces will add their own feature flags when they
+//! land; the umbrella `full` auto-picks them up.
 //!
 //! The crate deliberately depends only on `meshdb-core` (for
 //! [`meshdb_core::Property`]) — the executor-side adapter is what
@@ -46,6 +47,9 @@ pub mod map;
 
 #[cfg(feature = "util")]
 pub mod util;
+
+#[cfg(feature = "convert")]
+pub mod convert;
 
 /// Errors the APOC dispatcher surfaces back to the caller. All
 /// variants are recoverable in the sense that the executor can
@@ -109,6 +113,11 @@ pub fn call_scalar(name: &str, args: &[Property]) -> Result<Property, ApocError>
     #[cfg(feature = "util")]
     if let Some(suffix) = _lc.strip_prefix("apoc.util.") {
         return util::call(suffix, args);
+    }
+
+    #[cfg(feature = "convert")]
+    if let Some(suffix) = _lc.strip_prefix("apoc.convert.") {
+        return convert::call(suffix, args);
     }
 
     let _ = args;
