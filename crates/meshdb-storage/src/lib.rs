@@ -4,7 +4,7 @@ mod keys;
 mod rocksdb_engine;
 
 pub use engine::{
-    ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PropertyConstraintKind,
+    ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PointIndexSpec, PropertyConstraintKind,
     PropertyConstraintSpec, PropertyIndexSpec, PropertyType, StorageEngine,
 };
 pub use error::{Error, Result};

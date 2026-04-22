@@ -50,6 +50,22 @@ pub struct EdgePropertyIndexSpec {
     pub properties: Vec<String>,
 }
 
+/// Declarative spec for a point / spatial index on a single
+/// `Property::Point` property. A point index accelerates bounding-box
+/// containment and distance-radius queries via a Z-order (Morton)
+/// cell quantizer — points map to sortable u64 cell IDs, so bbox
+/// queries reduce to a cell-range scan plus a per-row precision
+/// filter.
+///
+/// Single-property for now; a future "composite point index" would
+/// have to pick a curve that extends cleanly to N spatial axes and
+/// so gets its own spec shape when it lands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PointIndexSpec {
+    pub label: String,
+    pub property: String,
+}
+
 /// Kind of single-property constraint. `Unique` comes from
 /// `REQUIRE n.prop IS UNIQUE`, `NotNull` from `REQUIRE n.prop IS NOT
 /// NULL`, and `PropertyType(t)` from `REQUIRE n.prop IS :: <TYPE>`.

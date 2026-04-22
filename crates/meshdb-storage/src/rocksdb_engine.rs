@@ -13,17 +13,20 @@
 
 use crate::{
     engine::{
-        ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PropertyConstraintKind,
-        PropertyConstraintSpec, PropertyIndexSpec, PropertyType, StorageEngine,
+        ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PointIndexSpec,
+        PropertyConstraintKind, PropertyConstraintSpec, PropertyIndexSpec, PropertyType,
+        StorageEngine,
     },
     error::{Error, Result},
     keys::{
-        adj_key, constraint_meta_decode, constraint_meta_encode, edge_from_adj_key,
-        edge_id_from_property_index_key, edge_property_index_composite_key,
-        edge_property_index_composite_value_prefix, encode_index_tuple, encode_index_value,
-        id_from_str_index_key, label_index_key, label_index_prefix, node_from_adj_value,
-        node_id_from_property_index_key, parse_property_index_entry_props,
-        property_index_composite_key, property_index_composite_value_prefix,
+        adj_key, cell_from_point_index_key, constraint_meta_decode, constraint_meta_encode,
+        decode_point_index_value, edge_from_adj_key, edge_id_from_property_index_key,
+        edge_property_index_composite_key, edge_property_index_composite_value_prefix,
+        encode_index_tuple, encode_index_value, id_from_str_index_key, label_index_key,
+        label_index_prefix, node_from_adj_value, node_id_from_point_index_key,
+        node_id_from_property_index_key, parse_property_index_entry_props, point_cell,
+        point_cell_range, point_index_key, point_index_label_prop_prefix, point_index_srid_prefix,
+        point_index_value, property_index_composite_key, property_index_composite_value_prefix,
         property_index_label_prefix, type_index_key, type_index_prefix, ID_LEN,
     },
 };
@@ -46,6 +49,8 @@ const CF_INDEX_META: &str = "index_meta";
 const CF_EDGE_PROPERTY_INDEX: &str = "edge_property_index";
 const CF_EDGE_INDEX_META: &str = "edge_index_meta";
 const CF_CONSTRAINT_META: &str = "constraint_meta";
+const CF_POINT_INDEX: &str = "point_index";
+const CF_POINT_INDEX_META: &str = "point_index_meta";
 
 const ALL_CFS: &[&str] = &[
     CF_NODES,
@@ -59,6 +64,8 @@ const ALL_CFS: &[&str] = &[
     CF_EDGE_PROPERTY_INDEX,
     CF_EDGE_INDEX_META,
     CF_CONSTRAINT_META,
+    CF_POINT_INDEX,
+    CF_POINT_INDEX_META,
 ];
 
 const EMPTY: &[u8] = &[];
@@ -172,6 +179,55 @@ fn edge_index_meta_key_decode(key: &[u8]) -> Result<EdgePropertyIndexSpec> {
     })
 }
 
+/// Encode a [`PointIndexSpec`] as a stable `CF_POINT_INDEX_META`
+/// key: `<label>\0<property>`. Single-property on purpose — the
+/// spec only carries one property. NUL-split, same shape as the
+/// non-spatial index meta format so tooling that inspects CFs by
+/// hand stays predictable.
+fn point_index_meta_key(spec: &PointIndexSpec) -> Vec<u8> {
+    let mut k = Vec::with_capacity(spec.label.len() + spec.property.len() + 1);
+    k.extend_from_slice(spec.label.as_bytes());
+    k.push(0);
+    k.extend_from_slice(spec.property.as_bytes());
+    k
+}
+
+fn point_index_meta_key_decode(key: &[u8]) -> Result<PointIndexSpec> {
+    let mut parts = key.splitn(2, |b| *b == 0);
+    let label_bytes = parts.next().ok_or(Error::CorruptBytes {
+        cf: CF_POINT_INDEX_META,
+        expected: 1,
+        actual: 0,
+    })?;
+    let property_bytes = parts.next().ok_or(Error::CorruptBytes {
+        cf: CF_POINT_INDEX_META,
+        expected: label_bytes.len() + 2,
+        actual: key.len(),
+    })?;
+    let label = std::str::from_utf8(label_bytes)
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_POINT_INDEX_META,
+            expected: label_bytes.len(),
+            actual: label_bytes.len(),
+        })?
+        .to_string();
+    let property = std::str::from_utf8(property_bytes)
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_POINT_INDEX_META,
+            expected: property_bytes.len(),
+            actual: property_bytes.len(),
+        })?
+        .to_string();
+    if property.is_empty() {
+        return Err(Error::CorruptBytes {
+            cf: CF_POINT_INDEX_META,
+            expected: 1,
+            actual: 0,
+        });
+    }
+    Ok(PointIndexSpec { label, property })
+}
+
 pub struct RocksDbStorageEngine {
     db: DB,
     /// In-memory view of the registered property indexes, populated
@@ -205,6 +261,14 @@ pub struct RocksDbStorageEngine {
     /// and runs `nodes_by_property` against the backing index only
     /// when a UNIQUE check actually needs it.
     constraints: RwLock<Vec<PropertyConstraintSpec>>,
+    /// In-memory view of the registered point indexes. Loaded from
+    /// [`CF_POINT_INDEX_META`] at open and kept in sync by
+    /// [`RocksDbStorageEngine::create_point_index`] /
+    /// [`RocksDbStorageEngine::drop_point_index`]. `append_put_node`
+    /// and `append_detach_delete_node` walk this list to maintain
+    /// entries, so — as with the other in-memory index catalogs — it
+    /// must not hit the DB on the hot path.
+    point_indexes: RwLock<Vec<PointIndexSpec>>,
 }
 
 impl RocksDbStorageEngine {
@@ -222,11 +286,13 @@ impl RocksDbStorageEngine {
         let indexes = load_index_meta(&db)?;
         let edge_indexes = load_edge_index_meta(&db)?;
         let constraints = load_constraint_meta(&db)?;
+        let point_indexes = load_point_index_meta(&db)?;
         Ok(Self {
             db,
             indexes: RwLock::new(indexes),
             edge_indexes: RwLock::new(edge_indexes),
             constraints: RwLock::new(constraints),
+            point_indexes: RwLock::new(point_indexes),
         })
     }
 
@@ -313,6 +379,52 @@ impl RocksDbStorageEngine {
                     property_index_composite_key(&spec.label, &spec.properties, values, node.id),
                     EMPTY,
                 );
+            }
+        }
+
+        // Point-index maintenance. Same delta shape as the
+        // property-index loop: compare old vs new indexed point and
+        // emit the minimum entry set. Cheap-bail when neither the
+        // label membership nor the point value has changed.
+        let point_indexes = self
+            .point_indexes
+            .read()
+            .expect("point_indexes lock poisoned");
+        if !point_indexes.is_empty() {
+            let point_cf = self.cf(CF_POINT_INDEX)?;
+            for spec in point_indexes.iter() {
+                let was_indexed = existing_labels.iter().any(|l| l == &spec.label);
+                let now_indexed = node.labels.iter().any(|l| l == &spec.label);
+                let old_point = if was_indexed {
+                    existing
+                        .as_ref()
+                        .and_then(|n| extract_indexable_point(&n.properties, &spec.property))
+                } else {
+                    None
+                };
+                let new_point = if now_indexed {
+                    extract_indexable_point(&node.properties, &spec.property)
+                } else {
+                    None
+                };
+                if old_point == new_point {
+                    continue;
+                }
+                if let Some(p) = &old_point {
+                    let cell = point_cell(p.srid, p.x, p.y);
+                    batch.delete_cf(
+                        point_cf,
+                        point_index_key(&spec.label, &spec.property, p.srid, cell, node.id),
+                    );
+                }
+                if let Some(p) = &new_point {
+                    let cell = point_cell(p.srid, p.x, p.y);
+                    batch.put_cf(
+                        point_cf,
+                        point_index_key(&spec.label, &spec.property, p.srid, cell, node.id),
+                        point_index_value(p.x, p.y, p.z),
+                    );
+                }
             }
         }
 
@@ -501,6 +613,27 @@ impl RocksDbStorageEngine {
                         prop_cf,
                         property_index_composite_key(&spec.label, &spec.properties, &values, id),
                     );
+                }
+            }
+            // Point-index entries held by this node, mirror of the
+            // property-index sweep above.
+            let point_indexes = self
+                .point_indexes
+                .read()
+                .expect("point_indexes lock poisoned");
+            if !point_indexes.is_empty() {
+                let point_cf = self.cf(CF_POINT_INDEX)?;
+                for spec in point_indexes.iter() {
+                    if !n.labels.iter().any(|l| l == &spec.label) {
+                        continue;
+                    }
+                    if let Some(p) = extract_indexable_point(&n.properties, &spec.property) {
+                        let cell = point_cell(p.srid, p.x, p.y);
+                        batch.delete_cf(
+                            point_cf,
+                            point_index_key(&spec.label, &spec.property, p.srid, cell, id),
+                        );
+                    }
                 }
             }
         }
@@ -1385,6 +1518,180 @@ impl RocksDbStorageEngine {
         Ok(())
     }
 
+    // ---------------------------------------------------------------
+    // Point / spatial index (node scope).
+    //
+    // Z-order (Morton) cell encoding over a fixed per-SRID domain.
+    // Each indexed `Property::Point` produces one row keyed by
+    // `<label>\0<prop>\0<srid:4><cell:8><node_id:16>` with the point's
+    // coordinates stored in the value. Cross-SRID queries are
+    // impossible by construction — the SRID is in the key prefix, so
+    // a bbox scan is naturally scoped to one CRS.
+    //
+    // Single-property only for now. Extending to composite spatial
+    // or to relationship scope is additive — separate CFs and
+    // separate spec shapes.
+    // ---------------------------------------------------------------
+
+    pub fn list_point_indexes(&self) -> Vec<PointIndexSpec> {
+        self.point_indexes
+            .read()
+            .expect("point_indexes lock poisoned")
+            .clone()
+    }
+
+    /// Declare a new point index on `(label, property)` and backfill
+    /// it by scanning every node that currently carries the label.
+    /// Idempotent: re-creating a registered index is a no-op. Same
+    /// "single WriteBatch" atomicity guarantee as the property-index
+    /// create path — a crash mid-backfill leaves the store with
+    /// either zero entries or a fully-populated index.
+    pub fn create_point_index(&self, label: &str, property: &str) -> Result<()> {
+        let spec = PointIndexSpec {
+            label: label.to_string(),
+            property: property.to_string(),
+        };
+        let mut guard = self
+            .point_indexes
+            .write()
+            .expect("point_indexes lock poisoned");
+        if guard.contains(&spec) {
+            return Ok(());
+        }
+
+        let meta_cf = self.cf(CF_POINT_INDEX_META)?;
+        let point_cf = self.cf(CF_POINT_INDEX)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(meta_cf, point_index_meta_key(&spec), EMPTY);
+
+        for node_id in self.nodes_by_label(label)? {
+            let node = match self.get_node(node_id)? {
+                Some(n) => n,
+                None => continue,
+            };
+            if let Some(Property::Point(p)) = node.properties.get(property) {
+                let cell = point_cell(p.srid, p.x, p.y);
+                batch.put_cf(
+                    point_cf,
+                    point_index_key(label, property, p.srid, cell, node_id),
+                    point_index_value(p.x, p.y, p.z),
+                );
+            }
+        }
+
+        self.db.write(batch)?;
+        guard.push(spec);
+        Ok(())
+    }
+
+    /// Tear down a point index. Removes the meta entry and every
+    /// entry under the `<label>\0<prop>\0` prefix — that sweep
+    /// covers all SRID variants at once, since SRID is to the right
+    /// of the label+property header. Idempotent.
+    pub fn drop_point_index(&self, label: &str, property: &str) -> Result<()> {
+        let spec = PointIndexSpec {
+            label: label.to_string(),
+            property: property.to_string(),
+        };
+        let mut guard = self
+            .point_indexes
+            .write()
+            .expect("point_indexes lock poisoned");
+        if !guard.contains(&spec) {
+            return Ok(());
+        }
+
+        let meta_cf = self.cf(CF_POINT_INDEX_META)?;
+        let point_cf = self.cf(CF_POINT_INDEX)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(meta_cf, point_index_meta_key(&spec));
+
+        let prefix = point_index_label_prop_prefix(label, property);
+        let iter = self
+            .db
+            .iterator_cf(point_cf, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            batch.delete_cf(point_cf, key);
+        }
+
+        self.db.write(batch)?;
+        guard.retain(|s| s != &spec);
+        Ok(())
+    }
+
+    /// Range query: node ids whose indexed point falls inside the
+    /// axis-aligned bounding box `[(xlo, ylo), (xhi, yhi)]` under
+    /// `srid`. The scan walks the Morton-code cell range that
+    /// covers the bbox and applies a precise per-row filter against
+    /// the coordinates stored in the value — the cell range is a
+    /// superset, so the filter is what guarantees correctness.
+    ///
+    /// A missing index returns empty rather than erroring, matching
+    /// the property-seek convention (lets the planner race a DROP
+    /// without a fatal). Results are sorted by `NodeId` for
+    /// determinism across runs.
+    pub fn nodes_in_bbox(
+        &self,
+        label: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<NodeId>> {
+        let spec = PointIndexSpec {
+            label: label.to_string(),
+            property: property.to_string(),
+        };
+        {
+            let guard = self
+                .point_indexes
+                .read()
+                .expect("point_indexes lock poisoned");
+            if !guard.contains(&spec) {
+                return Ok(Vec::new());
+            }
+        }
+
+        let (lo_x, hi_x) = if xlo <= xhi { (xlo, xhi) } else { (xhi, xlo) };
+        let (lo_y, hi_y) = if ylo <= yhi { (ylo, yhi) } else { (yhi, ylo) };
+        let (min_cell, max_cell) = point_cell_range(srid, lo_x, lo_y, hi_x, hi_y);
+
+        let prefix = point_index_srid_prefix(label, property, srid);
+        let header_len = prefix.len();
+        let mut seek = prefix.clone();
+        seek.extend_from_slice(&min_cell.to_be_bytes());
+
+        let cf = self.cf(CF_POINT_INDEX)?;
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&seek, Direction::Forward));
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let cell = cell_from_point_index_key(CF_POINT_INDEX, &key, header_len)?;
+            if cell > max_cell {
+                break;
+            }
+            let (x, y, _z) = decode_point_index_value(CF_POINT_INDEX, &value)?;
+            if x < lo_x || x > hi_x || y < lo_y || y > hi_y {
+                continue;
+            }
+            let id_bytes = node_id_from_point_index_key(CF_POINT_INDEX, &key)?;
+            results.push(NodeId::from_bytes(id_bytes));
+        }
+        results.sort();
+        Ok(results)
+    }
+
     /// Look up edge ids for a `(edge_type, property, value)` equality
     /// via the edge-property-index CF. Mirror of
     /// [`RocksDbStorageEngine::nodes_by_property`] for relationship
@@ -1561,6 +1868,23 @@ impl RocksDbStorageEngine {
             results.push((edge_id, other));
         }
         Ok(results)
+    }
+}
+
+/// Return the [`meshdb_core::Point`] at `properties[key]` when the
+/// property is present and of point type. Used by point-index
+/// maintenance to decide whether a node's indexed property changed
+/// across a put. Non-point or missing values yield `None`, which the
+/// index maintenance treats as "no entry" — the same way
+/// `encode_index_tuple` treats missing / unindexable values for
+/// property indexes.
+fn extract_indexable_point(
+    properties: &std::collections::HashMap<String, Property>,
+    key: &str,
+) -> Option<meshdb_core::Point> {
+    match properties.get(key)? {
+        Property::Point(p) => Some(*p),
+        _ => None,
     }
 }
 
@@ -1931,6 +2255,20 @@ fn load_edge_index_meta(db: &DB) -> Result<Vec<EdgePropertyIndexSpec>> {
     for item in db.iterator_cf(cf, IteratorMode::Start) {
         let (key, _) = item?;
         specs.push(edge_index_meta_key_decode(&key)?);
+    }
+    Ok(specs)
+}
+
+/// Rehydrate the point-index registry from [`CF_POINT_INDEX_META`]
+/// at open. Same once-per-process walk as the other meta loaders.
+fn load_point_index_meta(db: &DB) -> Result<Vec<PointIndexSpec>> {
+    let cf = db
+        .cf_handle(CF_POINT_INDEX_META)
+        .ok_or(Error::MissingColumnFamily(CF_POINT_INDEX_META))?;
+    let mut specs = Vec::new();
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, _) = item?;
+        specs.push(point_index_meta_key_decode(&key)?);
     }
     Ok(specs)
 }

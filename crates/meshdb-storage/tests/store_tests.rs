@@ -1,6 +1,6 @@
-use meshdb_core::{Edge, Node, NodeId, Property};
+use meshdb_core::{Edge, Node, NodeId, Point, Property};
 use meshdb_storage::{
-    ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PropertyConstraintKind,
+    ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PointIndexSpec, PropertyConstraintKind,
     PropertyIndexSpec, RocksDbStorageEngine as Store,
 };
 use tempfile::TempDir;
@@ -1229,4 +1229,259 @@ fn drop_index_succeeds_when_no_backing_constraint() {
     store.create_property_index("Person", "nickname").unwrap();
     store.drop_property_index("Person", "nickname").unwrap();
     assert!(store.list_property_indexes().is_empty());
+}
+
+// ---------------------------------------------------------------
+// Point / spatial index.
+//
+// Z-order cell range scans, with exact bbox filter on stored
+// coords. Covers: backfill, incremental maintenance across
+// put_node / detach_delete_node, bbox containment (hits /
+// misses / edge cases), cross-SRID isolation, drop/list.
+// ---------------------------------------------------------------
+
+fn wgs84(lon: f64, lat: f64) -> Property {
+    Property::Point(Point {
+        srid: meshdb_core::SRID_WGS84_2D,
+        x: lon,
+        y: lat,
+        z: None,
+    })
+}
+
+#[test]
+fn point_index_backfills_existing_nodes() {
+    let (store, _dir) = tmp_store();
+    let p1 = Node::new()
+        .with_label("City")
+        .with_property("loc", wgs84(13.4, 52.5)); // Berlin
+    let p2 = Node::new()
+        .with_label("City")
+        .with_property("loc", wgs84(-73.9, 40.7)); // NYC
+    store.put_node(&p1).unwrap();
+    store.put_node(&p2).unwrap();
+
+    store.create_point_index("City", "loc").unwrap();
+    assert_eq!(
+        store.list_point_indexes(),
+        vec![PointIndexSpec {
+            label: "City".into(),
+            property: "loc".into(),
+        }]
+    );
+
+    // Bbox enclosing Berlin only.
+    let hits = store
+        .nodes_in_bbox("City", "loc", 4326, 10.0, 50.0, 20.0, 55.0)
+        .unwrap();
+    assert_eq!(hits, vec![p1.id]);
+}
+
+#[test]
+fn point_index_maintains_on_put_and_delete() {
+    let (store, _dir) = tmp_store();
+    store.create_point_index("City", "loc").unwrap();
+
+    let berlin = Node::new()
+        .with_label("City")
+        .with_property("loc", wgs84(13.4, 52.5));
+    store.put_node(&berlin).unwrap();
+
+    let hits = store
+        .nodes_in_bbox("City", "loc", 4326, 10.0, 50.0, 20.0, 55.0)
+        .unwrap();
+    assert_eq!(hits, vec![berlin.id]);
+
+    // Move the point — replacing the node's `loc` with a point in
+    // South America should kick the old cell entry out.
+    let mut moved = berlin.clone();
+    moved.properties.insert("loc".into(), wgs84(-58.4, -34.6)); // Buenos Aires
+    store.put_node(&moved).unwrap();
+
+    let hits = store
+        .nodes_in_bbox("City", "loc", 4326, 10.0, 50.0, 20.0, 55.0)
+        .unwrap();
+    assert!(hits.is_empty(), "old cell entry wasn't swept: {hits:?}");
+
+    let hits = store
+        .nodes_in_bbox("City", "loc", 4326, -60.0, -40.0, -50.0, -30.0)
+        .unwrap();
+    assert_eq!(hits, vec![berlin.id]);
+
+    // Detach-delete removes the index entry too.
+    store.detach_delete_node(berlin.id).unwrap();
+    let hits = store
+        .nodes_in_bbox("City", "loc", 4326, -60.0, -40.0, -50.0, -30.0)
+        .unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn point_index_skips_nodes_without_label() {
+    // A node carrying the indexed property but not the label must
+    // not appear in the index — the (label, property) tuple is the
+    // scope, so label-filtering is mandatory.
+    let (store, _dir) = tmp_store();
+    store.create_point_index("City", "loc").unwrap();
+    let not_a_city = Node::new().with_property("loc", wgs84(13.4, 52.5));
+    store.put_node(&not_a_city).unwrap();
+    let hits = store
+        .nodes_in_bbox("City", "loc", 4326, 0.0, 0.0, 180.0, 90.0)
+        .unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn point_index_skips_nodes_with_non_point_value() {
+    // A node with the label but a String at `loc` must not land in
+    // the index. Mirrors how `encode_index_tuple` ignores
+    // unindexable values at maintenance time.
+    let (store, _dir) = tmp_store();
+    store.create_point_index("City", "loc").unwrap();
+    let weird = Node::new().with_label("City").with_property("loc", "here");
+    store.put_node(&weird).unwrap();
+    let hits = store
+        .nodes_in_bbox("City", "loc", 4326, -180.0, -90.0, 180.0, 90.0)
+        .unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn point_index_isolates_srids() {
+    // Two points at identical (x, y) but different SRIDs must not
+    // alias — the SRID is part of the key prefix, so a bbox query
+    // under one SRID never touches entries tagged with another.
+    let (store, _dir) = tmp_store();
+    store.create_point_index("Spot", "loc").unwrap();
+    let geo = Node::new()
+        .with_label("Spot")
+        .with_property("loc", wgs84(5.0, 5.0));
+    let cart = Node::new().with_label("Spot").with_property(
+        "loc",
+        Property::Point(Point {
+            srid: meshdb_core::SRID_CARTESIAN_2D,
+            x: 5.0,
+            y: 5.0,
+            z: None,
+        }),
+    );
+    store.put_node(&geo).unwrap();
+    store.put_node(&cart).unwrap();
+
+    let wgs = store
+        .nodes_in_bbox("Spot", "loc", 4326, 0.0, 0.0, 10.0, 10.0)
+        .unwrap();
+    assert_eq!(wgs, vec![geo.id]);
+
+    let cartesian = store
+        .nodes_in_bbox("Spot", "loc", 7203, 0.0, 0.0, 10.0, 10.0)
+        .unwrap();
+    assert_eq!(cartesian, vec![cart.id]);
+}
+
+#[test]
+fn point_index_returns_empty_when_index_missing() {
+    // A query against a non-existent point index returns an empty
+    // vector rather than erroring — matches the property-seek
+    // convention so a DROP / query race stays soft-failing.
+    let (store, _dir) = tmp_store();
+    let hits = store
+        .nodes_in_bbox("City", "loc", 4326, 0.0, 0.0, 10.0, 10.0)
+        .unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn point_index_drop_sweeps_all_srid_entries() {
+    let (store, _dir) = tmp_store();
+    store.create_point_index("Spot", "loc").unwrap();
+    let geo = Node::new()
+        .with_label("Spot")
+        .with_property("loc", wgs84(5.0, 5.0));
+    let cart = Node::new().with_label("Spot").with_property(
+        "loc",
+        Property::Point(Point {
+            srid: meshdb_core::SRID_CARTESIAN_2D,
+            x: 5.0,
+            y: 5.0,
+            z: None,
+        }),
+    );
+    store.put_node(&geo).unwrap();
+    store.put_node(&cart).unwrap();
+
+    store.drop_point_index("Spot", "loc").unwrap();
+    assert!(store.list_point_indexes().is_empty());
+
+    // After drop, queries return empty under every SRID — the
+    // label-prop prefix sweep covered all variants.
+    assert!(store
+        .nodes_in_bbox("Spot", "loc", 4326, 0.0, 0.0, 10.0, 10.0)
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .nodes_in_bbox("Spot", "loc", 7203, 0.0, 0.0, 10.0, 10.0)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn point_index_create_is_idempotent() {
+    let (store, _dir) = tmp_store();
+    store.create_point_index("City", "loc").unwrap();
+    store.create_point_index("City", "loc").unwrap();
+    assert_eq!(store.list_point_indexes().len(), 1);
+}
+
+#[test]
+fn point_index_bbox_filters_morton_overshoot() {
+    // Morton order zigzags, so the cell range covering a bbox
+    // includes cells outside the bbox. The per-row precision filter
+    // must discard those. Plant one point inside the bbox and one
+    // adjacent-but-outside, at coordinates chosen so they share a
+    // Z-order neighbourhood; the result must contain only the
+    // inside one.
+    let (store, _dir) = tmp_store();
+    store.create_point_index("P", "loc").unwrap();
+    let inside = Node::new()
+        .with_label("P")
+        .with_property("loc", wgs84(5.0, 5.0));
+    let outside = Node::new()
+        .with_label("P")
+        .with_property("loc", wgs84(5.5, 20.0)); // outside the bbox below
+    store.put_node(&inside).unwrap();
+    store.put_node(&outside).unwrap();
+
+    let hits = store
+        .nodes_in_bbox("P", "loc", 4326, 0.0, 0.0, 10.0, 10.0)
+        .unwrap();
+    assert_eq!(hits, vec![inside.id]);
+}
+
+#[test]
+fn point_index_survives_reopen() {
+    // Meta is loaded from the CF at open(), so the registry must
+    // come back with the spec list intact and the index continues
+    // to answer queries after a restart.
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let store = Store::open(dir.path()).unwrap();
+        store.create_point_index("City", "loc").unwrap();
+        let berlin = Node::new()
+            .with_label("City")
+            .with_property("loc", wgs84(13.4, 52.5));
+        store.put_node(&berlin).unwrap();
+    }
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store.list_point_indexes(),
+        vec![PointIndexSpec {
+            label: "City".into(),
+            property: "loc".into(),
+        }]
+    );
+    let hits = store
+        .nodes_in_bbox("City", "loc", 4326, 10.0, 50.0, 20.0, 55.0)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
 }

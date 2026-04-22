@@ -664,3 +664,267 @@ pub(crate) fn parse_property_index_entry_props(key: &[u8]) -> Option<Vec<String>
     }
     Some(props)
 }
+
+// ---------------------------------------------------------------
+// Point index — Z-order (Morton) cell keys.
+//
+// Layout:
+//   `<label>\0<property>\0<srid:i32 BE><cell:u64 BE><node_id:16>`
+//
+// The label/property NUL-split header mirrors the property-index
+// meta format. The `srid` is folded into the key (not just the
+// metadata) so a bbox scan over one CRS can't accidentally sweep
+// points tagged with a different CRS — the i32 BE prefix confines
+// each SRID's entries to their own sorted neighbourhood.
+//
+// `cell` is the Morton code produced by `point_cell()`. Its position
+// between the SRID and the node_id means rows under one SRID sort in
+// Z-order, which is what makes a bbox → cell-range scan work.
+//
+// The stored value is a small fixed-shape record produced by
+// `point_index_value()` — `[has_z: u8][x: f64 BE 8][y: f64 BE 8]
+// [z: f64 BE 8]?`. Keeping coords in the value lets the per-row
+// precision filter run without fetching the full node.
+// ---------------------------------------------------------------
+
+const POINT_INDEX_CELL_LEN: usize = 8;
+
+/// Per-SRID spatial domain for the Morton quantizer, as
+/// `(xmin, xmax, ymin, ymax)`. Geographic CRSs have fixed bounds
+/// (lon/lat); Cartesian gets a generous symmetric window — points
+/// outside it clamp to the edge and still get an index entry, just
+/// one at the boundary cell (the precision filter on stored coords
+/// still accepts the real value on lookup).
+fn point_domain(srid: i32) -> (f64, f64, f64, f64) {
+    match srid {
+        // WGS-84 2D / 3D — longitude, latitude.
+        4326 | 4979 => (-180.0, 180.0, -90.0, 90.0),
+        // Cartesian and unknown SRIDs share one generous window.
+        _ => (-1.0e9, 1.0e9, -1.0e9, 1.0e9),
+    }
+}
+
+fn normalize_axis(v: f64, lo: f64, hi: f64) -> u32 {
+    let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+    // `u32::MAX as f64` rounds to 2^32 (one past the max u32) because
+    // f64 can't represent 2^32 - 1 exactly. Clamp on the way back.
+    let scaled = (t * (u32::MAX as f64)).round();
+    if scaled >= u32::MAX as f64 {
+        u32::MAX
+    } else {
+        scaled as u32
+    }
+}
+
+/// Interleave the bits of two u32s into a single u64. Standard
+/// "Magic bits" expansion — x goes to even positions, y to odd.
+fn interleave_u32(x: u32, y: u32) -> u64 {
+    fn spread(v: u32) -> u64 {
+        let mut v = v as u64;
+        v = (v | (v << 16)) & 0x0000_FFFF_0000_FFFF;
+        v = (v | (v << 8)) & 0x00FF_00FF_00FF_00FF;
+        v = (v | (v << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+        v = (v | (v << 2)) & 0x3333_3333_3333_3333;
+        v = (v | (v << 1)) & 0x5555_5555_5555_5555;
+        v
+    }
+    spread(x) | (spread(y) << 1)
+}
+
+/// Morton-code cell ID for `(x, y)` under the domain of `srid`.
+/// Coordinates outside the domain clamp — they still index, but at
+/// the boundary cell.
+pub(crate) fn point_cell(srid: i32, x: f64, y: f64) -> u64 {
+    let (xmin, xmax, ymin, ymax) = point_domain(srid);
+    let nx = normalize_axis(x, xmin, xmax);
+    let ny = normalize_axis(y, ymin, ymax);
+    interleave_u32(nx, ny)
+}
+
+/// Cell range that covers a bbox. Returns `(min_cell, max_cell)`
+/// such that every cell whose point lies inside the bbox satisfies
+/// `min_cell <= cell <= max_cell`. The range overshoots — Morton
+/// order zigzags across cell boundaries — so the caller must apply
+/// a precise bbox filter on the stored coords after the scan.
+pub(crate) fn point_cell_range(srid: i32, xlo: f64, ylo: f64, xhi: f64, yhi: f64) -> (u64, u64) {
+    let (xmin, xmax, ymin, ymax) = point_domain(srid);
+    let nxlo = normalize_axis(xlo.min(xhi), xmin, xmax);
+    let nxhi = normalize_axis(xlo.max(xhi), xmin, xmax);
+    let nylo = normalize_axis(ylo.min(yhi), ymin, ymax);
+    let nyhi = normalize_axis(ylo.max(yhi), ymin, ymax);
+    // The min/max Morton for the axis-aligned rectangle [nxlo..nxhi] ×
+    // [nylo..nyhi] are the interleavings of the min-min and max-max
+    // corners. That's a property of Morton order: within a rectangle,
+    // the lex-min cell is at the SW corner and lex-max at the NE.
+    let lo = interleave_u32(nxlo, nylo);
+    let hi = interleave_u32(nxhi, nyhi);
+    (lo, hi)
+}
+
+/// Label+property header shared by every point-index key — without
+/// the SRID or cell suffix. Used when dropping a whole index: one
+/// range scan covers every SRID variant at once.
+pub(crate) fn point_index_label_prop_prefix(label: &str, property: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(label.len() + property.len() + 2);
+    k.extend_from_slice(label.as_bytes());
+    k.push(0);
+    k.extend_from_slice(property.as_bytes());
+    k.push(0);
+    k
+}
+
+/// Header including the SRID — every entry for one `(label,
+/// property, srid)` tuple shares this prefix. Bbox scans seek
+/// relative to it.
+pub(crate) fn point_index_srid_prefix(label: &str, property: &str, srid: i32) -> Vec<u8> {
+    let mut k = point_index_label_prop_prefix(label, property);
+    k.extend_from_slice(&srid.to_be_bytes());
+    k
+}
+
+/// Full point-index key for one indexed point.
+pub(crate) fn point_index_key(
+    label: &str,
+    property: &str,
+    srid: i32,
+    cell: u64,
+    node: NodeId,
+) -> Vec<u8> {
+    let mut k = point_index_srid_prefix(label, property, srid);
+    k.extend_from_slice(&cell.to_be_bytes());
+    k.extend_from_slice(node.as_bytes());
+    k
+}
+
+/// Value record for a point-index entry: the point's coordinates,
+/// plus a 1-byte `has_z` discriminator. Kept in the value so bbox /
+/// distance filters don't have to fetch the full node.
+pub(crate) fn point_index_value(x: f64, y: f64, z: Option<f64>) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 16 + z.map_or(0, |_| 8));
+    v.push(if z.is_some() { 1 } else { 0 });
+    v.extend_from_slice(&x.to_be_bytes());
+    v.extend_from_slice(&y.to_be_bytes());
+    if let Some(zv) = z {
+        v.extend_from_slice(&zv.to_be_bytes());
+    }
+    v
+}
+
+pub(crate) fn decode_point_index_value(
+    cf: &'static str,
+    bytes: &[u8],
+) -> Result<(f64, f64, Option<f64>)> {
+    if bytes.is_empty() {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected: 17,
+            actual: 0,
+        });
+    }
+    let has_z = bytes[0] != 0;
+    let expected = if has_z { 25 } else { 17 };
+    if bytes.len() != expected {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected,
+            actual: bytes.len(),
+        });
+    }
+    let x = f64::from_be_bytes(bytes[1..9].try_into().unwrap());
+    let y = f64::from_be_bytes(bytes[9..17].try_into().unwrap());
+    let z = if has_z {
+        Some(f64::from_be_bytes(bytes[17..25].try_into().unwrap()))
+    } else {
+        None
+    };
+    Ok((x, y, z))
+}
+
+/// Extract the trailing node id from a point-index key. The key
+/// layout puts the id in the last [`ID_LEN`] bytes regardless of the
+/// header's length, so tail extraction is position-independent.
+pub(crate) fn node_id_from_point_index_key(cf: &'static str, key: &[u8]) -> Result<[u8; ID_LEN]> {
+    if key.len() < ID_LEN {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected: ID_LEN,
+            actual: key.len(),
+        });
+    }
+    let mut bytes = [0u8; ID_LEN];
+    bytes.copy_from_slice(&key[key.len() - ID_LEN..]);
+    Ok(bytes)
+}
+
+/// Extract the `u64 BE` cell ID from a point-index key. Positioned
+/// immediately before the trailing node id and after the
+/// `<label>\0<prop>\0<srid:4>` header. Used by `nodes_in_bbox` to
+/// break out of a forward iterator once the cell passes the upper
+/// bound of the query's cell range.
+pub(crate) fn cell_from_point_index_key(
+    cf: &'static str,
+    key: &[u8],
+    header_len: usize,
+) -> Result<u64> {
+    if key.len() < header_len + POINT_INDEX_CELL_LEN + ID_LEN {
+        return Err(Error::CorruptBytes {
+            cf,
+            expected: header_len + POINT_INDEX_CELL_LEN + ID_LEN,
+            actual: key.len(),
+        });
+    }
+    let start = header_len;
+    let cell_bytes: [u8; POINT_INDEX_CELL_LEN] =
+        key[start..start + POINT_INDEX_CELL_LEN].try_into().unwrap();
+    Ok(u64::from_be_bytes(cell_bytes))
+}
+
+#[cfg(test)]
+mod point_index_tests {
+    use super::*;
+
+    #[test]
+    fn morton_cell_range_encloses_contained_point() {
+        let srid = 4326;
+        let (lo, hi) = point_cell_range(srid, -10.0, -5.0, 10.0, 5.0);
+        let inside = point_cell(srid, 0.0, 0.0);
+        assert!(lo <= inside && inside <= hi);
+    }
+
+    #[test]
+    fn morton_cell_range_corners_are_extrema() {
+        let srid = 4326;
+        let (lo, hi) = point_cell_range(srid, -10.0, -5.0, 10.0, 5.0);
+        let sw = point_cell(srid, -10.0, -5.0);
+        let ne = point_cell(srid, 10.0, 5.0);
+        assert_eq!(lo, sw);
+        assert_eq!(hi, ne);
+    }
+
+    #[test]
+    fn point_index_value_roundtrips_2d_and_3d() {
+        let v2 = point_index_value(1.5, 2.5, None);
+        let (x, y, z) = decode_point_index_value("point_index", &v2).unwrap();
+        assert_eq!((x, y, z), (1.5, 2.5, None));
+        let v3 = point_index_value(1.5, 2.5, Some(3.5));
+        let (x, y, z) = decode_point_index_value("point_index", &v3).unwrap();
+        assert_eq!((x, y, z), (1.5, 2.5, Some(3.5)));
+    }
+
+    #[test]
+    fn point_index_key_tail_is_node_id() {
+        let id = NodeId::new();
+        let k = point_index_key("L", "p", 4326, 0, id);
+        let tail = node_id_from_point_index_key("point_index", &k).unwrap();
+        assert_eq!(tail, *id.as_bytes());
+    }
+
+    #[test]
+    fn clamp_keeps_out_of_domain_points_in_range() {
+        // A WGS-84 coord way out of range still yields a valid cell
+        // at the domain boundary (not a crash / wraparound).
+        let cell = point_cell(4326, 1e9, 1e9);
+        let (_, hi) = point_cell_range(4326, -180.0, -90.0, 180.0, 90.0);
+        assert_eq!(cell, hi);
+    }
+}
