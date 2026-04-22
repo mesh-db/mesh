@@ -30,7 +30,12 @@ coll = []
 # a separate crate for percent-escapes.
 text = ["dep:regex"]
 
+# `apoc.map.*` — merge / fromPairs / fromLists / fromValues /
+# setKey / removeKey / removeKeys / values / submap / mergeList.
+# Pure HashMap transforms, no extra deps.
+map = []
+
 # Umbrella convenience: everything we ship today. Add new
 # namespace features to this list as they land so
 # `--features full` keeps its "turn on everything" meaning.
-full = ["coll", "text"]
+full = ["coll", "text", "map"]

@@ -9235,3 +9235,102 @@ mod apoc_text {
         assert_eq!(str_prop(&rows[0], "h"), "FF");
     }
 }
+
+#[cfg(feature = "apoc-map")]
+mod apoc_map {
+    use super::*;
+
+    fn as_map<'a>(row: &'a Row, key: &str) -> &'a std::collections::HashMap<String, Property> {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::Map(m)) => m,
+            other => panic!("expected Property::Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_map_merge_right_wins() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.merge({a: 1, b: 2}, {b: 20, c: 3}) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert_eq!(m.len(), 3);
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("b"), Some(Property::Int64(20))));
+        assert!(matches!(m.get("c"), Some(Property::Int64(3))));
+    }
+
+    #[test]
+    fn apoc_map_from_pairs_builds_map() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.fromPairs([['a', 1], ['b', 2]]) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("b"), Some(Property::Int64(2))));
+    }
+
+    #[test]
+    fn apoc_map_from_lists_zips() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.map.fromLists(['a', 'b'], [1, 2]) AS m");
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("b"), Some(Property::Int64(2))));
+    }
+
+    #[test]
+    fn apoc_map_set_key_and_remove_key() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.setKey({a: 1}, 'b', 2) AS added, \
+                    apoc.map.removeKey({a: 1, b: 2}, 'b') AS dropped",
+        );
+        let added = as_map(&rows[0], "added");
+        assert!(matches!(added.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(added.get("b"), Some(Property::Int64(2))));
+        let dropped = as_map(&rows[0], "dropped");
+        assert_eq!(dropped.len(), 1);
+        assert!(matches!(dropped.get("a"), Some(Property::Int64(1))));
+    }
+
+    #[test]
+    fn apoc_map_remove_keys_bulk() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.removeKeys({a: 1, b: 2, c: 3}, ['a', 'c']) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert_eq!(m.len(), 1);
+        assert!(matches!(m.get("b"), Some(Property::Int64(2))));
+    }
+
+    #[test]
+    fn apoc_map_submap_skips_missing() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.submap({a: 1, b: 2, c: 3}, ['a', 'z']) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert_eq!(m.len(), 1);
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+    }
+
+    #[test]
+    fn apoc_map_merge_list_combines() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.mergeList([{a: 1}, {b: 2}, {a: 10}]) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("a"), Some(Property::Int64(10))));
+        assert!(matches!(m.get("b"), Some(Property::Int64(2))));
+    }
+}

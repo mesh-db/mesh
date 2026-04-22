@@ -57,4 +57,5 @@ rustls-pki-types = "1"
 default = []
 apoc-coll = ["meshdb-executor/apoc-coll"]
 apoc-text = ["meshdb-executor/apoc-text"]
+apoc-map = ["meshdb-executor/apoc-map"]
 apoc = ["meshdb-executor/apoc"]

@@ -643,7 +643,12 @@ list_comp = {
 list_comp_where = { kw_where ~ expression }
 list_comp_proj = { "|" ~ expression }
 
-function_call = { identifier ~ ("." ~ identifier)* ~ "(" ~ fn_args? ~ ")" }
+function_call = { identifier ~ ("." ~ qualified_part)* ~ "(" ~ fn_args? ~ ")" }
+// Namespace / function-name suffix after a `.`. Reserved words are
+// fine here — the leading `.` disambiguates them from statement
+// keywords, so `apoc.map.merge(...)` parses even though `MERGE`
+// starts a top-level clause.
+qualified_part = @{ backtick_id | (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 fn_args = { count_star | fn_arg_list }
 count_star = { "*" }
 fn_arg_list = { kw_distinct? ~ expression ~ ("," ~ expression)* }

@@ -2587,7 +2587,7 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
             let mut name = parse_ident(first.as_str());
             let mut next = inner.next();
             while let Some(ref p) = next {
-                if p.as_rule() == Rule::identifier {
+                if matches!(p.as_rule(), Rule::identifier | Rule::qualified_part) {
                     name = format!("{}.{}", name, parse_ident(p.as_str()));
                     next = inner.next();
                 } else {

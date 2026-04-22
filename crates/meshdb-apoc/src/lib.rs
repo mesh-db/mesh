@@ -18,9 +18,10 @@
 //! |---------|---------|
 //! | `coll`  | `apoc.coll.*` collection helpers |
 //! | `text`  | `apoc.text.*` string manipulation |
+//! | `map`   | `apoc.map.*` map transforms |
 //! | `full`  | Every shipped namespace (convenience umbrella) |
 //!
-//! More namespaces (`map`, `util`) will add their own feature
+//! More namespaces (`util`, `convert`) will add their own feature
 //! flags when they land; the umbrella `full` auto-picks them up.
 //!
 //! The crate deliberately depends only on `meshdb-core` (for
@@ -38,6 +39,9 @@ pub mod coll;
 
 #[cfg(feature = "text")]
 pub mod text;
+
+#[cfg(feature = "map")]
+pub mod map;
 
 /// Errors the APOC dispatcher surfaces back to the caller. All
 /// variants are recoverable in the sense that the executor can
@@ -91,6 +95,11 @@ pub fn call_scalar(name: &str, args: &[Property]) -> Result<Property, ApocError>
     #[cfg(feature = "text")]
     if let Some(suffix) = _lc.strip_prefix("apoc.text.") {
         return text::call(suffix, args);
+    }
+
+    #[cfg(feature = "map")]
+    if let Some(suffix) = _lc.strip_prefix("apoc.map.") {
+        return map::call(suffix, args);
     }
 
     let _ = args;
