@@ -831,6 +831,19 @@ pub enum AggregateFn {
     StDevP,
     PercentileDisc,
     PercentileCont,
+    /// `apoc.agg.first(expr)` — first non-null value seen.
+    ApocFirst,
+    /// `apoc.agg.last(expr)` — last non-null value seen.
+    ApocLast,
+    /// `apoc.agg.nth(expr, n)` — n-th (0-indexed) non-null value.
+    /// `n` is a constant stashed in [`AggregateSpec::extra_arg`].
+    ApocNth,
+    /// `apoc.agg.median(expr)` — median of numeric values.
+    ApocMedian,
+    /// `apoc.agg.product(expr)` — multiplicative aggregate, like
+    /// [`AggregateFn::Sum`] but returning the running product.
+    /// Identity on an empty stream is 1 (Int64).
+    ApocProduct,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -852,6 +865,11 @@ fn aggregate_fn_from_name(name: &str) -> Option<AggregateFn> {
         "stdevp" => Some(AggregateFn::StDevP),
         "percentiledisc" => Some(AggregateFn::PercentileDisc),
         "percentilecont" => Some(AggregateFn::PercentileCont),
+        "apoc.agg.first" => Some(AggregateFn::ApocFirst),
+        "apoc.agg.last" => Some(AggregateFn::ApocLast),
+        "apoc.agg.nth" => Some(AggregateFn::ApocNth),
+        "apoc.agg.median" => Some(AggregateFn::ApocMedian),
+        "apoc.agg.product" => Some(AggregateFn::ApocProduct),
         _ => None,
     }
 }
@@ -6535,7 +6553,9 @@ fn classify_return_items(
                     if es.len() == 2
                         && matches!(
                             func,
-                            AggregateFn::PercentileDisc | AggregateFn::PercentileCont
+                            AggregateFn::PercentileDisc
+                                | AggregateFn::PercentileCont
+                                | AggregateFn::ApocNth
                         ) =>
                 {
                     percentile_extra = Some(es[1].clone());
@@ -6661,7 +6681,9 @@ fn extract_nested_aggregates(
                     if es.len() == 2
                         && matches!(
                             func,
-                            AggregateFn::PercentileDisc | AggregateFn::PercentileCont
+                            AggregateFn::PercentileDisc
+                                | AggregateFn::PercentileCont
+                                | AggregateFn::ApocNth
                         ) =>
                 {
                     extra = Some(es[1].clone());

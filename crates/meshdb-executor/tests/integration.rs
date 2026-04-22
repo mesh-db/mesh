@@ -9695,3 +9695,141 @@ mod apoc_create {
         assert_ne!(a, b, "two apoc.create.uuid() calls should differ");
     }
 }
+
+mod apoc_agg {
+    use super::*;
+
+    #[test]
+    fn apoc_agg_first_and_last() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [1, 2, 3, 4, 5] AS x \
+             RETURN apoc.agg.first(x) AS f, apoc.agg.last(x) AS l",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(int_prop(&rows[0], "f"), 1);
+        assert_eq!(int_prop(&rows[0], "l"), 5);
+    }
+
+    #[test]
+    fn apoc_agg_first_skips_nulls() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [null, null, 'hello', 'world'] AS x \
+             RETURN apoc.agg.first(x) AS f",
+        );
+        assert_eq!(str_prop(&rows[0], "f"), "hello");
+    }
+
+    #[test]
+    fn apoc_agg_nth_indexes_from_zero() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [10, 20, 30, 40] AS x RETURN apoc.agg.nth(x, 2) AS third",
+        );
+        assert_eq!(int_prop(&rows[0], "third"), 30);
+    }
+
+    #[test]
+    fn apoc_agg_nth_past_end_is_null() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [1, 2, 3] AS x RETURN apoc.agg.nth(x, 10) AS fifth",
+        );
+        assert!(matches!(
+            rows[0].get("fifth"),
+            Some(Value::Null) | Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_agg_median_odd_and_even_length() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [5, 1, 3, 2, 4] AS x RETURN apoc.agg.median(x) AS m",
+        );
+        match rows[0].get("m").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 3.0),
+            other => panic!("expected Float64 median, got {other:?}"),
+        }
+        // Even length → average of two middles.
+        let rows = run(
+            &store,
+            "UNWIND [1, 2, 3, 4] AS x RETURN apoc.agg.median(x) AS m",
+        );
+        match rows[0].get("m").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 2.5),
+            other => panic!("expected Float64 median, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_agg_product_integer_stays_integer() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [2, 3, 5] AS x RETURN apoc.agg.product(x) AS p",
+        );
+        assert_eq!(int_prop(&rows[0], "p"), 30);
+    }
+
+    #[test]
+    fn apoc_agg_product_mixed_numeric_promotes_to_float() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [2, 3, 0.5] AS x RETURN apoc.agg.product(x) AS p",
+        );
+        match rows[0].get("p").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 3.0),
+            other => panic!("expected Float64 product, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_agg_product_empty_stream_is_null() {
+        let (store, _d) = open_store();
+        // UNWIND over an empty list produces no rows; the aggregate
+        // still emits one finalized output row.
+        let rows = run(&store, "UNWIND [] AS x RETURN apoc.agg.product(x) AS p");
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0].get("p"),
+            Some(Value::Null) | Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_agg_grouped_by_key() {
+        let (store, _d) = open_store();
+        // Group by parity and pick the first of each bucket.
+        let mut rows = run(
+            &store,
+            "UNWIND [1, 2, 3, 4, 5, 6] AS x \
+             RETURN x % 2 AS parity, apoc.agg.first(x) AS first",
+        );
+        rows.sort_by_key(|r| int_prop(r, "parity"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(int_prop(&rows[0], "parity"), 0);
+        assert_eq!(int_prop(&rows[0], "first"), 2);
+        assert_eq!(int_prop(&rows[1], "parity"), 1);
+        assert_eq!(int_prop(&rows[1], "first"), 1);
+    }
+
+    #[test]
+    fn apoc_agg_nth_negative_index_errors() {
+        let (store, _d) = open_store();
+        let stmt = parse("UNWIND [1, 2] AS x RETURN apoc.agg.nth(x, -1) AS f").unwrap();
+        let p = plan(&stmt).unwrap();
+        let err = execute(&p, &store).unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected out-of-range error, got: {err}"
+        );
+    }
+}
