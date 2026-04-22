@@ -38,6 +38,11 @@ pub fn call(suffix: &str, args: &[Property]) -> Result<Property, ApocError> {
         "urldecode" => url_decode(args),
         "regexgroups" => regex_groups(args),
         "hexvalue" => hex_value(args),
+        "base64encode" => map_string(args, "base64Encode", base64_encode),
+        "base64decode" => base64_decode(args),
+        "bytecount" => byte_count(args),
+        "clean" => map_string(args, "clean", clean),
+        "levenshteindistance" => levenshtein_distance(args),
         _ => Err(ApocError::UnknownFunction(format!("apoc.text.{suffix}"))),
     }
 }
@@ -513,6 +518,165 @@ fn compile_regex(name: &str, pattern: &str) -> Result<regex::Regex, ApocError> {
     })
 }
 
+// ---------------------------------------------------------------
+// Base64 (RFC 4648, standard alphabet `+/` with `=` padding).
+// Hand-rolled for the same reason as the UUID base64 in
+// `create.rs`: a dedicated `base64` crate would be overkill for a
+// 20-line implementation that only needs one alphabet and
+// handles arbitrary input lengths correctly.
+// ---------------------------------------------------------------
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(BASE64_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(BASE64_ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        match chunk.len() {
+            3 => {
+                out.push(BASE64_ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+                out.push(BASE64_ALPHABET[(b2 & 0x3f) as usize] as char);
+            }
+            2 => {
+                out.push(BASE64_ALPHABET[((b1 & 0x0f) << 2) as usize] as char);
+                out.push('=');
+            }
+            _ => {
+                out.push('=');
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn base64_decode(args: &[Property]) -> Result<Property, ApocError> {
+    check_arity("base64Decode", args, 1)?;
+    let Property::String(s) = &args[0] else {
+        return match &args[0] {
+            Property::Null => Ok(Property::Null),
+            other => Err(ApocError::TypeMismatch {
+                name: "apoc.text.base64Decode".into(),
+                details: format!("expected string, got {}", other.type_name()),
+            }),
+        };
+    };
+    let trimmed = s.trim_end_matches('=');
+    let mut bytes: Vec<u8> = Vec::with_capacity((trimmed.len() * 3) / 4);
+    let mut buf: u32 = 0;
+    let mut acc_bits: u32 = 0;
+    for c in trimmed.chars() {
+        let val: u32 = match c {
+            'A'..='Z' => (c as u32) - ('A' as u32),
+            'a'..='z' => (c as u32) - ('a' as u32) + 26,
+            '0'..='9' => (c as u32) - ('0' as u32) + 52,
+            '+' | '-' => 62,
+            '/' | '_' => 63,
+            c if c.is_whitespace() => continue,
+            bad => {
+                return Err(ApocError::TypeMismatch {
+                    name: "apoc.text.base64Decode".into(),
+                    details: format!("invalid base64 character: {bad:?}"),
+                });
+            }
+        };
+        buf = (buf << 6) | val;
+        acc_bits += 6;
+        if acc_bits >= 8 {
+            acc_bits -= 8;
+            bytes.push((buf >> acc_bits) as u8);
+            buf &= (1 << acc_bits) - 1;
+        }
+    }
+    match std::str::from_utf8(&bytes) {
+        Ok(s) => Ok(Property::String(s.to_string())),
+        Err(_) => Err(ApocError::TypeMismatch {
+            name: "apoc.text.base64Decode".into(),
+            details: "decoded bytes are not valid UTF-8".into(),
+        }),
+    }
+}
+
+/// UTF-8 byte length — useful when callers need storage-cost
+/// estimates that `size()` (character count) doesn't give.
+fn byte_count(args: &[Property]) -> Result<Property, ApocError> {
+    check_arity("byteCount", args, 1)?;
+    match &args[0] {
+        Property::Null => Ok(Property::Null),
+        Property::String(s) => Ok(Property::Int64(s.len() as i64)),
+        other => Err(ApocError::TypeMismatch {
+            name: "apoc.text.byteCount".into(),
+            details: format!("expected string, got {}", other.type_name()),
+        }),
+    }
+}
+
+/// Canonicalise a string: strip non-alphanumeric characters and
+/// lowercase the result. Matches Neo4j APOC's `apoc.text.clean` —
+/// used for fuzzy-match / dedupe pipelines where punctuation and
+/// case should be ignored.
+fn clean(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Classic Levenshtein edit distance (insertions, deletions,
+/// single-character substitutions). O(len1 * len2) time, O(min)
+/// space via the two-row trick. Unicode-safe: operates on chars,
+/// not bytes, so multi-byte characters count as one edit.
+fn levenshtein_distance(args: &[Property]) -> Result<Property, ApocError> {
+    check_arity("levenshteinDistance", args, 2)?;
+    let a = match &args[0] {
+        Property::String(s) => s.as_str(),
+        Property::Null => return Ok(Property::Null),
+        other => {
+            return Err(ApocError::TypeMismatch {
+                name: "apoc.text.levenshteinDistance".into(),
+                details: format!("expected string, got {}", other.type_name()),
+            });
+        }
+    };
+    let b = match &args[1] {
+        Property::String(s) => s.as_str(),
+        Property::Null => return Ok(Property::Null),
+        other => {
+            return Err(ApocError::TypeMismatch {
+                name: "apoc.text.levenshteinDistance".into(),
+                details: format!("expected string, got {}", other.type_name()),
+            });
+        }
+    };
+    let ac: Vec<char> = a.chars().collect();
+    let bc: Vec<char> = b.chars().collect();
+    if ac.is_empty() {
+        return Ok(Property::Int64(bc.len() as i64));
+    }
+    if bc.is_empty() {
+        return Ok(Property::Int64(ac.len() as i64));
+    }
+    let mut prev: Vec<usize> = (0..=bc.len()).collect();
+    let mut curr: Vec<usize> = vec![0; bc.len() + 1];
+    for (i, ca) in ac.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in bc.iter().enumerate() {
+            let substitute = prev[j] + if ca == cb { 0 } else { 1 };
+            let insert = curr[j] + 1;
+            let delete = prev[j + 1] + 1;
+            curr[j + 1] = substitute.min(insert).min(delete);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    Ok(Property::Int64(prev[bc.len()] as i64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +874,69 @@ mod tests {
     fn null_input_returns_null() {
         assert_eq!(
             map_string(&[Property::Null], "reverse", |s| s.to_string()).unwrap(),
+            Property::Null,
+        );
+    }
+
+    #[test]
+    fn base64_encode_decodes_round_trip() {
+        let cases = ["", "a", "ab", "abc", "hello, world", "π☆"];
+        for input in cases {
+            let encoded = base64_encode(input);
+            let decoded = base64_decode(&[s(&encoded)]).unwrap();
+            assert_eq!(decoded, s(input), "round-trip for {input:?}");
+        }
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vector() {
+        // RFC 4648 §10: "foobar" → "Zm9vYmFy"
+        assert_eq!(base64_encode("foobar"), "Zm9vYmFy");
+        // Padding cases
+        assert_eq!(base64_encode("fo"), "Zm8=");
+        assert_eq!(base64_encode("f"), "Zg==");
+    }
+
+    #[test]
+    fn base64_decode_rejects_invalid_char() {
+        let err = base64_decode(&[s("****")]).unwrap_err();
+        assert!(matches!(err, ApocError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn byte_count_vs_size() {
+        // ASCII: byte count equals character count.
+        assert_eq!(byte_count(&[s("hello")]).unwrap(), Property::Int64(5));
+        // Multi-byte UTF-8: byte count exceeds character count.
+        assert_eq!(byte_count(&[s("π")]).unwrap(), Property::Int64(2));
+        assert_eq!(byte_count(&[s("☆")]).unwrap(), Property::Int64(3));
+    }
+
+    #[test]
+    fn clean_strips_non_alphanumeric_and_lowercases() {
+        assert_eq!(clean("Hello, World!"), "helloworld");
+        assert_eq!(clean("A-B_C.D 1-2-3"), "abcd123");
+    }
+
+    #[test]
+    fn levenshtein_distance_known_cases() {
+        let d = |a: &str, b: &str| levenshtein_distance(&[s(a), s(b)]).unwrap();
+        assert_eq!(d("kitten", "sitting"), Property::Int64(3));
+        assert_eq!(d("", "abc"), Property::Int64(3));
+        assert_eq!(d("abc", ""), Property::Int64(3));
+        assert_eq!(d("same", "same"), Property::Int64(0));
+        // Unicode: insert a multi-byte char counts as one edit.
+        assert_eq!(d("abc", "aπbc"), Property::Int64(1));
+    }
+
+    #[test]
+    fn levenshtein_null_arg_propagates_null() {
+        assert_eq!(
+            levenshtein_distance(&[Property::Null, s("x")]).unwrap(),
+            Property::Null,
+        );
+        assert_eq!(
+            levenshtein_distance(&[s("x"), Property::Null]).unwrap(),
             Property::Null,
         );
     }

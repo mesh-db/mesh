@@ -31,6 +31,10 @@ pub fn call(suffix: &str, args: &[Property]) -> Result<Property, ApocError> {
         "intersection" => intersection(args),
         "subtract" => subtract(args),
         "flatten" => flatten(args),
+        "zip" => zip(args),
+        "indexof" => index_of(args),
+        "occurrences" => occurrences(args),
+        "tomap" => to_map(args),
         _ => Err(ApocError::UnknownFunction(format!("apoc.coll.{suffix}"))),
     }
 }
@@ -361,6 +365,131 @@ fn flatten(args: &[Property]) -> Result<Property, ApocError> {
     Ok(Property::List(out))
 }
 
+/// `apoc.coll.zip(list1, list2)` — pair elements positionally
+/// into 2-element sublists, truncating to the shorter list.
+/// Matches Neo4j APOC: no padding, no error on length mismatch.
+/// Either list may be null → null out.
+fn zip(args: &[Property]) -> Result<Property, ApocError> {
+    if args.len() != 2 {
+        return Err(ApocError::Arity {
+            name: "apoc.coll.zip".into(),
+            expected: 2,
+            got: args.len(),
+        });
+    }
+    let Some(a) = as_list("zip", &args[0])? else {
+        return Ok(Property::Null);
+    };
+    let Some(b) = as_list("zip", &args[1])? else {
+        return Ok(Property::Null);
+    };
+    let paired: Vec<Property> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| Property::List(vec![x.clone(), y.clone()]))
+        .collect();
+    Ok(Property::List(paired))
+}
+
+/// `apoc.coll.indexOf(list, item)` — first 0-indexed position of
+/// `item` in `list`, or `-1` if not present. Null list → null
+/// result; null item matches explicit null elements.
+fn index_of(args: &[Property]) -> Result<Property, ApocError> {
+    if args.len() != 2 {
+        return Err(ApocError::Arity {
+            name: "apoc.coll.indexOf".into(),
+            expected: 2,
+            got: args.len(),
+        });
+    }
+    let Some(items) = as_list("indexOf", &args[0])? else {
+        return Ok(Property::Null);
+    };
+    for (i, item) in items.iter().enumerate() {
+        if properties_equal(item, &args[1]) {
+            return Ok(Property::Int64(i as i64));
+        }
+    }
+    Ok(Property::Int64(-1))
+}
+
+/// `apoc.coll.occurrences(list, item)` — count of `item` in
+/// `list`. Null list → null; null item counts explicit nulls.
+fn occurrences(args: &[Property]) -> Result<Property, ApocError> {
+    if args.len() != 2 {
+        return Err(ApocError::Arity {
+            name: "apoc.coll.occurrences".into(),
+            expected: 2,
+            got: args.len(),
+        });
+    }
+    let Some(items) = as_list("occurrences", &args[0])? else {
+        return Ok(Property::Null);
+    };
+    let count = items
+        .iter()
+        .filter(|p| properties_equal(p, &args[1]))
+        .count();
+    Ok(Property::Int64(count as i64))
+}
+
+/// `apoc.coll.toMap(list)` — convert a list of `[key, value]`
+/// 2-element sublists into a map. Duplicate keys keep the last
+/// value encountered (matches Neo4j). Non-pair elements raise
+/// TypeMismatch; non-string keys likewise.
+fn to_map(args: &[Property]) -> Result<Property, ApocError> {
+    let Some(items) = as_list("toMap", single("toMap", args)?)? else {
+        return Ok(Property::Null);
+    };
+    let mut map: std::collections::HashMap<String, Property> =
+        std::collections::HashMap::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let pair = match item {
+            Property::List(inner) if inner.len() == 2 => inner,
+            other => {
+                return Err(ApocError::TypeMismatch {
+                    name: "apoc.coll.toMap".into(),
+                    details: format!(
+                        "element {i} is not a 2-element list, got {}",
+                        other.type_name()
+                    ),
+                });
+            }
+        };
+        let key = match &pair[0] {
+            Property::String(s) => s.clone(),
+            other => {
+                return Err(ApocError::TypeMismatch {
+                    name: "apoc.coll.toMap".into(),
+                    details: format!(
+                        "element {i} key must be a string, got {}",
+                        other.type_name()
+                    ),
+                });
+            }
+        };
+        map.insert(key, pair[1].clone());
+    }
+    Ok(Property::Map(map))
+}
+
+/// Value equality for list-membership operations. Treats
+/// `Int64` and `Float64` as comparable when numerically equal
+/// (matches Neo4j's `=` semantics for mixed-numeric lists).
+/// Nulls compare equal to each other here — `indexOf([1, null,
+/// 3], null)` should find the explicit null at index 1.
+fn properties_equal(a: &Property, b: &Property) -> bool {
+    match (a, b) {
+        (Property::Null, Property::Null) => true,
+        (Property::Int64(x), Property::Int64(y)) => x == y,
+        (Property::Float64(x), Property::Float64(y)) => x == y,
+        (Property::Int64(i), Property::Float64(f)) | (Property::Float64(f), Property::Int64(i)) => {
+            *f == (*i as f64)
+        }
+        _ => a == b,
+    }
+}
+
 /// Hashable witness for equality across [`Property`] values.
 /// `Property` doesn't implement `Hash` itself because `Float64` and
 /// `Point`'s f64 fields break total ordering — we encode them into a
@@ -619,6 +748,87 @@ mod tests {
     #[test]
     fn non_numeric_element_in_sum_errors() {
         let err = sum(&[lst(vec![i(1), s("x")])]).unwrap_err();
+        assert!(matches!(err, ApocError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn zip_pairs_items_truncating_to_shorter() {
+        let out = zip(&[lst(vec![i(1), i(2), i(3)]), lst(vec![s("a"), s("b")])]).unwrap();
+        assert_eq!(
+            out,
+            lst(vec![lst(vec![i(1), s("a")]), lst(vec![i(2), s("b")])]),
+        );
+    }
+
+    #[test]
+    fn zip_null_either_arg_is_null() {
+        assert_eq!(
+            zip(&[Property::Null, lst(vec![i(1)])]).unwrap(),
+            Property::Null,
+        );
+        assert_eq!(
+            zip(&[lst(vec![i(1)]), Property::Null]).unwrap(),
+            Property::Null,
+        );
+    }
+
+    #[test]
+    fn index_of_finds_first_occurrence() {
+        assert_eq!(
+            index_of(&[lst(vec![i(10), i(20), i(30), i(20)]), i(20)]).unwrap(),
+            i(1),
+        );
+    }
+
+    #[test]
+    fn index_of_missing_returns_neg_one() {
+        assert_eq!(index_of(&[lst(vec![i(1), i(2)]), i(99)]).unwrap(), i(-1));
+    }
+
+    #[test]
+    fn index_of_matches_explicit_null() {
+        assert_eq!(
+            index_of(&[lst(vec![i(1), Property::Null, i(3)]), Property::Null]).unwrap(),
+            i(1),
+        );
+    }
+
+    #[test]
+    fn occurrences_counts_matches() {
+        assert_eq!(
+            occurrences(&[lst(vec![i(1), i(2), i(1), i(3), i(1)]), i(1)]).unwrap(),
+            i(3),
+        );
+    }
+
+    #[test]
+    fn to_map_converts_pair_list() {
+        let out = to_map(&[lst(vec![
+            lst(vec![s("name"), s("alice")]),
+            lst(vec![s("age"), i(30)]),
+        ])])
+        .unwrap();
+        match out {
+            Property::Map(m) => {
+                assert_eq!(m.get("name"), Some(&s("alice")));
+                assert_eq!(m.get("age"), Some(&i(30)));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_map_last_wins_on_duplicate_keys() {
+        let out = to_map(&[lst(vec![lst(vec![s("k"), i(1)]), lst(vec![s("k"), i(2)])])]).unwrap();
+        match out {
+            Property::Map(m) => assert_eq!(m.get("k"), Some(&i(2))),
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_map_non_pair_element_errors() {
+        let err = to_map(&[lst(vec![lst(vec![s("k"), i(1), i(2)])])]).unwrap_err();
         assert!(matches!(err, ApocError::TypeMismatch { .. }));
     }
 }

@@ -9105,6 +9105,52 @@ mod apoc_coll {
         assert_eq!(int_list(&rows[0], "f"), vec![1, 2, 3, 4, 5]);
     }
 
+    #[test]
+    fn apoc_coll_zip_pairs_and_truncates() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.zip([1, 2, 3], ['a', 'b']) AS z");
+        match rows[0].get("z").unwrap() {
+            Value::Property(Property::List(items)) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(
+                    items[0],
+                    Property::List(vec![Property::Int64(1), Property::String("a".into()),]),
+                );
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_coll_index_of_and_occurrences() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.indexOf([10, 20, 30, 20], 20) AS i, \
+                    apoc.coll.occurrences([1, 2, 1, 3, 1], 1) AS c, \
+                    apoc.coll.indexOf([1, 2, 3], 99) AS miss",
+        );
+        assert_eq!(int_prop(&rows[0], "i"), 1);
+        assert_eq!(int_prop(&rows[0], "c"), 3);
+        assert_eq!(int_prop(&rows[0], "miss"), -1);
+    }
+
+    #[test]
+    fn apoc_coll_to_map_from_pair_list() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.toMap([['name', 'alice'], ['age', 30]]) AS m",
+        );
+        match rows[0].get("m").unwrap() {
+            Value::Property(Property::Map(m)) => {
+                assert_eq!(m.get("name"), Some(&Property::String("alice".into())));
+                assert_eq!(m.get("age"), Some(&Property::Int64(30)));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
     /// Sanity-check the non-apoc name goes through the native
     /// dispatcher even with the feature on (no shadowing).
     #[test]
@@ -9233,6 +9279,45 @@ mod apoc_text {
         let (store, _d) = open_store();
         let rows = run(&store, "RETURN apoc.text.hexValue(255) AS h");
         assert_eq!(str_prop(&rows[0], "h"), "FF");
+    }
+
+    #[test]
+    fn apoc_text_base64_round_trip() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.base64Decode(apoc.text.base64Encode('hello, world')) AS r",
+        );
+        assert_eq!(str_prop(&rows[0], "r"), "hello, world");
+    }
+
+    #[test]
+    fn apoc_text_byte_count_utf8() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.byteCount('hello') AS a, \
+                    apoc.text.byteCount('π') AS p",
+        );
+        assert_eq!(int_prop(&rows[0], "a"), 5);
+        assert_eq!(int_prop(&rows[0], "p"), 2);
+    }
+
+    #[test]
+    fn apoc_text_clean_strips_and_lowercases() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.text.clean('Hello, World!') AS c");
+        assert_eq!(str_prop(&rows[0], "c"), "helloworld");
+    }
+
+    #[test]
+    fn apoc_text_levenshtein_distance_classic() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.levenshteinDistance('kitten', 'sitting') AS d",
+        );
+        assert_eq!(int_prop(&rows[0], "d"), 3);
     }
 }
 
