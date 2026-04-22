@@ -106,6 +106,8 @@ impl TxOverlayState {
             | GraphCommand::DropIndex { .. }
             | GraphCommand::CreateEdgeIndex { .. }
             | GraphCommand::DropEdgeIndex { .. }
+            | GraphCommand::CreatePointIndex { .. }
+            | GraphCommand::DropPointIndex { .. }
             | GraphCommand::CreateConstraint { .. }
             | GraphCommand::DropConstraint { .. } => {}
         }
@@ -207,6 +209,11 @@ impl<'a> GraphReader for OverlayGraphReader<'a> {
         // DDL is a store-level concern; the overlay never shadows
         // it, so read-through is correct.
         self.base.list_edge_property_indexes()
+    }
+
+    fn list_point_indexes(&self) -> ExecResult<Vec<(String, String)>> {
+        // Same rationale: point-index DDL is a store concern.
+        self.base.list_point_indexes()
     }
 
     fn list_property_constraints(&self) -> ExecResult<Vec<meshdb_storage::PropertyConstraintSpec>> {

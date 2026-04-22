@@ -338,6 +338,24 @@ pub trait StorageEngine: Send + Sync {
     /// Snapshot the currently-registered edge property indexes.
     fn list_edge_property_indexes(&self) -> Vec<EdgePropertyIndexSpec>;
 
+    // --- Point / spatial index DDL ---
+
+    /// Declare a point index on `(label, property)` and backfill it
+    /// by scanning every node carrying `label`. Idempotent:
+    /// re-creating a registered index is a no-op. Single-property
+    /// and node-scope only — composite / relationship-scope spatial
+    /// indexes are follow-ups.
+    fn create_point_index(&self, label: &str, property: &str) -> Result<()>;
+
+    /// Tear down a point index. Removes the meta entry and sweeps
+    /// every stored entry under the `(label, property)` header — the
+    /// SRID-keyed sub-prefixes all fall inside that header, so one
+    /// range scan covers all coordinate systems. Idempotent.
+    fn drop_point_index(&self, label: &str, property: &str) -> Result<()>;
+
+    /// Snapshot the currently-registered point indexes.
+    fn list_point_indexes(&self) -> Vec<PointIndexSpec>;
+
     // --- Constraint DDL ---
 
     /// Declare a new property constraint. If `name` is `None`, the

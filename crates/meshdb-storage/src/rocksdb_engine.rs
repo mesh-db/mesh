@@ -2405,6 +2405,18 @@ impl StorageEngine for RocksDbStorageEngine {
         RocksDbStorageEngine::list_edge_property_indexes(self)
     }
 
+    fn create_point_index(&self, label: &str, property: &str) -> Result<()> {
+        RocksDbStorageEngine::create_point_index(self, label, property)
+    }
+
+    fn drop_point_index(&self, label: &str, property: &str) -> Result<()> {
+        RocksDbStorageEngine::drop_point_index(self, label, property)
+    }
+
+    fn list_point_indexes(&self) -> Vec<PointIndexSpec> {
+        RocksDbStorageEngine::list_point_indexes(self)
+    }
+
     fn create_property_constraint(
         &self,
         name: Option<&str>,

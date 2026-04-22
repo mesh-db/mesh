@@ -550,6 +550,25 @@ pub enum LogicalPlan {
     /// rows from both the node and edge index registries so a single
     /// `SHOW INDEXES` surfaces everything.
     ShowPropertyIndexes,
+    /// Schema DDL — declare a node point / spatial index on
+    /// `(label, property)`. Single-property and node-scope only in
+    /// v1; composite / relationship variants would land as new
+    /// plan variants rather than widening this one.
+    CreatePointIndex {
+        label: String,
+        property: String,
+    },
+    /// Schema DDL — tear down a point index. Mirror of
+    /// [`LogicalPlan::CreatePointIndex`].
+    DropPointIndex {
+        label: String,
+        property: String,
+    },
+    /// Schema DDL — emit one row per registered point index. Kept
+    /// separate from [`LogicalPlan::ShowPropertyIndexes`] so `SHOW
+    /// POINT INDEXES` and `SHOW INDEXES` produce independent row
+    /// streams with scope-appropriate column sets.
+    ShowPointIndexes,
     /// Schema DDL — declare a new property constraint. Same short-
     /// circuit dispatch pattern as [`LogicalPlan::CreatePropertyIndex`]:
     /// the executor handles the mutation outside the operator pipeline.
@@ -782,6 +801,15 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
             }
         }
         Statement::ShowIndexes => LogicalPlan::ShowPropertyIndexes,
+        Statement::CreatePointIndex(pd) => LogicalPlan::CreatePointIndex {
+            label: pd.label.clone(),
+            property: pd.property.clone(),
+        },
+        Statement::DropPointIndex(pd) => LogicalPlan::DropPointIndex {
+            label: pd.label.clone(),
+            property: pd.property.clone(),
+        },
+        Statement::ShowPointIndexes => LogicalPlan::ShowPointIndexes,
         Statement::CreateConstraint(CreateConstraintStmt {
             name,
             scope,
@@ -1156,6 +1184,15 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         }
         LogicalPlan::ShowPropertyIndexes => {
             buf.push_str(&format!("{indent}ShowPropertyIndexes\n"));
+        }
+        LogicalPlan::CreatePointIndex { label, property } => {
+            buf.push_str(&format!("{indent}CreatePointIndex({label}.{property})\n"));
+        }
+        LogicalPlan::DropPointIndex { label, property } => {
+            buf.push_str(&format!("{indent}DropPointIndex({label}.{property})\n"));
+        }
+        LogicalPlan::ShowPointIndexes => {
+            buf.push_str(&format!("{indent}ShowPointIndexes\n"));
         }
         LogicalPlan::CreatePropertyConstraint {
             name,
@@ -1533,6 +1570,9 @@ where
         | LogicalPlan::CreateEdgePropertyIndex { .. }
         | LogicalPlan::DropEdgePropertyIndex { .. }
         | LogicalPlan::ShowPropertyIndexes
+        | LogicalPlan::CreatePointIndex { .. }
+        | LogicalPlan::DropPointIndex { .. }
+        | LogicalPlan::ShowPointIndexes
         | LogicalPlan::CreatePropertyConstraint { .. }
         | LogicalPlan::DropPropertyConstraint { .. }
         | LogicalPlan::ShowPropertyConstraints => Ok(()),
@@ -1772,6 +1812,9 @@ fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::ShowIndexes
+        | Statement::CreatePointIndex(_)
+        | Statement::DropPointIndex(_)
+        | Statement::ShowPointIndexes
         | Statement::CreateConstraint(_)
         | Statement::DropConstraint(_)
         | Statement::ShowConstraints
@@ -1850,6 +1893,9 @@ fn call_subquery_output_columns(stmt: &Statement) -> Result<Option<Vec<String>>>
         Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::ShowIndexes
+        | Statement::CreatePointIndex(_)
+        | Statement::DropPointIndex(_)
+        | Statement::ShowPointIndexes
         | Statement::CreateConstraint(_)
         | Statement::DropConstraint(_)
         | Statement::ShowConstraints => Err(Error::Plan(

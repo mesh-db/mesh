@@ -115,6 +115,20 @@ impl GraphWriter for RaftGraphWriter {
         })
     }
 
+    fn create_point_index(&self, label: &str, property: &str) -> ExecResult<()> {
+        self.propose(GraphCommand::CreatePointIndex {
+            label: label.to_string(),
+            property: property.to_string(),
+        })
+    }
+
+    fn drop_point_index(&self, label: &str, property: &str) -> ExecResult<()> {
+        self.propose(GraphCommand::DropPointIndex {
+            label: label.to_string(),
+            property: property.to_string(),
+        })
+    }
+
     fn create_property_constraint(
         &self,
         name: Option<&str>,
@@ -261,6 +275,28 @@ impl GraphWriter for BufferingGraphWriter {
             .push(GraphCommand::DropEdgeIndex {
                 edge_type: edge_type.to_string(),
                 properties: properties.iter().map(|p| p.to_string()).collect(),
+            });
+        Ok(())
+    }
+
+    fn create_point_index(&self, label: &str, property: &str) -> ExecResult<()> {
+        self.buffer
+            .lock()
+            .unwrap()
+            .push(GraphCommand::CreatePointIndex {
+                label: label.to_string(),
+                property: property.to_string(),
+            });
+        Ok(())
+    }
+
+    fn drop_point_index(&self, label: &str, property: &str) -> ExecResult<()> {
+        self.buffer
+            .lock()
+            .unwrap()
+            .push(GraphCommand::DropPointIndex {
+                label: label.to_string(),
+                property: property.to_string(),
             });
         Ok(())
     }

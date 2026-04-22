@@ -10,6 +10,7 @@ query = { SOI ~ (kw_explain | kw_profile)? ~ query_body ~ EOI }
 // unionable row streams and are rejected at parse time.
 query_body = {
     create_constraint_stmt | drop_constraint_stmt | show_constraints_stmt |
+    create_point_index_stmt | drop_point_index_stmt | show_point_indexes_stmt |
     create_index_stmt | drop_index_stmt | show_indexes_stmt |
     union_query |
     create_stmt
@@ -83,6 +84,22 @@ drop_index_stmt = {
     kw_on ~ "(" ~ index_property ~ ("," ~ index_property)* ~ ")"
 }
 show_indexes_stmt = { kw_show ~ kw_indexes }
+
+// Point / spatial index DDL. Single-property and node-scope only
+// for the v1 spatial surface — matches what the storage layer and
+// the Raft log entry carry. Relationship-scope spatial indexes are
+// a follow-up with their own grammar rule.
+create_point_index_stmt = {
+    kw_create ~ kw_point ~ kw_index ~ kw_for ~
+    index_node_source ~
+    kw_on ~ "(" ~ index_property ~ ")"
+}
+drop_point_index_stmt = {
+    kw_drop ~ kw_point ~ kw_index ~ kw_for ~
+    index_node_source ~
+    kw_on ~ "(" ~ index_property ~ ")"
+}
+show_point_indexes_stmt = { kw_show ~ kw_point ~ kw_indexes }
 
 // Node source: `(var:Label)`. The variable is grammar-required but
 // discarded by the builder — the index is per-label, not
@@ -690,6 +707,7 @@ kw_in = @{ ^"in" ~ !id_cont }
 kw_unwind = @{ ^"unwind" ~ !id_cont }
 kw_index = @{ ^"index" ~ !id_cont }
 kw_indexes = @{ ^"indexes" ~ !id_cont }
+kw_point = @{ ^"point" ~ !id_cont }
 kw_constraint = @{ ^"constraint" ~ !id_cont }
 kw_constraints = @{ ^"constraints" ~ !id_cont }
 kw_require = @{ ^"require" ~ !id_cont }

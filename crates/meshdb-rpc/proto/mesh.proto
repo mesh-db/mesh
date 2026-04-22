@@ -269,6 +269,18 @@ service MeshWrite {
   // DROP fan-out and the compensating rollback for a partial create.
   rpc DropEdgePropertyIndex(DropEdgePropertyIndexRequest)
       returns (DropEdgePropertyIndexResponse);
+  // Apply a point / spatial index creation to this peer's local
+  // store. Routing-mode fan-out only; Raft-mode replicates through
+  // the shared log instead. Single-property, node-scope only for the
+  // v1 spatial-index surface — composite spatial and relationship
+  // spatial indexes would get their own RPCs so pre-spatial peers
+  // can reject unknown variants cleanly.
+  rpc CreatePointIndex(CreatePointIndexRequest)
+      returns (CreatePointIndexResponse);
+  // Tear down a point index on this peer's local store. Mirrors
+  // `CreatePointIndex`; used as both DROP fan-out and compensating
+  // rollback for a partial create.
+  rpc DropPointIndex(DropPointIndexRequest) returns (DropPointIndexResponse);
   // Apply a constraint creation to this peer's local store. Used by
   // the routing-mode DDL fan-out the same way `CreatePropertyIndex`
   // is — leader applies locally, then calls this RPC on every other
@@ -357,6 +369,18 @@ message DropEdgePropertyIndexRequest {
   repeated string properties = 3;
 }
 message DropEdgePropertyIndexResponse {}
+
+message CreatePointIndexRequest {
+  string label = 1;
+  string property = 2;
+}
+message CreatePointIndexResponse {}
+
+message DropPointIndexRequest {
+  string label = 1;
+  string property = 2;
+}
+message DropPointIndexResponse {}
 
 // Mirrors `meshdb_cluster::ConstraintKind`. New kinds land as
 // additional enum values so existing peers can reject unknown kinds

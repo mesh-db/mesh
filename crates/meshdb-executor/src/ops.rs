@@ -303,6 +303,31 @@ fn try_execute_ddl(
             }
             Ok(Some(rows))
         }
+        LogicalPlan::CreatePointIndex { label, property } => {
+            writer.create_point_index(label, property)?;
+            Ok(Some(vec![point_index_ddl_ack_row(
+                "created", label, property,
+            )]))
+        }
+        LogicalPlan::DropPointIndex { label, property } => {
+            writer.drop_point_index(label, property)?;
+            Ok(Some(vec![point_index_ddl_ack_row(
+                "dropped", label, property,
+            )]))
+        }
+        LogicalPlan::ShowPointIndexes => {
+            // Kept on its own row stream rather than folded into
+            // `SHOW INDEXES` so the point-specific `type` column
+            // stays a stable part of the shape and callers can
+            // filter without depending on string-matching `type`
+            // across mixed rows.
+            let rows: Vec<Row> = reader
+                .list_point_indexes()?
+                .into_iter()
+                .map(|(label, property)| show_point_index_row(label, property))
+                .collect();
+            Ok(Some(rows))
+        }
         LogicalPlan::CreatePropertyConstraint {
             name,
             scope,
@@ -486,6 +511,61 @@ fn properties_list_value(properties: &[String]) -> Value {
             .map(|p| Value::Property(Property::String(p.clone())))
             .collect(),
     )
+}
+
+/// One-row ack emitted after `CREATE POINT INDEX` / `DROP POINT
+/// INDEX`. Same column shape as the non-point variant plus a
+/// `type: "POINT"` column so clients consuming a unified DDL
+/// response stream can distinguish the kind at a glance.
+fn point_index_ddl_ack_row(state: &str, label: &str, property: &str) -> Row {
+    let mut row = Row::default();
+    row.insert(
+        "state".into(),
+        Value::Property(Property::String(state.into())),
+    );
+    row.insert(
+        "scope".into(),
+        Value::Property(Property::String("NODE".into())),
+    );
+    row.insert(
+        "type".into(),
+        Value::Property(Property::String("POINT".into())),
+    );
+    row.insert(
+        "label".into(),
+        Value::Property(Property::String(label.into())),
+    );
+    row.insert(
+        "property".into(),
+        Value::Property(Property::String(property.into())),
+    );
+    row
+}
+
+/// Row shape for `SHOW POINT INDEXES`. Kept minimal — one row per
+/// registered point index with its label + property + a stable
+/// `type` marker so drivers can filter without inspecting row
+/// provenance.
+fn show_point_index_row(label: String, property: String) -> Row {
+    let mut row = Row::default();
+    row.insert(
+        "scope".into(),
+        Value::Property(Property::String("NODE".into())),
+    );
+    row.insert(
+        "type".into(),
+        Value::Property(Property::String("POINT".into())),
+    );
+    row.insert("label".into(), Value::Property(Property::String(label)));
+    row.insert(
+        "property".into(),
+        Value::Property(Property::String(property)),
+    );
+    row.insert(
+        "state".into(),
+        Value::Property(Property::String("online".into())),
+    );
+    row
 }
 
 /// Row shape for `SHOW INDEXES` output. Columns: `scope`
@@ -837,6 +917,9 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
         | LogicalPlan::CreateEdgePropertyIndex { .. }
         | LogicalPlan::DropEdgePropertyIndex { .. }
         | LogicalPlan::ShowPropertyIndexes
+        | LogicalPlan::CreatePointIndex { .. }
+        | LogicalPlan::DropPointIndex { .. }
+        | LogicalPlan::ShowPointIndexes
         | LogicalPlan::CreatePropertyConstraint { .. }
         | LogicalPlan::DropPropertyConstraint { .. }
         | LogicalPlan::ShowPropertyConstraints => {

@@ -19,6 +19,9 @@ pub enum Statement {
     CreateIndex(IndexDdl),
     DropIndex(IndexDdl),
     ShowIndexes,
+    CreatePointIndex(PointIndexDdl),
+    DropPointIndex(PointIndexDdl),
+    ShowPointIndexes,
     CreateConstraint(CreateConstraintStmt),
     DropConstraint(DropConstraintStmt),
     ShowConstraints,
@@ -131,6 +134,17 @@ pub enum IndexScope {
 pub struct IndexDdl {
     pub scope: IndexScope,
     pub properties: Vec<String>,
+}
+
+/// Parsed payload of `CREATE POINT INDEX FOR (n:Label) ON (n.prop)`
+/// and its mirror forms. Single-property and node-scope only today
+/// — the grammar rejects composite and relationship variants up
+/// front so every downstream consumer can assume this shape without
+/// defending against nonsense.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointIndexDdl {
+    pub label: String,
+    pub property: String,
 }
 
 /// Kind of property constraint. UNIQUE comes from

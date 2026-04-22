@@ -261,6 +261,8 @@ impl<'a> TxCoordinator<'a> {
                 | GraphCommand::DropIndex { .. }
                 | GraphCommand::CreateEdgeIndex { .. }
                 | GraphCommand::DropEdgeIndex { .. }
+                | GraphCommand::CreatePointIndex { .. }
+                | GraphCommand::DropPointIndex { .. }
                 | GraphCommand::CreateConstraint { .. }
                 | GraphCommand::DropConstraint { .. } => {
                     debug_assert!(

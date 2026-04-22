@@ -82,6 +82,22 @@ pub enum GraphCommand {
         edge_type: String,
         properties: Vec<String>,
     },
+    /// Declare a node point / spatial index on every replica.
+    /// Single-property and node-scope only in the v1 point-index
+    /// surface — composite spatial and relationship-scope spatial
+    /// indexes would add new variants rather than widening this one,
+    /// so pre-spatial replicas can replay an existing Raft log
+    /// without misinterpreting the payload.
+    CreatePointIndex {
+        label: String,
+        property: String,
+    },
+    /// Tear down a point index across every replica. Mirrors
+    /// `CreatePointIndex` — idempotent.
+    DropPointIndex {
+        label: String,
+        property: String,
+    },
     /// Declare a property constraint on every replica. Reaches every
     /// peer through the Raft log / routing-mode fan-out, so the
     /// resulting registry entry and its on-write enforcement agree

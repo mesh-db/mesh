@@ -4014,6 +4014,64 @@ fn drop_edge_index_empties_show_indexes() {
     assert!(run(&store, "SHOW INDEXES").is_empty());
 }
 
+// ---------------------------------------------------------------
+// POINT INDEX DDL end-to-end.
+//
+// Exercises the full Cypher surface: parse → plan → executor DDL
+// dispatch → writer → storage. Separate `SHOW POINT INDEXES` row
+// stream confirms the DDL doesn't leak into the non-spatial
+// `SHOW INDEXES` output (and vice versa).
+// ---------------------------------------------------------------
+
+#[test]
+fn create_point_index_and_show_point_indexes_round_trip() {
+    let (store, _d) = open_store();
+    let create_rows = run(&store, "CREATE POINT INDEX FOR (c:City) ON (c.loc)");
+    assert_eq!(create_rows.len(), 1);
+    assert_eq!(str_prop(&create_rows[0], "state"), "created");
+    assert_eq!(str_prop(&create_rows[0], "scope"), "NODE");
+    assert_eq!(str_prop(&create_rows[0], "type"), "POINT");
+    assert_eq!(str_prop(&create_rows[0], "label"), "City");
+    assert_eq!(str_prop(&create_rows[0], "property"), "loc");
+
+    let shown = run(&store, "SHOW POINT INDEXES");
+    assert_eq!(shown.len(), 1);
+    assert_eq!(str_prop(&shown[0], "scope"), "NODE");
+    assert_eq!(str_prop(&shown[0], "type"), "POINT");
+    assert_eq!(str_prop(&shown[0], "label"), "City");
+    assert_eq!(str_prop(&shown[0], "property"), "loc");
+    assert_eq!(str_prop(&shown[0], "state"), "online");
+}
+
+#[test]
+fn drop_point_index_empties_show_point_indexes() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE POINT INDEX FOR (c:City) ON (c.loc)");
+    let drop_rows = run(&store, "DROP POINT INDEX FOR (c:City) ON (c.loc)");
+    assert_eq!(drop_rows.len(), 1);
+    assert_eq!(str_prop(&drop_rows[0], "state"), "dropped");
+    assert!(run(&store, "SHOW POINT INDEXES").is_empty());
+}
+
+#[test]
+fn point_index_and_property_index_shows_are_independent() {
+    // Point DDL must not surface in `SHOW INDEXES` and vice versa —
+    // the two row streams have different column shapes and mixing
+    // them would break the `SHOW INDEXES` contract.
+    let (store, _d) = open_store();
+    run(&store, "CREATE INDEX FOR (p:Person) ON (p.name)");
+    run(&store, "CREATE POINT INDEX FOR (c:City) ON (c.loc)");
+
+    let prop = run(&store, "SHOW INDEXES");
+    assert_eq!(prop.len(), 1);
+    assert_eq!(str_prop(&prop[0], "label"), "Person");
+
+    let point = run(&store, "SHOW POINT INDEXES");
+    assert_eq!(point.len(), 1);
+    assert_eq!(str_prop(&point[0], "label"), "City");
+    assert_eq!(str_prop(&point[0], "type"), "POINT");
+}
+
 #[test]
 fn edge_seek_anonymous_endpoints_finds_indexed_edges() {
     let (store, _d) = open_store();

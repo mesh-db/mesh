@@ -4,6 +4,12 @@ use meshdb_storage::{
     ConstraintScope, PropertyConstraintKind, PropertyConstraintSpec, StorageEngine,
 };
 
+/// `(label, property)` pair identifying a single-property node point
+/// / spatial index. Always length-1 on `property` side for now —
+/// composite spatial indexes are a separate design and get their own
+/// spec shape if they ship.
+pub type PointIndexSpec = (String, String);
+
 /// `(label, properties)` pair identifying a node property index.
 /// `properties` is a `Vec<String>` so composite indexes round-trip
 /// through the reader/writer boundary without truncating —
@@ -77,6 +83,29 @@ pub trait GraphWriter {
     /// `(edge_type, property)` pairs. Default impl returns an empty
     /// list.
     fn list_edge_property_indexes(&self) -> Result<Vec<EdgeIndexSpec>> {
+        Ok(Vec::new())
+    }
+
+    /// Declare a point / spatial index on `(label, property)`.
+    /// Default impl errors — remote writers opt in via the blanket
+    /// `StorageEngine` impl or a cluster-aware override.
+    fn create_point_index(&self, _label: &str, _property: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "point-index DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Tear down a point index. Mirrors
+    /// [`Self::create_point_index`].
+    fn drop_point_index(&self, _label: &str, _property: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "point-index DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Snapshot the currently-registered point indexes as
+    /// `(label, property)` pairs. Default impl returns empty.
+    fn list_point_indexes(&self) -> Result<Vec<PointIndexSpec>> {
         Ok(Vec::new())
     }
 
@@ -175,6 +204,23 @@ impl<T: StorageEngine> GraphWriter for T {
             .collect())
     }
 
+    fn create_point_index(&self, label: &str, property: &str) -> Result<()> {
+        StorageEngine::create_point_index(self, label, property)?;
+        Ok(())
+    }
+
+    fn drop_point_index(&self, label: &str, property: &str) -> Result<()> {
+        StorageEngine::drop_point_index(self, label, property)?;
+        Ok(())
+    }
+
+    fn list_point_indexes(&self) -> Result<Vec<PointIndexSpec>> {
+        Ok(StorageEngine::list_point_indexes(self)
+            .into_iter()
+            .map(|s| (s.label, s.property))
+            .collect())
+    }
+
     fn create_property_constraint(
         &self,
         name: Option<&str>,
@@ -267,6 +313,25 @@ impl GraphWriter for StorageWriterAdapter<'_> {
             .list_edge_property_indexes()
             .into_iter()
             .map(|s| (s.edge_type, s.properties))
+            .collect())
+    }
+
+    fn create_point_index(&self, label: &str, property: &str) -> Result<()> {
+        self.0.create_point_index(label, property)?;
+        Ok(())
+    }
+
+    fn drop_point_index(&self, label: &str, property: &str) -> Result<()> {
+        self.0.drop_point_index(label, property)?;
+        Ok(())
+    }
+
+    fn list_point_indexes(&self) -> Result<Vec<PointIndexSpec>> {
+        Ok(self
+            .0
+            .list_point_indexes()
+            .into_iter()
+            .map(|s| (s.label, s.property))
             .collect())
     }
 

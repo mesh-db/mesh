@@ -45,6 +45,11 @@ fn build_query_body(pair: Pair<Rule>) -> Result<Statement> {
         Rule::create_index_stmt => Ok(Statement::CreateIndex(build_index_ddl(inner)?)),
         Rule::drop_index_stmt => Ok(Statement::DropIndex(build_index_ddl(inner)?)),
         Rule::show_indexes_stmt => Ok(Statement::ShowIndexes),
+        Rule::create_point_index_stmt => {
+            Ok(Statement::CreatePointIndex(build_point_index_ddl(inner)?))
+        }
+        Rule::drop_point_index_stmt => Ok(Statement::DropPointIndex(build_point_index_ddl(inner)?)),
+        Rule::show_point_indexes_stmt => Ok(Statement::ShowPointIndexes),
         Rule::create_constraint_stmt => {
             Ok(Statement::CreateConstraint(build_create_constraint(inner)?))
         }
@@ -264,6 +269,50 @@ fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
     Ok(crate::ast::IndexDdl {
         scope: scope.ok_or_else(|| Error::Parse("index ddl missing scope".into()))?,
         properties,
+    })
+}
+
+/// Build a [`PointIndexDdl`] from a `create_point_index_stmt` or
+/// `drop_point_index_stmt` pair. The grammar enforces single-property
+/// and node-scope, so the walker only has to collect those two
+/// pieces — it isn't a reshaped `build_index_ddl` because there is
+/// no rel-scope branch and no multi-property loop to flatten.
+fn build_point_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::PointIndexDdl> {
+    let mut label: Option<String> = None;
+    let mut property: Option<String> = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::index_node_source => {
+                let target = p
+                    .into_inner()
+                    .find(|c| c.as_rule() == Rule::index_target)
+                    .ok_or_else(|| Error::Parse("point index source missing target".into()))?;
+                let mut inner = target.into_inner();
+                let _var = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("point index target missing var".into()))?;
+                let lab = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("point index target missing label".into()))?;
+                label = Some(parse_ident(lab.as_str()));
+            }
+            Rule::index_property => {
+                let mut inner = p.into_inner();
+                let _var = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("point index property missing var".into()))?;
+                let key = inner
+                    .next()
+                    .ok_or_else(|| Error::Parse("point index property missing key".into()))?;
+                property = Some(parse_ident(key.as_str()));
+            }
+            _ => {}
+        }
+    }
+    Ok(crate::ast::PointIndexDdl {
+        label: label.ok_or_else(|| Error::Parse("point index ddl missing label".into()))?,
+        property: property
+            .ok_or_else(|| Error::Parse("point index ddl missing property".into()))?,
     })
 }
 

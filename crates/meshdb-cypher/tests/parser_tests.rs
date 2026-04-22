@@ -1244,6 +1244,50 @@ fn create_index_parses_composite_property_list() {
 }
 
 #[test]
+fn create_point_index_parses() {
+    match parse("CREATE POINT INDEX FOR (c:City) ON (c.loc)").unwrap() {
+        Statement::CreatePointIndex(ddl) => {
+            assert_eq!(ddl.label, "City");
+            assert_eq!(ddl.property, "loc");
+        }
+        other => panic!("expected CreatePointIndex, got {:?}", other),
+    }
+}
+
+#[test]
+fn drop_point_index_parses() {
+    match parse("DROP POINT INDEX FOR (c:City) ON (c.loc)").unwrap() {
+        Statement::DropPointIndex(ddl) => {
+            assert_eq!(ddl.label, "City");
+            assert_eq!(ddl.property, "loc");
+        }
+        other => panic!("expected DropPointIndex, got {:?}", other),
+    }
+}
+
+#[test]
+fn show_point_indexes_parses() {
+    assert!(matches!(
+        parse("SHOW POINT INDEXES").unwrap(),
+        Statement::ShowPointIndexes
+    ));
+}
+
+#[test]
+fn create_point_index_rejects_relationship_scope() {
+    // The grammar only allows the node source for point indexes —
+    // relationship-scope spatial is a follow-up with its own rule.
+    assert!(parse("CREATE POINT INDEX FOR ()-[r:KNOWS]-() ON (r.loc)").is_err());
+}
+
+#[test]
+fn create_point_index_rejects_composite_property_list() {
+    // Single-property only in v1. The grammar rule doesn't accept
+    // a comma-separated property list after `ON (`.
+    assert!(parse("CREATE POINT INDEX FOR (c:City) ON (c.lon, c.lat)").is_err());
+}
+
+#[test]
 fn drop_edge_index_parses_composite_property_list() {
     match parse("DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since, r.weight)").unwrap() {
         Statement::DropIndex(ddl) => {
