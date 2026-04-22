@@ -85,18 +85,19 @@ drop_index_stmt = {
 }
 show_indexes_stmt = { kw_show ~ kw_indexes }
 
-// Point / spatial index DDL. Single-property and node-scope only
-// for the v1 spatial surface — matches what the storage layer and
-// the Raft log entry carry. Relationship-scope spatial indexes are
-// a follow-up with their own grammar rule.
+// Point / spatial index DDL. Single-property; both node scope
+// `FOR (n:Label) ON (n.p)` and relationship scope
+// `FOR ()-[r:TYPE]-() ON (r.p)` are accepted — the two variants
+// use distinct storage CFs and separate registry vectors, so DROP
+// disambiguates through the scope source.
 create_point_index_stmt = {
     kw_create ~ kw_point ~ kw_index ~ kw_for ~
-    index_node_source ~
+    (index_rel_source | index_node_source) ~
     kw_on ~ "(" ~ index_property ~ ")"
 }
 drop_point_index_stmt = {
     kw_drop ~ kw_point ~ kw_index ~ kw_for ~
-    index_node_source ~
+    (index_rel_source | index_node_source) ~
     kw_on ~ "(" ~ index_property ~ ")"
 }
 show_point_indexes_stmt = { kw_show ~ kw_point ~ kw_indexes }

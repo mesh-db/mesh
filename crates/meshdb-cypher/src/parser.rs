@@ -273,12 +273,12 @@ fn build_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::IndexDdl> {
 }
 
 /// Build a [`PointIndexDdl`] from a `create_point_index_stmt` or
-/// `drop_point_index_stmt` pair. The grammar enforces single-property
-/// and node-scope, so the walker only has to collect those two
-/// pieces — it isn't a reshaped `build_index_ddl` because there is
-/// no rel-scope branch and no multi-property loop to flatten.
+/// `drop_point_index_stmt` pair. Grammar-enforced single property;
+/// scope comes from either the node source (`(n:Label)`) or the
+/// relationship source (`()-[r:TYPE]-()`). The rule that fired
+/// determines the [`IndexScope`] variant.
 fn build_point_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::PointIndexDdl> {
-    let mut label: Option<String> = None;
+    let mut scope: Option<crate::ast::IndexScope> = None;
     let mut property: Option<String> = None;
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -294,7 +294,19 @@ fn build_point_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::PointIndexDdl> 
                 let lab = inner
                     .next()
                     .ok_or_else(|| Error::Parse("point index target missing label".into()))?;
-                label = Some(parse_ident(lab.as_str()));
+                scope = Some(crate::ast::IndexScope::Node(parse_ident(lab.as_str())));
+            }
+            Rule::index_rel_source => {
+                let mut idents = p.into_inner().filter(|c| c.as_rule() == Rule::identifier);
+                let _var = idents
+                    .next()
+                    .ok_or_else(|| Error::Parse("point index rel source missing var".into()))?;
+                let et = idents.next().ok_or_else(|| {
+                    Error::Parse("point index rel source missing edge type".into())
+                })?;
+                scope = Some(crate::ast::IndexScope::Relationship(parse_ident(
+                    et.as_str(),
+                )));
             }
             Rule::index_property => {
                 let mut inner = p.into_inner();
@@ -310,7 +322,7 @@ fn build_point_index_ddl(pair: Pair<Rule>) -> Result<crate::ast::PointIndexDdl> 
         }
     }
     Ok(crate::ast::PointIndexDdl {
-        label: label.ok_or_else(|| Error::Parse("point index ddl missing label".into()))?,
+        scope: scope.ok_or_else(|| Error::Parse("point index ddl missing scope".into()))?,
         property: property
             .ok_or_else(|| Error::Parse("point index ddl missing property".into()))?,
     })

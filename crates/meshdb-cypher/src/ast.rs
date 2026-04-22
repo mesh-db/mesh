@@ -137,13 +137,14 @@ pub struct IndexDdl {
 }
 
 /// Parsed payload of `CREATE POINT INDEX FOR (n:Label) ON (n.prop)`
-/// and its mirror forms. Single-property and node-scope only today
-/// — the grammar rejects composite and relationship variants up
-/// front so every downstream consumer can assume this shape without
-/// defending against nonsense.
+/// and its relationship-scope mirror `FOR ()-[r:TYPE]-() ON (r.prop)`.
+/// Single-property — the grammar rejects composite lists up front
+/// so every downstream consumer can assume one property per spec.
+/// `scope` shares its shape with [`IndexDdl::scope`] so the scope
+/// tag is carried identically across the two DDL families.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PointIndexDdl {
-    pub label: String,
+    pub scope: IndexScope,
     pub property: String,
 }
 

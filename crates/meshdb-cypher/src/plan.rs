@@ -620,10 +620,26 @@ pub enum LogicalPlan {
         label: String,
         property: String,
     },
+    /// Schema DDL — declare an edge / relationship-scope point index
+    /// on `(edge_type, property)`. Relationship-scope analogue of
+    /// [`LogicalPlan::CreatePointIndex`]; lives in its own CF so
+    /// node-scope and edge-scope spatial entries don't alias.
+    CreateEdgePointIndex {
+        edge_type: String,
+        property: String,
+    },
+    /// Schema DDL — tear down an edge point index. Mirror of
+    /// [`LogicalPlan::CreateEdgePointIndex`].
+    DropEdgePointIndex {
+        edge_type: String,
+        property: String,
+    },
     /// Schema DDL — emit one row per registered point index. Kept
     /// separate from [`LogicalPlan::ShowPropertyIndexes`] so `SHOW
     /// POINT INDEXES` and `SHOW INDEXES` produce independent row
-    /// streams with scope-appropriate column sets.
+    /// streams with scope-appropriate column sets. Merges node- and
+    /// edge-scoped point indexes into one row stream, disambiguated
+    /// by the `scope` column.
     ShowPointIndexes,
     /// Schema DDL — declare a new property constraint. Same short-
     /// circuit dispatch pattern as [`LogicalPlan::CreatePropertyIndex`]:
@@ -857,13 +873,25 @@ pub fn plan_with_context(statement: &Statement, ctx: &PlannerContext) -> Result<
             }
         }
         Statement::ShowIndexes => LogicalPlan::ShowPropertyIndexes,
-        Statement::CreatePointIndex(pd) => LogicalPlan::CreatePointIndex {
-            label: pd.label.clone(),
-            property: pd.property.clone(),
+        Statement::CreatePointIndex(pd) => match &pd.scope {
+            IndexScope::Node(label) => LogicalPlan::CreatePointIndex {
+                label: label.clone(),
+                property: pd.property.clone(),
+            },
+            IndexScope::Relationship(edge_type) => LogicalPlan::CreateEdgePointIndex {
+                edge_type: edge_type.clone(),
+                property: pd.property.clone(),
+            },
         },
-        Statement::DropPointIndex(pd) => LogicalPlan::DropPointIndex {
-            label: pd.label.clone(),
-            property: pd.property.clone(),
+        Statement::DropPointIndex(pd) => match &pd.scope {
+            IndexScope::Node(label) => LogicalPlan::DropPointIndex {
+                label: label.clone(),
+                property: pd.property.clone(),
+            },
+            IndexScope::Relationship(edge_type) => LogicalPlan::DropEdgePointIndex {
+                edge_type: edge_type.clone(),
+                property: pd.property.clone(),
+            },
         },
         Statement::ShowPointIndexes => LogicalPlan::ShowPointIndexes,
         Statement::CreateConstraint(CreateConstraintStmt {
@@ -1261,6 +1289,22 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
         LogicalPlan::DropPointIndex { label, property } => {
             buf.push_str(&format!("{indent}DropPointIndex({label}.{property})\n"));
         }
+        LogicalPlan::CreateEdgePointIndex {
+            edge_type,
+            property,
+        } => {
+            buf.push_str(&format!(
+                "{indent}CreateEdgePointIndex(:{edge_type}.{property})\n"
+            ));
+        }
+        LogicalPlan::DropEdgePointIndex {
+            edge_type,
+            property,
+        } => {
+            buf.push_str(&format!(
+                "{indent}DropEdgePointIndex(:{edge_type}.{property})\n"
+            ));
+        }
         LogicalPlan::ShowPointIndexes => {
             buf.push_str(&format!("{indent}ShowPointIndexes\n"));
         }
@@ -1655,6 +1699,8 @@ where
         | LogicalPlan::ShowPropertyIndexes
         | LogicalPlan::CreatePointIndex { .. }
         | LogicalPlan::DropPointIndex { .. }
+        | LogicalPlan::CreateEdgePointIndex { .. }
+        | LogicalPlan::DropEdgePointIndex { .. }
         | LogicalPlan::ShowPointIndexes
         | LogicalPlan::CreatePropertyConstraint { .. }
         | LogicalPlan::DropPropertyConstraint { .. }

@@ -271,6 +271,17 @@ impl GraphReader for PartitionedGraphReader {
             .collect())
     }
 
+    fn list_edge_point_indexes(&self) -> ExecResult<Vec<(String, String)>> {
+        // Relationship-scope analogue — same authoritative-local
+        // view since the DDL fans out identically.
+        Ok(self
+            .local
+            .list_edge_point_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
+            .collect())
+    }
+
     fn list_property_constraints(&self) -> ExecResult<Vec<meshdb_storage::PropertyConstraintSpec>> {
         // Constraint DDL replicates to every peer via Raft or
         // routing-mode fan-out, so the local registry is an

@@ -1,7 +1,7 @@
 use meshdb_core::{Edge, Node, NodeId, Point, Property};
 use meshdb_storage::{
-    ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PointIndexSpec, PropertyConstraintKind,
-    PropertyIndexSpec, RocksDbStorageEngine as Store,
+    ConstraintScope, EdgePointIndexSpec, EdgePropertyIndexSpec, GraphMutation, PointIndexSpec,
+    PropertyConstraintKind, PropertyIndexSpec, RocksDbStorageEngine as Store,
 };
 use tempfile::TempDir;
 
@@ -1484,4 +1484,210 @@ fn point_index_survives_reopen() {
         .nodes_in_bbox("City", "loc", 4326, 10.0, 50.0, 20.0, 55.0)
         .unwrap();
     assert_eq!(hits.len(), 1);
+}
+
+// ---------------------------------------------------------------
+// Edge point index — relationship-scope spatial tests.
+//
+// Mirror of the node-scope suite (backfill, maintenance, drop,
+// bbox containment, label isolation, SRID isolation).
+// ---------------------------------------------------------------
+
+#[test]
+fn edge_point_index_backfills_existing_edges() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    let e1 = Edge::new("ROUTE", a.id, b.id).with_property("waypoint", wgs84(13.4, 52.5));
+    let e2 = Edge::new("ROUTE", a.id, b.id).with_property("waypoint", wgs84(-73.9, 40.7));
+    store.put_edge(&e1).unwrap();
+    store.put_edge(&e2).unwrap();
+
+    store.create_edge_point_index("ROUTE", "waypoint").unwrap();
+    assert_eq!(
+        store.list_edge_point_indexes(),
+        vec![EdgePointIndexSpec {
+            edge_type: "ROUTE".into(),
+            property: "waypoint".into(),
+        }]
+    );
+
+    // Bbox around Berlin only.
+    let hits = store
+        .edges_in_bbox("ROUTE", "waypoint", 4326, 10.0, 50.0, 20.0, 55.0)
+        .unwrap();
+    assert_eq!(hits, vec![e1.id]);
+}
+
+#[test]
+fn edge_point_index_maintains_on_put_and_delete() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    store.create_edge_point_index("ROUTE", "waypoint").unwrap();
+
+    let berlin_edge = Edge::new("ROUTE", a.id, b.id).with_property("waypoint", wgs84(13.4, 52.5));
+    store.put_edge(&berlin_edge).unwrap();
+
+    let hits = store
+        .edges_in_bbox("ROUTE", "waypoint", 4326, 10.0, 50.0, 20.0, 55.0)
+        .unwrap();
+    assert_eq!(hits, vec![berlin_edge.id]);
+
+    // Move the waypoint — update replaces the index entry.
+    let mut moved = berlin_edge.clone();
+    moved
+        .properties
+        .insert("waypoint".into(), wgs84(-58.4, -34.6));
+    store.put_edge(&moved).unwrap();
+    assert!(store
+        .edges_in_bbox("ROUTE", "waypoint", 4326, 10.0, 50.0, 20.0, 55.0)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .edges_in_bbox("ROUTE", "waypoint", 4326, -60.0, -40.0, -50.0, -30.0)
+            .unwrap(),
+        vec![berlin_edge.id]
+    );
+
+    // Delete the edge → index entry swept.
+    store.delete_edge(berlin_edge.id).unwrap();
+    assert!(store
+        .edges_in_bbox("ROUTE", "waypoint", 4326, -60.0, -40.0, -50.0, -30.0)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn edge_point_index_skips_edges_of_other_types() {
+    // The (edge_type, property) tuple is the scope — edges of a
+    // different type carrying the same property name must NOT land
+    // in the index.
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    store.create_edge_point_index("ROUTE", "waypoint").unwrap();
+    let right_type = Edge::new("ROUTE", a.id, b.id).with_property("waypoint", wgs84(5.0, 5.0));
+    let wrong_type = Edge::new("FLIGHT", a.id, b.id).with_property("waypoint", wgs84(5.0, 5.0));
+    store.put_edge(&right_type).unwrap();
+    store.put_edge(&wrong_type).unwrap();
+
+    let hits = store
+        .edges_in_bbox("ROUTE", "waypoint", 4326, 0.0, 0.0, 10.0, 10.0)
+        .unwrap();
+    assert_eq!(hits, vec![right_type.id]);
+}
+
+#[test]
+fn edge_point_index_isolates_srids() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    store.create_edge_point_index("ROUTE", "waypoint").unwrap();
+    let geo = Edge::new("ROUTE", a.id, b.id).with_property("waypoint", wgs84(5.0, 5.0));
+    let cart = Edge::new("ROUTE", a.id, b.id).with_property(
+        "waypoint",
+        Property::Point(Point {
+            srid: meshdb_core::SRID_CARTESIAN_2D,
+            x: 5.0,
+            y: 5.0,
+            z: None,
+        }),
+    );
+    store.put_edge(&geo).unwrap();
+    store.put_edge(&cart).unwrap();
+
+    assert_eq!(
+        store
+            .edges_in_bbox("ROUTE", "waypoint", 4326, 0.0, 0.0, 10.0, 10.0)
+            .unwrap(),
+        vec![geo.id]
+    );
+    assert_eq!(
+        store
+            .edges_in_bbox("ROUTE", "waypoint", 7203, 0.0, 0.0, 10.0, 10.0)
+            .unwrap(),
+        vec![cart.id]
+    );
+}
+
+#[test]
+fn edge_point_index_drop_sweeps_all_srid_entries() {
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    store.create_edge_point_index("ROUTE", "waypoint").unwrap();
+    store
+        .put_edge(&Edge::new("ROUTE", a.id, b.id).with_property("waypoint", wgs84(5.0, 5.0)))
+        .unwrap();
+
+    store.drop_edge_point_index("ROUTE", "waypoint").unwrap();
+    assert!(store.list_edge_point_indexes().is_empty());
+    assert!(store
+        .edges_in_bbox("ROUTE", "waypoint", 4326, 0.0, 0.0, 10.0, 10.0)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn edge_point_index_detach_delete_node_sweeps_incident_edges() {
+    // When a node is detach-deleted, every edge incident to it goes
+    // away — including its edge-point-index entries. Mirror of the
+    // detach_delete_node coverage for property indexes.
+    let (store, _dir) = tmp_store();
+    let a = Node::new();
+    let b = Node::new();
+    store.put_node(&a).unwrap();
+    store.put_node(&b).unwrap();
+    store.create_edge_point_index("ROUTE", "waypoint").unwrap();
+    let e = Edge::new("ROUTE", a.id, b.id).with_property("waypoint", wgs84(5.0, 5.0));
+    store.put_edge(&e).unwrap();
+
+    store.detach_delete_node(a.id).unwrap();
+    assert!(store
+        .edges_in_bbox("ROUTE", "waypoint", 4326, 0.0, 0.0, 10.0, 10.0)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn edge_point_index_survives_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let store = Store::open(dir.path()).unwrap();
+        let a = Node::new();
+        let b = Node::new();
+        store.put_node(&a).unwrap();
+        store.put_node(&b).unwrap();
+        store.create_edge_point_index("ROUTE", "waypoint").unwrap();
+        store
+            .put_edge(&Edge::new("ROUTE", a.id, b.id).with_property("waypoint", wgs84(13.4, 52.5)))
+            .unwrap();
+    }
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store.list_edge_point_indexes(),
+        vec![EdgePointIndexSpec {
+            edge_type: "ROUTE".into(),
+            property: "waypoint".into(),
+        }]
+    );
+    assert_eq!(
+        store
+            .edges_in_bbox("ROUTE", "waypoint", 4326, 10.0, 50.0, 20.0, 55.0)
+            .unwrap()
+            .len(),
+        1
+    );
 }

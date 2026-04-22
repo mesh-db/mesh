@@ -109,6 +109,28 @@ pub trait GraphWriter {
         Ok(Vec::new())
     }
 
+    /// Relationship-scope analogue of
+    /// [`Self::create_point_index`].
+    fn create_edge_point_index(&self, _edge_type: &str, _property: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "edge-point-index DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Tear down an edge point index. Mirrors
+    /// [`Self::create_edge_point_index`].
+    fn drop_edge_point_index(&self, _edge_type: &str, _property: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "edge-point-index DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Snapshot the currently-registered edge point indexes as
+    /// `(edge_type, property)` pairs.
+    fn list_edge_point_indexes(&self) -> Result<Vec<PointIndexSpec>> {
+        Ok(Vec::new())
+    }
+
     /// Declare a new property constraint. Default impl errors so
     /// remote writers that haven't plumbed constraint DDL yet surface
     /// the limitation immediately — storage-backed writers override
@@ -218,6 +240,23 @@ impl<T: StorageEngine> GraphWriter for T {
         Ok(StorageEngine::list_point_indexes(self)
             .into_iter()
             .map(|s| (s.label, s.property))
+            .collect())
+    }
+
+    fn create_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        StorageEngine::create_edge_point_index(self, edge_type, property)?;
+        Ok(())
+    }
+
+    fn drop_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        StorageEngine::drop_edge_point_index(self, edge_type, property)?;
+        Ok(())
+    }
+
+    fn list_edge_point_indexes(&self) -> Result<Vec<PointIndexSpec>> {
+        Ok(StorageEngine::list_edge_point_indexes(self)
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
             .collect())
     }
 
@@ -332,6 +371,25 @@ impl GraphWriter for StorageWriterAdapter<'_> {
             .list_point_indexes()
             .into_iter()
             .map(|s| (s.label, s.property))
+            .collect())
+    }
+
+    fn create_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        self.0.create_edge_point_index(edge_type, property)?;
+        Ok(())
+    }
+
+    fn drop_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        self.0.drop_edge_point_index(edge_type, property)?;
+        Ok(())
+    }
+
+    fn list_edge_point_indexes(&self) -> Result<Vec<PointIndexSpec>> {
+        Ok(self
+            .0
+            .list_edge_point_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
             .collect())
     }
 

@@ -66,6 +66,16 @@ pub struct PointIndexSpec {
     pub property: String,
 }
 
+/// Relationship-scope analogue of [`PointIndexSpec`]. Same
+/// single-property shape; the index lives under a separate CF so
+/// node and edge spatial entries can't alias and the two can be
+/// dropped independently.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EdgePointIndexSpec {
+    pub edge_type: String,
+    pub property: String,
+}
+
 /// Kind of single-property constraint. `Unique` comes from
 /// `REQUIRE n.prop IS UNIQUE`, `NotNull` from `REQUIRE n.prop IS NOT
 /// NULL`, and `PropertyType(t)` from `REQUIRE n.prop IS :: <TYPE>`.
@@ -372,6 +382,33 @@ pub trait StorageEngine: Send + Sync {
         xhi: f64,
         yhi: f64,
     ) -> Result<Vec<NodeId>>;
+
+    // --- Edge point / spatial index DDL ---
+
+    /// Relationship-scope analogue of [`Self::create_point_index`].
+    /// Declares an edge point index on `(edge_type, property)` and
+    /// backfills by scanning every edge currently carrying
+    /// `edge_type`. Idempotent.
+    fn create_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()>;
+
+    /// Tear down an edge point index. Idempotent. Mirrors
+    /// [`Self::drop_point_index`].
+    fn drop_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()>;
+
+    /// Snapshot the currently-registered edge point indexes.
+    fn list_edge_point_indexes(&self) -> Vec<EdgePointIndexSpec>;
+
+    /// Relationship-scope analogue of [`Self::nodes_in_bbox`].
+    fn edges_in_bbox(
+        &self,
+        edge_type: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<EdgeId>>;
 
     // --- Constraint DDL ---
 

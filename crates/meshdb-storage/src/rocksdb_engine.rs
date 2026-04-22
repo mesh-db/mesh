@@ -13,7 +13,7 @@
 
 use crate::{
     engine::{
-        ConstraintScope, EdgePropertyIndexSpec, GraphMutation, PointIndexSpec,
+        ConstraintScope, EdgePointIndexSpec, EdgePropertyIndexSpec, GraphMutation, PointIndexSpec,
         PropertyConstraintKind, PropertyConstraintSpec, PropertyIndexSpec, PropertyType,
         StorageEngine,
     },
@@ -51,6 +51,8 @@ const CF_EDGE_INDEX_META: &str = "edge_index_meta";
 const CF_CONSTRAINT_META: &str = "constraint_meta";
 const CF_POINT_INDEX: &str = "point_index";
 const CF_POINT_INDEX_META: &str = "point_index_meta";
+const CF_EDGE_POINT_INDEX: &str = "edge_point_index";
+const CF_EDGE_POINT_INDEX_META: &str = "edge_point_index_meta";
 
 const ALL_CFS: &[&str] = &[
     CF_NODES,
@@ -66,6 +68,8 @@ const ALL_CFS: &[&str] = &[
     CF_CONSTRAINT_META,
     CF_POINT_INDEX,
     CF_POINT_INDEX_META,
+    CF_EDGE_POINT_INDEX,
+    CF_EDGE_POINT_INDEX_META,
 ];
 
 const EMPTY: &[u8] = &[];
@@ -228,6 +232,55 @@ fn point_index_meta_key_decode(key: &[u8]) -> Result<PointIndexSpec> {
     Ok(PointIndexSpec { label, property })
 }
 
+/// Relationship-scope analogue of [`point_index_meta_key`]. Same
+/// `<edge_type>\0<property>` shape.
+fn edge_point_index_meta_key(spec: &EdgePointIndexSpec) -> Vec<u8> {
+    let mut k = Vec::with_capacity(spec.edge_type.len() + spec.property.len() + 1);
+    k.extend_from_slice(spec.edge_type.as_bytes());
+    k.push(0);
+    k.extend_from_slice(spec.property.as_bytes());
+    k
+}
+
+fn edge_point_index_meta_key_decode(key: &[u8]) -> Result<EdgePointIndexSpec> {
+    let mut parts = key.splitn(2, |b| *b == 0);
+    let type_bytes = parts.next().ok_or(Error::CorruptBytes {
+        cf: CF_EDGE_POINT_INDEX_META,
+        expected: 1,
+        actual: 0,
+    })?;
+    let property_bytes = parts.next().ok_or(Error::CorruptBytes {
+        cf: CF_EDGE_POINT_INDEX_META,
+        expected: type_bytes.len() + 2,
+        actual: key.len(),
+    })?;
+    let edge_type = std::str::from_utf8(type_bytes)
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_EDGE_POINT_INDEX_META,
+            expected: type_bytes.len(),
+            actual: type_bytes.len(),
+        })?
+        .to_string();
+    let property = std::str::from_utf8(property_bytes)
+        .map_err(|_| Error::CorruptBytes {
+            cf: CF_EDGE_POINT_INDEX_META,
+            expected: property_bytes.len(),
+            actual: property_bytes.len(),
+        })?
+        .to_string();
+    if property.is_empty() {
+        return Err(Error::CorruptBytes {
+            cf: CF_EDGE_POINT_INDEX_META,
+            expected: 1,
+            actual: 0,
+        });
+    }
+    Ok(EdgePointIndexSpec {
+        edge_type,
+        property,
+    })
+}
+
 pub struct RocksDbStorageEngine {
     db: DB,
     /// In-memory view of the registered property indexes, populated
@@ -269,6 +322,11 @@ pub struct RocksDbStorageEngine {
     /// entries, so — as with the other in-memory index catalogs — it
     /// must not hit the DB on the hot path.
     point_indexes: RwLock<Vec<PointIndexSpec>>,
+    /// Relationship-scope analogue of `point_indexes`. Consulted by
+    /// every edge write (`append_put_edge`, `append_delete_edge`,
+    /// `append_detach_delete_node`) to maintain
+    /// [`CF_EDGE_POINT_INDEX`] entries.
+    edge_point_indexes: RwLock<Vec<EdgePointIndexSpec>>,
 }
 
 impl RocksDbStorageEngine {
@@ -287,12 +345,14 @@ impl RocksDbStorageEngine {
         let edge_indexes = load_edge_index_meta(&db)?;
         let constraints = load_constraint_meta(&db)?;
         let point_indexes = load_point_index_meta(&db)?;
+        let edge_point_indexes = load_edge_point_index_meta(&db)?;
         Ok(Self {
             db,
             indexes: RwLock::new(indexes),
             edge_indexes: RwLock::new(edge_indexes),
             constraints: RwLock::new(constraints),
             point_indexes: RwLock::new(point_indexes),
+            edge_point_indexes: RwLock::new(edge_point_indexes),
         })
     }
 
@@ -414,14 +474,26 @@ impl RocksDbStorageEngine {
                     let cell = point_cell(p.srid, p.x, p.y);
                     batch.delete_cf(
                         point_cf,
-                        point_index_key(&spec.label, &spec.property, p.srid, cell, node.id),
+                        point_index_key(
+                            &spec.label,
+                            &spec.property,
+                            p.srid,
+                            cell,
+                            node.id.as_bytes(),
+                        ),
                     );
                 }
                 if let Some(p) = &new_point {
                     let cell = point_cell(p.srid, p.x, p.y);
                     batch.put_cf(
                         point_cf,
-                        point_index_key(&spec.label, &spec.property, p.srid, cell, node.id),
+                        point_index_key(
+                            &spec.label,
+                            &spec.property,
+                            p.srid,
+                            cell,
+                            node.id.as_bytes(),
+                        ),
                         point_index_value(p.x, p.y, p.z),
                     );
                 }
@@ -516,6 +588,57 @@ impl RocksDbStorageEngine {
                 );
             }
         }
+
+        // Edge-point-index maintenance — relationship-scope mirror
+        // of the node-point-index loop in `append_put_node`. Same
+        // delta shape: diff the indexed point across the previous
+        // and new edge state and emit the minimum put/delete set.
+        let edge_point_indexes = self
+            .edge_point_indexes
+            .read()
+            .expect("edge_point_indexes lock poisoned");
+        if !edge_point_indexes.is_empty() {
+            let point_cf = self.cf(CF_EDGE_POINT_INDEX)?;
+            for spec in edge_point_indexes.iter() {
+                if spec.edge_type != edge.edge_type {
+                    continue;
+                }
+                let old_point = existing_edge
+                    .as_ref()
+                    .and_then(|e| extract_indexable_point(&e.properties, &spec.property));
+                let new_point = extract_indexable_point(&edge.properties, &spec.property);
+                if old_point == new_point {
+                    continue;
+                }
+                if let Some(p) = &old_point {
+                    let cell = point_cell(p.srid, p.x, p.y);
+                    batch.delete_cf(
+                        point_cf,
+                        point_index_key(
+                            &spec.edge_type,
+                            &spec.property,
+                            p.srid,
+                            cell,
+                            edge.id.as_bytes(),
+                        ),
+                    );
+                }
+                if let Some(p) = &new_point {
+                    let cell = point_cell(p.srid, p.x, p.y);
+                    batch.put_cf(
+                        point_cf,
+                        point_index_key(
+                            &spec.edge_type,
+                            &spec.property,
+                            p.srid,
+                            cell,
+                            edge.id.as_bytes(),
+                        ),
+                        point_index_value(p.x, p.y, p.z),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -569,6 +692,34 @@ impl RocksDbStorageEngine {
                         id,
                     ),
                 );
+            }
+        }
+
+        // Edge-point-index sweep for the deleted edge. Mirrors the
+        // node-point-index sweep in `append_detach_delete_node`.
+        let edge_point_indexes = self
+            .edge_point_indexes
+            .read()
+            .expect("edge_point_indexes lock poisoned");
+        if !edge_point_indexes.is_empty() {
+            let point_cf = self.cf(CF_EDGE_POINT_INDEX)?;
+            for spec in edge_point_indexes.iter() {
+                if spec.edge_type != edge.edge_type {
+                    continue;
+                }
+                if let Some(p) = extract_indexable_point(&edge.properties, &spec.property) {
+                    let cell = point_cell(p.srid, p.x, p.y);
+                    batch.delete_cf(
+                        point_cf,
+                        point_index_key(
+                            &spec.edge_type,
+                            &spec.property,
+                            p.srid,
+                            cell,
+                            id.as_bytes(),
+                        ),
+                    );
+                }
             }
         }
         Ok(())
@@ -631,7 +782,13 @@ impl RocksDbStorageEngine {
                         let cell = point_cell(p.srid, p.x, p.y);
                         batch.delete_cf(
                             point_cf,
-                            point_index_key(&spec.label, &spec.property, p.srid, cell, id),
+                            point_index_key(
+                                &spec.label,
+                                &spec.property,
+                                p.srid,
+                                cell,
+                                id.as_bytes(),
+                            ),
                         );
                     }
                 }
@@ -646,6 +803,16 @@ impl RocksDbStorageEngine {
             .read()
             .expect("edge_indexes lock poisoned")
             .clone();
+        let edge_point_indexes_snapshot = self
+            .edge_point_indexes
+            .read()
+            .expect("edge_point_indexes lock poisoned")
+            .clone();
+        let edge_point_cf_opt = if edge_point_indexes_snapshot.is_empty() {
+            None
+        } else {
+            Some(self.cf(CF_EDGE_POINT_INDEX)?)
+        };
 
         for (edge_id, target) in &outgoing {
             if let Some(e) = self.get_edge(*edge_id)? {
@@ -664,6 +831,26 @@ impl RocksDbStorageEngine {
                                 *edge_id,
                             ),
                         );
+                    }
+                }
+                if let Some(point_cf) = edge_point_cf_opt {
+                    for spec in &edge_point_indexes_snapshot {
+                        if spec.edge_type != e.edge_type {
+                            continue;
+                        }
+                        if let Some(p) = extract_indexable_point(&e.properties, &spec.property) {
+                            let cell = point_cell(p.srid, p.x, p.y);
+                            batch.delete_cf(
+                                point_cf,
+                                point_index_key(
+                                    &spec.edge_type,
+                                    &spec.property,
+                                    p.srid,
+                                    cell,
+                                    edge_id.as_bytes(),
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -688,6 +875,26 @@ impl RocksDbStorageEngine {
                                 *edge_id,
                             ),
                         );
+                    }
+                }
+                if let Some(point_cf) = edge_point_cf_opt {
+                    for spec in &edge_point_indexes_snapshot {
+                        if spec.edge_type != e.edge_type {
+                            continue;
+                        }
+                        if let Some(p) = extract_indexable_point(&e.properties, &spec.property) {
+                            let cell = point_cell(p.srid, p.x, p.y);
+                            batch.delete_cf(
+                                point_cf,
+                                point_index_key(
+                                    &spec.edge_type,
+                                    &spec.property,
+                                    p.srid,
+                                    cell,
+                                    edge_id.as_bytes(),
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -1573,7 +1780,7 @@ impl RocksDbStorageEngine {
                 let cell = point_cell(p.srid, p.x, p.y);
                 batch.put_cf(
                     point_cf,
-                    point_index_key(label, property, p.srid, cell, node_id),
+                    point_index_key(label, property, p.srid, cell, node_id.as_bytes()),
                     point_index_value(p.x, p.y, p.z),
                 );
             }
@@ -1687,6 +1894,168 @@ impl RocksDbStorageEngine {
             }
             let id_bytes = node_id_from_point_index_key(CF_POINT_INDEX, &key)?;
             results.push(NodeId::from_bytes(id_bytes));
+        }
+        results.sort();
+        Ok(results)
+    }
+
+    // ---------------------------------------------------------------
+    // Point / spatial index (relationship scope).
+    //
+    // Mirror of the node-scope block above. Lives in its own CF so
+    // node and edge spatial entries can't alias and the two can be
+    // dropped independently — matches how non-spatial property
+    // indexes are split between `CF_PROPERTY_INDEX` and
+    // `CF_EDGE_PROPERTY_INDEX`.
+    // ---------------------------------------------------------------
+
+    pub fn list_edge_point_indexes(&self) -> Vec<EdgePointIndexSpec> {
+        self.edge_point_indexes
+            .read()
+            .expect("edge_point_indexes lock poisoned")
+            .clone()
+    }
+
+    /// Declare a new edge point index and backfill it by scanning
+    /// every edge currently carrying `edge_type`. Idempotent.
+    /// Single-property / relationship-scope analogue of
+    /// [`RocksDbStorageEngine::create_point_index`].
+    pub fn create_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        let spec = EdgePointIndexSpec {
+            edge_type: edge_type.to_string(),
+            property: property.to_string(),
+        };
+        let mut guard = self
+            .edge_point_indexes
+            .write()
+            .expect("edge_point_indexes lock poisoned");
+        if guard.contains(&spec) {
+            return Ok(());
+        }
+
+        let meta_cf = self.cf(CF_EDGE_POINT_INDEX_META)?;
+        let point_cf = self.cf(CF_EDGE_POINT_INDEX)?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(meta_cf, edge_point_index_meta_key(&spec), EMPTY);
+
+        for edge_id in self.edges_by_type(edge_type)? {
+            let edge = match self.get_edge(edge_id)? {
+                Some(e) => e,
+                None => continue,
+            };
+            if let Some(Property::Point(p)) = edge.properties.get(property) {
+                let cell = point_cell(p.srid, p.x, p.y);
+                batch.put_cf(
+                    point_cf,
+                    // Reuse the node-scope key builder: the key layout
+                    // `<label>\0<prop>\0<srid:4><cell:8><id:16>` doesn't
+                    // care whether `id` is a node or edge id — both are
+                    // 16-byte UUIDs. The separate CF is what scopes
+                    // relationship entries away from node entries.
+                    point_index_key(edge_type, property, p.srid, cell, edge_id.as_bytes()),
+                    point_index_value(p.x, p.y, p.z),
+                );
+            }
+        }
+
+        self.db.write(batch)?;
+        guard.push(spec);
+        Ok(())
+    }
+
+    /// Tear down an edge point index. Idempotent.
+    pub fn drop_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        let spec = EdgePointIndexSpec {
+            edge_type: edge_type.to_string(),
+            property: property.to_string(),
+        };
+        let mut guard = self
+            .edge_point_indexes
+            .write()
+            .expect("edge_point_indexes lock poisoned");
+        if !guard.contains(&spec) {
+            return Ok(());
+        }
+
+        let meta_cf = self.cf(CF_EDGE_POINT_INDEX_META)?;
+        let point_cf = self.cf(CF_EDGE_POINT_INDEX)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(meta_cf, edge_point_index_meta_key(&spec));
+
+        let prefix = point_index_label_prop_prefix(edge_type, property);
+        let iter = self
+            .db
+            .iterator_cf(point_cf, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            batch.delete_cf(point_cf, key);
+        }
+
+        self.db.write(batch)?;
+        guard.retain(|s| s != &spec);
+        Ok(())
+    }
+
+    /// Relationship-scope analogue of
+    /// [`RocksDbStorageEngine::nodes_in_bbox`]. Same Z-order cell
+    /// range + precise bbox filter via stored coords, just over
+    /// `CF_EDGE_POINT_INDEX`.
+    pub fn edges_in_bbox(
+        &self,
+        edge_type: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<EdgeId>> {
+        let spec = EdgePointIndexSpec {
+            edge_type: edge_type.to_string(),
+            property: property.to_string(),
+        };
+        {
+            let guard = self
+                .edge_point_indexes
+                .read()
+                .expect("edge_point_indexes lock poisoned");
+            if !guard.contains(&spec) {
+                return Ok(Vec::new());
+            }
+        }
+
+        let (lo_x, hi_x) = if xlo <= xhi { (xlo, xhi) } else { (xhi, xlo) };
+        let (lo_y, hi_y) = if ylo <= yhi { (ylo, yhi) } else { (yhi, ylo) };
+        let (min_cell, max_cell) = point_cell_range(srid, lo_x, lo_y, hi_x, hi_y);
+
+        let prefix = point_index_srid_prefix(edge_type, property, srid);
+        let header_len = prefix.len();
+        let mut seek = prefix.clone();
+        seek.extend_from_slice(&min_cell.to_be_bytes());
+
+        let cf = self.cf(CF_EDGE_POINT_INDEX)?;
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&seek, Direction::Forward));
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let cell = cell_from_point_index_key(CF_EDGE_POINT_INDEX, &key, header_len)?;
+            if cell > max_cell {
+                break;
+            }
+            let (x, y, _z) = decode_point_index_value(CF_EDGE_POINT_INDEX, &value)?;
+            if x < lo_x || x > hi_x || y < lo_y || y > hi_y {
+                continue;
+            }
+            let id_bytes = node_id_from_point_index_key(CF_EDGE_POINT_INDEX, &key)?;
+            results.push(EdgeId::from_bytes(id_bytes));
         }
         results.sort();
         Ok(results)
@@ -2273,6 +2642,19 @@ fn load_point_index_meta(db: &DB) -> Result<Vec<PointIndexSpec>> {
     Ok(specs)
 }
 
+/// Relationship-scope analogue of [`load_point_index_meta`].
+fn load_edge_point_index_meta(db: &DB) -> Result<Vec<EdgePointIndexSpec>> {
+    let cf = db
+        .cf_handle(CF_EDGE_POINT_INDEX_META)
+        .ok_or(Error::MissingColumnFamily(CF_EDGE_POINT_INDEX_META))?;
+    let mut specs = Vec::new();
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, _) = item?;
+        specs.push(edge_point_index_meta_key_decode(&key)?);
+    }
+    Ok(specs)
+}
+
 impl StorageEngine for RocksDbStorageEngine {
     fn put_node(&self, node: &Node) -> Result<()> {
         RocksDbStorageEngine::put_node(self, node)
@@ -2428,6 +2810,31 @@ impl StorageEngine for RocksDbStorageEngine {
         yhi: f64,
     ) -> Result<Vec<NodeId>> {
         RocksDbStorageEngine::nodes_in_bbox(self, label, property, srid, xlo, ylo, xhi, yhi)
+    }
+
+    fn create_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        RocksDbStorageEngine::create_edge_point_index(self, edge_type, property)
+    }
+
+    fn drop_edge_point_index(&self, edge_type: &str, property: &str) -> Result<()> {
+        RocksDbStorageEngine::drop_edge_point_index(self, edge_type, property)
+    }
+
+    fn list_edge_point_indexes(&self) -> Vec<EdgePointIndexSpec> {
+        RocksDbStorageEngine::list_edge_point_indexes(self)
+    }
+
+    fn edges_in_bbox(
+        &self,
+        edge_type: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<EdgeId>> {
+        RocksDbStorageEngine::edges_in_bbox(self, edge_type, property, srid, xlo, ylo, xhi, yhi)
     }
 
     fn create_property_constraint(

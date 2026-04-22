@@ -98,6 +98,20 @@ pub enum GraphCommand {
         label: String,
         property: String,
     },
+    /// Relationship-scope analogue of `CreatePointIndex`. Declares
+    /// an edge point index on every replica and triggers a per-peer
+    /// backfill against the local edge catalog. Added as a distinct
+    /// variant so pre-spatial replicas can reject unknown payloads
+    /// cleanly instead of silently misapplying.
+    CreateEdgePointIndex {
+        edge_type: String,
+        property: String,
+    },
+    /// Tear down an edge point index. Mirrors `CreateEdgePointIndex`.
+    DropEdgePointIndex {
+        edge_type: String,
+        property: String,
+    },
     /// Declare a property constraint on every replica. Reaches every
     /// peer through the Raft log / routing-mode fan-out, so the
     /// resulting registry entry and its on-write enforcement agree

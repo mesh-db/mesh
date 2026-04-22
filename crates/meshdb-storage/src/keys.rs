@@ -782,17 +782,21 @@ pub(crate) fn point_index_srid_prefix(label: &str, property: &str, srid: i32) ->
     k
 }
 
-/// Full point-index key for one indexed point.
+/// Full point-index key for one indexed point. `id` is the 16-byte
+/// UUID tail — accepts both `NodeId::as_bytes()` and
+/// `EdgeId::as_bytes()`, since the node-scope and edge-scope point
+/// indexes share this key layout (they live in separate CFs, so the
+/// overlap is contained).
 pub(crate) fn point_index_key(
-    label: &str,
+    label_or_type: &str,
     property: &str,
     srid: i32,
     cell: u64,
-    node: NodeId,
+    id: &[u8; ID_LEN],
 ) -> Vec<u8> {
-    let mut k = point_index_srid_prefix(label, property, srid);
+    let mut k = point_index_srid_prefix(label_or_type, property, srid);
     k.extend_from_slice(&cell.to_be_bytes());
-    k.extend_from_slice(node.as_bytes());
+    k.extend_from_slice(id);
     k
 }
 
@@ -914,7 +918,7 @@ mod point_index_tests {
     #[test]
     fn point_index_key_tail_is_node_id() {
         let id = NodeId::new();
-        let k = point_index_key("L", "p", 4326, 0, id);
+        let k = point_index_key("L", "p", 4326, 0, id.as_bytes());
         let tail = node_id_from_point_index_key("point_index", &k).unwrap();
         assert_eq!(tail, *id.as_bytes());
     }

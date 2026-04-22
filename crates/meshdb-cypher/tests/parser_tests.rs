@@ -1247,7 +1247,7 @@ fn create_index_parses_composite_property_list() {
 fn create_point_index_parses() {
     match parse("CREATE POINT INDEX FOR (c:City) ON (c.loc)").unwrap() {
         Statement::CreatePointIndex(ddl) => {
-            assert_eq!(ddl.label, "City");
+            assert_eq!(ddl.scope, IndexScope::Node("City".into()));
             assert_eq!(ddl.property, "loc");
         }
         other => panic!("expected CreatePointIndex, got {:?}", other),
@@ -1258,7 +1258,7 @@ fn create_point_index_parses() {
 fn drop_point_index_parses() {
     match parse("DROP POINT INDEX FOR (c:City) ON (c.loc)").unwrap() {
         Statement::DropPointIndex(ddl) => {
-            assert_eq!(ddl.label, "City");
+            assert_eq!(ddl.scope, IndexScope::Node("City".into()));
             assert_eq!(ddl.property, "loc");
         }
         other => panic!("expected DropPointIndex, got {:?}", other),
@@ -1274,10 +1274,25 @@ fn show_point_indexes_parses() {
 }
 
 #[test]
-fn create_point_index_rejects_relationship_scope() {
-    // The grammar only allows the node source for point indexes —
-    // relationship-scope spatial is a follow-up with its own rule.
-    assert!(parse("CREATE POINT INDEX FOR ()-[r:KNOWS]-() ON (r.loc)").is_err());
+fn create_point_index_parses_relationship_scope() {
+    match parse("CREATE POINT INDEX FOR ()-[r:KNOWS]-() ON (r.loc)").unwrap() {
+        Statement::CreatePointIndex(ddl) => {
+            assert_eq!(ddl.scope, IndexScope::Relationship("KNOWS".into()));
+            assert_eq!(ddl.property, "loc");
+        }
+        other => panic!("expected CreatePointIndex with rel scope, got {:?}", other),
+    }
+}
+
+#[test]
+fn drop_point_index_parses_relationship_scope() {
+    match parse("DROP POINT INDEX FOR ()-[r:KNOWS]-() ON (r.loc)").unwrap() {
+        Statement::DropPointIndex(ddl) => {
+            assert_eq!(ddl.scope, IndexScope::Relationship("KNOWS".into()));
+            assert_eq!(ddl.property, "loc");
+        }
+        other => panic!("expected DropPointIndex with rel scope, got {:?}", other),
+    }
 }
 
 #[test]

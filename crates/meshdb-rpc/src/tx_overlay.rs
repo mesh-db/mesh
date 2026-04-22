@@ -108,6 +108,8 @@ impl TxOverlayState {
             | GraphCommand::DropEdgeIndex { .. }
             | GraphCommand::CreatePointIndex { .. }
             | GraphCommand::DropPointIndex { .. }
+            | GraphCommand::CreateEdgePointIndex { .. }
+            | GraphCommand::DropEdgePointIndex { .. }
             | GraphCommand::CreateConstraint { .. }
             | GraphCommand::DropConstraint { .. } => {}
         }
@@ -214,6 +216,10 @@ impl<'a> GraphReader for OverlayGraphReader<'a> {
     fn list_point_indexes(&self) -> ExecResult<Vec<(String, String)>> {
         // Same rationale: point-index DDL is a store concern.
         self.base.list_point_indexes()
+    }
+
+    fn list_edge_point_indexes(&self) -> ExecResult<Vec<(String, String)>> {
+        self.base.list_edge_point_indexes()
     }
 
     fn list_property_constraints(&self) -> ExecResult<Vec<meshdb_storage::PropertyConstraintSpec>> {

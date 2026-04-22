@@ -271,16 +271,25 @@ service MeshWrite {
       returns (DropEdgePropertyIndexResponse);
   // Apply a point / spatial index creation to this peer's local
   // store. Routing-mode fan-out only; Raft-mode replicates through
-  // the shared log instead. Single-property, node-scope only for the
-  // v1 spatial-index surface — composite spatial and relationship
-  // spatial indexes would get their own RPCs so pre-spatial peers
-  // can reject unknown variants cleanly.
+  // the shared log instead. Single-property, node scope. The
+  // relationship-scope variant ships as a sibling RPC
+  // (`CreateEdgePointIndex`) so pre-spatial peers can reject
+  // unknown variants cleanly.
   rpc CreatePointIndex(CreatePointIndexRequest)
       returns (CreatePointIndexResponse);
   // Tear down a point index on this peer's local store. Mirrors
   // `CreatePointIndex`; used as both DROP fan-out and compensating
   // rollback for a partial create.
   rpc DropPointIndex(DropPointIndexRequest) returns (DropPointIndexResponse);
+  // Relationship-scope analogue of `CreatePointIndex`. Installs an
+  // edge point index on this peer's local store; backfill runs
+  // per-peer against local edges of the given type.
+  rpc CreateEdgePointIndex(CreateEdgePointIndexRequest)
+      returns (CreateEdgePointIndexResponse);
+  // Tear down an edge point index. Mirrors
+  // `CreateEdgePointIndex`.
+  rpc DropEdgePointIndex(DropEdgePointIndexRequest)
+      returns (DropEdgePointIndexResponse);
   // Apply a constraint creation to this peer's local store. Used by
   // the routing-mode DDL fan-out the same way `CreatePropertyIndex`
   // is — leader applies locally, then calls this RPC on every other
@@ -381,6 +390,18 @@ message DropPointIndexRequest {
   string property = 2;
 }
 message DropPointIndexResponse {}
+
+message CreateEdgePointIndexRequest {
+  string edge_type = 1;
+  string property = 2;
+}
+message CreateEdgePointIndexResponse {}
+
+message DropEdgePointIndexRequest {
+  string edge_type = 1;
+  string property = 2;
+}
+message DropEdgePointIndexResponse {}
 
 // Mirrors `meshdb_cluster::ConstraintKind`. New kinds land as
 // additional enum values so existing peers can reject unknown kinds

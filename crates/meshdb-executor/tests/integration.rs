@@ -4313,6 +4313,68 @@ fn distance_query_with_parameterized_radius() {
     assert_eq!(rows.len(), 1);
 }
 
+// ---------------------------------------------------------------
+// Relationship-scope POINT INDEX DDL end-to-end (slice 5).
+// ---------------------------------------------------------------
+
+#[test]
+fn create_edge_point_index_and_show_round_trip() {
+    let (store, _d) = open_store();
+    let create_rows = run_with_ctx(
+        &store,
+        "CREATE POINT INDEX FOR ()-[r:ROUTE]-() ON (r.waypoint)",
+    );
+    assert_eq!(create_rows.len(), 1);
+    assert_eq!(str_prop(&create_rows[0], "state"), "created");
+    assert_eq!(str_prop(&create_rows[0], "scope"), "RELATIONSHIP");
+    assert_eq!(str_prop(&create_rows[0], "type"), "POINT");
+    assert_eq!(str_prop(&create_rows[0], "edge_type"), "ROUTE");
+    assert_eq!(str_prop(&create_rows[0], "property"), "waypoint");
+
+    let shown = run_with_ctx(&store, "SHOW POINT INDEXES");
+    assert_eq!(shown.len(), 1);
+    assert_eq!(str_prop(&shown[0], "scope"), "RELATIONSHIP");
+    assert_eq!(str_prop(&shown[0], "type"), "POINT");
+    assert_eq!(str_prop(&shown[0], "edge_type"), "ROUTE");
+    assert_eq!(str_prop(&shown[0], "property"), "waypoint");
+    assert_eq!(str_prop(&shown[0], "state"), "online");
+}
+
+#[test]
+fn drop_edge_point_index_empties_show() {
+    let (store, _d) = open_store();
+    run_with_ctx(
+        &store,
+        "CREATE POINT INDEX FOR ()-[r:ROUTE]-() ON (r.waypoint)",
+    );
+    let drop_rows = run_with_ctx(
+        &store,
+        "DROP POINT INDEX FOR ()-[r:ROUTE]-() ON (r.waypoint)",
+    );
+    assert_eq!(drop_rows.len(), 1);
+    assert_eq!(str_prop(&drop_rows[0], "state"), "dropped");
+    assert!(run_with_ctx(&store, "SHOW POINT INDEXES").is_empty());
+}
+
+#[test]
+fn show_point_indexes_merges_node_and_edge_scopes() {
+    let (store, _d) = open_store();
+    run_with_ctx(&store, "CREATE POINT INDEX FOR (c:City) ON (c.loc)");
+    run_with_ctx(
+        &store,
+        "CREATE POINT INDEX FOR ()-[r:ROUTE]-() ON (r.waypoint)",
+    );
+
+    let shown = run_with_ctx(&store, "SHOW POINT INDEXES");
+    assert_eq!(shown.len(), 2);
+    let scopes: std::collections::HashSet<_> = shown
+        .iter()
+        .map(|r| str_prop(r, "scope").to_string())
+        .collect();
+    assert!(scopes.contains("NODE"));
+    assert!(scopes.contains("RELATIONSHIP"));
+}
+
 #[test]
 fn point_index_and_property_index_shows_are_independent() {
     // Point DDL must not surface in `SHOW INDEXES` and vice versa —

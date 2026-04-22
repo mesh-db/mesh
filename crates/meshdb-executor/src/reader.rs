@@ -87,6 +87,11 @@ pub trait GraphReader: Send + Sync {
     fn list_point_indexes(&self) -> Result<Vec<(String, String)>> {
         Ok(Vec::new())
     }
+    /// Relationship-scope analogue of [`Self::list_point_indexes`].
+    /// `(edge_type, property)` pairs. Default impl returns empty.
+    fn list_edge_point_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
     /// Axis-aligned bounding-box range query over the point index
     /// `(label, property)`. Returns every node carrying `label`
     /// whose `property` is a `Property::Point` under `srid` that
@@ -123,6 +128,25 @@ pub trait GraphReader: Send + Sync {
             }
         }
         Ok(result)
+    }
+    /// Relationship-scope analogue of [`Self::nodes_in_bbox`].
+    /// Default impl returns empty — edge-scoped bbox queries aren't
+    /// yet part of the planner's rewrite surface, so no read path
+    /// exercises this on anything but the storage-backed blanket.
+    /// When the edge point-seek lowering lands this default should
+    /// grow a naive scan via `edges_by_type` (needs to be added to
+    /// the trait first).
+    fn edges_in_bbox(
+        &self,
+        _edge_type: &str,
+        _property: &str,
+        _srid: i32,
+        _xlo: f64,
+        _ylo: f64,
+        _xhi: f64,
+        _yhi: f64,
+    ) -> Result<Vec<EdgeId>> {
+        Ok(Vec::new())
     }
     /// Snapshot every registered constraint visible through this
     /// reader, for `SHOW CONSTRAINTS` and `db.constraints()`. Default
@@ -216,6 +240,13 @@ impl<T: StorageEngine> GraphReader for T {
             .collect())
     }
 
+    fn list_edge_point_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(StorageEngine::list_edge_point_indexes(self)
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
+            .collect())
+    }
+
     fn nodes_in_bbox(
         &self,
         label: &str,
@@ -230,6 +261,21 @@ impl<T: StorageEngine> GraphReader for T {
         // skip the default naive scan.
         Ok(StorageEngine::nodes_in_bbox(
             self, label, property, srid, xlo, ylo, xhi, yhi,
+        )?)
+    }
+
+    fn edges_in_bbox(
+        &self,
+        edge_type: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<EdgeId>> {
+        Ok(StorageEngine::edges_in_bbox(
+            self, edge_type, property, srid, xlo, ylo, xhi, yhi,
         )?)
     }
 
@@ -315,6 +361,15 @@ impl GraphReader for StorageReaderAdapter<'_> {
             .collect())
     }
 
+    fn list_edge_point_indexes(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .0
+            .list_edge_point_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
+            .collect())
+    }
+
     fn nodes_in_bbox(
         &self,
         label: &str,
@@ -328,6 +383,21 @@ impl GraphReader for StorageReaderAdapter<'_> {
         Ok(self
             .0
             .nodes_in_bbox(label, property, srid, xlo, ylo, xhi, yhi)?)
+    }
+
+    fn edges_in_bbox(
+        &self,
+        edge_type: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<EdgeId>> {
+        Ok(self
+            .0
+            .edges_in_bbox(edge_type, property, srid, xlo, ylo, xhi, yhi)?)
     }
 
     fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
