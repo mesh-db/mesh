@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 edition = "2021"
 description = "A distributed, Cypher-compliant graph database written in Rust."
 license = "MIT"
