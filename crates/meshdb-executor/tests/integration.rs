@@ -9787,6 +9787,109 @@ mod apoc_create {
             "expected label-type error, got: {msg}",
         );
     }
+
+    #[test]
+    fn apoc_create_relationship_persists_edge_between_matched_nodes() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'alice'})");
+        run(&store, "CREATE (:Person {name: 'bob'})");
+        let created = run_with_default_procs(
+            &store,
+            "MATCH (a:Person {name: 'alice'}), (b:Person {name: 'bob'}) \
+             CALL apoc.create.relationship(a, 'KNOWS', {since: 2020}, b) YIELD rel \
+             RETURN rel",
+        );
+        match created[0].get("rel").unwrap() {
+            Value::Edge(e) => {
+                assert_eq!(e.edge_type, "KNOWS");
+                assert_eq!(e.properties.get("since"), Some(&Property::Int64(2020)));
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+        // Round-trip via MATCH to confirm it's actually persisted
+        // and traversable, not just emitted into the row stream.
+        let traversed = run(
+            &store,
+            "MATCH (a:Person {name: 'alice'})-[r:KNOWS]->(b:Person {name: 'bob'}) \
+             RETURN r.since AS y",
+        );
+        assert_eq!(traversed.len(), 1);
+        assert_eq!(int_prop(&traversed[0], "y"), 2020);
+    }
+
+    #[test]
+    fn apoc_create_relationship_with_null_props_yields_propertyless_edge() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})");
+        run(&store, "CREATE (:T {n: 2})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (a:T {n: 1}), (b:T {n: 2}) \
+             CALL apoc.create.relationship(a, 'R', null, b) YIELD rel \
+             RETURN rel",
+        );
+        match rows[0].get("rel").unwrap() {
+            Value::Edge(e) => {
+                assert_eq!(e.edge_type, "R");
+                assert!(e.properties.is_empty());
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_create_relationship_chains_with_apoc_create_node() {
+        // Both endpoints created by apoc.create.node, then the
+        // edge by apoc.create.relationship — exercises that
+        // Value::Node yielded by one write procedure flows into
+        // the next as an arg.
+        let (store, _d) = open_store();
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.create.node(['A'], {tag: 'left'}) YIELD node AS x \
+             CALL apoc.create.node(['A'], {tag: 'right'}) YIELD node AS y \
+             CALL apoc.create.relationship(x, 'LINK', {weight: 7}, y) YIELD rel \
+             RETURN rel",
+        );
+        match rows[0].get("rel").unwrap() {
+            Value::Edge(e) => {
+                assert_eq!(e.edge_type, "LINK");
+                assert_eq!(e.properties.get("weight"), Some(&Property::Int64(7)));
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+        let found = run(
+            &store,
+            "MATCH (l:A {tag: 'left'})-[r:LINK]->(:A {tag: 'right'}) RETURN r.weight AS w",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(int_prop(&found[0], "w"), 7);
+    }
+
+    #[test]
+    fn apoc_create_relationship_rejects_non_node_endpoint() {
+        let (store, _d) = open_store();
+        let stmt =
+            parse("CALL apoc.create.relationship(1, 'R', {}, 2) YIELD rel RETURN rel").unwrap();
+        let p = plan(&stmt).unwrap();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let params = ParamMap::new();
+        let err = execute_with_reader_and_procs(
+            &p,
+            &store as &dyn GraphReader,
+            &store as &dyn GraphWriter,
+            &params,
+            &procs,
+        )
+        .err()
+        .expect("expected an error for non-node endpoint");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("apoc.create.relationship") && msg.to_ascii_lowercase().contains("node"),
+            "expected node-type error, got: {msg}",
+        );
+    }
 }
 
 #[cfg(feature = "apoc-meta")]

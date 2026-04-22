@@ -5,9 +5,9 @@ use crate::reader::GraphReader;
 use crate::value::Value;
 #[cfg(feature = "apoc-create")]
 use crate::writer::GraphWriter;
-#[cfg(feature = "apoc-create")]
-use meshdb_core::Node;
 use meshdb_core::Property;
+#[cfg(feature = "apoc-create")]
+use meshdb_core::{Edge, Node};
 use std::collections::{BTreeSet, HashMap};
 
 /// Declared argument / output type for a procedure signature.
@@ -117,6 +117,14 @@ pub enum BuiltinProc {
     /// the row directly, no candidate-row filtering needed.
     #[cfg(feature = "apoc-create")]
     ApocCreateNode,
+    /// `apoc.create.relationship(from, relType, props, to)` —
+    /// write builtin that creates an edge between two existing
+    /// nodes and yields it as `rel`. Argument order matches
+    /// Neo4j's APOC (relType + props between the two endpoints,
+    /// not at the end). Both endpoints must already exist; this
+    /// procedure does not auto-create missing nodes.
+    #[cfg(feature = "apoc-create")]
+    ApocCreateRelationship,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -150,7 +158,7 @@ impl Procedure {
     pub fn is_write_builtin(&self) -> bool {
         match self.builtin {
             #[cfg(feature = "apoc-create")]
-            Some(BuiltinProc::ApocCreateNode) => true,
+            Some(BuiltinProc::ApocCreateNode) | Some(BuiltinProc::ApocCreateRelationship) => true,
             _ => false,
         }
     }
@@ -169,6 +177,11 @@ impl Procedure {
             Some(BuiltinProc::ApocCreateNode) => Err(Error::Procedure(
                 "apoc.create.node is a write procedure — call via resolve_write_rows".into(),
             )),
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateRelationship) => Err(Error::Procedure(
+                "apoc.create.relationship is a write procedure — call via resolve_write_rows"
+                    .into(),
+            )),
         }
     }
 
@@ -185,6 +198,7 @@ impl Procedure {
     ) -> Result<Vec<ProcRow>> {
         match self.builtin {
             Some(BuiltinProc::ApocCreateNode) => apoc_create_node(writer, args),
+            Some(BuiltinProc::ApocCreateRelationship) => apoc_create_relationship(writer, args),
             _ => Err(Error::Procedure("procedure is not a write builtin".into())),
         }
     }
@@ -336,6 +350,74 @@ fn apoc_create_node(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<Proc
     let mut row = HashMap::new();
     row.insert("node".to_string(), Value::Node(node));
     Ok(vec![row])
+}
+
+/// Implementation of the `apoc.create.relationship(from, type,
+/// props, to)` write builtin. Argument order matches Neo4j's
+/// APOC: from + type + props + to. Both endpoint args must
+/// resolve to a [`Value::Node`]; the procedure does not
+/// auto-create missing endpoints (use `apoc.create.node` first
+/// or merge through CREATE).
+#[cfg(feature = "apoc-create")]
+fn apoc_create_relationship(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<ProcRow>> {
+    let from = expect_node_id(&args[0], "first argument (from)")?;
+    let rel_type = match &args[1] {
+        Value::Property(Property::String(s)) => s.clone(),
+        Value::Null | Value::Property(Property::Null) => {
+            return Err(Error::Procedure(
+                "apoc.create.relationship: relationship type must not be null".into(),
+            ));
+        }
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.create.relationship: relationship type must be a string, got {other:?}"
+            )));
+        }
+    };
+    let props: HashMap<String, Property> = match &args[2] {
+        Value::Null | Value::Property(Property::Null) => HashMap::new(),
+        Value::Map(pairs) => pairs
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), value_to_storable_property(v)?)))
+            .collect::<Result<HashMap<_, _>>>()?,
+        Value::Property(Property::Map(entries)) => entries
+            .iter()
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect(),
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.create.relationship: third argument must be a map, got {other:?}"
+            )));
+        }
+    };
+    let to = expect_node_id(&args[3], "fourth argument (to)")?;
+    let mut edge = Edge::new(rel_type, from, to);
+    for (k, p) in props {
+        if !matches!(p, Property::Null) {
+            edge.properties.insert(k, p);
+        }
+    }
+    writer.put_edge(&edge)?;
+    let mut row = HashMap::new();
+    row.insert("rel".to_string(), Value::Edge(edge));
+    Ok(vec![row])
+}
+
+/// Resolve an endpoint argument to its [`NodeId`]. Both
+/// [`Value::Node`] (a fully-materialised node) and a node-id
+/// integer are accepted; everything else (including null) is a
+/// type error since a relationship needs concrete endpoints.
+#[cfg(feature = "apoc-create")]
+fn expect_node_id(v: &Value, position: &str) -> Result<meshdb_core::NodeId> {
+    match v {
+        Value::Node(n) => Ok(n.id),
+        Value::Null | Value::Property(Property::Null) => Err(Error::Procedure(format!(
+            "apoc.create.relationship: {position} must be a node, got null"
+        ))),
+        other => Err(Error::Procedure(format!(
+            "apoc.create.relationship: {position} must be a node, got {other:?}"
+        ))),
+    }
 }
 
 /// Convert a [`Value`] supplied as a procedure arg into a
@@ -495,6 +577,38 @@ impl ProcedureRegistry {
             }],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::ApocCreateNode),
+        });
+        #[cfg(feature = "apoc-create")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "create".into(), "relationship".into()],
+            inputs: vec![
+                // Argument order matches Neo4j's APOC: from, type,
+                // props, to. Endpoints accept Value::Node directly;
+                // ProcType::Any is the broadest match that lets a
+                // node value flow through without coercion.
+                ProcArgSpec {
+                    name: "from".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "relType".into(),
+                    ty: ProcType::String,
+                },
+                ProcArgSpec {
+                    name: "props".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "to".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "rel".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocCreateRelationship),
         });
     }
 }
