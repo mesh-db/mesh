@@ -9867,6 +9867,144 @@ mod apoc_create {
     }
 
     #[test]
+    fn apoc_create_add_labels_appends_only_missing() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'alice'})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (n:Person {name: 'alice'}) \
+             CALL apoc.create.addLabels(n, ['Person', 'Customer', 'VIP']) YIELD node \
+             RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => {
+                let mut labels = n.labels.clone();
+                labels.sort();
+                assert_eq!(
+                    labels,
+                    vec![
+                        "Customer".to_string(),
+                        "Person".to_string(),
+                        "VIP".to_string(),
+                    ],
+                    "Person should not be duplicated; Customer and VIP added",
+                );
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+        let found = run(&store, "MATCH (n:VIP) RETURN n.name AS x");
+        assert_eq!(found.len(), 1);
+        assert_eq!(str_prop(&found[0], "x"), "alice");
+    }
+
+    #[test]
+    fn apoc_create_remove_labels_drops_only_present() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person:Customer:VIP {name: 'alice'})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (n:Person {name: 'alice'}) \
+             CALL apoc.create.removeLabels(n, ['VIP', 'Nonexistent']) YIELD node \
+             RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => {
+                let mut labels = n.labels.clone();
+                labels.sort();
+                assert_eq!(labels, vec!["Customer".to_string(), "Person".to_string()]);
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_create_set_labels_replaces_entire_label_set() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person:Customer {name: 'alice'})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (n:Person {name: 'alice'}) \
+             CALL apoc.create.setLabels(n, ['Visitor']) YIELD node \
+             RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => assert_eq!(n.labels, vec!["Visitor".to_string()]),
+            other => panic!("expected Node, got {other:?}"),
+        }
+        let still_person = run(&store, "MATCH (n:Person {name: 'alice'}) RETURN n");
+        assert!(still_person.is_empty());
+    }
+
+    #[test]
+    fn apoc_create_label_mutators_accept_node_list() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})");
+        run(&store, "CREATE (:T {n: 2})");
+        run(&store, "CREATE (:T {n: 3})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (n:T) WITH collect(n) AS xs \
+             CALL apoc.create.addLabels(xs, ['Marked']) YIELD node \
+             RETURN node",
+        );
+        assert_eq!(rows.len(), 3, "should yield one row per node in the list");
+        let marked = run(&store, "MATCH (n:Marked) RETURN n.n AS k ORDER BY k");
+        assert_eq!(marked.len(), 3);
+    }
+
+    #[test]
+    fn apoc_create_set_property_sets_and_clears() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {a: 1, b: 2})");
+        run_with_default_procs(
+            &store,
+            "MATCH (n:T) CALL apoc.create.setProperty(n, 'b', 99) YIELD node RETURN node",
+        );
+        let after_set = run(&store, "MATCH (n:T) RETURN n.b AS v");
+        assert_eq!(int_prop(&after_set[0], "v"), 99);
+        run_with_default_procs(
+            &store,
+            "MATCH (n:T) CALL apoc.create.setProperty(n, 'a', null) YIELD node RETURN node",
+        );
+        let after_clear = run(&store, "MATCH (n:T) RETURN keys(n) AS ks");
+        let names: Vec<String> = match after_clear[0].get("ks").unwrap() {
+            Value::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::String(s)) => s.clone(),
+                    other => panic!("non-string key element: {other:?}"),
+                })
+                .collect(),
+            Value::Property(Property::List(items)) => items
+                .iter()
+                .map(|p| match p {
+                    Property::String(s) => s.clone(),
+                    other => panic!("non-string key element: {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected list at ks, got {other:?}"),
+        };
+        assert!(
+            !names.iter().any(|n| n == "a"),
+            "a should be cleared, got {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "b"));
+    }
+
+    #[test]
+    fn apoc_create_set_rel_property_sets_value() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})-[:R {w: 1}]->(:T {n: 2})");
+        run_with_default_procs(
+            &store,
+            "MATCH ()-[r:R]->() \
+             CALL apoc.create.setRelProperty(r, 'w', 42) YIELD rel RETURN rel",
+        );
+        let after = run(&store, "MATCH ()-[r:R]->() RETURN r.w AS v");
+        assert_eq!(int_prop(&after[0], "v"), 42);
+    }
+
+    #[test]
     fn apoc_create_relationship_rejects_non_node_endpoint() {
         let (store, _d) = open_store();
         let stmt =
