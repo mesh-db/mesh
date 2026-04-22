@@ -929,6 +929,23 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             *direction,
             residual_properties.clone(),
         )),
+        LogicalPlan::EdgePointIndexSeek {
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            property,
+            direction,
+            bounds,
+        } => Box::new(EdgePointIndexSeekOp::new(
+            edge_var.clone(),
+            src_var.clone(),
+            dst_var.clone(),
+            edge_type.clone(),
+            property.clone(),
+            *direction,
+            bounds.clone(),
+        )),
         // DDL plans are handled by `try_execute_ddl` before the
         // operator pipeline is built, so they should never reach
         // this point. An assertion here catches any future
@@ -2849,6 +2866,134 @@ impl EdgeSeekOp {
         row.insert(self.src_var.clone(), Value::Node(src.clone()));
         row.insert(self.dst_var.clone(), Value::Node(dst.clone()));
         row
+    }
+}
+
+/// Relationship-scope analogue of [`PointIndexSeekOp`]. Drives
+/// `reader.edges_in_bbox(...)` off the bounds, then hydrates each
+/// matching edge + its endpoints and emits rows binding
+/// `edge_var`, `src_var`, `dst_var` — same shape as [`EdgeSeekOp`].
+/// For `Direction::Both`, each edge emits two rows (one per
+/// orientation), matching the `-[r]-` pattern semantics.
+struct EdgePointIndexSeekOp {
+    edge_var: String,
+    src_var: String,
+    dst_var: String,
+    edge_type: String,
+    property: String,
+    direction: Direction,
+    bounds: PointSeekBounds,
+    results: Option<Vec<Row>>,
+    cursor: usize,
+}
+
+impl EdgePointIndexSeekOp {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        edge_var: String,
+        src_var: String,
+        dst_var: String,
+        edge_type: String,
+        property: String,
+        direction: Direction,
+        bounds: PointSeekBounds,
+    ) -> Self {
+        Self {
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            property,
+            direction,
+            bounds,
+            results: None,
+            cursor: 0,
+        }
+    }
+
+    fn make_row(&self, edge: &Edge, src: &Node, dst: &Node) -> Row {
+        let mut row = Row::new();
+        row.insert(self.edge_var.clone(), Value::Edge(edge.clone()));
+        row.insert(self.src_var.clone(), Value::Node(src.clone()));
+        row.insert(self.dst_var.clone(), Value::Node(dst.clone()));
+        row
+    }
+}
+
+impl Operator for EdgePointIndexSeekOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.results.is_none() {
+            let empty = Row::new();
+            let ectx = ctx.eval_ctx(&empty);
+            let ids = match &self.bounds {
+                PointSeekBounds::Corners { lo, hi } => {
+                    let lo_pt = extract_point(&eval_expr(lo, &ectx)?);
+                    let hi_pt = extract_point(&eval_expr(hi, &ectx)?);
+                    match (lo_pt, hi_pt) {
+                        (Some(lo), Some(hi)) if lo.srid == hi.srid => ctx.store.edges_in_bbox(
+                            &self.edge_type,
+                            &self.property,
+                            lo.srid,
+                            lo.x,
+                            lo.y,
+                            hi.x,
+                            hi.y,
+                        )?,
+                        _ => Vec::new(),
+                    }
+                }
+                PointSeekBounds::Radius { center, radius } => {
+                    let center_pt = extract_point(&eval_expr(center, &ectx)?);
+                    let radius_val = extract_f64(&eval_expr(radius, &ectx)?);
+                    match (center_pt, radius_val) {
+                        (Some(c), Some(r)) if r.is_finite() && r >= 0.0 => {
+                            let (xlo, ylo, xhi, yhi) = enclosing_bbox(&c, r);
+                            ctx.store.edges_in_bbox(
+                                &self.edge_type,
+                                &self.property,
+                                c.srid,
+                                xlo,
+                                ylo,
+                                xhi,
+                                yhi,
+                            )?
+                        }
+                        _ => Vec::new(),
+                    }
+                }
+            };
+
+            let mut rows: Vec<Row> = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(edge) = ctx.store.get_edge(id)? else {
+                    continue;
+                };
+                let Some(src_node) = ctx.store.get_node(edge.source)? else {
+                    continue;
+                };
+                let Some(dst_node) = ctx.store.get_node(edge.target)? else {
+                    continue;
+                };
+                match self.direction {
+                    Direction::Outgoing => rows.push(self.make_row(&edge, &src_node, &dst_node)),
+                    Direction::Incoming => rows.push(self.make_row(&edge, &dst_node, &src_node)),
+                    Direction::Both => {
+                        rows.push(self.make_row(&edge, &src_node, &dst_node));
+                        if edge.source != edge.target {
+                            rows.push(self.make_row(&edge, &dst_node, &src_node));
+                        }
+                    }
+                }
+            }
+            self.results = Some(rows);
+        }
+        let rows = self.results.as_ref().unwrap();
+        if self.cursor < rows.len() {
+            let row = rows[self.cursor].clone();
+            self.cursor += 1;
+            return Ok(Some(row));
+        }
+        Ok(None)
     }
 }
 

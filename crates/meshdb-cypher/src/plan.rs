@@ -54,6 +54,11 @@ pub struct PlannerContext {
     /// construction — composite spatial indexes would need their
     /// own plan variant.
     pub point_indexes: Vec<(String, String)>,
+    /// Relationship-scope analogue of [`Self::point_indexes`].
+    /// Gates the `WHERE point.withinbbox(r.prop, ...)` rewrite that
+    /// lowers unbound-endpoints edge patterns to
+    /// [`LogicalPlan::EdgePointIndexSeek`].
+    pub edge_point_indexes: Vec<(String, String)>,
     /// Variables bound in an enclosing query scope. Populated when
     /// planning the body of an `exists { ... }` / `count { ... }`
     /// subquery so that a first-clause `MATCH (n)-->(m)` where `n`
@@ -119,6 +124,15 @@ impl PlannerContext {
         self.point_indexes
             .iter()
             .any(|(l, p)| l == label && p == property)
+    }
+
+    /// Relationship-scope analogue of [`Self::has_point_index`].
+    /// Gates the edge-scope `point.withinbbox` / `point.distance`
+    /// rewrites.
+    pub fn has_edge_point_index(&self, edge_type: &str, property: &str) -> bool {
+        self.edge_point_indexes
+            .iter()
+            .any(|(t, p)| t == edge_type && p == property)
     }
 
     /// Pick the best composite index on `label` covered by the equality
@@ -571,6 +585,28 @@ pub enum LogicalPlan {
         value: Expr,
         direction: Direction,
         residual_properties: Vec<(String, Expr)>,
+    },
+    /// Relationship-scope bbox / distance-radius spatial seek.
+    /// Emitted when a WHERE conjunct matches `point.withinbbox(r.p,
+    /// lo, hi)` or `point.distance(r.p, center) <[=] r` against an
+    /// edge variable from an unbound-endpoints pattern, and an
+    /// edge point index on `(edge_type, property)` is registered.
+    /// Same `Corners` / `Radius` duality as [`LogicalPlan::PointIndexSeek`];
+    /// the distance-variant caller keeps the distance predicate as
+    /// a residual Filter so the enclosing-bbox overshoot gets culled.
+    ///
+    /// Direction preserves the pattern's arrow — a directed pattern
+    /// only yields edges where source/target alignment matches;
+    /// `Direction::Both` accepts either orientation (edges emit once
+    /// per orientation, matching `EdgeSeek`).
+    EdgePointIndexSeek {
+        edge_var: String,
+        src_var: String,
+        dst_var: String,
+        edge_type: String,
+        property: String,
+        direction: Direction,
+        bounds: PointSeekBounds,
     },
     /// Schema DDL — declare a new node property index. Has no input
     /// and produces no rows. The executor short-circuits this before
@@ -1175,6 +1211,29 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
                 "{indent}EdgeSeek({src_var}){dir}[{edge_var}:{edge_type}.{property}]{dir_end}({dst_var})\n"
             ));
         }
+        LogicalPlan::EdgePointIndexSeek {
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            property,
+            direction,
+            bounds,
+        } => {
+            let dir = format_dir(direction);
+            let dir_end = if matches!(direction, Direction::Incoming) {
+                ""
+            } else {
+                ">"
+            };
+            let shape = match bounds {
+                PointSeekBounds::Corners { .. } => "bbox",
+                PointSeekBounds::Radius { .. } => "radius",
+            };
+            buf.push_str(&format!(
+                "{indent}EdgePointIndexSeek({src_var}){dir}[{edge_var}:{edge_type}.{property}, {shape}]{dir_end}({dst_var})\n"
+            ));
+        }
         LogicalPlan::SeedRow => {
             buf.push_str(&format!("{indent}SeedRow\n"));
         }
@@ -1630,6 +1689,19 @@ where
             visit(value)?;
             for (_, e) in residual_properties {
                 visit(e)?;
+            }
+            Ok(())
+        }
+        LogicalPlan::EdgePointIndexSeek { bounds, .. } => {
+            match bounds {
+                PointSeekBounds::Corners { lo, hi } => {
+                    visit(lo)?;
+                    visit(hi)?;
+                }
+                PointSeekBounds::Radius { center, radius } => {
+                    visit(center)?;
+                    visit(radius)?;
+                }
             }
             Ok(())
         }
@@ -3773,6 +3845,128 @@ fn optimize_filter_chain_to_point_index_seek(
     rebuild_filter_chain(current, conjuncts)
 }
 
+/// Relationship-scope analogue of
+/// [`optimize_filter_chain_to_point_index_seek`]. Recognizes a
+/// `Filter { ... EdgeExpand { NodeScanAll } }` leaf shape lowered
+/// from `MATCH ()-[r:T]-()` with both endpoints anonymous, matches
+/// `point.withinbbox(r.p, lo, hi)` or distance-radius predicates
+/// against an edge point index on `(T, p)`, and rewrites to
+/// [`LogicalPlan::EdgePointIndexSeek`] — bypassing the full-graph
+/// edge expansion.
+///
+/// Gating conditions (deliberately conservative so the rewrite
+/// doesn't change the semantics of any existing pattern):
+/// - Exactly one `Filter` chain above one `EdgeExpand`.
+/// - The `EdgeExpand` input is `NodeScanAll { var }` where `var`
+///   matches the expand's `src_var`.
+/// - The pattern names a single edge type, no inline edge
+///   properties, no pre-bound edge constraint, no destination
+///   label filter.
+/// - The edge variable is bound (anonymous edges can't host a
+///   WHERE predicate).
+fn optimize_filter_chain_to_edge_point_index_seek(
+    plan: LogicalPlan,
+    ctx: &PlannerContext,
+) -> LogicalPlan {
+    if !matches!(plan, LogicalPlan::Filter { .. }) {
+        return plan;
+    }
+
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    let mut current = plan;
+    while let LogicalPlan::Filter { input, predicate } = current {
+        push_conjuncts(predicate, &mut conjuncts);
+        current = *input;
+    }
+
+    // The leaf must be an EdgeExpand over a NodeScanAll whose var
+    // is the expand's src_var. Anything else falls through — the
+    // rewrite is opt-in for this one shape.
+    let (edge_var, src_var, dst_var, edge_type, direction) = match &current {
+        LogicalPlan::EdgeExpand {
+            input,
+            src_var,
+            edge_var: Some(edge_var),
+            dst_var,
+            dst_labels,
+            edge_properties,
+            edge_types,
+            direction,
+            edge_constraint_var,
+        } if edge_types.len() == 1
+            && edge_properties.is_empty()
+            && dst_labels.is_empty()
+            && edge_constraint_var.is_none() =>
+        {
+            match input.as_ref() {
+                LogicalPlan::NodeScanAll { var } if var == src_var => (
+                    edge_var.clone(),
+                    src_var.clone(),
+                    dst_var.clone(),
+                    edge_types[0].clone(),
+                    *direction,
+                ),
+                _ => return rebuild_filter_chain(current, conjuncts),
+            }
+        }
+        _ => return rebuild_filter_chain(current, conjuncts),
+    };
+
+    // Strategy 1: withinbbox — consume the conjunct if a matching
+    // edge point index is registered. The storage bbox filter is
+    // exact, so no residual is needed from this predicate.
+    let mut consumed: Option<(usize, String, Expr, Expr)> = None;
+    for (i, c) in conjuncts.iter().enumerate() {
+        if let Some((prop, lo, hi)) = extract_point_withinbbox(c, &edge_var) {
+            if ctx.has_edge_point_index(&edge_type, &prop) {
+                consumed = Some((i, prop, lo, hi));
+                break;
+            }
+        }
+    }
+    if let Some((idx, property, lo, hi)) = consumed {
+        let seek = LogicalPlan::EdgePointIndexSeek {
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            property,
+            direction,
+            bounds: PointSeekBounds::Corners { lo, hi },
+        };
+        let residual: Vec<Expr> = conjuncts
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, c)| c)
+            .collect();
+        return rebuild_filter_chain(seek, residual);
+    }
+
+    // Strategy 2: distance-radius. Keep the distance conjunct as a
+    // residual Filter so the circle-vs-square overshoot gets culled.
+    for c in &conjuncts {
+        let Some((property, center, radius)) = extract_point_distance_bound(c, &edge_var) else {
+            continue;
+        };
+        if !ctx.has_edge_point_index(&edge_type, &property) {
+            continue;
+        }
+        let seek = LogicalPlan::EdgePointIndexSeek {
+            edge_var,
+            src_var,
+            dst_var,
+            edge_type,
+            property,
+            direction,
+            bounds: PointSeekBounds::Radius { center, radius },
+        };
+        return rebuild_filter_chain(seek, conjuncts);
+    }
+
+    rebuild_filter_chain(current, conjuncts)
+}
+
 /// Recognize `point.withinbbox(scan_var.prop, lo, hi)` as a
 /// candidate for `PointIndexSeek`. Returns the indexed property name
 /// plus the two corner expressions, or `None` when:
@@ -4497,7 +4691,13 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // post-IndexSeek plan; if the equality seek already
                 // consumed the leaf NodeScanByLabels, the withinbbox
                 // stays in the residual filter above the seek.
-                plan = Some(optimize_filter_chain_to_point_index_seek(current, ctx));
+                let current = optimize_filter_chain_to_point_index_seek(current, ctx);
+                // Edge-scope point-index rewrite — fires against the
+                // `Filter { EdgeExpand { NodeScanAll } }` shape that
+                // an unbound-endpoints single-hop pattern lowers to.
+                // Order doesn't matter relative to the node-scope
+                // rewrite above: the two target different leaves.
+                plan = Some(optimize_filter_chain_to_edge_point_index_seek(current, ctx));
             }
             ReadingClause::OptionalMatch(o) => {
                 let current = match plan.take() {

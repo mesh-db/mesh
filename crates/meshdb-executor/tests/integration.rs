@@ -3912,6 +3912,11 @@ fn run_with_ctx(store: &Store, q: &str) -> Vec<Row> {
             .into_iter()
             .map(|s| (s.label, s.property))
             .collect(),
+        edge_point_indexes: store
+            .list_edge_point_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
+            .collect(),
     };
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
     let plan = plan_with_context(&stmt, &ctx).unwrap_or_else(|e| panic!("plan {q}: {e}"));
@@ -3944,6 +3949,11 @@ fn run_with_ctx_params(store: &Store, q: &str, params: &ParamMap) -> Vec<Row> {
             .list_point_indexes()
             .into_iter()
             .map(|s| (s.label, s.property))
+            .collect(),
+        edge_point_indexes: store
+            .list_edge_point_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
             .collect(),
     };
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
@@ -4373,6 +4383,120 @@ fn show_point_indexes_merges_node_and_edge_scopes() {
         .collect();
     assert!(scopes.contains("NODE"));
     assert!(scopes.contains("RELATIONSHIP"));
+}
+
+// ---------------------------------------------------------------
+// Edge-scope PointIndexSeek end-to-end.
+// ---------------------------------------------------------------
+
+#[test]
+fn edge_withinbbox_query_returns_edges_inside_bbox() {
+    let (store, _d) = open_store();
+    run_with_ctx(
+        &store,
+        "CREATE POINT INDEX FOR ()-[r:ROUTE]-() ON (r.waypoint)",
+    );
+    run_with_ctx(&store, "CREATE (:P {name: 'a'}), (:P {name: 'b'})");
+    run_with_ctx(
+        &store,
+        "MATCH (a:P {name: 'a'}), (b:P {name: 'b'}) \
+         CREATE (a)-[:ROUTE {waypoint: point({x: 5.0, y: 5.0}), tag: 'inside'}]->(b)",
+    );
+    run_with_ctx(
+        &store,
+        "MATCH (a:P {name: 'a'}), (b:P {name: 'b'}) \
+         CREATE (a)-[:ROUTE {waypoint: point({x: 50.0, y: 50.0}), tag: 'outside'}]->(b)",
+    );
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH ()-[r:ROUTE]->() \
+         WHERE point.withinbbox(r.waypoint, point({x: 0.0, y: 0.0}), point({x: 10.0, y: 10.0})) \
+         RETURN r.tag AS tag",
+    );
+    let tags: Vec<String> = rows.iter().map(|r| str_prop(r, "tag")).collect();
+    assert_eq!(tags, vec!["inside".to_string()]);
+}
+
+#[test]
+fn edge_withinbbox_matches_scan_result() {
+    // Parity with the non-rewritten fallback: same dataset, same
+    // query, with / without the edge point index.
+    let (indexed, _d1) = open_store();
+    let (scan_only, _d2) = open_store();
+    for store in [&indexed, &scan_only] {
+        run_with_ctx(store, "CREATE (:N {id: 1}), (:N {id: 2})");
+        run_with_ctx(
+            store,
+            "MATCH (a:N {id: 1}), (b:N {id: 2}) \
+             CREATE (a)-[:ROUTE {waypoint: point({x: 1.0, y: 1.0}), tag: 'near'}]->(b)",
+        );
+        run_with_ctx(
+            store,
+            "MATCH (a:N {id: 1}), (b:N {id: 2}) \
+             CREATE (a)-[:ROUTE {waypoint: point({x: 9.0, y: 9.0}), tag: 'corner'}]->(b)",
+        );
+        run_with_ctx(
+            store,
+            "MATCH (a:N {id: 1}), (b:N {id: 2}) \
+             CREATE (a)-[:ROUTE {waypoint: point({x: 50.0, y: 50.0}), tag: 'far'}]->(b)",
+        );
+    }
+    run_with_ctx(
+        &indexed,
+        "CREATE POINT INDEX FOR ()-[r:ROUTE]-() ON (r.waypoint)",
+    );
+
+    let q = "MATCH ()-[r:ROUTE]->() \
+             WHERE point.withinbbox(r.waypoint, point({x: 0.0, y: 0.0}), point({x: 10.0, y: 10.0})) \
+             RETURN r.tag AS tag";
+    let mut with_idx: Vec<String> = run_with_ctx(&indexed, q)
+        .iter()
+        .map(|r| str_prop(r, "tag"))
+        .collect();
+    let mut without_idx: Vec<String> = run_with_ctx(&scan_only, q)
+        .iter()
+        .map(|r| str_prop(r, "tag"))
+        .collect();
+    with_idx.sort();
+    without_idx.sort();
+    assert_eq!(with_idx, without_idx);
+    assert_eq!(with_idx, vec!["corner".to_string(), "near".to_string()]);
+}
+
+#[test]
+fn edge_distance_query_returns_edges_within_radius() {
+    let (store, _d) = open_store();
+    run_with_ctx(
+        &store,
+        "CREATE POINT INDEX FOR ()-[r:ROUTE]-() ON (r.waypoint)",
+    );
+    run_with_ctx(&store, "CREATE (:N {id: 1}), (:N {id: 2})");
+    for (x, y, tag) in &[
+        (1.0, 1.0, "inside"),
+        (4.5, 4.5, "corner"),
+        (20.0, 20.0, "far"),
+    ] {
+        run_with_ctx(
+            &store,
+            &format!(
+                "MATCH (a:N {{id: 1}}), (b:N {{id: 2}}) \
+                 CREATE (a)-[:ROUTE {{waypoint: point({{x: {x}, y: {y}, srid: 7203}}), tag: '{tag}'}}]->(b)"
+            ),
+        );
+    }
+
+    let rows = run_with_ctx(
+        &store,
+        "MATCH ()-[r:ROUTE]->() \
+         WHERE point.distance(r.waypoint, point({x: 0.0, y: 0.0, srid: 7203})) < 5.0 \
+         RETURN r.tag AS tag",
+    );
+    let tags: Vec<String> = rows.iter().map(|r| str_prop(r, "tag")).collect();
+    // `corner` at (4.5, 4.5) distance = sqrt(40.5) ≈ 6.36 > 5 →
+    // excluded by residual filter even though it's in the
+    // enclosing bbox.
+    assert_eq!(tags, vec!["inside".to_string()]);
 }
 
 #[test]

@@ -1311,6 +1311,17 @@ fn ctx_with_point_index(label: &str, prop: &str) -> PlannerContext {
         indexes: Vec::new(),
         edge_indexes: Vec::new(),
         point_indexes: vec![(label.into(), prop.into())],
+        edge_point_indexes: Vec::new(),
+        outer_bindings: Vec::new(),
+    }
+}
+
+fn ctx_with_edge_point_index(edge_type: &str, prop: &str) -> PlannerContext {
+    PlannerContext {
+        indexes: Vec::new(),
+        edge_indexes: Vec::new(),
+        point_indexes: Vec::new(),
+        edge_point_indexes: vec![(edge_type.into(), prop.into())],
         outer_bindings: Vec::new(),
     }
 }
@@ -1464,6 +1475,88 @@ fn distance_without_point_index_stays_as_filter() {
     let rendered = format_plan(&plan);
     assert!(!rendered.contains("PointIndexSeek"));
     assert!(rendered.contains("NodeScanByLabels"));
+}
+
+// ---------------------------------------------------------------
+// Edge-scope PointIndexSeek rewrite.
+// ---------------------------------------------------------------
+
+#[test]
+fn edge_withinbbox_with_edge_point_index_rewrites_to_seek() {
+    let stmt = parse(
+        "MATCH ()-[r:ROUTE]-() \
+         WHERE point.withinbbox(r.waypoint, point({x:0,y:0}), point({x:10,y:10})) \
+         RETURN r",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_edge_point_index("ROUTE", "waypoint")).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(
+        rendered.contains("EdgePointIndexSeek") && rendered.contains(":ROUTE.waypoint, bbox"),
+        "expected EdgePointIndexSeek, got:\n{rendered}",
+    );
+    // withinbbox consumed; no residual.
+    assert!(
+        !rendered.contains("withinbbox"),
+        "withinbbox should be absorbed, got:\n{rendered}",
+    );
+}
+
+#[test]
+fn edge_distance_with_edge_point_index_rewrites_to_radius_seek() {
+    let stmt = parse(
+        "MATCH ()-[r:ROUTE]-() \
+         WHERE point.distance(r.waypoint, point({x:0.0,y:0.0})) < 1000.0 \
+         RETURN r",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_edge_point_index("ROUTE", "waypoint")).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(
+        rendered.contains("EdgePointIndexSeek") && rendered.contains(":ROUTE.waypoint, radius"),
+        "expected radius seek, got:\n{rendered}",
+    );
+    // Distance predicate stays in the residual Filter to cull the
+    // enclosing-bbox overshoot.
+    assert!(
+        rendered.contains("Filter") && rendered.contains("point.distance"),
+        "distance predicate must survive, got:\n{rendered}",
+    );
+}
+
+#[test]
+fn edge_withinbbox_without_index_stays_as_filter() {
+    let stmt = parse(
+        "MATCH ()-[r:ROUTE]-() \
+         WHERE point.withinbbox(r.waypoint, point({x:0,y:0}), point({x:10,y:10})) \
+         RETURN r",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &PlannerContext::default()).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(
+        !rendered.contains("EdgePointIndexSeek"),
+        "no index → no rewrite, got:\n{rendered}",
+    );
+    assert!(rendered.contains("EdgeExpand"));
+}
+
+#[test]
+fn edge_withinbbox_preserves_sibling_conjuncts() {
+    let stmt = parse(
+        "MATCH ()-[r:ROUTE]-() \
+         WHERE point.withinbbox(r.waypoint, point({x:0,y:0}), point({x:10,y:10})) \
+           AND r.score > 5 \
+         RETURN r",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_edge_point_index("ROUTE", "waypoint")).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(rendered.contains("EdgePointIndexSeek"));
+    assert!(
+        rendered.contains("score"),
+        "sibling conjunct must survive residual Filter:\n{rendered}",
+    );
 }
 
 #[test]
@@ -1760,6 +1853,7 @@ fn ctx_with_index(label: &str, prop: &str) -> PlannerContext {
         indexes: vec![(label.into(), vec![prop.into()])],
         edge_indexes: Vec::new(),
         point_indexes: Vec::new(),
+        edge_point_indexes: Vec::new(),
         outer_bindings: Vec::new(),
     }
 }
@@ -1772,6 +1866,7 @@ fn ctx_with_composite_index(label: &str, props: &[&str]) -> PlannerContext {
         )],
         edge_indexes: Vec::new(),
         point_indexes: Vec::new(),
+        edge_point_indexes: Vec::new(),
         outer_bindings: Vec::new(),
     }
 }
@@ -2037,6 +2132,7 @@ fn ctx_with_edge_index(edge_type: &str, prop: &str) -> PlannerContext {
         indexes: Vec::new(),
         edge_indexes: vec![(edge_type.into(), vec![prop.into()])],
         point_indexes: Vec::new(),
+        edge_point_indexes: Vec::new(),
         outer_bindings: Vec::new(),
     }
 }
