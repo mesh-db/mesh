@@ -9696,6 +9696,73 @@ mod apoc_create {
     }
 }
 
+#[cfg(feature = "apoc-meta")]
+mod apoc_meta {
+    use super::*;
+
+    #[test]
+    fn apoc_meta_type_for_each_scalar_kind() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.meta.type('x') AS s, \
+                    apoc.meta.type(1) AS i, \
+                    apoc.meta.type(1.5) AS f, \
+                    apoc.meta.type(true) AS b, \
+                    apoc.meta.type([1, 2]) AS l, \
+                    apoc.meta.type({k: 1}) AS m, \
+                    apoc.meta.type(null) AS n",
+        );
+        assert_eq!(str_prop(&rows[0], "s"), "STRING");
+        assert_eq!(str_prop(&rows[0], "i"), "INTEGER");
+        assert_eq!(str_prop(&rows[0], "f"), "FLOAT");
+        assert_eq!(str_prop(&rows[0], "b"), "BOOLEAN");
+        assert_eq!(str_prop(&rows[0], "l"), "LIST");
+        assert_eq!(str_prop(&rows[0], "m"), "MAP");
+        assert_eq!(str_prop(&rows[0], "n"), "NULL");
+    }
+
+    #[test]
+    fn apoc_meta_is_type_matches_case_insensitively() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.meta.isType(42, 'INTEGER') AS a, \
+                    apoc.meta.isType(42, 'integer') AS b, \
+                    apoc.meta.isType(42, 'STRING') AS c",
+        );
+        match rows[0].get("a").unwrap() {
+            Value::Property(Property::Bool(v)) => assert!(*v),
+            other => panic!("a: expected Bool, got {other:?}"),
+        }
+        match rows[0].get("b").unwrap() {
+            Value::Property(Property::Bool(v)) => assert!(*v),
+            other => panic!("b: expected Bool, got {other:?}"),
+        }
+        match rows[0].get("c").unwrap() {
+            Value::Property(Property::Bool(v)) => assert!(!*v),
+            other => panic!("c: expected Bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_meta_types_of_map_labels_each_entry() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.meta.types({name: 'alice', age: 30, score: 0.5}) AS t",
+        );
+        match rows[0].get("t").unwrap() {
+            Value::Property(Property::Map(m)) => {
+                assert_eq!(m.get("name"), Some(&Property::String("STRING".into())));
+                assert_eq!(m.get("age"), Some(&Property::String("INTEGER".into())));
+                assert_eq!(m.get("score"), Some(&Property::String("FLOAT".into())));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+}
+
 mod apoc_agg {
     use super::*;
 

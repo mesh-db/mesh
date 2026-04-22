@@ -24,6 +24,7 @@
 //! | `date`    | `apoc.date.*` epoch-millis helpers |
 //! | `number`  | `apoc.number.*` parse / roman / format |
 //! | `create`  | `apoc.create.*` UUID generator / format helpers |
+//! | `meta`    | `apoc.meta.*` value type introspection |
 //! | `full`    | Every shipped namespace (convenience umbrella) |
 //!
 //! More namespaces will add their own feature flags when they
@@ -62,6 +63,9 @@ pub mod number;
 
 #[cfg(feature = "create")]
 pub mod create;
+
+#[cfg(feature = "meta")]
+pub mod meta;
 
 /// Errors the APOC dispatcher surfaces back to the caller. All
 /// variants are recoverable in the sense that the executor can
@@ -145,6 +149,11 @@ pub fn call_scalar(name: &str, args: &[Property]) -> Result<Property, ApocError>
     #[cfg(feature = "create")]
     if let Some(suffix) = _lc.strip_prefix("apoc.create.") {
         return create::call(suffix, args);
+    }
+
+    #[cfg(feature = "meta")]
+    if let Some(suffix) = _lc.strip_prefix("apoc.meta.") {
+        return meta::call(suffix, args);
     }
 
     let _ = args;

@@ -74,7 +74,14 @@ number = []
 # we don't pull in a separate base64 crate.
 create = ["dep:uuid"]
 
+# `apoc.meta.*` — value type introspection: type / isType / types.
+# Pure match over `Property` variants, no extra deps. The graph-
+# walking side of `apoc.meta.*` (schema / nodeTypeProperties /
+# relTypeProperties) belongs in the executor's procedure
+# registry, not here.
+meta = []
+
 # Umbrella convenience: everything we ship today. Add new
 # namespace features to this list as they land so
 # `--features full` keeps its "turn on everything" meaning.
-full = ["coll", "text", "map", "util", "convert", "date", "number", "create"]
+full = ["coll", "text", "map", "util", "convert", "date", "number", "create", "meta"]
