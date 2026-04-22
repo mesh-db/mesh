@@ -213,6 +213,15 @@ relationship (`FOR ()-[r:TYPE]-() ON (r.p)`) scopes. The planner rewrites
 pattern-property equalities and `WHERE` conjuncts to composite `IndexSeek`
 when a covering prefix exists; unbound-endpoint patterns with an indexed
 edge property (`MATCH (a)-[r:T {p: v}]->(b)`) lower to `EdgeSeek`.
+`CREATE POINT INDEX` / `DROP POINT INDEX` / `SHOW POINT INDEXES` on
+`Property::Point` columns — `FOR (n:Label) ON (n.loc)` or
+`FOR ()-[r:TYPE]-() ON (r.loc)` — backed by a Z-order (Morton) cell
+quantizer with per-SRID domains so bbox queries scan a tight cell range
+and SRID mismatches can't alias. Node-scope `WHERE point.withinbbox(n.p,
+lo, hi)` and `WHERE point.distance(n.p, center) <[=] r` lower to
+`PointIndexSeek`; Cartesian and WGS-84 (geographic) coordinates both
+index, with the distance operator computing an SRID-aware enclosing
+bbox and a residual Filter culling the circle-vs-square overshoot.
 `CREATE CONSTRAINT` / `DROP CONSTRAINT` / `SHOW CONSTRAINTS` for `UNIQUE`,
 `NOT NULL`, `IS :: <TYPE>` (STRING/INTEGER/FLOAT/BOOLEAN), and composite
 `IS NODE KEY` — node scope `FOR (n:Label)` or relationship scope
@@ -412,10 +421,11 @@ pair, `ca_path` to the shared CA bundle.
 - **No built-in APOC procedure library.** The `CALL` procedure framework
   and an extensible `ProcedureRegistry` are in place, but no APOC-compatible
   procedures ship with Mesh.
-- **No point / spatial indexes.** `Property::Point` round-trips correctly
-  and spatial scalars (`point`, `distance`, `cartesian`, `x`, `y`, `z`,
-  `latitude`, `longitude`, `srid`, `crs`) all work, but there's no R-tree
-  or spatial acceleration — spatial predicates fall back to a full scan.
+- **Edge-scope point-seek rewrites** aren't emitted by the planner yet.
+  `CREATE POINT INDEX FOR ()-[r:T]-() ON (r.p)` stores and replicates
+  correctly, but `WHERE point.withinbbox(r.p, ...)` predicates on edges
+  still go through a full scan. Node-scope point seeks (both `withinbbox`
+  and `distance < r`) do fire.
 - **GQL quantified path patterns** — parenthesized-subpath form like
   `((a)-[:T]-(b))+` — aren't parsed. The Neo4j 5 relationship-level
   shorthand (`->+`, `->*`, `->{n,m}`) is fully supported.
