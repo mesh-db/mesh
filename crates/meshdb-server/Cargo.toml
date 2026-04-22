@@ -45,3 +45,24 @@ reqwest = { version = "0.12", default-features = false }
 bcrypt = { workspace = true }
 rcgen = "0.13"
 rustls-pki-types = "1"
+
+[features]
+# APOC-compatible scalars are split per namespace. Pick the subset
+# you want or turn everything on with `--features apoc`. Default
+# builds stay lean.
+#
+# Examples:
+#   cargo install meshdb-server --features apoc        # everything
+#   cargo install meshdb-server --features apoc-coll   # just apoc.coll.*
+default = []
+apoc-coll = ["meshdb-executor/apoc-coll"]
+apoc-text = ["meshdb-executor/apoc-text"]
+apoc-map = ["meshdb-executor/apoc-map"]
+apoc-util = ["meshdb-executor/apoc-util"]
+apoc-convert = ["meshdb-executor/apoc-convert"]
+apoc-date = ["meshdb-executor/apoc-date"]
+apoc-number = ["meshdb-executor/apoc-number"]
+apoc-create = ["meshdb-executor/apoc-create"]
+apoc-meta = ["meshdb-executor/apoc-meta"]
+apoc-refactor = ["meshdb-executor/apoc-refactor"]
+apoc = ["meshdb-executor/apoc"]

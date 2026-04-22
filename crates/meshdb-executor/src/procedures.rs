@@ -1,6 +1,14 @@
+#[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+use crate::error::Error;
 use crate::error::Result;
 use crate::reader::GraphReader;
 use crate::value::Value;
+#[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+use crate::writer::GraphWriter;
+#[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+use meshdb_core::Edge;
+#[cfg(feature = "apoc-create")]
+use meshdb_core::Node;
 use meshdb_core::Property;
 use std::collections::{BTreeSet, HashMap};
 
@@ -103,6 +111,68 @@ pub enum BuiltinProc {
     /// carrying `name`, `label`, `property`, and `type` columns.
     /// Mirrors the `SHOW CONSTRAINTS` surface.
     DbConstraints,
+    /// `apoc.create.node(labels, props)` — write builtin that
+    /// creates a node with the given labels and properties and
+    /// yields it as `node`. The first builtin that mutates the
+    /// store, so it goes through [`Procedure::resolve_write_rows`]
+    /// rather than [`Procedure::resolve_rows`] — the args drive
+    /// the row directly, no candidate-row filtering needed.
+    #[cfg(feature = "apoc-create")]
+    ApocCreateNode,
+    /// `apoc.create.relationship(from, relType, props, to)` —
+    /// write builtin that creates an edge between two existing
+    /// nodes and yields it as `rel`. Argument order matches
+    /// Neo4j's APOC (relType + props between the two endpoints,
+    /// not at the end). Both endpoints must already exist; this
+    /// procedure does not auto-create missing nodes.
+    #[cfg(feature = "apoc-create")]
+    ApocCreateRelationship,
+    /// `apoc.create.addLabels(node|nodes, labels)` — adds the
+    /// given labels to the supplied nodes (no-op for labels
+    /// already present) and yields each updated node back. The
+    /// first arg accepts either a single Node or a list of Nodes
+    /// to match Neo4j APOC's variadic input convention.
+    #[cfg(feature = "apoc-create")]
+    ApocCreateAddLabels,
+    /// `apoc.create.removeLabels(node|nodes, labels)` — removes
+    /// the given labels from the supplied nodes (no-op for
+    /// labels not present) and yields each updated node back.
+    #[cfg(feature = "apoc-create")]
+    ApocCreateRemoveLabels,
+    /// `apoc.create.setLabels(node|nodes, labels)` — replaces
+    /// the entire label set on each supplied node with the given
+    /// list and yields the result back.
+    #[cfg(feature = "apoc-create")]
+    ApocCreateSetLabels,
+    /// `apoc.create.setProperty(node|nodes, key, value)` — sets
+    /// (or, if value is null, clears) a single property on each
+    /// supplied node and yields the result. Mirrors Neo4j APOC's
+    /// signature; for relationships use
+    /// [`Self::ApocCreateSetRelProperty`].
+    #[cfg(feature = "apoc-create")]
+    ApocCreateSetProperty,
+    /// `apoc.create.setRelProperty(rel|rels, key, value)` —
+    /// relationship-scope counterpart to
+    /// [`Self::ApocCreateSetProperty`].
+    #[cfg(feature = "apoc-create")]
+    ApocCreateSetRelProperty,
+    /// `apoc.refactor.setType(rel, newType)` — change a
+    /// relationship's type. Implementation deletes the old edge
+    /// and creates a new one with the supplied type, preserving
+    /// endpoints and properties; the new edge has a fresh
+    /// EdgeId. Yields the new edge as `rel`.
+    #[cfg(feature = "apoc-refactor")]
+    ApocRefactorSetType,
+    /// `apoc.meta.schema()` — read-only introspection that walks
+    /// the live graph and produces a single-row Map keyed by
+    /// label and relationship-type names. Each entry carries a
+    /// `count`, a `type` discriminator (`"node"` or
+    /// `"relationship"`), and a `properties` map describing each
+    /// observed property's APOC type and (for nodes) whether
+    /// it's covered by a property index. O(N) in the graph size,
+    /// same complexity class as Neo4j APOC's equivalent.
+    #[cfg(feature = "apoc-meta")]
+    ApocMetaSchema,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -128,6 +198,29 @@ impl Procedure {
         true
     }
 
+    /// True when this procedure mutates the store and therefore
+    /// needs to be dispatched through [`Self::resolve_write_rows`]
+    /// (which receives the writer and the already-evaluated args)
+    /// rather than [`Self::resolve_rows`]. Read-only built-ins and
+    /// pre-populated rows return `false`.
+    pub fn is_write_builtin(&self) -> bool {
+        match self.builtin {
+            #[cfg(feature = "apoc-create")]
+            Some(
+                BuiltinProc::ApocCreateNode
+                | BuiltinProc::ApocCreateRelationship
+                | BuiltinProc::ApocCreateAddLabels
+                | BuiltinProc::ApocCreateRemoveLabels
+                | BuiltinProc::ApocCreateSetLabels
+                | BuiltinProc::ApocCreateSetProperty
+                | BuiltinProc::ApocCreateSetRelProperty,
+            ) => true,
+            #[cfg(feature = "apoc-refactor")]
+            Some(BuiltinProc::ApocRefactorSetType) => true,
+            _ => false,
+        }
+    }
+
     /// Produce the row set the executor should iterate. Static
     /// procedures simply hand back their pre-populated `rows`;
     /// built-ins derive their rows from the live graph via `reader`.
@@ -138,6 +231,73 @@ impl Procedure {
             Some(BuiltinProc::DbRelationshipTypes) => builtin_db_relationship_types(reader),
             Some(BuiltinProc::DbPropertyKeys) => builtin_db_property_keys(reader),
             Some(BuiltinProc::DbConstraints) => builtin_db_constraints(reader),
+            #[cfg(feature = "apoc-meta")]
+            Some(BuiltinProc::ApocMetaSchema) => builtin_apoc_meta_schema(reader),
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateNode) => Err(Error::Procedure(
+                "apoc.create.node is a write procedure — call via resolve_write_rows".into(),
+            )),
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateRelationship) => Err(Error::Procedure(
+                "apoc.create.relationship is a write procedure — call via resolve_write_rows"
+                    .into(),
+            )),
+            #[cfg(feature = "apoc-create")]
+            Some(
+                BuiltinProc::ApocCreateAddLabels
+                | BuiltinProc::ApocCreateRemoveLabels
+                | BuiltinProc::ApocCreateSetLabels
+                | BuiltinProc::ApocCreateSetProperty
+                | BuiltinProc::ApocCreateSetRelProperty,
+            ) => Err(Error::Procedure(
+                "apoc.create.* mutator is a write procedure — call via resolve_write_rows".into(),
+            )),
+            #[cfg(feature = "apoc-refactor")]
+            Some(BuiltinProc::ApocRefactorSetType) => Err(Error::Procedure(
+                "apoc.refactor.setType is a write procedure — call via resolve_write_rows".into(),
+            )),
+        }
+    }
+
+    /// Write-procedure dispatch path. The args are already
+    /// evaluated and type-checked; the row is produced as a side
+    /// effect of the mutation (e.g. the newly-created node) so
+    /// `row_matches` is skipped for these procedures.
+    #[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+    pub fn resolve_write_rows(
+        &self,
+        reader: &dyn GraphReader,
+        writer: &dyn GraphWriter,
+        args: &[Value],
+    ) -> Result<Vec<ProcRow>> {
+        match self.builtin {
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateNode) => apoc_create_node(writer, args),
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateRelationship) => apoc_create_relationship(writer, args),
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateAddLabels) => {
+                apoc_label_mutator(reader, writer, args, LabelMode::Add)
+            }
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateRemoveLabels) => {
+                apoc_label_mutator(reader, writer, args, LabelMode::Remove)
+            }
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateSetLabels) => {
+                apoc_label_mutator(reader, writer, args, LabelMode::Set)
+            }
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateSetProperty) => {
+                apoc_set_node_property(reader, writer, args)
+            }
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateSetRelProperty) => {
+                apoc_set_rel_property(reader, writer, args)
+            }
+            #[cfg(feature = "apoc-refactor")]
+            Some(BuiltinProc::ApocRefactorSetType) => apoc_refactor_set_type(reader, writer, args),
+            _ => Err(Error::Procedure("procedure is not a write builtin".into())),
         }
     }
 }
@@ -222,6 +382,616 @@ fn builtin_db_property_keys(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
         .into_iter()
         .map(|k| str_row("propertyKey", k))
         .collect())
+}
+
+/// Implementation of `apoc.meta.schema()` — one full graph walk,
+/// collecting per-label and per-relationship-type statistics and
+/// merging them with the registered index set into a single Map
+/// keyed by label / type name. Matches Neo4j's APOC shape closely
+/// enough that ported dashboards rendering the `value` column
+/// keep working:
+///
+/// ```text
+/// {
+///   <label>: {
+///     type: "node",
+///     count: <int>,
+///     properties: {
+///       <key>: { type: <APOC type name>, indexed: <bool> }
+///     }
+///   },
+///   <edgeType>: {
+///     type: "relationship",
+///     count: <int>,
+///     properties: {
+///       <key>: { type: <APOC type name> }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Emits a single row under the `value` column (standard APOC
+/// convention). Unlabeled nodes are omitted — Neo4j APOC does the
+/// same, since there's no natural key for that bucket.
+#[cfg(feature = "apoc-meta")]
+fn builtin_apoc_meta_schema(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
+    use std::collections::HashSet;
+    // Per-label accumulator: count + observed (key → type set).
+    let mut label_count: HashMap<String, i64> = HashMap::new();
+    let mut label_props: HashMap<String, HashMap<String, HashSet<&'static str>>> = HashMap::new();
+    let mut edge_count: HashMap<String, i64> = HashMap::new();
+    let mut edge_props: HashMap<String, HashMap<String, HashSet<&'static str>>> = HashMap::new();
+
+    for id in reader.all_node_ids()? {
+        let node = match reader.get_node(id)? {
+            Some(n) => n,
+            None => continue,
+        };
+        for label in &node.labels {
+            *label_count.entry(label.clone()).or_insert(0) += 1;
+            let per_label = label_props.entry(label.clone()).or_default();
+            for (k, v) in &node.properties {
+                per_label
+                    .entry(k.clone())
+                    .or_default()
+                    .insert(apoc_schema_type(v));
+            }
+        }
+        for (edge_id, _) in reader.outgoing(id)? {
+            let edge = match reader.get_edge(edge_id)? {
+                Some(e) => e,
+                None => continue,
+            };
+            *edge_count.entry(edge.edge_type.clone()).or_insert(0) += 1;
+            let per_type = edge_props.entry(edge.edge_type.clone()).or_default();
+            for (k, v) in &edge.properties {
+                per_type
+                    .entry(k.clone())
+                    .or_default()
+                    .insert(apoc_schema_type(v));
+            }
+        }
+    }
+
+    // Index lookup: a property is marked `indexed: true` if any
+    // registered index mentions it (composite indexes count for
+    // each of their columns). Only node-scope indexes feed the
+    // per-label view; relationship property indexes follow the
+    // same pattern but under the edge type.
+    let mut node_indexed: HashMap<String, HashSet<String>> = HashMap::new();
+    for (label, props) in reader.list_property_indexes()? {
+        let entry = node_indexed.entry(label).or_default();
+        for p in props {
+            entry.insert(p);
+        }
+    }
+    let mut edge_indexed: HashMap<String, HashSet<String>> = HashMap::new();
+    for (edge_type, props) in reader.list_edge_property_indexes()? {
+        let entry = edge_indexed.entry(edge_type).or_default();
+        for p in props {
+            entry.insert(p);
+        }
+    }
+
+    let mut schema: HashMap<String, Property> = HashMap::new();
+    for (label, count) in label_count {
+        let props = label_props.remove(&label).unwrap_or_default();
+        let indexed = node_indexed.remove(&label).unwrap_or_default();
+        schema.insert(
+            label,
+            Property::Map(schema_entry(count, "node", props, Some(&indexed))),
+        );
+    }
+    for (edge_type, count) in edge_count {
+        let props = edge_props.remove(&edge_type).unwrap_or_default();
+        let indexed = edge_indexed.remove(&edge_type).unwrap_or_default();
+        schema.insert(
+            edge_type,
+            Property::Map(schema_entry(count, "relationship", props, Some(&indexed))),
+        );
+    }
+
+    let mut row = HashMap::new();
+    row.insert("value".to_string(), Value::Property(Property::Map(schema)));
+    Ok(vec![row])
+}
+
+/// Build one label-or-type entry in the schema map. `type_tag`
+/// is `"node"` or `"relationship"`. If a property was observed
+/// with several value kinds across rows, its `type` cell collapses
+/// those into a sorted `"STRING|INTEGER"` string — that's the
+/// convention Neo4j APOC uses for heterogeneous columns.
+#[cfg(feature = "apoc-meta")]
+fn schema_entry(
+    count: i64,
+    type_tag: &str,
+    props: HashMap<String, std::collections::HashSet<&'static str>>,
+    indexed: Option<&std::collections::HashSet<String>>,
+) -> HashMap<String, Property> {
+    let mut out: HashMap<String, Property> = HashMap::new();
+    out.insert("type".into(), Property::String(type_tag.into()));
+    out.insert("count".into(), Property::Int64(count));
+    let mut properties: HashMap<String, Property> = HashMap::new();
+    for (k, types) in props {
+        let mut sorted: Vec<&'static str> = types.into_iter().collect();
+        sorted.sort_unstable();
+        let ty = sorted.join("|");
+        let mut info: HashMap<String, Property> = HashMap::new();
+        info.insert("type".into(), Property::String(ty));
+        if let Some(idx) = indexed {
+            info.insert("indexed".into(), Property::Bool(idx.contains(&k)));
+        }
+        properties.insert(k, Property::Map(info));
+    }
+    out.insert("properties".into(), Property::Map(properties));
+    out
+}
+
+/// Upper-snake-case type name for a [`Property`], matching the
+/// spelling used by `apoc.meta.type` (e.g. `"STRING"`,
+/// `"DATE_TIME"`). Duplicates the scalar-side table in
+/// `meshdb_apoc::meta` because procedures.rs deliberately stays
+/// decoupled from meshdb-apoc.
+#[cfg(feature = "apoc-meta")]
+fn apoc_schema_type(p: &Property) -> &'static str {
+    match p {
+        Property::Null => "NULL",
+        Property::String(_) => "STRING",
+        Property::Int64(_) => "INTEGER",
+        Property::Float64(_) => "FLOAT",
+        Property::Bool(_) => "BOOLEAN",
+        Property::List(_) => "LIST",
+        Property::Map(_) => "MAP",
+        Property::DateTime { .. } => "DATE_TIME",
+        Property::LocalDateTime(_) => "LOCAL_DATE_TIME",
+        Property::Date(_) => "DATE",
+        Property::Time { .. } => "TIME",
+        Property::Duration(_) => "DURATION",
+        Property::Point(_) => "POINT",
+    }
+}
+
+/// Implementation of the `apoc.create.node(labels, props)` write
+/// builtin. Constructs a [`Node`] from the args, persists it via
+/// `writer.put_node`, and yields a single row with the new node
+/// under the `node` column. Both args may be Null (Neo4j allows
+/// `apoc.create.node(null, null)` — yields an empty unlabeled
+/// node), but a non-null first arg must be a list of strings and
+/// a non-null second arg must be a map.
+#[cfg(feature = "apoc-create")]
+fn apoc_create_node(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<ProcRow>> {
+    let labels = match &args[0] {
+        Value::Null | Value::Property(Property::Null) => Vec::new(),
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::Property(Property::String(s)) => Ok(s.clone()),
+                other => Err(Error::Procedure(format!(
+                    "apoc.create.node: labels must be strings, got {other:?}"
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Value::Property(Property::List(items)) => items
+            .iter()
+            .map(|p| match p {
+                Property::String(s) => Ok(s.clone()),
+                other => Err(Error::Procedure(format!(
+                    "apoc.create.node: labels must be strings, got {other:?}"
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.create.node: first argument must be a list of strings, got {other:?}"
+            )));
+        }
+    };
+    let props: HashMap<String, Property> = match &args[1] {
+        Value::Null | Value::Property(Property::Null) => HashMap::new(),
+        Value::Map(pairs) => pairs
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), value_to_storable_property(v)?)))
+            .collect::<Result<HashMap<_, _>>>()?,
+        Value::Property(Property::Map(entries)) => entries
+            .iter()
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect(),
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.create.node: second argument must be a map, got {other:?}"
+            )));
+        }
+    };
+    let mut node = Node::new();
+    node.labels = labels;
+    // Skip null property values — matches the openCypher rule used
+    // by `CREATE (n {k: null})`: the key is treated as absent.
+    for (k, p) in props {
+        if !matches!(p, Property::Null) {
+            node.properties.insert(k, p);
+        }
+    }
+    writer.put_node(&node)?;
+    let mut row = HashMap::new();
+    row.insert("node".to_string(), Value::Node(node));
+    Ok(vec![row])
+}
+
+/// Implementation of the `apoc.create.relationship(from, type,
+/// props, to)` write builtin. Argument order matches Neo4j's
+/// APOC: from + type + props + to. Both endpoint args must
+/// resolve to a [`Value::Node`]; the procedure does not
+/// auto-create missing endpoints (use `apoc.create.node` first
+/// or merge through CREATE).
+#[cfg(feature = "apoc-create")]
+fn apoc_create_relationship(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<ProcRow>> {
+    let from = expect_node_id(&args[0], "first argument (from)")?;
+    let rel_type = match &args[1] {
+        Value::Property(Property::String(s)) => s.clone(),
+        Value::Null | Value::Property(Property::Null) => {
+            return Err(Error::Procedure(
+                "apoc.create.relationship: relationship type must not be null".into(),
+            ));
+        }
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.create.relationship: relationship type must be a string, got {other:?}"
+            )));
+        }
+    };
+    let props: HashMap<String, Property> = match &args[2] {
+        Value::Null | Value::Property(Property::Null) => HashMap::new(),
+        Value::Map(pairs) => pairs
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), value_to_storable_property(v)?)))
+            .collect::<Result<HashMap<_, _>>>()?,
+        Value::Property(Property::Map(entries)) => entries
+            .iter()
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect(),
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.create.relationship: third argument must be a map, got {other:?}"
+            )));
+        }
+    };
+    let to = expect_node_id(&args[3], "fourth argument (to)")?;
+    let mut edge = Edge::new(rel_type, from, to);
+    for (k, p) in props {
+        if !matches!(p, Property::Null) {
+            edge.properties.insert(k, p);
+        }
+    }
+    writer.put_edge(&edge)?;
+    let mut row = HashMap::new();
+    row.insert("rel".to_string(), Value::Edge(edge));
+    Ok(vec![row])
+}
+
+/// Implementation of `apoc.refactor.setType(rel, newType)`.
+/// Edges in Mesh carry their type as immutable storage state, so
+/// changing it requires a delete + recreate. The new edge keeps
+/// the source / target / properties of the old but receives a
+/// fresh [`EdgeId`] — mirrors what Neo4j APOC does (the
+/// procedure documents the ID change explicitly).
+#[cfg(feature = "apoc-refactor")]
+fn apoc_refactor_set_type(
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    args: &[Value],
+) -> Result<Vec<ProcRow>> {
+    let old_id = match &args[0] {
+        Value::Edge(e) => e.id,
+        Value::Null | Value::Property(Property::Null) => {
+            return Err(Error::Procedure(
+                "apoc.refactor.setType: relationship argument must not be null".into(),
+            ));
+        }
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.refactor.setType: first argument must be a relationship, got {other:?}"
+            )));
+        }
+    };
+    let new_type = match &args[1] {
+        Value::Property(Property::String(s)) => s.clone(),
+        Value::Null | Value::Property(Property::Null) => {
+            return Err(Error::Procedure(
+                "apoc.refactor.setType: new type must not be null".into(),
+            ));
+        }
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.refactor.setType: new type must be a string, got {other:?}"
+            )));
+        }
+    };
+    let old = reader
+        .get_edge(old_id)?
+        .ok_or_else(|| Error::Procedure(format!("edge {old_id:?} no longer exists")))?;
+    // Same-type case is a no-op: hand the existing edge back
+    // unchanged so the caller's EdgeId stays valid.
+    if old.edge_type == new_type {
+        let mut row = HashMap::new();
+        row.insert("rel".to_string(), Value::Edge(old));
+        return Ok(vec![row]);
+    }
+    let mut new_edge = Edge::new(new_type, old.source, old.target);
+    new_edge.properties = old.properties.clone();
+    writer.delete_edge(old_id)?;
+    writer.put_edge(&new_edge)?;
+    let mut row = HashMap::new();
+    row.insert("rel".to_string(), Value::Edge(new_edge));
+    Ok(vec![row])
+}
+
+/// Three-way switch shared by the label mutators
+/// (`apoc.create.addLabels` / `removeLabels` / `setLabels`). The
+/// per-mode logic is identical except for how the existing label
+/// list is combined with the supplied list.
+#[cfg(feature = "apoc-create")]
+#[derive(Debug, Clone, Copy)]
+enum LabelMode {
+    Add,
+    Remove,
+    Set,
+}
+
+/// Implementation of `apoc.create.addLabels` / `removeLabels` /
+/// `setLabels`. The first arg is either a single Node or a list
+/// of Nodes (matching APOC's variadic input). The second arg is
+/// a list of label strings. Each input node is reloaded fresh
+/// from the reader so we apply the mutation to the latest state
+/// (the Node value in the row may have been captured earlier in
+/// the query). The updated node is written back via the writer
+/// and yielded under the `node` column.
+#[cfg(feature = "apoc-create")]
+fn apoc_label_mutator(
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    args: &[Value],
+    mode: LabelMode,
+) -> Result<Vec<ProcRow>> {
+    let node_ids = expect_node_or_node_list(&args[0], "first argument")?;
+    let labels = expect_string_list(&args[1], "second argument (labels)")?;
+    let mut out: Vec<ProcRow> = Vec::with_capacity(node_ids.len());
+    for nid in node_ids {
+        let mut node = reader
+            .get_node(nid)?
+            .ok_or_else(|| Error::Procedure(format!("node {nid:?} no longer exists")))?;
+        match mode {
+            LabelMode::Add => {
+                for l in &labels {
+                    if !node.labels.iter().any(|existing| existing == l) {
+                        node.labels.push(l.clone());
+                    }
+                }
+            }
+            LabelMode::Remove => {
+                node.labels
+                    .retain(|existing| !labels.iter().any(|l| l == existing));
+            }
+            LabelMode::Set => {
+                node.labels = labels.clone();
+            }
+        }
+        writer.put_node(&node)?;
+        let mut row = HashMap::new();
+        row.insert("node".to_string(), Value::Node(node));
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Implementation of `apoc.create.setProperty(nodes, key,
+/// value)`. Sets the property on each supplied node; passing a
+/// null value clears the property (matches APOC, and matches the
+/// `SET n.k = null` openCypher rule). The node is reloaded from
+/// the reader before mutation so concurrent writes earlier in
+/// the query are picked up.
+#[cfg(feature = "apoc-create")]
+fn apoc_set_node_property(
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    args: &[Value],
+) -> Result<Vec<ProcRow>> {
+    let node_ids = expect_node_or_node_list(&args[0], "first argument")?;
+    let key = expect_string(&args[1], "second argument (key)")?;
+    let value = value_to_storable_property(&args[2])?;
+    let mut out: Vec<ProcRow> = Vec::with_capacity(node_ids.len());
+    for nid in node_ids {
+        let mut node = reader
+            .get_node(nid)?
+            .ok_or_else(|| Error::Procedure(format!("node {nid:?} no longer exists")))?;
+        if matches!(value, Property::Null) {
+            node.properties.remove(&key);
+        } else {
+            node.properties.insert(key.clone(), value.clone());
+        }
+        writer.put_node(&node)?;
+        let mut row = HashMap::new();
+        row.insert("node".to_string(), Value::Node(node));
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Relationship-scope counterpart to [`apoc_set_node_property`].
+#[cfg(feature = "apoc-create")]
+fn apoc_set_rel_property(
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    args: &[Value],
+) -> Result<Vec<ProcRow>> {
+    let edge_ids = expect_edge_or_edge_list(&args[0], "first argument")?;
+    let key = expect_string(&args[1], "second argument (key)")?;
+    let value = value_to_storable_property(&args[2])?;
+    let mut out: Vec<ProcRow> = Vec::with_capacity(edge_ids.len());
+    for eid in edge_ids {
+        let mut edge = reader
+            .get_edge(eid)?
+            .ok_or_else(|| Error::Procedure(format!("edge {eid:?} no longer exists")))?;
+        if matches!(value, Property::Null) {
+            edge.properties.remove(&key);
+        } else {
+            edge.properties.insert(key.clone(), value.clone());
+        }
+        writer.put_edge(&edge)?;
+        let mut row = HashMap::new();
+        row.insert("rel".to_string(), Value::Edge(edge));
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Coerce the variadic first argument used by the label / set-
+/// property mutators into a flat list of [`NodeId`]s. Accepts a
+/// single Node or a (possibly nested) list of Nodes — anything
+/// else is a type error.
+#[cfg(feature = "apoc-create")]
+fn expect_node_or_node_list(v: &Value, position: &str) -> Result<Vec<meshdb_core::NodeId>> {
+    let mut ids: Vec<meshdb_core::NodeId> = Vec::new();
+    collect_node_ids(v, position, &mut ids)?;
+    if ids.is_empty() {
+        return Err(Error::Procedure(format!(
+            "apoc.create.*: {position} resolved to zero nodes"
+        )));
+    }
+    Ok(ids)
+}
+
+#[cfg(feature = "apoc-create")]
+fn collect_node_ids(v: &Value, position: &str, out: &mut Vec<meshdb_core::NodeId>) -> Result<()> {
+    match v {
+        Value::Node(n) => {
+            out.push(n.id);
+            Ok(())
+        }
+        Value::List(items) => {
+            for item in items {
+                collect_node_ids(item, position, out)?;
+            }
+            Ok(())
+        }
+        Value::Null | Value::Property(Property::Null) => Ok(()),
+        other => Err(Error::Procedure(format!(
+            "apoc.create.*: {position} must be a node or list of nodes, got {other:?}"
+        ))),
+    }
+}
+
+/// Edge-scope counterpart to [`expect_node_or_node_list`].
+#[cfg(feature = "apoc-create")]
+fn expect_edge_or_edge_list(v: &Value, position: &str) -> Result<Vec<meshdb_core::EdgeId>> {
+    let mut ids: Vec<meshdb_core::EdgeId> = Vec::new();
+    collect_edge_ids(v, position, &mut ids)?;
+    if ids.is_empty() {
+        return Err(Error::Procedure(format!(
+            "apoc.create.*: {position} resolved to zero relationships"
+        )));
+    }
+    Ok(ids)
+}
+
+#[cfg(feature = "apoc-create")]
+fn collect_edge_ids(v: &Value, position: &str, out: &mut Vec<meshdb_core::EdgeId>) -> Result<()> {
+    match v {
+        Value::Edge(e) => {
+            out.push(e.id);
+            Ok(())
+        }
+        Value::List(items) => {
+            for item in items {
+                collect_edge_ids(item, position, out)?;
+            }
+            Ok(())
+        }
+        Value::Null | Value::Property(Property::Null) => Ok(()),
+        other => Err(Error::Procedure(format!(
+            "apoc.create.*: {position} must be a relationship or list of relationships, got {other:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "apoc-create")]
+fn expect_string_list(v: &Value, position: &str) -> Result<Vec<String>> {
+    match v {
+        Value::Null | Value::Property(Property::Null) => Ok(Vec::new()),
+        Value::List(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Property(Property::String(s)) => Ok(s.clone()),
+                other => Err(Error::Procedure(format!(
+                    "apoc.create.*: {position} must contain strings, got {other:?}"
+                ))),
+            })
+            .collect(),
+        Value::Property(Property::List(items)) => items
+            .iter()
+            .map(|p| match p {
+                Property::String(s) => Ok(s.clone()),
+                other => Err(Error::Procedure(format!(
+                    "apoc.create.*: {position} must contain strings, got {other:?}"
+                ))),
+            })
+            .collect(),
+        other => Err(Error::Procedure(format!(
+            "apoc.create.*: {position} must be a list of strings, got {other:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "apoc-create")]
+fn expect_string(v: &Value, position: &str) -> Result<String> {
+    match v {
+        Value::Property(Property::String(s)) => Ok(s.clone()),
+        other => Err(Error::Procedure(format!(
+            "apoc.create.*: {position} must be a string, got {other:?}"
+        ))),
+    }
+}
+
+/// Resolve an endpoint argument to its [`NodeId`]. Both
+/// [`Value::Node`] (a fully-materialised node) and a node-id
+/// integer are accepted; everything else (including null) is a
+/// type error since a relationship needs concrete endpoints.
+#[cfg(feature = "apoc-create")]
+fn expect_node_id(v: &Value, position: &str) -> Result<meshdb_core::NodeId> {
+    match v {
+        Value::Node(n) => Ok(n.id),
+        Value::Null | Value::Property(Property::Null) => Err(Error::Procedure(format!(
+            "apoc.create.relationship: {position} must be a node, got null"
+        ))),
+        other => Err(Error::Procedure(format!(
+            "apoc.create.relationship: {position} must be a node, got {other:?}"
+        ))),
+    }
+}
+
+/// Convert a [`Value`] supplied as a procedure arg into a
+/// storable [`Property`]. Mirrors the `value_to_property` helper
+/// in `ops.rs` but lives here so procedures.rs can stay
+/// self-contained — graph elements (Node/Edge/Path) and
+/// graph-aware Maps aren't valid as stored properties.
+#[cfg(feature = "apoc-create")]
+fn value_to_storable_property(v: &Value) -> Result<Property> {
+    match v {
+        Value::Property(p) => Ok(p.clone()),
+        Value::Null => Ok(Property::Null),
+        Value::List(items) => {
+            let props = items
+                .iter()
+                .map(value_to_storable_property)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Property::List(props))
+        }
+        Value::Map(_) | Value::Node(_) | Value::Edge(_) | Value::Path { .. } => {
+            Err(Error::Procedure(
+                "apoc.create.node: property values can't be graph elements or graph-aware maps"
+                    .into(),
+            ))
+        }
+    }
 }
 
 fn values_equal_for_procedure(a: &Value, b: &Value) -> bool {
@@ -332,6 +1102,168 @@ impl ProcedureRegistry {
             ],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::DbConstraints),
+        });
+        #[cfg(feature = "apoc-create")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "create".into(), "node".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "labels".into(),
+                    // List<String> declared as ANY because the type
+                    // lattice doesn't carry container parameters; the
+                    // builtin validates structure at call time.
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "props".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "node".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocCreateNode),
+        });
+        #[cfg(feature = "apoc-create")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "create".into(), "relationship".into()],
+            inputs: vec![
+                // Argument order matches Neo4j's APOC: from, type,
+                // props, to. Endpoints accept Value::Node directly;
+                // ProcType::Any is the broadest match that lets a
+                // node value flow through without coercion.
+                ProcArgSpec {
+                    name: "from".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "relType".into(),
+                    ty: ProcType::String,
+                },
+                ProcArgSpec {
+                    name: "props".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "to".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "rel".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocCreateRelationship),
+        });
+        #[cfg(feature = "apoc-create")]
+        for (name, builtin) in [
+            ("addLabels", BuiltinProc::ApocCreateAddLabels),
+            ("removeLabels", BuiltinProc::ApocCreateRemoveLabels),
+            ("setLabels", BuiltinProc::ApocCreateSetLabels),
+        ] {
+            self.register(Procedure {
+                qualified_name: vec!["apoc".into(), "create".into(), name.into()],
+                inputs: vec![
+                    // First arg accepts a Node or a list of Nodes;
+                    // ProcType::Any covers both without coercion.
+                    ProcArgSpec {
+                        name: "nodes".into(),
+                        ty: ProcType::Any,
+                    },
+                    ProcArgSpec {
+                        name: "labels".into(),
+                        ty: ProcType::Any,
+                    },
+                ],
+                outputs: vec![ProcOutSpec {
+                    name: "node".into(),
+                    ty: ProcType::Any,
+                }],
+                rows: Vec::new(),
+                builtin: Some(builtin),
+            });
+        }
+        #[cfg(feature = "apoc-create")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "create".into(), "setProperty".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "nodes".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "key".into(),
+                    ty: ProcType::String,
+                },
+                ProcArgSpec {
+                    name: "value".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "node".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocCreateSetProperty),
+        });
+        #[cfg(feature = "apoc-create")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "create".into(), "setRelProperty".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "rels".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "key".into(),
+                    ty: ProcType::String,
+                },
+                ProcArgSpec {
+                    name: "value".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "rel".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocCreateSetRelProperty),
+        });
+        #[cfg(feature = "apoc-meta")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "meta".into(), "schema".into()],
+            inputs: Vec::new(),
+            outputs: vec![ProcOutSpec {
+                name: "value".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocMetaSchema),
+        });
+        #[cfg(feature = "apoc-refactor")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "refactor".into(), "setType".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "rel".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "newType".into(),
+                    ty: ProcType::String,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "rel".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocRefactorSetType),
         });
     }
 }

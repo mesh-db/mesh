@@ -4770,7 +4770,88 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             truncate_temporal(name, &unit_str, &temporal, overrides.as_ref())
         }
 
-        _ => Err(Error::UnknownScalarFunction(name.to_string())),
+        _ => {
+            // APOC scalar dispatcher — feature-gated so builds
+            // without `--features apoc` see the usual "unknown
+            // function" error for apoc.* names. When the feature
+            // is on, evaluate every argument to a `Property`
+            // (APOC scalars never inspect Node/Edge/Path) and
+            // route the call to the `meshdb-apoc` crate.
+            #[cfg(feature = "__apoc")]
+            if name.to_ascii_lowercase().starts_with("apoc.") {
+                return call_apoc_scalar(name, arg_exprs, ctx);
+            }
+            Err(Error::UnknownScalarFunction(name.to_string()))
+        }
+    }
+}
+
+/// Evaluate every argument to a [`Property`] and dispatch to the
+/// `meshdb-apoc` scalar entry point. Errors thread back through
+/// the executor's `Error` type so user-facing messages stay
+/// consistent with the native scalar path.
+#[cfg(feature = "__apoc")]
+fn call_apoc_scalar(name: &str, arg_exprs: &[Expr], ctx: &EvalCtx) -> Result<Value> {
+    let mut props: Vec<Property> = Vec::with_capacity(arg_exprs.len());
+    for arg in arg_exprs {
+        match eval_expr(arg, ctx)? {
+            Value::Property(p) => props.push(p),
+            Value::Null => props.push(Property::Null),
+            // `Value::List` / `Value::Map` can hold Nodes/Edges which
+            // APOC scalars don't model. Convert scalar-only lists /
+            // maps into `Property::List` / `Property::Map`; reject
+            // the graph-element cases with a TypeMismatch so the
+            // user knows the function isn't applicable.
+            Value::List(items) => props.push(Property::List(
+                items
+                    .into_iter()
+                    .map(value_to_property_or_null)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            )),
+            Value::Map(m) => props.push(Property::Map(
+                m.into_iter()
+                    .map(|(k, v)| value_to_property_or_null(v).map(|p| (k, p)))
+                    .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?,
+            )),
+            Value::Node(_) | Value::Edge(_) | Value::Path { .. } => {
+                return Err(Error::TypeMismatch);
+            }
+        }
+    }
+    match meshdb_apoc::call_scalar(name, &props) {
+        Ok(p) => Ok(Value::Property(p)),
+        Err(meshdb_apoc::ApocError::UnknownFunction(n)) => Err(Error::UnknownScalarFunction(n)),
+        Err(meshdb_apoc::ApocError::Arity {
+            name,
+            expected,
+            got,
+        }) => Err(Error::UnknownScalarFunction(format!(
+            "{name} expects {expected} argument(s), got {got}",
+        ))),
+        Err(meshdb_apoc::ApocError::TypeMismatch { .. }) => Err(Error::TypeMismatch),
+    }
+}
+
+/// Unwrap a `Value` into a `Property`, recursively handling nested
+/// lists and maps. Rejects graph elements with the executor's
+/// `TypeMismatch` since they have no `Property` representation.
+#[cfg(feature = "__apoc")]
+fn value_to_property_or_null(v: Value) -> Result<Property> {
+    match v {
+        Value::Property(p) => Ok(p),
+        Value::Null => Ok(Property::Null),
+        Value::List(items) => Ok(Property::List(
+            items
+                .into_iter()
+                .map(value_to_property_or_null)
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        )),
+        Value::Map(m) => Ok(Property::Map(
+            m.into_iter()
+                .map(|(k, v)| value_to_property_or_null(v).map(|p| (k, p)))
+                .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?,
+        )),
+        Value::Node(_) | Value::Edge(_) | Value::Path { .. } => Err(Error::TypeMismatch),
     }
 }
 

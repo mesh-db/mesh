@@ -253,7 +253,13 @@ call_subquery = { kw_call ~ "{" ~ union_query ~ "}" }
 // rule inside `reading_clause` so subquery-style calls aren't
 // accidentally committed as procedure calls.
 call_procedure = { kw_call ~ procedure_name ~ procedure_args? ~ yield_clause? }
-procedure_name = { identifier ~ ("." ~ identifier)* }
+// Procedure name segments are allowed to coincide with Cypher
+// reserved words (e.g. `apoc.create.node`, `apoc.merge.node`) —
+// the CALL context disambiguates them from clause keywords, so
+// `procedure_name_segment` skips the `!reserved` guard that
+// `identifier` enforces. Backticked names still go through.
+procedure_name = { procedure_name_segment ~ ("." ~ procedure_name_segment)* }
+procedure_name_segment = @{ backtick_id | (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 procedure_args = { "(" ~ procedure_arg_list? ~ ")" }
 procedure_arg_list = { expression ~ ("," ~ expression)* }
 yield_clause = { kw_yield ~ (yield_star | yield_items) }
@@ -643,7 +649,12 @@ list_comp = {
 list_comp_where = { kw_where ~ expression }
 list_comp_proj = { "|" ~ expression }
 
-function_call = { identifier ~ ("." ~ identifier)? ~ "(" ~ fn_args? ~ ")" }
+function_call = { identifier ~ ("." ~ qualified_part)* ~ "(" ~ fn_args? ~ ")" }
+// Namespace / function-name suffix after a `.`. Reserved words are
+// fine here — the leading `.` disambiguates them from statement
+// keywords, so `apoc.map.merge(...)` parses even though `MERGE`
+// starts a top-level clause.
+qualified_part = @{ backtick_id | (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 fn_args = { count_star | fn_arg_list }
 count_star = { "*" }
 fn_arg_list = { kw_distinct? ~ expression ~ ("," ~ expression)* }

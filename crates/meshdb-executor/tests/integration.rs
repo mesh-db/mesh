@@ -8980,3 +8980,1537 @@ fn constraint_persists_across_reopen() {
     assert_eq!(shown.len(), 1);
     assert_eq!(str_prop(&shown[0], "name"), "persist_me");
 }
+
+// ---------------------------------------------------------------
+// APOC scalar functions (feature-gated).
+//
+// The entire module compiles only when `--features apoc` is on;
+// a minus-build with no APOC support passes the workspace test
+// suite without running these.
+// ---------------------------------------------------------------
+
+#[cfg(feature = "apoc-coll")]
+mod apoc_coll {
+    use super::*;
+
+    fn int_list(row: &Row, key: &str) -> Vec<i64> {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::List(items)) => items
+                .iter()
+                .filter_map(|p| match p {
+                    Property::Int64(n) => Some(*n),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected Property::List, got {other:?}"),
+        }
+    }
+
+    fn bool_prop(row: &Row, key: &str) -> bool {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::Bool(b)) => *b,
+            other => panic!("expected Bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_coll_sum_on_integer_list() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.sum([1, 2, 3]) AS total");
+        assert_eq!(int_prop(&rows[0], "total"), 6);
+    }
+
+    #[test]
+    fn apoc_coll_avg_returns_float() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.avg([1, 2, 3, 4]) AS m");
+        match rows[0].get("m").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 2.5),
+            other => panic!("expected Float64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_coll_max_min_on_mixed_numeric() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.max([1, 3.5, 2]) AS hi, apoc.coll.min([1, 3.5, 2]) AS lo",
+        );
+        match rows[0].get("hi").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 3.5),
+            other => panic!("hi: expected Float64, got {other:?}"),
+        }
+        match rows[0].get("lo").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 1.0),
+            other => panic!("lo: expected Float64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_coll_to_set_dedupes_preserving_order() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.toSet([1, 2, 1, 3, 2]) AS s");
+        assert_eq!(int_list(&rows[0], "s"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn apoc_coll_sort_ascending_and_descending() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.sort([3, 1, 2]) AS up, apoc.coll.sortDesc([3, 1, 2]) AS down",
+        );
+        assert_eq!(int_list(&rows[0], "up"), vec![1, 2, 3]);
+        assert_eq!(int_list(&rows[0], "down"), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn apoc_coll_reverse_reverses_items() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.reverse([1, 2, 3]) AS r");
+        assert_eq!(int_list(&rows[0], "r"), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn apoc_coll_contains_hit_and_miss() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.contains([1, 2, 3], 2) AS hit, \
+                    apoc.coll.contains([1, 2, 3], 9) AS miss",
+        );
+        assert_eq!(bool_prop(&rows[0], "hit"), true);
+        assert_eq!(bool_prop(&rows[0], "miss"), false);
+    }
+
+    #[test]
+    fn apoc_coll_set_operations() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.union([1, 2, 3], [3, 4]) AS u, \
+                    apoc.coll.intersection([1, 2, 3], [2, 3, 5]) AS i, \
+                    apoc.coll.subtract([1, 2, 3], [2]) AS s",
+        );
+        assert_eq!(int_list(&rows[0], "u"), vec![1, 2, 3, 4]);
+        assert_eq!(int_list(&rows[0], "i"), vec![2, 3]);
+        assert_eq!(int_list(&rows[0], "s"), vec![1, 3]);
+    }
+
+    #[test]
+    fn apoc_coll_flatten_one_level() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.flatten([[1, 2], [3, 4], 5]) AS f");
+        assert_eq!(int_list(&rows[0], "f"), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn apoc_coll_zip_pairs_and_truncates() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.zip([1, 2, 3], ['a', 'b']) AS z");
+        match rows[0].get("z").unwrap() {
+            Value::Property(Property::List(items)) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(
+                    items[0],
+                    Property::List(vec![Property::Int64(1), Property::String("a".into()),]),
+                );
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_coll_index_of_and_occurrences() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.indexOf([10, 20, 30, 20], 20) AS i, \
+                    apoc.coll.occurrences([1, 2, 1, 3, 1], 1) AS c, \
+                    apoc.coll.indexOf([1, 2, 3], 99) AS miss",
+        );
+        assert_eq!(int_prop(&rows[0], "i"), 1);
+        assert_eq!(int_prop(&rows[0], "c"), 3);
+        assert_eq!(int_prop(&rows[0], "miss"), -1);
+    }
+
+    #[test]
+    fn apoc_coll_to_map_from_pair_list() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.toMap([['name', 'alice'], ['age', 30]]) AS m",
+        );
+        match rows[0].get("m").unwrap() {
+            Value::Property(Property::Map(m)) => {
+                assert_eq!(m.get("name"), Some(&Property::String("alice".into())));
+                assert_eq!(m.get("age"), Some(&Property::Int64(30)));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    /// Sanity-check the non-apoc name goes through the native
+    /// dispatcher even with the feature on (no shadowing).
+    #[test]
+    fn native_scalars_still_resolve_with_feature_on() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN size([1, 2, 3]) AS n");
+        assert_eq!(int_prop(&rows[0], "n"), 3);
+    }
+}
+
+#[cfg(not(feature = "apoc-coll"))]
+#[test]
+fn apoc_scalar_without_feature_surfaces_unknown_function_error() {
+    let (store, _d) = open_store();
+    let stmt = parse("RETURN apoc.coll.sum([1, 2, 3]) AS total").unwrap();
+    let p = plan(&stmt).unwrap();
+    let err = execute(&p, &store).unwrap_err();
+    assert!(
+        err.to_string()
+            .to_ascii_lowercase()
+            .contains("apoc.coll.sum"),
+        "expected unknown-function error for apoc.coll.sum without the feature, got: {err}",
+    );
+}
+
+#[cfg(feature = "apoc-text")]
+mod apoc_text {
+    use super::*;
+
+    fn string_list(row: &Row, key: &str) -> Vec<String> {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::List(items)) => items
+                .iter()
+                .filter_map(|p| match p {
+                    Property::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected Property::List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_text_join_and_split() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.join(['a', 'b', 'c'], '-') AS j, \
+                    apoc.text.split('a,b;c', '[,;]') AS parts",
+        );
+        assert_eq!(str_prop(&rows[0], "j"), "a-b-c");
+        assert_eq!(
+            string_list(&rows[0], "parts"),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+    }
+
+    #[test]
+    fn apoc_text_replace_and_index_of() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.replace('hello world', 'o', '0') AS r, \
+                    apoc.text.indexOf('hello', 'll') AS idx",
+        );
+        assert_eq!(str_prop(&rows[0], "r"), "hell0 w0rld");
+        assert_eq!(int_prop(&rows[0], "idx"), 2);
+    }
+
+    #[test]
+    fn apoc_text_pad_functions() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.lpad('7', 4, '0') AS padded, \
+                    apoc.text.rpad('x', 5, '.-') AS right",
+        );
+        assert_eq!(str_prop(&rows[0], "padded"), "0007");
+        assert_eq!(str_prop(&rows[0], "right"), "x.-.-");
+    }
+
+    #[test]
+    fn apoc_text_case_helpers() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.capitalize('hello') AS cap, \
+                    apoc.text.capitalizeAll('hello world') AS title, \
+                    apoc.text.camelCase('api_key_name') AS camel, \
+                    apoc.text.snakeCase('Hello World') AS snake, \
+                    apoc.text.upperCamelCase('hello world') AS pascal",
+        );
+        assert_eq!(str_prop(&rows[0], "cap"), "Hello");
+        assert_eq!(str_prop(&rows[0], "title"), "Hello World");
+        assert_eq!(str_prop(&rows[0], "camel"), "apiKeyName");
+        assert_eq!(str_prop(&rows[0], "snake"), "hello_world");
+        assert_eq!(str_prop(&rows[0], "pascal"), "HelloWorld");
+    }
+
+    #[test]
+    fn apoc_text_url_roundtrips() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.urlencode('a b&c=1') AS enc, \
+                    apoc.text.urldecode('a%20b%26c%3D1') AS dec",
+        );
+        assert_eq!(str_prop(&rows[0], "enc"), "a%20b%26c%3D1");
+        assert_eq!(str_prop(&rows[0], "dec"), "a b&c=1");
+    }
+
+    #[test]
+    fn apoc_text_repeat_and_reverse() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.repeat('ab', 3) AS r, \
+                    apoc.text.reverse('hello') AS rev",
+        );
+        assert_eq!(str_prop(&rows[0], "r"), "ababab");
+        assert_eq!(str_prop(&rows[0], "rev"), "olleh");
+    }
+
+    #[test]
+    fn apoc_text_hex_value() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.text.hexValue(255) AS h");
+        assert_eq!(str_prop(&rows[0], "h"), "FF");
+    }
+
+    #[test]
+    fn apoc_text_base64_round_trip() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.base64Decode(apoc.text.base64Encode('hello, world')) AS r",
+        );
+        assert_eq!(str_prop(&rows[0], "r"), "hello, world");
+    }
+
+    #[test]
+    fn apoc_text_byte_count_utf8() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.byteCount('hello') AS a, \
+                    apoc.text.byteCount('π') AS p",
+        );
+        assert_eq!(int_prop(&rows[0], "a"), 5);
+        assert_eq!(int_prop(&rows[0], "p"), 2);
+    }
+
+    #[test]
+    fn apoc_text_clean_strips_and_lowercases() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.text.clean('Hello, World!') AS c");
+        assert_eq!(str_prop(&rows[0], "c"), "helloworld");
+    }
+
+    #[test]
+    fn apoc_text_levenshtein_distance_classic() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.levenshteinDistance('kitten', 'sitting') AS d",
+        );
+        assert_eq!(int_prop(&rows[0], "d"), 3);
+    }
+}
+
+#[cfg(feature = "apoc-map")]
+mod apoc_map {
+    use super::*;
+
+    fn as_map<'a>(row: &'a Row, key: &str) -> &'a std::collections::HashMap<String, Property> {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::Map(m)) => m,
+            other => panic!("expected Property::Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_map_merge_right_wins() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.merge({a: 1, b: 2}, {b: 20, c: 3}) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert_eq!(m.len(), 3);
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("b"), Some(Property::Int64(20))));
+        assert!(matches!(m.get("c"), Some(Property::Int64(3))));
+    }
+
+    #[test]
+    fn apoc_map_from_pairs_builds_map() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.fromPairs([['a', 1], ['b', 2]]) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("b"), Some(Property::Int64(2))));
+    }
+
+    #[test]
+    fn apoc_map_from_lists_zips() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.map.fromLists(['a', 'b'], [1, 2]) AS m");
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("b"), Some(Property::Int64(2))));
+    }
+
+    #[test]
+    fn apoc_map_set_key_and_remove_key() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.setKey({a: 1}, 'b', 2) AS added, \
+                    apoc.map.removeKey({a: 1, b: 2}, 'b') AS dropped",
+        );
+        let added = as_map(&rows[0], "added");
+        assert!(matches!(added.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(added.get("b"), Some(Property::Int64(2))));
+        let dropped = as_map(&rows[0], "dropped");
+        assert_eq!(dropped.len(), 1);
+        assert!(matches!(dropped.get("a"), Some(Property::Int64(1))));
+    }
+
+    #[test]
+    fn apoc_map_remove_keys_bulk() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.removeKeys({a: 1, b: 2, c: 3}, ['a', 'c']) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert_eq!(m.len(), 1);
+        assert!(matches!(m.get("b"), Some(Property::Int64(2))));
+    }
+
+    #[test]
+    fn apoc_map_submap_skips_missing() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.submap({a: 1, b: 2, c: 3}, ['a', 'z']) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert_eq!(m.len(), 1);
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+    }
+
+    #[test]
+    fn apoc_map_merge_list_combines() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.map.mergeList([{a: 1}, {b: 2}, {a: 10}]) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("a"), Some(Property::Int64(10))));
+        assert!(matches!(m.get("b"), Some(Property::Int64(2))));
+    }
+}
+
+#[cfg(feature = "apoc-util")]
+mod apoc_util {
+    use super::*;
+
+    #[test]
+    fn apoc_util_md5_matches_known_vector() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.util.md5('abc') AS h");
+        assert_eq!(str_prop(&rows[0], "h"), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn apoc_util_sha1_matches_known_vector() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.util.sha1('abc') AS h");
+        assert_eq!(
+            str_prop(&rows[0], "h"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d",
+        );
+    }
+
+    #[test]
+    fn apoc_util_sha_family_matches_known_vectors() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.util.sha256('abc') AS s256, \
+                    apoc.util.sha384('abc') AS s384, \
+                    apoc.util.sha512('abc') AS s512",
+        );
+        assert_eq!(
+            str_prop(&rows[0], "s256"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+        assert_eq!(
+            str_prop(&rows[0], "s384"),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
+        );
+        assert_eq!(
+            str_prop(&rows[0], "s512"),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        );
+    }
+
+    #[test]
+    fn apoc_util_null_propagates() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.util.sha256(null) AS h");
+        assert!(matches!(
+            rows[0].get("h"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+}
+
+#[cfg(feature = "apoc-convert")]
+mod apoc_convert {
+    use super::*;
+
+    fn as_map<'a>(row: &'a Row, key: &str) -> &'a std::collections::HashMap<String, Property> {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::Map(m)) => m,
+            other => panic!("expected Property::Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_convert_to_json_on_primitives() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.toJson(42) AS n, \
+                    apoc.convert.toJson('hi') AS s, \
+                    apoc.convert.toJson(true) AS b, \
+                    apoc.convert.toJson(null) AS nil",
+        );
+        assert_eq!(str_prop(&rows[0], "n"), "42");
+        assert_eq!(str_prop(&rows[0], "s"), "\"hi\"");
+        assert_eq!(str_prop(&rows[0], "b"), "true");
+        assert_eq!(str_prop(&rows[0], "nil"), "null");
+    }
+
+    #[test]
+    fn apoc_convert_to_json_list() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.convert.toJson([1, 2, 'x', null]) AS j");
+        assert_eq!(str_prop(&rows[0], "j"), "[1,2,\"x\",null]");
+    }
+
+    #[test]
+    fn apoc_convert_from_json_map_parses_object() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.fromJsonMap('{\"n\": 1, \"s\": \"x\"}') AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("n"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("s"), Some(Property::String(v)) if v == "x"));
+    }
+
+    #[test]
+    fn apoc_convert_from_json_list_parses_array() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.fromJsonList('[1, 2.5, \"x\", null]') AS xs",
+        );
+        match rows[0].get("xs").unwrap() {
+            Value::Property(Property::List(items)) => {
+                assert_eq!(items.len(), 4);
+                assert!(matches!(items[0], Property::Int64(1)));
+                assert!(matches!(items[1], Property::Float64(f) if f == 2.5));
+                assert!(matches!(&items[2], Property::String(v) if v == "x"));
+                assert!(matches!(items[3], Property::Null));
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_convert_round_trip_through_json() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.fromJsonMap(apoc.convert.toJson({a: 1, b: 'hi'})) AS m",
+        );
+        let m = as_map(&rows[0], "m");
+        assert!(matches!(m.get("a"), Some(Property::Int64(1))));
+        assert!(matches!(m.get("b"), Some(Property::String(v)) if v == "hi"));
+    }
+
+    #[test]
+    fn apoc_convert_null_input_passes_through() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.convert.fromJsonMap(null) AS m, \
+                    apoc.convert.fromJsonList(null) AS xs",
+        );
+        assert!(matches!(
+            rows[0].get("m"),
+            Some(Value::Property(Property::Null))
+        ));
+        assert!(matches!(
+            rows[0].get("xs"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+}
+
+#[cfg(feature = "apoc-date")]
+mod apoc_date {
+    use super::*;
+
+    #[test]
+    fn apoc_date_current_timestamp_is_positive() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.date.currentTimestamp() AS t");
+        // Any post-2020 wall clock should yield a positive i64 > 1.5e12 ms.
+        assert!(int_prop(&rows[0], "t") > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn apoc_date_to_iso8601_known_instant() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.date.toISO8601(1700000000000) AS s");
+        assert_eq!(str_prop(&rows[0], "s"), "2023-11-14T22:13:20.000Z");
+    }
+
+    #[test]
+    fn apoc_date_iso8601_round_trip() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.date.fromISO8601(apoc.date.toISO8601(1700000000456)) AS ms",
+        );
+        assert_eq!(int_prop(&rows[0], "ms"), 1_700_000_000_456);
+    }
+
+    #[test]
+    fn apoc_date_convert_units() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.date.convert(1, 'h', 'ms') AS hours_to_ms, \
+                    apoc.date.convert(3600000, 'ms', 'h') AS ms_to_hours, \
+                    apoc.date.convert(1, 'week', 'days') AS week_to_days",
+        );
+        assert_eq!(int_prop(&rows[0], "hours_to_ms"), 3_600_000);
+        assert_eq!(int_prop(&rows[0], "ms_to_hours"), 1);
+        assert_eq!(int_prop(&rows[0], "week_to_days"), 7);
+    }
+
+    #[test]
+    fn apoc_date_add_cross_unit() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.date.add(5, 'min', 1, 'h') AS m, \
+                    apoc.date.add(1000, 'ms', 2, 's') AS ms",
+        );
+        assert_eq!(int_prop(&rows[0], "m"), 65);
+        assert_eq!(int_prop(&rows[0], "ms"), 3000);
+    }
+
+    #[test]
+    fn apoc_date_null_propagates() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.date.toISO8601(null) AS s");
+        assert!(matches!(
+            rows[0].get("s"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+}
+
+#[cfg(feature = "apoc-number")]
+mod apoc_number {
+    use super::*;
+
+    #[test]
+    fn apoc_number_parse_int_default_and_radix() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.number.parseInt('42') AS d, \
+                    apoc.number.parseInt('ff', 16) AS hex, \
+                    apoc.number.parseInt('1010', 2) AS bin, \
+                    apoc.number.parseInt('nope') AS bad",
+        );
+        assert_eq!(int_prop(&rows[0], "d"), 42);
+        assert_eq!(int_prop(&rows[0], "hex"), 255);
+        assert_eq!(int_prop(&rows[0], "bin"), 10);
+        assert!(matches!(
+            rows[0].get("bad"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_number_parse_float() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.number.parseFloat('1.5e3') AS f, \
+                    apoc.number.parseFloat('garbage') AS bad",
+        );
+        match rows[0].get("f").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 1500.0),
+            other => panic!("expected Float64, got {other:?}"),
+        }
+        assert!(matches!(
+            rows[0].get("bad"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_number_roman_round_trip() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.number.arabicToRoman(1994) AS r, \
+                    apoc.number.romanToArabic('MCMXCIV') AS a",
+        );
+        assert_eq!(str_prop(&rows[0], "r"), "MCMXCIV");
+        assert_eq!(int_prop(&rows[0], "a"), 1994);
+    }
+
+    #[test]
+    fn apoc_number_format_default_and_decimals() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.number.format(1234567) AS i, \
+                    apoc.number.format(1234.5678, 2) AS f, \
+                    apoc.number.format(1000, 2) AS ii",
+        );
+        assert_eq!(str_prop(&rows[0], "i"), "1,234,567");
+        assert_eq!(str_prop(&rows[0], "f"), "1,234.57");
+        assert_eq!(str_prop(&rows[0], "ii"), "1,000.00");
+    }
+
+    #[test]
+    fn apoc_number_roman_null_passthrough() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.number.arabicToRoman(null) AS r");
+        assert!(matches!(
+            rows[0].get("r"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+}
+
+#[cfg(feature = "apoc-create")]
+mod apoc_create {
+    use super::*;
+
+    #[test]
+    fn apoc_create_uuid_shape() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.create.uuid() AS id");
+        let id = str_prop(&rows[0], "id");
+        assert_eq!(id.len(), 36);
+        assert_eq!(&id[14..15], "4");
+    }
+
+    #[test]
+    fn apoc_create_uuid_base64_length() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.create.uuidBase64() AS b");
+        let b = str_prop(&rows[0], "b");
+        assert_eq!(b.len(), 22);
+    }
+
+    #[test]
+    fn apoc_create_uuid_format_round_trip() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "WITH '550e8400-e29b-41d4-a716-446655440000' AS hex \
+             RETURN apoc.create.uuidBase64ToHex(apoc.create.uuidHexToBase64(hex)) AS back",
+        );
+        assert_eq!(
+            str_prop(&rows[0], "back"),
+            "550e8400-e29b-41d4-a716-446655440000",
+        );
+    }
+
+    #[test]
+    fn apoc_create_uuid_conversions_null_propagate() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.create.uuidBase64ToHex(null) AS a, \
+                    apoc.create.uuidHexToBase64(null) AS b",
+        );
+        assert!(matches!(
+            rows[0].get("a"),
+            Some(Value::Property(Property::Null))
+        ));
+        assert!(matches!(
+            rows[0].get("b"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_create_uuid_is_fresh_per_call() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.create.uuid() AS a, apoc.create.uuid() AS b",
+        );
+        let a = str_prop(&rows[0], "a");
+        let b = str_prop(&rows[0], "b");
+        assert_ne!(a, b, "two apoc.create.uuid() calls should differ");
+    }
+
+    #[test]
+    fn apoc_create_node_persists_labels_and_props() {
+        let (store, _d) = open_store();
+        let created = run_with_default_procs(
+            &store,
+            "CALL apoc.create.node(['Person', 'Customer'], {name: 'alice', age: 30}) \
+             YIELD node RETURN node",
+        );
+        match created[0].get("node").unwrap() {
+            Value::Node(n) => {
+                let mut labels = n.labels.clone();
+                labels.sort();
+                assert_eq!(labels, vec!["Customer".to_string(), "Person".to_string()]);
+                assert_eq!(
+                    n.properties.get("name"),
+                    Some(&Property::String("alice".into())),
+                );
+                assert_eq!(n.properties.get("age"), Some(&Property::Int64(30)));
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+        // The node should now be findable via a regular MATCH —
+        // confirming the write went through the same store path
+        // CREATE uses, not just an in-memory yield.
+        let found = run(
+            &store,
+            "MATCH (p:Person) WHERE p.name = 'alice' RETURN p.age AS a",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(int_prop(&found[0], "a"), 30);
+    }
+
+    #[test]
+    fn apoc_create_node_with_null_labels_and_props_yields_empty_node() {
+        let (store, _d) = open_store();
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.create.node(null, null) YIELD node RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => {
+                assert!(n.labels.is_empty());
+                assert!(n.properties.is_empty());
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_create_node_skips_null_property_values() {
+        let (store, _d) = open_store();
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.create.node(['T'], {a: 1, b: null, c: 'x'}) YIELD node RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => {
+                assert_eq!(n.properties.get("a"), Some(&Property::Int64(1)));
+                assert_eq!(n.properties.get("c"), Some(&Property::String("x".into())));
+                assert!(
+                    !n.properties.contains_key("b"),
+                    "null property should be absent, found: {:?}",
+                    n.properties.get("b")
+                );
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_create_node_rejects_non_string_label() {
+        let (store, _d) = open_store();
+        let stmt = parse("CALL apoc.create.node([1, 2], {}) YIELD node RETURN node").unwrap();
+        let p = plan(&stmt).unwrap();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let params = ParamMap::new();
+        let err = execute_with_reader_and_procs(
+            &p,
+            &store as &dyn GraphReader,
+            &store as &dyn GraphWriter,
+            &params,
+            &procs,
+        )
+        .err()
+        .expect("expected an error for non-string label");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("apoc.create.node") && msg.to_ascii_lowercase().contains("string"),
+            "expected label-type error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn apoc_create_relationship_persists_edge_between_matched_nodes() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'alice'})");
+        run(&store, "CREATE (:Person {name: 'bob'})");
+        let created = run_with_default_procs(
+            &store,
+            "MATCH (a:Person {name: 'alice'}), (b:Person {name: 'bob'}) \
+             CALL apoc.create.relationship(a, 'KNOWS', {since: 2020}, b) YIELD rel \
+             RETURN rel",
+        );
+        match created[0].get("rel").unwrap() {
+            Value::Edge(e) => {
+                assert_eq!(e.edge_type, "KNOWS");
+                assert_eq!(e.properties.get("since"), Some(&Property::Int64(2020)));
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+        // Round-trip via MATCH to confirm it's actually persisted
+        // and traversable, not just emitted into the row stream.
+        let traversed = run(
+            &store,
+            "MATCH (a:Person {name: 'alice'})-[r:KNOWS]->(b:Person {name: 'bob'}) \
+             RETURN r.since AS y",
+        );
+        assert_eq!(traversed.len(), 1);
+        assert_eq!(int_prop(&traversed[0], "y"), 2020);
+    }
+
+    #[test]
+    fn apoc_create_relationship_with_null_props_yields_propertyless_edge() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})");
+        run(&store, "CREATE (:T {n: 2})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (a:T {n: 1}), (b:T {n: 2}) \
+             CALL apoc.create.relationship(a, 'R', null, b) YIELD rel \
+             RETURN rel",
+        );
+        match rows[0].get("rel").unwrap() {
+            Value::Edge(e) => {
+                assert_eq!(e.edge_type, "R");
+                assert!(e.properties.is_empty());
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_create_relationship_chains_with_apoc_create_node() {
+        // Both endpoints created by apoc.create.node, then the
+        // edge by apoc.create.relationship — exercises that
+        // Value::Node yielded by one write procedure flows into
+        // the next as an arg.
+        let (store, _d) = open_store();
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.create.node(['A'], {tag: 'left'}) YIELD node AS x \
+             CALL apoc.create.node(['A'], {tag: 'right'}) YIELD node AS y \
+             CALL apoc.create.relationship(x, 'LINK', {weight: 7}, y) YIELD rel \
+             RETURN rel",
+        );
+        match rows[0].get("rel").unwrap() {
+            Value::Edge(e) => {
+                assert_eq!(e.edge_type, "LINK");
+                assert_eq!(e.properties.get("weight"), Some(&Property::Int64(7)));
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+        let found = run(
+            &store,
+            "MATCH (l:A {tag: 'left'})-[r:LINK]->(:A {tag: 'right'}) RETURN r.weight AS w",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(int_prop(&found[0], "w"), 7);
+    }
+
+    #[test]
+    fn apoc_create_add_labels_appends_only_missing() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'alice'})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (n:Person {name: 'alice'}) \
+             CALL apoc.create.addLabels(n, ['Person', 'Customer', 'VIP']) YIELD node \
+             RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => {
+                let mut labels = n.labels.clone();
+                labels.sort();
+                assert_eq!(
+                    labels,
+                    vec![
+                        "Customer".to_string(),
+                        "Person".to_string(),
+                        "VIP".to_string(),
+                    ],
+                    "Person should not be duplicated; Customer and VIP added",
+                );
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+        let found = run(&store, "MATCH (n:VIP) RETURN n.name AS x");
+        assert_eq!(found.len(), 1);
+        assert_eq!(str_prop(&found[0], "x"), "alice");
+    }
+
+    #[test]
+    fn apoc_create_remove_labels_drops_only_present() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person:Customer:VIP {name: 'alice'})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (n:Person {name: 'alice'}) \
+             CALL apoc.create.removeLabels(n, ['VIP', 'Nonexistent']) YIELD node \
+             RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => {
+                let mut labels = n.labels.clone();
+                labels.sort();
+                assert_eq!(labels, vec!["Customer".to_string(), "Person".to_string()]);
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_create_set_labels_replaces_entire_label_set() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person:Customer {name: 'alice'})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (n:Person {name: 'alice'}) \
+             CALL apoc.create.setLabels(n, ['Visitor']) YIELD node \
+             RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => assert_eq!(n.labels, vec!["Visitor".to_string()]),
+            other => panic!("expected Node, got {other:?}"),
+        }
+        let still_person = run(&store, "MATCH (n:Person {name: 'alice'}) RETURN n");
+        assert!(still_person.is_empty());
+    }
+
+    #[test]
+    fn apoc_create_label_mutators_accept_node_list() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})");
+        run(&store, "CREATE (:T {n: 2})");
+        run(&store, "CREATE (:T {n: 3})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (n:T) WITH collect(n) AS xs \
+             CALL apoc.create.addLabels(xs, ['Marked']) YIELD node \
+             RETURN node",
+        );
+        assert_eq!(rows.len(), 3, "should yield one row per node in the list");
+        let marked = run(&store, "MATCH (n:Marked) RETURN n.n AS k ORDER BY k");
+        assert_eq!(marked.len(), 3);
+    }
+
+    #[test]
+    fn apoc_create_set_property_sets_and_clears() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {a: 1, b: 2})");
+        run_with_default_procs(
+            &store,
+            "MATCH (n:T) CALL apoc.create.setProperty(n, 'b', 99) YIELD node RETURN node",
+        );
+        let after_set = run(&store, "MATCH (n:T) RETURN n.b AS v");
+        assert_eq!(int_prop(&after_set[0], "v"), 99);
+        run_with_default_procs(
+            &store,
+            "MATCH (n:T) CALL apoc.create.setProperty(n, 'a', null) YIELD node RETURN node",
+        );
+        let after_clear = run(&store, "MATCH (n:T) RETURN keys(n) AS ks");
+        let names: Vec<String> = match after_clear[0].get("ks").unwrap() {
+            Value::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(Property::String(s)) => s.clone(),
+                    other => panic!("non-string key element: {other:?}"),
+                })
+                .collect(),
+            Value::Property(Property::List(items)) => items
+                .iter()
+                .map(|p| match p {
+                    Property::String(s) => s.clone(),
+                    other => panic!("non-string key element: {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected list at ks, got {other:?}"),
+        };
+        assert!(
+            !names.iter().any(|n| n == "a"),
+            "a should be cleared, got {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "b"));
+    }
+
+    #[test]
+    fn apoc_create_set_rel_property_sets_value() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})-[:R {w: 1}]->(:T {n: 2})");
+        run_with_default_procs(
+            &store,
+            "MATCH ()-[r:R]->() \
+             CALL apoc.create.setRelProperty(r, 'w', 42) YIELD rel RETURN rel",
+        );
+        let after = run(&store, "MATCH ()-[r:R]->() RETURN r.w AS v");
+        assert_eq!(int_prop(&after[0], "v"), 42);
+    }
+
+    #[test]
+    fn apoc_create_relationship_rejects_non_node_endpoint() {
+        let (store, _d) = open_store();
+        let stmt =
+            parse("CALL apoc.create.relationship(1, 'R', {}, 2) YIELD rel RETURN rel").unwrap();
+        let p = plan(&stmt).unwrap();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let params = ParamMap::new();
+        let err = execute_with_reader_and_procs(
+            &p,
+            &store as &dyn GraphReader,
+            &store as &dyn GraphWriter,
+            &params,
+            &procs,
+        )
+        .err()
+        .expect("expected an error for non-node endpoint");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("apoc.create.relationship") && msg.to_ascii_lowercase().contains("node"),
+            "expected node-type error, got: {msg}",
+        );
+    }
+}
+
+#[cfg(feature = "apoc-refactor")]
+mod apoc_refactor {
+    use super::*;
+
+    #[test]
+    fn apoc_refactor_set_type_changes_relationship_type() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})-[:OLD {w: 5}]->(:T {n: 2})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH ()-[r:OLD]->() \
+             CALL apoc.refactor.setType(r, 'NEW') YIELD rel \
+             RETURN rel",
+        );
+        match rows[0].get("rel").unwrap() {
+            Value::Edge(e) => {
+                assert_eq!(e.edge_type, "NEW");
+                assert_eq!(e.properties.get("w"), Some(&Property::Int64(5)));
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+        // Old type should no longer match anything.
+        let still_old = run(&store, "MATCH ()-[r:OLD]->() RETURN r");
+        assert!(still_old.is_empty(), "old type should be gone");
+        // New type matches with properties + endpoints preserved.
+        let by_new = run(
+            &store,
+            "MATCH (a:T)-[r:NEW]->(b:T) RETURN a.n AS s, b.n AS t, r.w AS w",
+        );
+        assert_eq!(by_new.len(), 1);
+        assert_eq!(int_prop(&by_new[0], "s"), 1);
+        assert_eq!(int_prop(&by_new[0], "t"), 2);
+        assert_eq!(int_prop(&by_new[0], "w"), 5);
+    }
+
+    #[test]
+    fn apoc_refactor_set_type_same_type_is_noop() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})-[:R {w: 7}]->(:T {n: 2})");
+        let before_id = match run(&store, "MATCH ()-[r:R]->() RETURN r")[0]
+            .get("r")
+            .unwrap()
+        {
+            Value::Edge(e) => e.id,
+            other => panic!("expected Edge, got {other:?}"),
+        };
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH ()-[r:R]->() \
+             CALL apoc.refactor.setType(r, 'R') YIELD rel \
+             RETURN rel",
+        );
+        // Same-type case must keep the original EdgeId — callers
+        // hold references to it (Bolt drivers, application code).
+        match rows[0].get("rel").unwrap() {
+            Value::Edge(e) => assert_eq!(e.id, before_id, "EdgeId must be preserved on no-op"),
+            other => panic!("expected Edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_refactor_set_type_rejects_null_new_type() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})-[:R]->(:T {n: 2})");
+        let stmt =
+            parse("MATCH ()-[r:R]->() CALL apoc.refactor.setType(r, null) YIELD rel RETURN rel")
+                .unwrap();
+        let p = plan(&stmt).unwrap();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let params = ParamMap::new();
+        let err = execute_with_reader_and_procs(
+            &p,
+            &store as &dyn GraphReader,
+            &store as &dyn GraphWriter,
+            &params,
+            &procs,
+        )
+        .err()
+        .expect("expected an error for null type");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("apoc.refactor.setType") && msg.to_ascii_lowercase().contains("null"),
+            "expected null-type error, got: {msg}",
+        );
+    }
+}
+
+#[cfg(feature = "apoc-meta")]
+mod apoc_meta {
+    use super::*;
+
+    #[test]
+    fn apoc_meta_type_for_each_scalar_kind() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.meta.type('x') AS s, \
+                    apoc.meta.type(1) AS i, \
+                    apoc.meta.type(1.5) AS f, \
+                    apoc.meta.type(true) AS b, \
+                    apoc.meta.type([1, 2]) AS l, \
+                    apoc.meta.type({k: 1}) AS m, \
+                    apoc.meta.type(null) AS n",
+        );
+        assert_eq!(str_prop(&rows[0], "s"), "STRING");
+        assert_eq!(str_prop(&rows[0], "i"), "INTEGER");
+        assert_eq!(str_prop(&rows[0], "f"), "FLOAT");
+        assert_eq!(str_prop(&rows[0], "b"), "BOOLEAN");
+        assert_eq!(str_prop(&rows[0], "l"), "LIST");
+        assert_eq!(str_prop(&rows[0], "m"), "MAP");
+        assert_eq!(str_prop(&rows[0], "n"), "NULL");
+    }
+
+    #[test]
+    fn apoc_meta_is_type_matches_case_insensitively() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.meta.isType(42, 'INTEGER') AS a, \
+                    apoc.meta.isType(42, 'integer') AS b, \
+                    apoc.meta.isType(42, 'STRING') AS c",
+        );
+        match rows[0].get("a").unwrap() {
+            Value::Property(Property::Bool(v)) => assert!(*v),
+            other => panic!("a: expected Bool, got {other:?}"),
+        }
+        match rows[0].get("b").unwrap() {
+            Value::Property(Property::Bool(v)) => assert!(*v),
+            other => panic!("b: expected Bool, got {other:?}"),
+        }
+        match rows[0].get("c").unwrap() {
+            Value::Property(Property::Bool(v)) => assert!(!*v),
+            other => panic!("c: expected Bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_meta_types_of_map_labels_each_entry() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.meta.types({name: 'alice', age: 30, score: 0.5}) AS t",
+        );
+        match rows[0].get("t").unwrap() {
+            Value::Property(Property::Map(m)) => {
+                assert_eq!(m.get("name"), Some(&Property::String("STRING".into())));
+                assert_eq!(m.get("age"), Some(&Property::String("INTEGER".into())));
+                assert_eq!(m.get("score"), Some(&Property::String("FLOAT".into())));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_meta_schema_reports_node_counts_and_property_types() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'alice', age: 30})");
+        run(&store, "CREATE (:Person {name: 'bob', age: 25})");
+        run(&store, "CREATE (:Widget {sku: 'abc'})");
+        let rows =
+            run_with_default_procs(&store, "CALL apoc.meta.schema() YIELD value RETURN value");
+        let Value::Property(Property::Map(m)) = rows[0].get("value").unwrap() else {
+            panic!("expected value to be a Map");
+        };
+        let Some(Property::Map(person)) = m.get("Person") else {
+            panic!(
+                "missing Person entry, got keys: {:?}",
+                m.keys().collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(person.get("type"), Some(&Property::String("node".into())));
+        assert_eq!(person.get("count"), Some(&Property::Int64(2)));
+        let Some(Property::Map(person_props)) = person.get("properties") else {
+            panic!("missing Person properties");
+        };
+        let Some(Property::Map(name_info)) = person_props.get("name") else {
+            panic!("missing Person.name info");
+        };
+        assert_eq!(
+            name_info.get("type"),
+            Some(&Property::String("STRING".into())),
+        );
+        let Some(Property::Map(age_info)) = person_props.get("age") else {
+            panic!("missing Person.age info");
+        };
+        assert_eq!(
+            age_info.get("type"),
+            Some(&Property::String("INTEGER".into())),
+        );
+        let Some(Property::Map(widget)) = m.get("Widget") else {
+            panic!("missing Widget entry");
+        };
+        assert_eq!(widget.get("count"), Some(&Property::Int64(1)));
+    }
+
+    #[test]
+    fn apoc_meta_schema_reports_relationship_counts_and_props() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (:Person {n: 1})-[:KNOWS {since: 2020}]->(:Person {n: 2})",
+        );
+        run(
+            &store,
+            "CREATE (:Person {n: 3})-[:KNOWS {since: 2021}]->(:Person {n: 4})",
+        );
+        let rows =
+            run_with_default_procs(&store, "CALL apoc.meta.schema() YIELD value RETURN value");
+        let Value::Property(Property::Map(m)) = rows[0].get("value").unwrap() else {
+            panic!("expected Map");
+        };
+        let Some(Property::Map(knows)) = m.get("KNOWS") else {
+            panic!(
+                "missing KNOWS entry, got keys: {:?}",
+                m.keys().collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(
+            knows.get("type"),
+            Some(&Property::String("relationship".into())),
+        );
+        assert_eq!(knows.get("count"), Some(&Property::Int64(2)));
+        let Some(Property::Map(props)) = knows.get("properties") else {
+            panic!("missing KNOWS properties");
+        };
+        let Some(Property::Map(since_info)) = props.get("since") else {
+            panic!("missing KNOWS.since info");
+        };
+        assert_eq!(
+            since_info.get("type"),
+            Some(&Property::String("INTEGER".into())),
+        );
+    }
+
+    #[test]
+    fn apoc_meta_schema_marks_indexed_property_true() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE INDEX FOR (n:Person) ON (n.name)");
+        run(&store, "CREATE (:Person {name: 'alice', age: 30})");
+        let rows =
+            run_with_default_procs(&store, "CALL apoc.meta.schema() YIELD value RETURN value");
+        let Value::Property(Property::Map(m)) = rows[0].get("value").unwrap() else {
+            panic!("expected Map");
+        };
+        let Property::Map(person) = m.get("Person").unwrap() else {
+            panic!("missing Person")
+        };
+        let Property::Map(props) = person.get("properties").unwrap() else {
+            panic!("missing properties")
+        };
+        let Property::Map(name_info) = props.get("name").unwrap() else {
+            panic!("missing name info")
+        };
+        assert_eq!(name_info.get("indexed"), Some(&Property::Bool(true)));
+        let Property::Map(age_info) = props.get("age").unwrap() else {
+            panic!("missing age info")
+        };
+        assert_eq!(age_info.get("indexed"), Some(&Property::Bool(false)));
+    }
+}
+
+mod apoc_agg {
+    use super::*;
+
+    #[test]
+    fn apoc_agg_first_and_last() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [1, 2, 3, 4, 5] AS x \
+             RETURN apoc.agg.first(x) AS f, apoc.agg.last(x) AS l",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(int_prop(&rows[0], "f"), 1);
+        assert_eq!(int_prop(&rows[0], "l"), 5);
+    }
+
+    #[test]
+    fn apoc_agg_first_skips_nulls() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [null, null, 'hello', 'world'] AS x \
+             RETURN apoc.agg.first(x) AS f",
+        );
+        assert_eq!(str_prop(&rows[0], "f"), "hello");
+    }
+
+    #[test]
+    fn apoc_agg_nth_indexes_from_zero() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [10, 20, 30, 40] AS x RETURN apoc.agg.nth(x, 2) AS third",
+        );
+        assert_eq!(int_prop(&rows[0], "third"), 30);
+    }
+
+    #[test]
+    fn apoc_agg_nth_past_end_is_null() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [1, 2, 3] AS x RETURN apoc.agg.nth(x, 10) AS fifth",
+        );
+        assert!(matches!(
+            rows[0].get("fifth"),
+            Some(Value::Null) | Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_agg_median_odd_and_even_length() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [5, 1, 3, 2, 4] AS x RETURN apoc.agg.median(x) AS m",
+        );
+        match rows[0].get("m").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 3.0),
+            other => panic!("expected Float64 median, got {other:?}"),
+        }
+        // Even length → average of two middles.
+        let rows = run(
+            &store,
+            "UNWIND [1, 2, 3, 4] AS x RETURN apoc.agg.median(x) AS m",
+        );
+        match rows[0].get("m").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 2.5),
+            other => panic!("expected Float64 median, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_agg_product_integer_stays_integer() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [2, 3, 5] AS x RETURN apoc.agg.product(x) AS p",
+        );
+        assert_eq!(int_prop(&rows[0], "p"), 30);
+    }
+
+    #[test]
+    fn apoc_agg_product_mixed_numeric_promotes_to_float() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "UNWIND [2, 3, 0.5] AS x RETURN apoc.agg.product(x) AS p",
+        );
+        match rows[0].get("p").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 3.0),
+            other => panic!("expected Float64 product, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_agg_product_empty_stream_is_null() {
+        let (store, _d) = open_store();
+        // UNWIND over an empty list produces no rows; the aggregate
+        // still emits one finalized output row.
+        let rows = run(&store, "UNWIND [] AS x RETURN apoc.agg.product(x) AS p");
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0].get("p"),
+            Some(Value::Null) | Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_agg_grouped_by_key() {
+        let (store, _d) = open_store();
+        // Group by parity and pick the first of each bucket.
+        let mut rows = run(
+            &store,
+            "UNWIND [1, 2, 3, 4, 5, 6] AS x \
+             RETURN x % 2 AS parity, apoc.agg.first(x) AS first",
+        );
+        rows.sort_by_key(|r| int_prop(r, "parity"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(int_prop(&rows[0], "parity"), 0);
+        assert_eq!(int_prop(&rows[0], "first"), 2);
+        assert_eq!(int_prop(&rows[1], "parity"), 1);
+        assert_eq!(int_prop(&rows[1], "first"), 1);
+    }
+
+    #[test]
+    fn apoc_agg_nth_negative_index_errors() {
+        let (store, _d) = open_store();
+        let stmt = parse("UNWIND [1, 2] AS x RETURN apoc.agg.nth(x, -1) AS f").unwrap();
+        let p = plan(&stmt).unwrap();
+        let err = execute(&p, &store).unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected out-of-range error, got: {err}"
+        );
+    }
+}

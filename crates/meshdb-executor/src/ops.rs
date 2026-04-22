@@ -2290,9 +2290,32 @@ impl ProcedureCallOp {
             return Ok(());
         }
         let args = self.evaluate_args(ctx, input_row, proc)?;
-        let rows = proc.resolve_rows(ctx.store)?;
+        // Write builtins (apoc.create.node, …) take the writer +
+        // args directly and produce already-final rows, so we skip
+        // the row_matches filter that read builtins use to look up
+        // matching candidate rows from a static / read-derived set.
+        let is_write = proc.is_write_builtin();
+        let rows = if is_write {
+            // The cfg gate must include every feature that owns a
+            // write builtin — `is_write_builtin` returns true only
+            // when one of those features is on, so widen the gate
+            // when a new write namespace lands.
+            #[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+            {
+                proc.resolve_write_rows(ctx.store, ctx.writer, &args)?
+            }
+            #[cfg(not(any(feature = "apoc-create", feature = "apoc-refactor")))]
+            {
+                let _ = (ctx, &args);
+                return Err(Error::Procedure(
+                    "write procedure dispatched in a non-write-apoc build".into(),
+                ));
+            }
+        } else {
+            proc.resolve_rows(ctx.store)?
+        };
         for proc_row in &rows {
-            if !proc.row_matches(proc_row, &args) {
+            if !is_write && !proc.row_matches(proc_row, &args) {
                 continue;
             }
             let mut merged = if self.standalone {
@@ -5481,12 +5504,13 @@ impl AggregateOp {
                         continue;
                     }
                 }
-                entry.agg_states[i].update(&spec.arg, &ctx.eval_ctx(&row))?;
-                // The percentile is a constant expression — evaluate
-                // it once against the first row we see and stash it
-                // in the state so finalize() has a number to use.
+                // Resolve the extra-arg constant *before* update so
+                // `apoc.agg.nth` sees its target index on row 0;
+                // percentile aggregators just collect into a Vec and
+                // don't read the extra arg during update, so the
+                // ordering is safe for them too.
                 if let Some(extra_expr) = &spec.extra_arg {
-                    let need_resolve = matches!(
+                    let need_resolve_percentile = matches!(
                         &entry.agg_states[i],
                         AggState::PercentileDisc {
                             percentile: None,
@@ -5496,7 +5520,9 @@ impl AggregateOp {
                             ..
                         }
                     );
-                    if need_resolve {
+                    let need_resolve_nth =
+                        matches!(&entry.agg_states[i], AggState::ApocNth { target: None, .. });
+                    if need_resolve_percentile {
                         let pv = eval_expr(extra_expr, &ctx.eval_ctx(&row))?;
                         let p = match pv {
                             Value::Property(Property::Float64(f)) => f,
@@ -5517,7 +5543,27 @@ impl AggregateOp {
                             _ => {}
                         }
                     }
+                    if need_resolve_nth {
+                        let nv = eval_expr(extra_expr, &ctx.eval_ctx(&row))?;
+                        let n = match nv {
+                            Value::Property(Property::Int64(i)) => i,
+                            _ => {
+                                return Err(Error::Procedure(
+                                    "apoc.agg.nth expects an integer index".into(),
+                                ))
+                            }
+                        };
+                        if n < 0 {
+                            return Err(Error::Procedure(format!(
+                                "apoc.agg.nth index out of range: {n}"
+                            )));
+                        }
+                        if let AggState::ApocNth { target, .. } = &mut entry.agg_states[i] {
+                            *target = Some(n);
+                        }
+                    }
                 }
+                entry.agg_states[i].update(&spec.arg, &ctx.eval_ctx(&row))?;
             }
         }
 
@@ -5608,6 +5654,30 @@ enum AggState {
         items: Vec<Value>,
         percentile: Option<f64>,
     },
+    /// `apoc.agg.first` — latches the first non-null value seen.
+    ApocFirst(Option<Value>),
+    /// `apoc.agg.last` — overwrites the slot on every non-null value.
+    ApocLast(Option<Value>),
+    /// `apoc.agg.nth(expr, n)` — `target` is the constant `n`, resolved
+    /// once from the spec's `extra_arg` on the first row (same shape
+    /// as percentiles). `count` tracks non-null inputs; `slot` is set
+    /// exactly when `count` reaches `target`.
+    ApocNth {
+        target: Option<i64>,
+        count: i64,
+        slot: Option<Value>,
+    },
+    /// `apoc.agg.median` — collects numeric values, sort + pick middle
+    /// (or average of the two middles) at finalize.
+    ApocMedian(Vec<f64>),
+    /// `apoc.agg.product` — running product. Mirrors the Sum
+    /// int-vs-float split so integer-only streams stay in Int64.
+    ApocProduct {
+        int_part: i64,
+        float_part: f64,
+        is_float: bool,
+        seen: bool,
+    },
 }
 
 impl AggState {
@@ -5643,6 +5713,20 @@ impl AggState {
             AggregateFn::PercentileCont => AggState::PercentileCont {
                 items: Vec::new(),
                 percentile: None,
+            },
+            AggregateFn::ApocFirst => AggState::ApocFirst(None),
+            AggregateFn::ApocLast => AggState::ApocLast(None),
+            AggregateFn::ApocNth => AggState::ApocNth {
+                target: None,
+                count: 0,
+                slot: None,
+            },
+            AggregateFn::ApocMedian => AggState::ApocMedian(Vec::new()),
+            AggregateFn::ApocProduct => AggState::ApocProduct {
+                int_part: 1,
+                float_part: 1.0,
+                is_float: false,
+                seen: false,
             },
         }
     }
@@ -5754,6 +5838,70 @@ impl AggState {
                     _ => return Err(Error::AggregateTypeError),
                 }
             }
+            AggState::ApocFirst(slot) => {
+                if slot.is_some() {
+                    return Ok(());
+                }
+                let v = expr_arg_value(arg, ctx)?;
+                if !matches!(v, Value::Null | Value::Property(Property::Null)) {
+                    *slot = Some(v);
+                }
+            }
+            AggState::ApocLast(slot) => {
+                let v = expr_arg_value(arg, ctx)?;
+                if !matches!(v, Value::Null | Value::Property(Property::Null)) {
+                    *slot = Some(v);
+                }
+            }
+            AggState::ApocNth {
+                target,
+                count,
+                slot,
+            } => {
+                if slot.is_some() {
+                    return Ok(());
+                }
+                let v = expr_arg_value(arg, ctx)?;
+                if matches!(v, Value::Null | Value::Property(Property::Null)) {
+                    return Ok(());
+                }
+                if let Some(t) = *target {
+                    if *count == t {
+                        *slot = Some(v);
+                    }
+                    *count += 1;
+                }
+            }
+            AggState::ApocMedian(items) => {
+                let v = expr_arg_value(arg, ctx)?;
+                match v {
+                    Value::Null | Value::Property(Property::Null) => {}
+                    Value::Property(Property::Int64(i)) => items.push(i as f64),
+                    Value::Property(Property::Float64(f)) => items.push(f),
+                    _ => return Err(Error::AggregateTypeError),
+                }
+            }
+            AggState::ApocProduct {
+                int_part,
+                float_part,
+                is_float,
+                seen,
+            } => {
+                let v = expr_arg_value(arg, ctx)?;
+                match v {
+                    Value::Null | Value::Property(Property::Null) => {}
+                    Value::Property(Property::Int64(i)) => {
+                        *int_part = int_part.saturating_mul(i);
+                        *seen = true;
+                    }
+                    Value::Property(Property::Float64(f)) => {
+                        *float_part *= f;
+                        *is_float = true;
+                        *seen = true;
+                    }
+                    _ => return Err(Error::AggregateTypeError),
+                }
+            }
         }
         Ok(())
     }
@@ -5807,6 +5955,45 @@ impl AggState {
             }
             AggState::PercentileCont { items, percentile } => {
                 percentile_cont(items, percentile.unwrap_or(0.0))
+            }
+            AggState::ApocFirst(slot) | AggState::ApocLast(slot) => match slot {
+                Some(v) => v.clone(),
+                None => Value::Null,
+            },
+            AggState::ApocNth { slot, .. } => match slot {
+                Some(v) => v.clone(),
+                None => Value::Null,
+            },
+            AggState::ApocMedian(items) => {
+                if items.is_empty() {
+                    return Value::Null;
+                }
+                let mut sorted = items.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let n = sorted.len();
+                let median = if n % 2 == 1 {
+                    sorted[n / 2]
+                } else {
+                    (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+                };
+                Value::Property(Property::Float64(median))
+            }
+            AggState::ApocProduct {
+                int_part,
+                float_part,
+                is_float,
+                seen,
+            } => {
+                // Empty stream: null, matching the convention for
+                // avg/min/max (and unlike sum, which folds to 0).
+                if !*seen {
+                    return Value::Null;
+                }
+                if *is_float {
+                    Value::Property(Property::Float64(*float_part * *int_part as f64))
+                } else {
+                    Value::Property(Property::Int64(*int_part))
+                }
             }
         }
     }

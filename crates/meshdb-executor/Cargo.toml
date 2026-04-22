@@ -10,6 +10,7 @@ description = "Physical operators and query execution for Mesh"
 meshdb-core = { workspace = true }
 meshdb-storage = { workspace = true }
 meshdb-cypher = { workspace = true }
+meshdb-apoc = { workspace = true, optional = true }
 serde = { workspace = true }
 thiserror.workspace = true
 chrono.workspace = true
@@ -19,3 +20,49 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# APOC-compatible scalars are split into per-namespace sub-features
+# so users can compile in exactly the subset they need. Turning on
+# any sub-feature activates the executor-side adapter via the
+# private `__apoc` marker; the umbrella `apoc` feature pulls in
+# every shipped namespace and is the convenience knob for "just
+# give me all of APOC".
+default = []
+
+# Private marker — any `apoc-*` sub-feature depends on it so the
+# adapter code in `eval.rs` only compiles when something actually
+# needs it. Users don't set this directly.
+__apoc = []
+
+# Per-namespace opt-in. Each maps 1:1 to a feature on the
+# `meshdb-apoc` crate.
+apoc-coll = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/coll"]
+apoc-text = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/text"]
+apoc-map = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/map"]
+apoc-util = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/util"]
+apoc-convert = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/convert"]
+apoc-date = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/date"]
+apoc-number = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/number"]
+apoc-create = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/create"]
+apoc-meta = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/meta"]
+# `apoc.refactor.*` is procedure-only — there's no scalar slice in
+# `meshdb-apoc` to depend on, so this feature gates the executor-
+# side procedure registration directly. No `__apoc` either, since
+# that flag is the scalar dispatcher's marker.
+apoc-refactor = []
+
+# Umbrella: every shipped namespace. Add new sub-features here as
+# they land so `--features apoc` keeps meaning "everything".
+apoc = [
+    "apoc-coll",
+    "apoc-text",
+    "apoc-map",
+    "apoc-util",
+    "apoc-convert",
+    "apoc-date",
+    "apoc-number",
+    "apoc-create",
+    "apoc-meta",
+    "apoc-refactor",
+]
