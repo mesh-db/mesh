@@ -6855,6 +6855,15 @@ fn is_non_deterministic_function(name: &str) -> bool {
 }
 
 fn is_known_scalar_function(name: &str) -> bool {
+    // `apoc.*` functions are opt-in Cargo features resolved at
+    // runtime by the executor's APOC adapter. The planner doesn't
+    // know which sub-features the current build carries, so
+    // accept any `apoc.*` name here and let the runtime dispatcher
+    // raise a precise `UnknownFunction` if the namespace / name
+    // isn't available in this build.
+    if name.to_ascii_lowercase().starts_with("apoc.") {
+        return true;
+    }
     matches!(
         name.to_ascii_lowercase().as_str(),
         "size"

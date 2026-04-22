@@ -9629,3 +9629,69 @@ mod apoc_number {
         ));
     }
 }
+
+#[cfg(feature = "apoc-create")]
+mod apoc_create {
+    use super::*;
+
+    #[test]
+    fn apoc_create_uuid_shape() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.create.uuid() AS id");
+        let id = str_prop(&rows[0], "id");
+        assert_eq!(id.len(), 36);
+        assert_eq!(&id[14..15], "4");
+    }
+
+    #[test]
+    fn apoc_create_uuid_base64_length() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.create.uuidBase64() AS b");
+        let b = str_prop(&rows[0], "b");
+        assert_eq!(b.len(), 22);
+    }
+
+    #[test]
+    fn apoc_create_uuid_format_round_trip() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "WITH '550e8400-e29b-41d4-a716-446655440000' AS hex \
+             RETURN apoc.create.uuidBase64ToHex(apoc.create.uuidHexToBase64(hex)) AS back",
+        );
+        assert_eq!(
+            str_prop(&rows[0], "back"),
+            "550e8400-e29b-41d4-a716-446655440000",
+        );
+    }
+
+    #[test]
+    fn apoc_create_uuid_conversions_null_propagate() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.create.uuidBase64ToHex(null) AS a, \
+                    apoc.create.uuidHexToBase64(null) AS b",
+        );
+        assert!(matches!(
+            rows[0].get("a"),
+            Some(Value::Property(Property::Null))
+        ));
+        assert!(matches!(
+            rows[0].get("b"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_create_uuid_is_fresh_per_call() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.create.uuid() AS a, apoc.create.uuid() AS b",
+        );
+        let a = str_prop(&rows[0], "a");
+        let b = str_prop(&rows[0], "b");
+        assert_ne!(a, b, "two apoc.create.uuid() calls should differ");
+    }
+}

@@ -44,6 +44,7 @@ apoc-util = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/util"]
 apoc-convert = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/convert"]
 apoc-date = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/date"]
 apoc-number = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/number"]
+apoc-create = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/create"]
 
 # Umbrella: every shipped namespace. Add new sub-features here as
 # they land so `--features apoc` keeps meaning "everything".
@@ -55,4 +56,5 @@ apoc = [
     "apoc-convert",
     "apoc-date",
     "apoc-number",
+    "apoc-create",
 ]
