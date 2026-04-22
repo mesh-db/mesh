@@ -22,7 +22,8 @@ use crate::proto::{
     GetEdgeResponse, GetNodeRequest, GetNodeResponse, HealthRequest, HealthResponse, NeighborInfo,
     NeighborRequest, NeighborResponse, NodesByLabelRequest, NodesByLabelResponse,
     NodesByPropertyRequest, NodesByPropertyResponse, PropertyTypeKind as ProtoPropertyTypeKind,
-    PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse,
+    PutEdgeRequest, PutEdgeResponse, PutNodeRequest, PutNodeResponse, ResolveTransactionRequest,
+    ResolveTransactionResponse,
 };
 use crate::raft_applier::{storage_kind, storage_scope};
 use crate::routing::Routing;
@@ -64,6 +65,11 @@ pub struct MeshService {
     /// only behaviour — acceptable for single-node tests but not for
     /// a production routing cluster.
     participant_log: Option<Arc<crate::ParticipantLog>>,
+    /// Per-phase deadlines applied to every peer RPC the coordinator
+    /// issues on this service. Defaulted at construction; overrides
+    /// exist for tests that need millisecond-scale deadlines to
+    /// exercise the timeout paths.
+    tx_timeouts: crate::TxCoordinatorTimeouts,
     /// Client TLS config used when this service builds ad-hoc gRPC
     /// endpoints (leader forwarding in Raft mode, for example). `None`
     /// means inter-peer gRPC traffic is plaintext. The `Routing` /
@@ -83,6 +89,7 @@ impl MeshService {
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
             participant_log: None,
+            tx_timeouts: crate::TxCoordinatorTimeouts::default(),
             client_tls: None,
         }
     }
@@ -109,6 +116,7 @@ impl MeshService {
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log,
             participant_log: None,
+            tx_timeouts: crate::TxCoordinatorTimeouts::default(),
             client_tls: None,
         }
     }
@@ -119,6 +127,15 @@ impl MeshService {
     /// `None`) for local-only services that don't run the 2PC path.
     pub fn with_participant_log(mut self, log: Option<Arc<crate::ParticipantLog>>) -> Self {
         self.participant_log = log;
+        self
+    }
+
+    /// Override the per-phase 2PC coordinator deadlines applied to
+    /// every peer RPC this service issues as coordinator. Defaults
+    /// come from [`crate::TxCoordinatorTimeouts::default`]; tests
+    /// that want to exercise the timeout branch pass shorter values.
+    pub fn with_tx_timeouts(mut self, timeouts: crate::TxCoordinatorTimeouts) -> Self {
+        self.tx_timeouts = timeouts;
         self
     }
 
@@ -134,6 +151,7 @@ impl MeshService {
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
             participant_log: None,
+            tx_timeouts: crate::TxCoordinatorTimeouts::default(),
             client_tls: None,
         }
     }
@@ -444,7 +462,8 @@ impl MeshService {
                 return Ok(());
             }
             let mut coordinator =
-                TxCoordinator::new(self.store.as_ref(), &self.pending_batches, routing);
+                TxCoordinator::new(self.store.as_ref(), &self.pending_batches, routing)
+                    .with_timeouts(self.tx_timeouts);
             if let Some(log) = self.coordinator_log.as_deref() {
                 coordinator = coordinator.with_log(log);
             }
@@ -629,11 +648,9 @@ impl MeshService {
     /// resolve on *its* restart (the staging is in-memory and dies
     /// with the process).
     /// Rehydrate participant-side 2PC state from the durable log at
-    /// startup. Must be called before the `BatchWrite` RPC becomes
-    /// reachable, otherwise an inbound COMMIT can race ahead of the
-    /// replay and observe empty staging for a txid that actually
-    /// survived the crash. Synchronous — the log is tiny and the
-    /// replay is cheap.
+    /// startup. Synchronous complement to
+    /// [`Self::recover_participant_decisions`]; call this one first
+    /// so the staging map is populated before peer polling.
     ///
     /// Walks the participant log end-to-end:
     /// - Every `Prepared` whose last entry is still `Prepared` gets
@@ -685,6 +702,122 @@ impl MeshService {
                 aborted = aborted_count,
                 "recovered participant 2PC state from log",
             );
+        }
+        Ok(())
+    }
+
+    /// After [`Self::recover_participant_staging`] has rehydrated the
+    /// staging map, poll every peer's `ResolveTransaction` RPC for
+    /// each in-doubt txid and apply the decision locally when a peer
+    /// reports one. Closes the "coordinator alive, participant
+    /// crashed" window without waiting out the staging TTL — the
+    /// original coordinator's log carries the authoritative decision,
+    /// and any cluster peer can look it up for us.
+    ///
+    /// UNKNOWN from every peer means no coordinator has the
+    /// decision; the txid keeps its in-doubt state and eventually
+    /// ages out via the staging sweeper. No-op when the service has
+    /// no participant log or no routing (single-node / Raft).
+    pub async fn recover_participant_decisions(&self) -> std::result::Result<(), Status> {
+        let Some(log) = self.participant_log.clone() else {
+            return Ok(());
+        };
+        let Some(routing) = self.routing.clone() else {
+            return Ok(());
+        };
+
+        let entries = log
+            .read_all()
+            .map_err(|e| Status::internal(format!("reading participant log: {e}")))?;
+        let in_doubt = crate::replay_in_doubt_commands(&entries);
+        if in_doubt.is_empty() {
+            return Ok(());
+        }
+
+        let self_id = routing.cluster().self_id();
+        let remote_peers: Vec<meshdb_cluster::PeerId> = routing
+            .cluster()
+            .membership()
+            .peer_ids()
+            .filter(|p| *p != self_id)
+            .collect();
+        if remote_peers.is_empty() {
+            return Ok(());
+        }
+
+        let mut resolved = 0usize;
+        for (txid, _commands) in in_doubt {
+            let mut decision: Option<crate::proto::TxResolutionStatus> = None;
+            for peer in &remote_peers {
+                let Some(mut client) = routing.write_client(*peer) else {
+                    continue;
+                };
+                let req = ResolveTransactionRequest { txid: txid.clone() };
+                match client.resolve_transaction(req).await {
+                    Ok(resp) => {
+                        let status =
+                            crate::proto::TxResolutionStatus::try_from(resp.into_inner().status)
+                                .unwrap_or(crate::proto::TxResolutionStatus::Unspecified);
+                        match status {
+                            crate::proto::TxResolutionStatus::Committed
+                            | crate::proto::TxResolutionStatus::Aborted => {
+                                decision = Some(status);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %peer,
+                            txid = %txid,
+                            error = %e,
+                            "resolve_transaction RPC failed",
+                        );
+                    }
+                }
+            }
+
+            match decision {
+                Some(crate::proto::TxResolutionStatus::Committed) => {
+                    if let Some(cmds) = self.pending_batches.take(&txid) {
+                        if let Err(e) = apply_prepared_batch(self.store.as_ref(), &cmds) {
+                            tracing::warn!(
+                                txid = %txid,
+                                error = %e,
+                                "recovery apply failed; leaving in-doubt",
+                            );
+                            continue;
+                        }
+                    }
+                    if let Err(e) =
+                        log.append(&crate::ParticipantLogEntry::Committed { txid: txid.clone() })
+                    {
+                        tracing::warn!(error = %e, "participant log Committed append failed");
+                    }
+                    self.pending_batches
+                        .finalize(txid, crate::staging::TerminalOutcome::Committed);
+                    resolved += 1;
+                }
+                Some(crate::proto::TxResolutionStatus::Aborted) => {
+                    let _ = self.pending_batches.take(&txid);
+                    if let Err(e) =
+                        log.append(&crate::ParticipantLogEntry::Aborted { txid: txid.clone() })
+                    {
+                        tracing::warn!(error = %e, "participant log Aborted append failed");
+                    }
+                    self.pending_batches
+                        .finalize(txid, crate::staging::TerminalOutcome::Aborted);
+                    resolved += 1;
+                }
+                _ => {
+                    // No peer had a decision — leave it in-doubt for
+                    // the coordinator to push or the TTL to clean up.
+                }
+            }
+        }
+        if resolved > 0 {
+            tracing::info!(resolved, "resolved in-doubt transactions via peer polling");
         }
         Ok(())
     }
@@ -2170,25 +2303,58 @@ impl MeshWrite for MeshService {
             BatchPhase::Prepare => {
                 let commands: Vec<GraphCommand> =
                     serde_json::from_slice(&req.commands_json).map_err(bad_request)?;
-                // Durable first, staging second. If the fsync succeeds
-                // but the in-memory insert somehow fails (only path
-                // today is a duplicate txid), the log entry is
-                // harmless — startup replay ignores txids whose most
-                // recent log entry is a Prepared AND whose commands
-                // are already in staging.
-                if let Some(log) = &self.participant_log {
-                    log.append(&crate::ParticipantLogEntry::Prepared {
-                        txid: txid.clone(),
-                        commands: commands.clone(),
-                    })
-                    .map_err(internal)?;
+                // Terminal outcome takes precedence over staging
+                // state: a PREPARE arriving after the coordinator's
+                // COMMIT (or ABORT) already reached this peer is a
+                // coordinator bug. Return `already_exists` with an
+                // error message that names the prior decision so the
+                // coordinator's logs show the causal order.
+                if let Some(outcome) = self.pending_batches.terminal_outcome(&txid) {
+                    let label = match outcome {
+                        crate::staging::TerminalOutcome::Committed => "committed",
+                        crate::staging::TerminalOutcome::Aborted => "aborted",
+                    };
+                    return Err(Status::already_exists(format!(
+                        "txid {} was already {} on this peer",
+                        txid, label
+                    )));
                 }
-                self.pending_batches
-                    .try_insert(txid.clone(), commands)
-                    .map_err(|()| {
-                        Status::already_exists(format!("txid {} already prepared", txid))
-                    })?;
-                Ok(Response::new(BatchWriteResponse {}))
+                match self
+                    .pending_batches
+                    .try_insert_or_match(txid.clone(), commands.clone())
+                {
+                    crate::staging::InsertOutcome::Inserted => {
+                        // Fresh PREPARE — fsync before ACKing so a
+                        // crash between here and the return doesn't
+                        // orphan the staged batch. Log AFTER the
+                        // insert so a retry that finds the staged
+                        // entry via `Duplicate` doesn't double-log.
+                        if let Some(log) = &self.participant_log {
+                            if let Err(e) = log.append(&crate::ParticipantLogEntry::Prepared {
+                                txid: txid.clone(),
+                                commands,
+                            }) {
+                                // Rolling back the staging entry keeps
+                                // the invariant "staged implies logged"
+                                // after a fsync failure.
+                                let _ = self.pending_batches.take(&txid);
+                                return Err(internal(e));
+                            }
+                        }
+                        Ok(Response::new(BatchWriteResponse {}))
+                    }
+                    crate::staging::InsertOutcome::Duplicate => {
+                        // Identical retry — the first PREPARE
+                        // already fsync'd its log entry and staged
+                        // the commands. Nothing to do; return OK so
+                        // a coordinator retry after a transient
+                        // network glitch proceeds to COMMIT cleanly.
+                        Ok(Response::new(BatchWriteResponse {}))
+                    }
+                    crate::staging::InsertOutcome::Conflict => Err(Status::already_exists(
+                        format!("txid {} already prepared with different commands", txid),
+                    )),
+                }
             }
             BatchPhase::Commit => {
                 // Three cases on receiving COMMIT:
@@ -2391,5 +2557,40 @@ impl MeshWrite for MeshService {
             .drop_property_constraint(&req.name, req.if_exists)
             .map_err(internal)?;
         Ok(Response::new(DropPropertyConstraintResponse {}))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "resolve_transaction", txid))]
+    async fn resolve_transaction(
+        &self,
+        request: Request<ResolveTransactionRequest>,
+    ) -> Result<Response<ResolveTransactionResponse>, Status> {
+        let req = request.into_inner();
+        let txid = req.txid;
+        tracing::Span::current().record("txid", txid.as_str());
+
+        let Some(log) = self.coordinator_log.as_ref() else {
+            // This peer isn't a coordinator (no log) — can't possibly
+            // know the decision for anyone's txid. Return UNKNOWN so
+            // the caller keeps polling other peers.
+            return Ok(Response::new(ResolveTransactionResponse {
+                status: crate::proto::TxResolutionStatus::Unknown as i32,
+            }));
+        };
+
+        let entries = log
+            .read_all()
+            .map_err(|e| Status::internal(format!("reading coordinator log: {e}")))?;
+        let state = crate::coordinator_log::reconstruct_state(&entries);
+        let status = match state.get(&txid) {
+            Some(s) => match s.decision {
+                Some(crate::TxDecision::Commit) => crate::proto::TxResolutionStatus::Committed,
+                Some(crate::TxDecision::Abort) => crate::proto::TxResolutionStatus::Aborted,
+                None => crate::proto::TxResolutionStatus::Unknown,
+            },
+            None => crate::proto::TxResolutionStatus::Unknown,
+        };
+        Ok(Response::new(ResolveTransactionResponse {
+            status: status as i32,
+        }))
     }
 }

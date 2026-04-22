@@ -261,6 +261,15 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         tracing::warn!(error = %e, "participant staging recovery failed; continuing");
     }
 
+    // Poll every peer's `ResolveTransaction` RPC to learn the
+    // coordinator's decision for any in-doubt txid this peer is
+    // holding. Short-circuits the staging TTL in the common case
+    // where the coordinator is still alive but this peer crashed
+    // mid-flight.
+    if let Err(e) = service.recover_participant_decisions().await {
+        tracing::warn!(error = %e, "participant decision recovery failed; continuing");
+    }
+
     // Reconcile any transactions left unfinished by a prior crash
     // before we start accepting new traffic. In single-node and Raft
     // modes this is a no-op (no coordinator log). In routing mode,

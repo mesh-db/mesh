@@ -38,6 +38,7 @@ pub use routing::{Routing, RoutingError};
 pub use routing_writer::RoutingGraphWriter;
 pub use server::MeshService;
 pub use staging::{
-    ParticipantStaging, TerminalOutcome, DEFAULT_STAGING_TTL, DEFAULT_SWEEP_INTERVAL,
+    InsertOutcome, ParticipantStaging, TerminalOutcome, DEFAULT_STAGING_TTL, DEFAULT_SWEEP_INTERVAL,
 };
+pub use tx_coordinator::TxCoordinatorTimeouts;
 pub use tx_overlay::{OverlayGraphReader, TxOverlayState};

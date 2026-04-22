@@ -8,7 +8,9 @@ use meshdb_rpc::proto::{
     EdgesByPropertyRequest, ExecuteCypherRequest, GetEdgeRequest, GetNodeRequest, HealthRequest,
     NeighborRequest, NodesByLabelRequest, PutEdgeRequest, PutNodeRequest, UuidBytes,
 };
-use meshdb_rpc::{CoordinatorLog, MeshService, ParticipantLog, Routing, TxLogEntry};
+use meshdb_rpc::{
+    CoordinatorLog, MeshService, ParticipantLog, Routing, TxCoordinatorTimeouts, TxLogEntry,
+};
 use meshdb_storage::{RocksDbStorageEngine as Store, StorageEngine};
 use std::sync::Arc;
 use std::time::Duration;
@@ -921,9 +923,11 @@ async fn batch_write_abort_discards_staged_commands() {
 }
 
 #[tokio::test]
-async fn batch_write_duplicate_prepare_rejected() {
-    // Preparing the same txid twice must fail so a coordinator bug
-    // can't silently clobber a concurrent transaction's staged state.
+async fn batch_write_duplicate_prepare_same_payload_is_idempotent() {
+    // A retry with identical commands (transient network glitch
+    // caused the coordinator to resend PREPARE) must succeed instead
+    // of failing the whole transaction. The staged batch in memory
+    // stays intact, and the duplicate log entry is suppressed.
     let h = spawn_two_peer().await;
     let mut w = MeshWriteClient::connect(h.client_addr_a.clone())
         .await
@@ -932,7 +936,7 @@ async fn batch_write_duplicate_prepare_rejected() {
     let commands: Vec<meshdb_cluster::GraphCommand> = Vec::new();
     let payload = serde_json::to_vec(&commands).unwrap();
 
-    let txid = "tx-dup".to_string();
+    let txid = "tx-dup-same".to_string();
     w.batch_write(BatchWriteRequest {
         txid: txid.clone(),
         phase: BatchPhase::Prepare as i32,
@@ -941,15 +945,56 @@ async fn batch_write_duplicate_prepare_rejected() {
     .await
     .unwrap();
 
+    // Same txid + same payload → OK, no error.
+    w.batch_write(BatchWriteRequest {
+        txid,
+        phase: BatchPhase::Prepare as i32,
+        commands_json: payload,
+    })
+    .await
+    .expect("identical PREPARE retry must be idempotent");
+}
+
+#[tokio::test]
+async fn batch_write_duplicate_prepare_different_payload_rejected() {
+    // Same txid with a DIFFERENT commands payload is a coordinator
+    // bug — the caller could be silently clobbering a concurrent
+    // transaction's staged state. Must fail loudly.
+    let h = spawn_two_peer().await;
+    let mut w = MeshWriteClient::connect(h.client_addr_a.clone())
+        .await
+        .unwrap();
+
+    let first: Vec<meshdb_cluster::GraphCommand> = vec![meshdb_cluster::GraphCommand::PutNode(
+        Node::new().with_label("First"),
+    )];
+    let second: Vec<meshdb_cluster::GraphCommand> = vec![meshdb_cluster::GraphCommand::PutNode(
+        Node::new().with_label("Second"),
+    )];
+
+    let txid = "tx-dup-conflict".to_string();
+    w.batch_write(BatchWriteRequest {
+        txid: txid.clone(),
+        phase: BatchPhase::Prepare as i32,
+        commands_json: serde_json::to_vec(&first).unwrap(),
+    })
+    .await
+    .unwrap();
+
     let err = w
         .batch_write(BatchWriteRequest {
             txid,
             phase: BatchPhase::Prepare as i32,
-            commands_json: payload,
+            commands_json: serde_json::to_vec(&second).unwrap(),
         })
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    assert!(
+        err.message().contains("different commands"),
+        "error message should call out the payload mismatch, got: {}",
+        err.message(),
+    );
 }
 
 #[tokio::test]
@@ -2211,4 +2256,289 @@ async fn participant_log_replay_preserves_committed_outcome() {
         .batch_write(tonic::Request::new(commit_request("t-done")))
         .await
         .expect("late COMMIT after restart must be idempotent against the logged outcome");
+}
+
+// ---------------------------------------------------------------
+// Per-phase coordinator timeouts (slice A).
+//
+// A stalling peer must not block the coordinator past the
+// configured deadline. The test spins up a fake MeshWrite server
+// whose BatchWrite handler sleeps forever, registers it as peer 2
+// in a two-peer cluster, and runs a Cypher write whose commands
+// route across both peers. With a tight PREPARE timeout the
+// coordinator reports `DeadlineExceeded` within the budget rather
+// than waiting on the stalled peer indefinitely.
+// ---------------------------------------------------------------
+
+/// Minimal MeshWrite server that sleeps forever on every RPC. Used
+/// to simulate a peer that accepts a TCP connection but never
+/// completes the `BatchWrite` handler.
+#[derive(Clone, Default)]
+struct StallingMeshWrite;
+
+#[tonic::async_trait]
+impl meshdb_rpc::proto::mesh_write_server::MeshWrite for StallingMeshWrite {
+    async fn put_node(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::PutNodeRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::PutNodeResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn put_edge(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::PutEdgeRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::PutEdgeResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn delete_edge(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::DeleteEdgeRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::DeleteEdgeResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn detach_delete_node(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::DetachDeleteNodeRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::DetachDeleteNodeResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn batch_write(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::BatchWriteRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::BatchWriteResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn create_property_index(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::CreatePropertyIndexRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::CreatePropertyIndexResponse>, tonic::Status>
+    {
+        std::future::pending().await
+    }
+    async fn drop_property_index(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::DropPropertyIndexRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::DropPropertyIndexResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn create_edge_property_index(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::CreateEdgePropertyIndexRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::CreateEdgePropertyIndexResponse>, tonic::Status>
+    {
+        std::future::pending().await
+    }
+    async fn drop_edge_property_index(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::DropEdgePropertyIndexRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::DropEdgePropertyIndexResponse>, tonic::Status>
+    {
+        std::future::pending().await
+    }
+    async fn create_point_index(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::CreatePointIndexRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::CreatePointIndexResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn drop_point_index(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::DropPointIndexRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::DropPointIndexResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn create_edge_point_index(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::CreateEdgePointIndexRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::CreateEdgePointIndexResponse>, tonic::Status>
+    {
+        std::future::pending().await
+    }
+    async fn drop_edge_point_index(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::DropEdgePointIndexRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::DropEdgePointIndexResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn create_property_constraint(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::CreatePropertyConstraintRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::CreatePropertyConstraintResponse>, tonic::Status>
+    {
+        std::future::pending().await
+    }
+    async fn drop_property_constraint(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::DropPropertyConstraintRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::DropPropertyConstraintResponse>, tonic::Status>
+    {
+        std::future::pending().await
+    }
+    async fn resolve_transaction(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::ResolveTransactionRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::ResolveTransactionResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+}
+
+/// Spawn a two-peer cluster where peer A is a real `MeshService`
+/// and peer B is a stalling fake. Peer A runs its coordinator
+/// against peer B; every outgoing RPC to peer B hangs until its
+/// deadline fires.
+async fn spawn_two_peer_with_stalling_b(
+    timeouts: TxCoordinatorTimeouts,
+) -> (MeshService, Arc<dyn StorageEngine>, TempDir) {
+    let dir_a = TempDir::new().unwrap();
+    let store_a: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_a.path()).unwrap());
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let peers = vec![
+        Peer::new(PeerId(1), addr_a.to_string()),
+        Peer::new(PeerId(2), addr_b.to_string()),
+    ];
+    let cluster_a = Arc::new(Cluster::new(PeerId(1), 4, peers.clone()).unwrap());
+    let routing_a = Arc::new(Routing::new(cluster_a.clone()).unwrap());
+
+    let service_a =
+        MeshService::with_routing(store_a.clone(), routing_a).with_tx_timeouts(timeouts);
+
+    let stream_a = TcpListenerStream::new(listener_a);
+    let stream_b = TcpListenerStream::new(listener_b);
+
+    let service_a_for_server = service_a.clone();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service_a_for_server.clone().into_query_server())
+            .add_service(service_a_for_server.into_write_server())
+            .serve_with_incoming(stream_a)
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(meshdb_rpc::proto::mesh_write_server::MeshWriteServer::new(
+                StallingMeshWrite,
+            ))
+            .serve_with_incoming(stream_b)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    (service_a, store_a, dir_a)
+}
+
+#[tokio::test]
+async fn resolve_transaction_reports_coordinator_decision() {
+    // Peer A acts as coordinator, records a CommitDecision for a
+    // txid in its log. Peer B queries peer A via
+    // `ResolveTransaction` and should learn the decision.
+    use meshdb_rpc::proto::mesh_write_client::MeshWriteClient;
+    use meshdb_rpc::proto::{ResolveTransactionRequest, TxResolutionStatus};
+
+    let h = spawn_two_peer_with_log().await;
+
+    // Seed the coordinator log by hand with a Commit decision for
+    // a fabricated txid, as if peer A had run the 2PC protocol and
+    // decided to commit.
+    let txid = "resolve-test-tx".to_string();
+    h.log_a
+        .append(&TxLogEntry::Prepared {
+            txid: txid.clone(),
+            groups: vec![],
+        })
+        .unwrap();
+    h.log_a
+        .append(&TxLogEntry::CommitDecision { txid: txid.clone() })
+        .unwrap();
+
+    // Peer A's MeshWrite service answers `ResolveTransaction`.
+    let mut w = MeshWriteClient::connect(format!(
+        "http://{}",
+        h.cluster_a
+            .membership()
+            .address(h.cluster_a.self_id())
+            .unwrap()
+    ))
+    .await
+    .unwrap();
+    let resp = w
+        .resolve_transaction(ResolveTransactionRequest { txid })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.status, TxResolutionStatus::Committed as i32);
+
+    // Unknown txids return UNKNOWN (not an error).
+    let resp = w
+        .resolve_transaction(ResolveTransactionRequest {
+            txid: "never-seen".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.status, TxResolutionStatus::Unknown as i32);
+}
+
+#[tokio::test]
+async fn coordinator_prepare_timeout_fires_within_budget() {
+    // Pick a PREPARE deadline short enough to fire quickly but long
+    // enough for gRPC RPC startup cost. The stalling peer accepts
+    // the connection but never returns from `batch_write`.
+    let timeouts = TxCoordinatorTimeouts {
+        prepare: Duration::from_millis(300),
+        commit: Duration::from_secs(30),
+        abort: Duration::from_secs(10),
+    };
+    let (service_a, _store_a, _dir) = spawn_two_peer_with_stalling_b(timeouts).await;
+
+    // Cypher query whose WRITE routes to peer B: CREATE N nodes
+    // under a unique label, then check how long the failure takes
+    // to surface. At least one of the created nodes will hash to
+    // peer B (random UUIDs against a 2-peer FNV partition map land
+    // on each peer with ~0.5 probability), so the coordinator's
+    // PREPARE phase will contact the stalling peer and hit the
+    // timeout. If every node happened to land on peer A (unlikely
+    // but possible), the coordinator skips the cross-peer PREPARE
+    // altogether and the test shouldn't fail — just retry.
+    //
+    // To keep the test deterministic without overengineering, we
+    // create enough nodes that hitting peer B is overwhelmingly
+    // likely (p(all on A) = 0.5^16 ≈ 1e-5 with 16 nodes).
+    use meshdb_rpc::proto::mesh_query_server::MeshQuery;
+    let exec = ExecuteCypherRequest {
+        query: (1..=16)
+            .map(|i| format!("CREATE (:Stalled {{i: {i}}})"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        params_json: vec![],
+    };
+
+    let start = std::time::Instant::now();
+    let result = service_a.execute_cypher(tonic::Request::new(exec)).await;
+    let elapsed = start.elapsed();
+
+    // The RPC must return an error (the PREPARE fan-out hit the
+    // stall) within a bounded window — the 300ms deadline plus
+    // enough slack for RPC overhead. Two seconds is generous;
+    // without the timeout wrapper this call would hang until
+    // tonic's default client timeout (effectively forever).
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "coordinator must bail within the PREPARE deadline; elapsed {:?}",
+        elapsed,
+    );
+    let err = result.expect_err("stalled PREPARE must surface an error");
+    assert!(
+        err.message().contains("timed out") || err.code() == tonic::Code::DeadlineExceeded,
+        "expected a deadline error, got code={:?} message={:?}",
+        err.code(),
+        err.message(),
+    );
 }

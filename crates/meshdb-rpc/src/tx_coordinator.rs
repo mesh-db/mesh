@@ -21,9 +21,37 @@ use meshdb_cluster::{GraphCommand, PeerId};
 use meshdb_storage::StorageEngine;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::Status;
 use uuid::Uuid;
+
+/// Per-phase deadlines for the 2PC round. Each peer RPC is wrapped
+/// in the matching timeout; without these, a slow or hung peer would
+/// stall the entire transaction under tonic's default client timeout
+/// (effectively unbounded for in-cluster traffic).
+///
+/// Defaults: 10s on PREPARE and ABORT, 30s on COMMIT. The asymmetry
+/// reflects what each phase actually does — PREPARE should complete
+/// quickly because the work is only staging the commands, ABORT is a
+/// single `take()` on the staging map, but COMMIT applies the batch
+/// against RocksDB and may block on fsync under heavy write load.
+#[derive(Debug, Clone, Copy)]
+pub struct TxCoordinatorTimeouts {
+    pub prepare: Duration,
+    pub commit: Duration,
+    pub abort: Duration,
+}
+
+impl Default for TxCoordinatorTimeouts {
+    fn default() -> Self {
+        Self {
+            prepare: Duration::from_secs(10),
+            commit: Duration::from_secs(30),
+            abort: Duration::from_secs(10),
+        }
+    }
+}
 
 pub(crate) struct TxCoordinator<'a> {
     local_store: &'a dyn StorageEngine,
@@ -34,6 +62,10 @@ pub(crate) struct TxCoordinator<'a> {
     /// without crash recovery — useful for tests that don't care, but
     /// production paths should always pass a real log.
     log: Option<&'a crate::CoordinatorLog>,
+    /// Per-phase RPC deadlines. Defaulted at construction; override
+    /// via [`TxCoordinator::with_timeouts`] in tests that need
+    /// millisecond-scale deadlines to exercise the timeout paths.
+    timeouts: TxCoordinatorTimeouts,
 }
 
 impl<'a> TxCoordinator<'a> {
@@ -47,6 +79,7 @@ impl<'a> TxCoordinator<'a> {
             local_pending,
             routing,
             log: None,
+            timeouts: TxCoordinatorTimeouts::default(),
         }
     }
 
@@ -57,6 +90,14 @@ impl<'a> TxCoordinator<'a> {
     /// unfinished transactions forward.
     pub fn with_log(mut self, log: &'a crate::CoordinatorLog) -> Self {
         self.log = Some(log);
+        self
+    }
+
+    /// Override the per-phase RPC timeouts. Call sites pass
+    /// `MeshService`'s configured value through; tests override with
+    /// millisecond-scale deadlines to exercise the timeout branch.
+    pub fn with_timeouts(mut self, timeouts: TxCoordinatorTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
@@ -282,7 +323,8 @@ impl<'a> TxCoordinator<'a> {
             // Local shortcut: stage directly into the service's
             // participant staging. Matches the remote
             // BatchWrite(PREPARE) semantics, including the
-            // already-exists error on duplicate txid.
+            // already-exists error on duplicate txid. Purely synchronous,
+            // so no timeout wrapper.
             self.local_pending
                 .try_insert(txid.to_string(), cmds.to_vec())
                 .map_err(|()| {
@@ -294,14 +336,19 @@ impl<'a> TxCoordinator<'a> {
         let mut client = self.write_client(peer)?;
         let payload = serde_json::to_vec(&cmds.to_vec())
             .map_err(|e| Status::internal(format!("encode PREPARE payload: {e}")))?;
-        client
-            .batch_write(BatchWriteRequest {
-                txid: txid.to_string(),
-                phase: BatchPhase::Prepare as i32,
-                commands_json: payload,
-            })
-            .await?;
-        Ok(())
+        let call = client.batch_write(BatchWriteRequest {
+            txid: txid.to_string(),
+            phase: BatchPhase::Prepare as i32,
+            commands_json: payload,
+        });
+        match tokio::time::timeout(self.timeouts.prepare, call).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Status::deadline_exceeded(format!(
+                "PREPARE on peer {peer} timed out after {:?}",
+                self.timeouts.prepare
+            ))),
+        }
     }
 
     async fn commit(&self, peer: PeerId, txid: &str) -> Result<(), Status> {
@@ -315,14 +362,19 @@ impl<'a> TxCoordinator<'a> {
         }
 
         let mut client = self.write_client(peer)?;
-        client
-            .batch_write(BatchWriteRequest {
-                txid: txid.to_string(),
-                phase: BatchPhase::Commit as i32,
-                commands_json: Vec::new(),
-            })
-            .await?;
-        Ok(())
+        let call = client.batch_write(BatchWriteRequest {
+            txid: txid.to_string(),
+            phase: BatchPhase::Commit as i32,
+            commands_json: Vec::new(),
+        });
+        match tokio::time::timeout(self.timeouts.commit, call).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Status::deadline_exceeded(format!(
+                "COMMIT on peer {peer} timed out after {:?}",
+                self.timeouts.commit
+            ))),
+        }
     }
 
     async fn abort(&self, peer: PeerId, txid: &str) -> Result<(), Status> {
@@ -331,14 +383,19 @@ impl<'a> TxCoordinator<'a> {
             return Ok(());
         }
         let mut client = self.write_client(peer)?;
-        client
-            .batch_write(BatchWriteRequest {
-                txid: txid.to_string(),
-                phase: BatchPhase::Abort as i32,
-                commands_json: Vec::new(),
-            })
-            .await?;
-        Ok(())
+        let call = client.batch_write(BatchWriteRequest {
+            txid: txid.to_string(),
+            phase: BatchPhase::Abort as i32,
+            commands_json: Vec::new(),
+        });
+        match tokio::time::timeout(self.timeouts.abort, call).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Status::deadline_exceeded(format!(
+                "ABORT on peer {peer} timed out after {:?}",
+                self.timeouts.abort
+            ))),
+        }
     }
 
     fn write_client(&self, peer: PeerId) -> Result<MeshWriteClient<Channel>, Status> {

@@ -62,6 +62,19 @@ struct OutcomeEntry {
     at: Instant,
 }
 
+/// Outcome of [`ParticipantStaging::try_insert_or_match`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// Staging held no entry for this txid; one was created.
+    Inserted,
+    /// Staging already held an entry for this txid with an identical
+    /// commands payload. Safe to treat as a no-op retry.
+    Duplicate,
+    /// Staging held an entry for this txid with a different commands
+    /// payload. Coordinator bug.
+    Conflict,
+}
+
 /// Per-service in-memory 2PC participant staging. Safe to share across
 /// tasks via `Arc`; all mutating methods take `&self`.
 ///
@@ -100,7 +113,8 @@ impl ParticipantStaging {
 
     /// Insert a new staged entry for `txid`. Returns `Err(())` if the
     /// txid is already staged — the handler translates that into
-    /// `AlreadyExists`.
+    /// `AlreadyExists`. Used by the coordinator's local-peer
+    /// fast-path, where PREPARE retries are not expected.
     pub fn try_insert(&self, txid: String, commands: Vec<GraphCommand>) -> Result<(), ()> {
         let mut map = self.entries.lock().unwrap();
         if map.contains_key(&txid) {
@@ -115,6 +129,40 @@ impl ParticipantStaging {
         );
         crate::metrics::PENDING_2PC_STAGED.set(map.len() as i64);
         Ok(())
+    }
+
+    /// Try to insert, but recognise a matching retry as idempotent
+    /// success. The three outcomes:
+    ///
+    /// - [`InsertOutcome::Inserted`] — fresh entry, caller proceeds
+    ///   with the normal "PREPARE ack'd" path.
+    /// - [`InsertOutcome::Duplicate`] — a staged entry for this txid
+    ///   already exists and carries the same commands. Caller
+    ///   short-circuits to OK without re-appending the log.
+    /// - [`InsertOutcome::Conflict`] — same txid, different commands.
+    ///   Coordinator bug; caller errors with `AlreadyExists`.
+    ///
+    /// Used by the `BatchWrite(PREPARE)` RPC handler so a transient
+    /// network glitch that causes a coordinator retry of the same
+    /// PREPARE doesn't fatal the entire transaction.
+    pub fn try_insert_or_match(&self, txid: String, commands: Vec<GraphCommand>) -> InsertOutcome {
+        let mut map = self.entries.lock().unwrap();
+        if let Some(existing) = map.get(&txid) {
+            if existing.commands == commands {
+                return InsertOutcome::Duplicate;
+            } else {
+                return InsertOutcome::Conflict;
+            }
+        }
+        map.insert(
+            txid,
+            StagedEntry {
+                commands,
+                staged_at: Instant::now(),
+            },
+        );
+        crate::metrics::PENDING_2PC_STAGED.set(map.len() as i64);
+        InsertOutcome::Inserted
     }
 
     /// Remove and return the staged commands for `txid`. `None` means

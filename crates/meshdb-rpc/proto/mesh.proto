@@ -303,6 +303,15 @@ service MeshWrite {
   // fan-out and for rollback of a partial create.
   rpc DropPropertyConstraint(DropPropertyConstraintRequest)
       returns (DropPropertyConstraintResponse);
+  // Ask this peer whether it has a recorded decision for `txid`
+  // in its coordinator log. Returns COMMITTED, ABORTED, or UNKNOWN.
+  // Participants with in-doubt transactions use this on restart to
+  // short-circuit the staging TTL: they poll every peer, and on
+  // finding a decision apply it locally rather than waiting for
+  // the coordinator to eventually push the outcome or the TTL to
+  // expire.
+  rpc ResolveTransaction(ResolveTransactionRequest)
+      returns (ResolveTransactionResponse);
 }
 
 enum BatchPhase {
@@ -463,6 +472,26 @@ message DropPropertyConstraintRequest {
   bool if_exists = 2;
 }
 message DropPropertyConstraintResponse {}
+
+// Decision status the queried peer has on record for a transaction.
+// `UNKNOWN` means "I have no entry for this txid in my coordinator
+// log" — which for a peer that wasn't the coordinator is the
+// expected answer, and for the coordinator that moved past the
+// `Completed` + compaction boundary is also expected.
+enum TxResolutionStatus {
+  TX_RESOLUTION_STATUS_UNSPECIFIED = 0;
+  TX_RESOLUTION_STATUS_COMMITTED = 1;
+  TX_RESOLUTION_STATUS_ABORTED = 2;
+  TX_RESOLUTION_STATUS_UNKNOWN = 3;
+}
+
+message ResolveTransactionRequest {
+  string txid = 1;
+}
+
+message ResolveTransactionResponse {
+  TxResolutionStatus status = 1;
+}
 
 // Raft consensus RPCs. Each payload field carries a serde-serialized openraft
 // request/response struct, so the wire schema stays stable even as openraft's
