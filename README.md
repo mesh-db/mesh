@@ -265,8 +265,21 @@ and spatial `Point` (Cartesian 2D/3D, WGS-84 2D/3D, EPSG-tagged).
 - `PartitionedGraphReader` — point reads route to partition owner; bulk
   scans (`nodes_by_label`, `all_node_ids`) scatter-gather across peers
 - `RoutingGraphWriter` — point-routing for direct gRPC writes
-- 2PC coordinator for multi-peer Cypher transactions (per-peer prepare,
-  cross-peer commit-or-abort)
+- **Hardened 2PC** for multi-peer Cypher transactions:
+  - Durable coordinator log at `data_dir/coordinator-log.jsonl`
+    records PREPARE / CommitDecision / AbortDecision / Completed.
+  - Durable participant log at `data_dir/participant-log.jsonl`
+    records every PREPARE / COMMIT / ABORT the peer receives, fsync'd
+    before the RPC ACKs so the staged batch survives a peer crash.
+  - Per-phase RPC deadlines (10s PREPARE / 30s COMMIT / 10s ABORT by
+    default) so a stalled peer can't hang the round indefinitely.
+  - Idempotent PREPARE retry: a transient network glitch that causes
+    the coordinator to resend PREPARE with identical commands
+    returns OK; a conflicting payload still errors loudly.
+  - `ResolveTransaction` RPC lets a restarted participant poll every
+    peer for the coordinator's decision on any in-doubt txid — the
+    recovery path applies the outcome without waiting out the
+    staging TTL.
 - Ghost-edge replication: cross-partition edges land on both source-owner
   and target-owner so reverse traversal works
 - Raft consensus (via `openraft`) replicates the full graph in Raft mode
@@ -471,9 +484,12 @@ Multi-peer configs pick one of two modes via the top-level `mode` field:
   configs.
 - `mode = "routing"` — hash-partitioned sharding. Each node lives on
   exactly one peer; cross-peer reads scatter-gather and cross-peer
-  writes go through the 2PC coordinator with a durable recovery log
-  under `data_dir/coordinator-log.jsonl`. No consensus, so a peer
-  crash loses that peer's shard until it restarts.
+  writes go through the hardened 2PC path (coordinator + participant
+  logs at `data_dir/{coordinator,participant}-log.jsonl`, per-phase
+  timeouts, idempotent PREPARE retry, cross-peer `ResolveTransaction`
+  recovery). No consensus, so a peer crash loses that peer's shard
+  until it restarts — but the 2PC recovery logs guarantee no
+  in-flight transaction is lost in the process.
 
 A three-peer Raft cluster, one bootstrap seed, all speaking Bolt:
 

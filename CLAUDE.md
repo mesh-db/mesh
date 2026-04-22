@@ -60,7 +60,7 @@ mesh/
 - **Partitioning:** FNV-1a hash over NodeId maps each node to a `PartitionId`. Edges live on the partition that owns the source vertex, with ghost/stub copies on the target's partition for reverse traversal.
 - **Consensus:** Raft via `openraft` 0.9 for metadata and write coordination — full `RaftStorage` impl, AppendEntries / Vote / InstallSnapshot wired up.
 - **Reads:** Any node can serve a query; multi-partition traversals scatter-gather through `meshdb-rpc::partitioned_reader`.
-- **Writes:** Forwarded to the partition owner. Single-partition transactions work today; distributed (2PC) writes are still to come.
+- **Writes (routing mode):** Multi-peer Cypher writes ride a durable 2PC. Coordinator side logs PREPARE / CommitDecision / AbortDecision / Completed to `coordinator-log.jsonl`; participant side logs PREPARE / Committed / Aborted to `participant-log.jsonl` and fsyncs before each RPC ACKs. Both logs survive independent coordinator/participant crashes — on startup each peer rehydrates staging from its log, polls peers via `ResolveTransaction` to learn the coordinator's decision for any in-doubt txid, and only then opens the gRPC listener. Per-phase RPC timeouts (10s PREPARE / 30s COMMIT / 10s ABORT by default) bound a stalled peer's ability to block the round. PREPARE retries with identical commands are idempotent; conflicting payloads fail loudly.
 - **Future:** LDG streaming partitioner as an alternative to hash partitioning.
 
 ### Inter-Node Communication (`meshdb-rpc`)
@@ -97,7 +97,7 @@ mesh/
 
 ## Implementation Status
 
-The foundational phases are all shipping — single-node graph store, Cypher parser + executor, gRPC cluster RPCs, Raft-backed cluster membership, and a Bolt-speaking server. 2PC across partitions is wired with a durable coordinator log. The planner-side index work is caught up: composite property indexes (DDL + storage tuple encoding + prefix-matched seeks), edge IndexSeek for unbound-endpoint patterns (single-node, in-tx overlay, and cluster-routing scatter-gather), point / spatial indexes (Z-order cells + DDL + node-scope `withinbbox` and distance-radius planner rewrites + relationship-scope DDL), and Neo4j 5 quantifier shorthand all shipped. The remaining Cypher-surface gap is the APOC procedure library (plus edge-scope `PointIndexSeek` planner rewrite, which is a smaller follow-on).
+The foundational phases are all shipping — single-node graph store, Cypher parser + executor, gRPC cluster RPCs, Raft-backed cluster membership, and a Bolt-speaking server. 2PC across partitions is hardened end-to-end: durable coordinator + participant logs, per-phase timeouts, idempotent PREPARE retries, and cross-peer decision recovery via `ResolveTransaction` so coordinator and participant crashes recover independently without operator intervention. The planner-side index work is caught up: composite property indexes (DDL + storage tuple encoding + prefix-matched seeks), edge IndexSeek for unbound-endpoint patterns (single-node, in-tx overlay, and cluster-routing scatter-gather), point / spatial indexes (Z-order cells + DDL + node-scope `withinbbox` and distance-radius planner rewrites + relationship-scope DDL), and Neo4j 5 quantifier shorthand all shipped. The remaining Cypher-surface gap is the APOC procedure library (plus edge-scope `PointIndexSeek` planner rewrite, which is a smaller follow-on).
 
 ## Target System
 - AMD Ryzen 9 9900X (high core count — leverage for concurrent RocksDB operations)
