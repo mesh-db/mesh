@@ -1,0 +1,18 @@
+# Workspace-wide cargo configuration.
+
+[env]
+# Cap parallel test threads per test binary. The cluster
+# integration tests in `meshdb-rpc` and `meshdb-server` spawn
+# multi-peer setups that each open several RocksDB instances
+# plus tonic/gRPC sockets — at default `cargo test` parallelism
+# (`num_cpus`, often 16+ on developer machines) the cumulative
+# open-file count comfortably exceeds the typical Linux soft
+# limit of 1024, surfacing as
+#
+#   IO error: While open directory: /tmp/.tmpXXX: Too many open files
+#
+# Capping at 8 keeps the meshdb-rpc suite well under any
+# reasonable FD limit while still exercising real concurrency.
+# Override with `cargo test -- --test-threads=N` when you have
+# a higher `ulimit -n` and want the speed of full parallelism.
+RUST_TEST_THREADS = "8"

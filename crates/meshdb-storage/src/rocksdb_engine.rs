@@ -339,11 +339,16 @@ impl RocksDbStorageEngine {
         // families per database and the cluster integration tests
         // spawning multiple two-peer clusters in parallel, that
         // unbounded cache blows past typical FD soft limits
-        // (`ulimit -n` of 1024 on stock Linux). 256 is plenty for
+        // (`ulimit -n` of 1024 on stock Linux). 64 is plenty for
         // the SST hot set; cold files get reopened on access.
         // Production read-heavy workloads can override via tuning
         // config later.
-        db_opts.set_max_open_files(256);
+        db_opts.set_max_open_files(64);
+        // Cap retained INFO log files at a small number — the
+        // default of 1000 produces a long tail of LOG.old.* files
+        // that, while not all open as FDs, do compound disk
+        // pressure when many test databases run in parallel.
+        db_opts.set_keep_log_file_num(4);
 
         let cfs: Vec<ColumnFamilyDescriptor> = ALL_CFS
             .iter()
