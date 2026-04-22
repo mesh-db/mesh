@@ -17,11 +17,11 @@
 //! | Feature | Surface |
 //! |---------|---------|
 //! | `coll`  | `apoc.coll.*` collection helpers |
+//! | `text`  | `apoc.text.*` string manipulation |
 //! | `full`  | Every shipped namespace (convenience umbrella) |
 //!
-//! More namespaces (`text`, `map`, `util`) will add their own
-//! feature flags when they land; the umbrella `full` auto-picks
-//! them up.
+//! More namespaces (`map`, `util`) will add their own feature
+//! flags when they land; the umbrella `full` auto-picks them up.
 //!
 //! The crate deliberately depends only on `meshdb-core` (for
 //! [`meshdb_core::Property`]) — the executor-side adapter is what
@@ -35,6 +35,9 @@ use thiserror::Error;
 
 #[cfg(feature = "coll")]
 pub mod coll;
+
+#[cfg(feature = "text")]
+pub mod text;
 
 /// Errors the APOC dispatcher surfaces back to the caller. All
 /// variants are recoverable in the sense that the executor can
@@ -83,6 +86,11 @@ pub fn call_scalar(name: &str, args: &[Property]) -> Result<Property, ApocError>
     #[cfg(feature = "coll")]
     if let Some(suffix) = _lc.strip_prefix("apoc.coll.") {
         return coll::call(suffix, args);
+    }
+
+    #[cfg(feature = "text")]
+    if let Some(suffix) = _lc.strip_prefix("apoc.text.") {
+        return text::call(suffix, args);
     }
 
     let _ = args;

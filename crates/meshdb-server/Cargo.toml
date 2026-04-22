@@ -56,4 +56,5 @@ rustls-pki-types = "1"
 #   cargo install meshdb-server --features apoc-coll   # just apoc.coll.*
 default = []
 apoc-coll = ["meshdb-executor/apoc-coll"]
+apoc-text = ["meshdb-executor/apoc-text"]
 apoc = ["meshdb-executor/apoc"]

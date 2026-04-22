@@ -1729,6 +1729,7 @@ name = "meshdb-apoc"
 version = "0.1.0-alpha.6"
 dependencies = [
  "meshdb-core",
+ "regex",
  "thiserror 2.0.18",
 ]
 

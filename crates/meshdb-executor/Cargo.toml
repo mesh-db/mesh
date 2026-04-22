@@ -38,7 +38,8 @@ __apoc = []
 # Per-namespace opt-in. Each maps 1:1 to a feature on the
 # `meshdb-apoc` crate.
 apoc-coll = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/coll"]
+apoc-text = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/text"]
 
 # Umbrella: every shipped namespace. Add new sub-features here as
 # they land so `--features apoc` keeps meaning "everything".
-apoc = ["apoc-coll"]
+apoc = ["apoc-coll", "apoc-text"]

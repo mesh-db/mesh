@@ -9129,3 +9129,109 @@ fn apoc_scalar_without_feature_surfaces_unknown_function_error() {
         "expected unknown-function error for apoc.coll.sum without the feature, got: {err}",
     );
 }
+
+#[cfg(feature = "apoc-text")]
+mod apoc_text {
+    use super::*;
+
+    fn string_list(row: &Row, key: &str) -> Vec<String> {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::List(items)) => items
+                .iter()
+                .filter_map(|p| match p {
+                    Property::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected Property::List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_text_join_and_split() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.join(['a', 'b', 'c'], '-') AS j, \
+                    apoc.text.split('a,b;c', '[,;]') AS parts",
+        );
+        assert_eq!(str_prop(&rows[0], "j"), "a-b-c");
+        assert_eq!(
+            string_list(&rows[0], "parts"),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+    }
+
+    #[test]
+    fn apoc_text_replace_and_index_of() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.replace('hello world', 'o', '0') AS r, \
+                    apoc.text.indexOf('hello', 'll') AS idx",
+        );
+        assert_eq!(str_prop(&rows[0], "r"), "hell0 w0rld");
+        assert_eq!(int_prop(&rows[0], "idx"), 2);
+    }
+
+    #[test]
+    fn apoc_text_pad_functions() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.lpad('7', 4, '0') AS padded, \
+                    apoc.text.rpad('x', 5, '.-') AS right",
+        );
+        assert_eq!(str_prop(&rows[0], "padded"), "0007");
+        assert_eq!(str_prop(&rows[0], "right"), "x.-.-");
+    }
+
+    #[test]
+    fn apoc_text_case_helpers() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.capitalize('hello') AS cap, \
+                    apoc.text.capitalizeAll('hello world') AS title, \
+                    apoc.text.camelCase('api_key_name') AS camel, \
+                    apoc.text.snakeCase('Hello World') AS snake, \
+                    apoc.text.upperCamelCase('hello world') AS pascal",
+        );
+        assert_eq!(str_prop(&rows[0], "cap"), "Hello");
+        assert_eq!(str_prop(&rows[0], "title"), "Hello World");
+        assert_eq!(str_prop(&rows[0], "camel"), "apiKeyName");
+        assert_eq!(str_prop(&rows[0], "snake"), "hello_world");
+        assert_eq!(str_prop(&rows[0], "pascal"), "HelloWorld");
+    }
+
+    #[test]
+    fn apoc_text_url_roundtrips() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.urlencode('a b&c=1') AS enc, \
+                    apoc.text.urldecode('a%20b%26c%3D1') AS dec",
+        );
+        assert_eq!(str_prop(&rows[0], "enc"), "a%20b%26c%3D1");
+        assert_eq!(str_prop(&rows[0], "dec"), "a b&c=1");
+    }
+
+    #[test]
+    fn apoc_text_repeat_and_reverse() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.text.repeat('ab', 3) AS r, \
+                    apoc.text.reverse('hello') AS rev",
+        );
+        assert_eq!(str_prop(&rows[0], "r"), "ababab");
+        assert_eq!(str_prop(&rows[0], "rev"), "olleh");
+    }
+
+    #[test]
+    fn apoc_text_hex_value() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.text.hexValue(255) AS h");
+        assert_eq!(str_prop(&rows[0], "h"), "FF");
+    }
+}
