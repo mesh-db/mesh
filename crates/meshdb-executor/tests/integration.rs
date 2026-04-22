@@ -9551,3 +9551,81 @@ mod apoc_date {
         ));
     }
 }
+
+#[cfg(feature = "apoc-number")]
+mod apoc_number {
+    use super::*;
+
+    #[test]
+    fn apoc_number_parse_int_default_and_radix() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.number.parseInt('42') AS d, \
+                    apoc.number.parseInt('ff', 16) AS hex, \
+                    apoc.number.parseInt('1010', 2) AS bin, \
+                    apoc.number.parseInt('nope') AS bad",
+        );
+        assert_eq!(int_prop(&rows[0], "d"), 42);
+        assert_eq!(int_prop(&rows[0], "hex"), 255);
+        assert_eq!(int_prop(&rows[0], "bin"), 10);
+        assert!(matches!(
+            rows[0].get("bad"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_number_parse_float() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.number.parseFloat('1.5e3') AS f, \
+                    apoc.number.parseFloat('garbage') AS bad",
+        );
+        match rows[0].get("f").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 1500.0),
+            other => panic!("expected Float64, got {other:?}"),
+        }
+        assert!(matches!(
+            rows[0].get("bad"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+
+    #[test]
+    fn apoc_number_roman_round_trip() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.number.arabicToRoman(1994) AS r, \
+                    apoc.number.romanToArabic('MCMXCIV') AS a",
+        );
+        assert_eq!(str_prop(&rows[0], "r"), "MCMXCIV");
+        assert_eq!(int_prop(&rows[0], "a"), 1994);
+    }
+
+    #[test]
+    fn apoc_number_format_default_and_decimals() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.number.format(1234567) AS i, \
+                    apoc.number.format(1234.5678, 2) AS f, \
+                    apoc.number.format(1000, 2) AS ii",
+        );
+        assert_eq!(str_prop(&rows[0], "i"), "1,234,567");
+        assert_eq!(str_prop(&rows[0], "f"), "1,234.57");
+        assert_eq!(str_prop(&rows[0], "ii"), "1,000.00");
+    }
+
+    #[test]
+    fn apoc_number_roman_null_passthrough() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.number.arabicToRoman(null) AS r");
+        assert!(matches!(
+            rows[0].get("r"),
+            Some(Value::Property(Property::Null))
+        ));
+    }
+}
