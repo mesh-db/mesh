@@ -46,6 +46,11 @@ apoc-date = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/date"]
 apoc-number = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/number"]
 apoc-create = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/create"]
 apoc-meta = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/meta"]
+# `apoc.refactor.*` is procedure-only — there's no scalar slice in
+# `meshdb-apoc` to depend on, so this feature gates the executor-
+# side procedure registration directly. No `__apoc` either, since
+# that flag is the scalar dispatcher's marker.
+apoc-refactor = []
 
 # Umbrella: every shipped namespace. Add new sub-features here as
 # they land so `--features apoc` keeps meaning "everything".
@@ -59,4 +64,5 @@ apoc = [
     "apoc-number",
     "apoc-create",
     "apoc-meta",
+    "apoc-refactor",
 ]

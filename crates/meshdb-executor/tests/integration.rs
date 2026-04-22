@@ -10030,6 +10030,94 @@ mod apoc_create {
     }
 }
 
+#[cfg(feature = "apoc-refactor")]
+mod apoc_refactor {
+    use super::*;
+
+    #[test]
+    fn apoc_refactor_set_type_changes_relationship_type() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})-[:OLD {w: 5}]->(:T {n: 2})");
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH ()-[r:OLD]->() \
+             CALL apoc.refactor.setType(r, 'NEW') YIELD rel \
+             RETURN rel",
+        );
+        match rows[0].get("rel").unwrap() {
+            Value::Edge(e) => {
+                assert_eq!(e.edge_type, "NEW");
+                assert_eq!(e.properties.get("w"), Some(&Property::Int64(5)));
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+        // Old type should no longer match anything.
+        let still_old = run(&store, "MATCH ()-[r:OLD]->() RETURN r");
+        assert!(still_old.is_empty(), "old type should be gone");
+        // New type matches with properties + endpoints preserved.
+        let by_new = run(
+            &store,
+            "MATCH (a:T)-[r:NEW]->(b:T) RETURN a.n AS s, b.n AS t, r.w AS w",
+        );
+        assert_eq!(by_new.len(), 1);
+        assert_eq!(int_prop(&by_new[0], "s"), 1);
+        assert_eq!(int_prop(&by_new[0], "t"), 2);
+        assert_eq!(int_prop(&by_new[0], "w"), 5);
+    }
+
+    #[test]
+    fn apoc_refactor_set_type_same_type_is_noop() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})-[:R {w: 7}]->(:T {n: 2})");
+        let before_id = match run(&store, "MATCH ()-[r:R]->() RETURN r")[0]
+            .get("r")
+            .unwrap()
+        {
+            Value::Edge(e) => e.id,
+            other => panic!("expected Edge, got {other:?}"),
+        };
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH ()-[r:R]->() \
+             CALL apoc.refactor.setType(r, 'R') YIELD rel \
+             RETURN rel",
+        );
+        // Same-type case must keep the original EdgeId — callers
+        // hold references to it (Bolt drivers, application code).
+        match rows[0].get("rel").unwrap() {
+            Value::Edge(e) => assert_eq!(e.id, before_id, "EdgeId must be preserved on no-op"),
+            other => panic!("expected Edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_refactor_set_type_rejects_null_new_type() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:T {n: 1})-[:R]->(:T {n: 2})");
+        let stmt =
+            parse("MATCH ()-[r:R]->() CALL apoc.refactor.setType(r, null) YIELD rel RETURN rel")
+                .unwrap();
+        let p = plan(&stmt).unwrap();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let params = ParamMap::new();
+        let err = execute_with_reader_and_procs(
+            &p,
+            &store as &dyn GraphReader,
+            &store as &dyn GraphWriter,
+            &params,
+            &procs,
+        )
+        .err()
+        .expect("expected an error for null type");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("apoc.refactor.setType") && msg.to_ascii_lowercase().contains("null"),
+            "expected null-type error, got: {msg}",
+        );
+    }
+}
+
 #[cfg(feature = "apoc-meta")]
 mod apoc_meta {
     use super::*;

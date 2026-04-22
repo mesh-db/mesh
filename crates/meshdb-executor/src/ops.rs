@@ -2296,18 +2296,19 @@ impl ProcedureCallOp {
         // matching candidate rows from a static / read-derived set.
         let is_write = proc.is_write_builtin();
         let rows = if is_write {
-            #[cfg(feature = "__apoc")]
+            // The cfg gate must include every feature that owns a
+            // write builtin — `is_write_builtin` returns true only
+            // when one of those features is on, so widen the gate
+            // when a new write namespace lands.
+            #[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
             {
                 proc.resolve_write_rows(ctx.store, ctx.writer, &args)?
             }
-            // is_write_builtin can only be true when an apoc-* feature
-            // is on (the variants live behind those cfgs), so this
-            // branch is unreachable in non-apoc builds.
-            #[cfg(not(feature = "__apoc"))]
+            #[cfg(not(any(feature = "apoc-create", feature = "apoc-refactor")))]
             {
                 let _ = (ctx, &args);
                 return Err(Error::Procedure(
-                    "write procedure dispatched in a non-apoc build".into(),
+                    "write procedure dispatched in a non-write-apoc build".into(),
                 ));
             }
         } else {

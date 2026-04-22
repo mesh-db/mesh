@@ -1,13 +1,15 @@
-#[cfg(feature = "apoc-create")]
+#[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
 use crate::error::Error;
 use crate::error::Result;
 use crate::reader::GraphReader;
 use crate::value::Value;
-#[cfg(feature = "apoc-create")]
+#[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
 use crate::writer::GraphWriter;
-use meshdb_core::Property;
+#[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+use meshdb_core::Edge;
 #[cfg(feature = "apoc-create")]
-use meshdb_core::{Edge, Node};
+use meshdb_core::Node;
+use meshdb_core::Property;
 use std::collections::{BTreeSet, HashMap};
 
 /// Declared argument / output type for a procedure signature.
@@ -154,6 +156,13 @@ pub enum BuiltinProc {
     /// [`Self::ApocCreateSetProperty`].
     #[cfg(feature = "apoc-create")]
     ApocCreateSetRelProperty,
+    /// `apoc.refactor.setType(rel, newType)` — change a
+    /// relationship's type. Implementation deletes the old edge
+    /// and creates a new one with the supplied type, preserving
+    /// endpoints and properties; the new edge has a fresh
+    /// EdgeId. Yields the new edge as `rel`.
+    #[cfg(feature = "apoc-refactor")]
+    ApocRefactorSetType,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -196,6 +205,8 @@ impl Procedure {
                 | BuiltinProc::ApocCreateSetProperty
                 | BuiltinProc::ApocCreateSetRelProperty,
             ) => true,
+            #[cfg(feature = "apoc-refactor")]
+            Some(BuiltinProc::ApocRefactorSetType) => true,
             _ => false,
         }
     }
@@ -229,6 +240,10 @@ impl Procedure {
             ) => Err(Error::Procedure(
                 "apoc.create.* mutator is a write procedure — call via resolve_write_rows".into(),
             )),
+            #[cfg(feature = "apoc-refactor")]
+            Some(BuiltinProc::ApocRefactorSetType) => Err(Error::Procedure(
+                "apoc.refactor.setType is a write procedure — call via resolve_write_rows".into(),
+            )),
         }
     }
 
@@ -236,7 +251,7 @@ impl Procedure {
     /// evaluated and type-checked; the row is produced as a side
     /// effect of the mutation (e.g. the newly-created node) so
     /// `row_matches` is skipped for these procedures.
-    #[cfg(feature = "apoc-create")]
+    #[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
     pub fn resolve_write_rows(
         &self,
         reader: &dyn GraphReader,
@@ -244,23 +259,32 @@ impl Procedure {
         args: &[Value],
     ) -> Result<Vec<ProcRow>> {
         match self.builtin {
+            #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateNode) => apoc_create_node(writer, args),
+            #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateRelationship) => apoc_create_relationship(writer, args),
+            #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateAddLabels) => {
                 apoc_label_mutator(reader, writer, args, LabelMode::Add)
             }
+            #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateRemoveLabels) => {
                 apoc_label_mutator(reader, writer, args, LabelMode::Remove)
             }
+            #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateSetLabels) => {
                 apoc_label_mutator(reader, writer, args, LabelMode::Set)
             }
+            #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateSetProperty) => {
                 apoc_set_node_property(reader, writer, args)
             }
+            #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateSetRelProperty) => {
                 apoc_set_rel_property(reader, writer, args)
             }
+            #[cfg(feature = "apoc-refactor")]
+            Some(BuiltinProc::ApocRefactorSetType) => apoc_refactor_set_type(reader, writer, args),
             _ => Err(Error::Procedure("procedure is not a write builtin".into())),
         }
     }
@@ -462,6 +486,63 @@ fn apoc_create_relationship(writer: &dyn GraphWriter, args: &[Value]) -> Result<
     writer.put_edge(&edge)?;
     let mut row = HashMap::new();
     row.insert("rel".to_string(), Value::Edge(edge));
+    Ok(vec![row])
+}
+
+/// Implementation of `apoc.refactor.setType(rel, newType)`.
+/// Edges in Mesh carry their type as immutable storage state, so
+/// changing it requires a delete + recreate. The new edge keeps
+/// the source / target / properties of the old but receives a
+/// fresh [`EdgeId`] — mirrors what Neo4j APOC does (the
+/// procedure documents the ID change explicitly).
+#[cfg(feature = "apoc-refactor")]
+fn apoc_refactor_set_type(
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    args: &[Value],
+) -> Result<Vec<ProcRow>> {
+    let old_id = match &args[0] {
+        Value::Edge(e) => e.id,
+        Value::Null | Value::Property(Property::Null) => {
+            return Err(Error::Procedure(
+                "apoc.refactor.setType: relationship argument must not be null".into(),
+            ));
+        }
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.refactor.setType: first argument must be a relationship, got {other:?}"
+            )));
+        }
+    };
+    let new_type = match &args[1] {
+        Value::Property(Property::String(s)) => s.clone(),
+        Value::Null | Value::Property(Property::Null) => {
+            return Err(Error::Procedure(
+                "apoc.refactor.setType: new type must not be null".into(),
+            ));
+        }
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.refactor.setType: new type must be a string, got {other:?}"
+            )));
+        }
+    };
+    let old = reader
+        .get_edge(old_id)?
+        .ok_or_else(|| Error::Procedure(format!("edge {old_id:?} no longer exists")))?;
+    // Same-type case is a no-op: hand the existing edge back
+    // unchanged so the caller's EdgeId stays valid.
+    if old.edge_type == new_type {
+        let mut row = HashMap::new();
+        row.insert("rel".to_string(), Value::Edge(old));
+        return Ok(vec![row]);
+    }
+    let mut new_edge = Edge::new(new_type, old.source, old.target);
+    new_edge.properties = old.properties.clone();
+    writer.delete_edge(old_id)?;
+    writer.put_edge(&new_edge)?;
+    let mut row = HashMap::new();
+    row.insert("rel".to_string(), Value::Edge(new_edge));
     Ok(vec![row])
 }
 
@@ -973,6 +1054,26 @@ impl ProcedureRegistry {
             }],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::ApocCreateSetRelProperty),
+        });
+        #[cfg(feature = "apoc-refactor")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "refactor".into(), "setType".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "rel".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "newType".into(),
+                    ty: ProcType::String,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "rel".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocRefactorSetType),
         });
     }
 }
