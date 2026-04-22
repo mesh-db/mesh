@@ -334,6 +334,16 @@ impl RocksDbStorageEngine {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        // RocksDB's default `max_open_files = -1` keeps every SST
+        // file cached in the table cache forever. With 15 column
+        // families per database and the cluster integration tests
+        // spawning multiple two-peer clusters in parallel, that
+        // unbounded cache blows past typical FD soft limits
+        // (`ulimit -n` of 1024 on stock Linux). 256 is plenty for
+        // the SST hot set; cold files get reopened on access.
+        // Production read-heavy workloads can override via tuning
+        // config later.
+        db_opts.set_max_open_files(256);
 
         let cfs: Vec<ColumnFamilyDescriptor> = ALL_CFS
             .iter()
