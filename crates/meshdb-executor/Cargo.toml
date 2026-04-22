@@ -22,8 +22,23 @@ uuid.workspace = true
 tempfile = "3"
 
 [features]
-# APOC-compatible scalar functions (and later procedures) under the
-# `apoc.*` namespace. Off by default to keep minimal builds lean;
-# users who want the extra surface build with `--features apoc`.
+# APOC-compatible scalars are split into per-namespace sub-features
+# so users can compile in exactly the subset they need. Turning on
+# any sub-feature activates the executor-side adapter via the
+# private `__apoc` marker; the umbrella `apoc` feature pulls in
+# every shipped namespace and is the convenience knob for "just
+# give me all of APOC".
 default = []
-apoc = ["dep:meshdb-apoc"]
+
+# Private marker — any `apoc-*` sub-feature depends on it so the
+# adapter code in `eval.rs` only compiles when something actually
+# needs it. Users don't set this directly.
+__apoc = []
+
+# Per-namespace opt-in. Each maps 1:1 to a feature on the
+# `meshdb-apoc` crate.
+apoc-coll = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/coll"]
+
+# Umbrella: every shipped namespace. Add new sub-features here as
+# they land so `--features apoc` keeps meaning "everything".
+apoc = ["apoc-coll"]

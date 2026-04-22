@@ -4777,7 +4777,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
             // is on, evaluate every argument to a `Property`
             // (APOC scalars never inspect Node/Edge/Path) and
             // route the call to the `meshdb-apoc` crate.
-            #[cfg(feature = "apoc")]
+            #[cfg(feature = "__apoc")]
             if name.to_ascii_lowercase().starts_with("apoc.") {
                 return call_apoc_scalar(name, arg_exprs, ctx);
             }
@@ -4790,7 +4790,7 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
 /// `meshdb-apoc` scalar entry point. Errors thread back through
 /// the executor's `Error` type so user-facing messages stay
 /// consistent with the native scalar path.
-#[cfg(feature = "apoc")]
+#[cfg(feature = "__apoc")]
 fn call_apoc_scalar(name: &str, arg_exprs: &[Expr], ctx: &EvalCtx) -> Result<Value> {
     let mut props: Vec<Property> = Vec::with_capacity(arg_exprs.len());
     for arg in arg_exprs {
@@ -4835,7 +4835,7 @@ fn call_apoc_scalar(name: &str, arg_exprs: &[Expr], ctx: &EvalCtx) -> Result<Val
 /// Unwrap a `Value` into a `Property`, recursively handling nested
 /// lists and maps. Rejects graph elements with the executor's
 /// `TypeMismatch` since they have no `Property` representation.
-#[cfg(feature = "apoc")]
+#[cfg(feature = "__apoc")]
 fn value_to_property_or_null(v: Value) -> Result<Property> {
     match v {
         Value::Property(p) => Ok(p),

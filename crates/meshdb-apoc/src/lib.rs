@@ -4,29 +4,36 @@
 //! that ships hundreds of helper procedures and scalar functions
 //! under the `apoc.*` namespace. Mesh's implementation lives in a
 //! standalone crate so the APOC surface can be compiled in or out
-//! at build time — `cargo build --features apoc` turns it on,
-//! default builds leave it out. That keeps the minimal-binary story
-//! intact for users who don't want the extra code on their disk.
+//! at build time.
+//!
+//! ## Build-time features
+//!
+//! Each APOC namespace is an opt-in Cargo feature. Users pick the
+//! subset they want (or turn them all on with `full`) and the
+//! executor-side adapter gates the dispatch on the same features.
+//! A build with no APOC features is bitwise identical to a build
+//! without this crate depended on at all.
+//!
+//! | Feature | Surface |
+//! |---------|---------|
+//! | `coll`  | `apoc.coll.*` collection helpers |
+//! | `full`  | Every shipped namespace (convenience umbrella) |
+//!
+//! More namespaces (`text`, `map`, `util`) will add their own
+//! feature flags when they land; the umbrella `full` auto-picks
+//! them up.
 //!
 //! The crate deliberately depends only on `meshdb-core` (for
 //! [`meshdb_core::Property`]) — the executor-side adapter is what
 //! bridges `Value` to the [`Property`]-based entry points here.
 //! This setup avoids a cycle between the executor and apoc crates
-//! and keeps the apoc surface pure: every function is a side-effect-
-//! free transform over primitive types.
-//!
-//! ## Coverage
-//!
-//! - [`coll`] — `apoc.coll.*` collection operations (sum, avg, max,
-//!   min, toSet, sort, sortDesc, reverse, contains, union,
-//!   intersection, subtract, flatten).
-//!
-//! More namespaces (`apoc.text`, `apoc.map`, `apoc.util`) will land
-//! as follow-up slices.
+//! and keeps the apoc surface pure: every function is a
+//! side-effect-free transform over primitive types.
 
 use meshdb_core::Property;
 use thiserror::Error;
 
+#[cfg(feature = "coll")]
 pub mod coll;
 
 /// Errors the APOC dispatcher surfaces back to the caller. All
@@ -62,13 +69,22 @@ pub enum ApocError {
 /// case-insensitive to follow the Cypher-scalar convention. `args`
 /// are already-evaluated [`Property`] values in positional order.
 ///
-/// Returns [`ApocError::UnknownFunction`] for any name outside the
-/// currently-implemented set so the executor's fall-through can
-/// surface it as the usual "unknown scalar function" error.
+/// Each namespace arm is gated on its matching Cargo feature, so a
+/// build with `--features coll` routes `apoc.coll.*` but reports
+/// `UnknownFunction` for, say, `apoc.text.join`. That means the
+/// per-namespace cost is opt-in at both the source-size and
+/// binary-size levels.
 pub fn call_scalar(name: &str, args: &[Property]) -> Result<Property, ApocError> {
-    let lc = name.to_ascii_lowercase();
-    if let Some(suffix) = lc.strip_prefix("apoc.coll.") {
+    // `_lc` stays unused when every namespace feature is off, so
+    // the leading underscore silences the warning without needing
+    // a cfg_attr on the binding.
+    let _lc = name.to_ascii_lowercase();
+
+    #[cfg(feature = "coll")]
+    if let Some(suffix) = _lc.strip_prefix("apoc.coll.") {
         return coll::call(suffix, args);
     }
+
+    let _ = args;
     Err(ApocError::UnknownFunction(name.to_string()))
 }

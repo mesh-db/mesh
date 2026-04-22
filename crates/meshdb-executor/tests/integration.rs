@@ -8989,7 +8989,7 @@ fn constraint_persists_across_reopen() {
 // suite without running these.
 // ---------------------------------------------------------------
 
-#[cfg(feature = "apoc")]
+#[cfg(feature = "apoc-coll")]
 mod apoc_coll {
     use super::*;
 
@@ -9115,7 +9115,7 @@ mod apoc_coll {
     }
 }
 
-#[cfg(not(feature = "apoc"))]
+#[cfg(not(feature = "apoc-coll"))]
 #[test]
 fn apoc_scalar_without_feature_surfaces_unknown_function_error() {
     let (store, _d) = open_store();

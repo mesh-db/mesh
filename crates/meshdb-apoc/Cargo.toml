@@ -9,3 +9,19 @@ description = "APOC-compatible procedures and scalar functions for Mesh Cypher"
 [dependencies]
 meshdb-core = { workspace = true }
 thiserror.workspace = true
+
+[features]
+# Per-namespace opt-in. Each feature gates the module that
+# implements that `apoc.<namespace>.*` surface, so a build with
+# `--features coll` compiles only the collection helpers and
+# leaves every other namespace as an unknown-function error.
+default = []
+
+# `apoc.coll.*` — sum / avg / max / min / toSet / sort / sortDesc /
+# reverse / contains / union / intersection / subtract / flatten.
+coll = []
+
+# Umbrella convenience: everything we ship today. Add new
+# namespace features to this list as they land so
+# `--features full` keeps its "turn on everything" meaning.
+full = ["coll"]
