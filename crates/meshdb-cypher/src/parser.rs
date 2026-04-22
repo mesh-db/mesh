@@ -928,7 +928,7 @@ fn build_procedure_call(pair: Pair<Rule>) -> Result<crate::ast::ProcedureCall> {
         match p.as_rule() {
             Rule::procedure_name => {
                 for id in p.into_inner() {
-                    debug_assert_eq!(id.as_rule(), Rule::identifier);
+                    debug_assert_eq!(id.as_rule(), Rule::procedure_name_segment);
                     qualified_name.push(parse_ident(id.as_str()));
                 }
             }

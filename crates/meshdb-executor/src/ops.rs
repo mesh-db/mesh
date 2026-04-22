@@ -2290,9 +2290,31 @@ impl ProcedureCallOp {
             return Ok(());
         }
         let args = self.evaluate_args(ctx, input_row, proc)?;
-        let rows = proc.resolve_rows(ctx.store)?;
+        // Write builtins (apoc.create.node, …) take the writer +
+        // args directly and produce already-final rows, so we skip
+        // the row_matches filter that read builtins use to look up
+        // matching candidate rows from a static / read-derived set.
+        let is_write = proc.is_write_builtin();
+        let rows = if is_write {
+            #[cfg(feature = "__apoc")]
+            {
+                proc.resolve_write_rows(ctx.store, ctx.writer, &args)?
+            }
+            // is_write_builtin can only be true when an apoc-* feature
+            // is on (the variants live behind those cfgs), so this
+            // branch is unreachable in non-apoc builds.
+            #[cfg(not(feature = "__apoc"))]
+            {
+                let _ = (ctx, &args);
+                return Err(Error::Procedure(
+                    "write procedure dispatched in a non-apoc build".into(),
+                ));
+            }
+        } else {
+            proc.resolve_rows(ctx.store)?
+        };
         for proc_row in &rows {
-            if !proc.row_matches(proc_row, &args) {
+            if !is_write && !proc.row_matches(proc_row, &args) {
                 continue;
             }
             let mut merged = if self.standalone {

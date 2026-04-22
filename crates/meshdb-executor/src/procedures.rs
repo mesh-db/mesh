@@ -1,6 +1,12 @@
+#[cfg(feature = "apoc-create")]
+use crate::error::Error;
 use crate::error::Result;
 use crate::reader::GraphReader;
 use crate::value::Value;
+#[cfg(feature = "apoc-create")]
+use crate::writer::GraphWriter;
+#[cfg(feature = "apoc-create")]
+use meshdb_core::Node;
 use meshdb_core::Property;
 use std::collections::{BTreeSet, HashMap};
 
@@ -103,6 +109,14 @@ pub enum BuiltinProc {
     /// carrying `name`, `label`, `property`, and `type` columns.
     /// Mirrors the `SHOW CONSTRAINTS` surface.
     DbConstraints,
+    /// `apoc.create.node(labels, props)` — write builtin that
+    /// creates a node with the given labels and properties and
+    /// yields it as `node`. The first builtin that mutates the
+    /// store, so it goes through [`Procedure::resolve_write_rows`]
+    /// rather than [`Procedure::resolve_rows`] — the args drive
+    /// the row directly, no candidate-row filtering needed.
+    #[cfg(feature = "apoc-create")]
+    ApocCreateNode,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -128,6 +142,19 @@ impl Procedure {
         true
     }
 
+    /// True when this procedure mutates the store and therefore
+    /// needs to be dispatched through [`Self::resolve_write_rows`]
+    /// (which receives the writer and the already-evaluated args)
+    /// rather than [`Self::resolve_rows`]. Read-only built-ins and
+    /// pre-populated rows return `false`.
+    pub fn is_write_builtin(&self) -> bool {
+        match self.builtin {
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateNode) => true,
+            _ => false,
+        }
+    }
+
     /// Produce the row set the executor should iterate. Static
     /// procedures simply hand back their pre-populated `rows`;
     /// built-ins derive their rows from the live graph via `reader`.
@@ -138,6 +165,27 @@ impl Procedure {
             Some(BuiltinProc::DbRelationshipTypes) => builtin_db_relationship_types(reader),
             Some(BuiltinProc::DbPropertyKeys) => builtin_db_property_keys(reader),
             Some(BuiltinProc::DbConstraints) => builtin_db_constraints(reader),
+            #[cfg(feature = "apoc-create")]
+            Some(BuiltinProc::ApocCreateNode) => Err(Error::Procedure(
+                "apoc.create.node is a write procedure — call via resolve_write_rows".into(),
+            )),
+        }
+    }
+
+    /// Write-procedure dispatch path. The args are already
+    /// evaluated and type-checked; the row is produced as a side
+    /// effect of the mutation (e.g. the newly-created node) so
+    /// `row_matches` is skipped for these procedures.
+    #[cfg(feature = "apoc-create")]
+    pub fn resolve_write_rows(
+        &self,
+        _reader: &dyn GraphReader,
+        writer: &dyn GraphWriter,
+        args: &[Value],
+    ) -> Result<Vec<ProcRow>> {
+        match self.builtin {
+            Some(BuiltinProc::ApocCreateNode) => apoc_create_node(writer, args),
+            _ => Err(Error::Procedure("procedure is not a write builtin".into())),
         }
     }
 }
@@ -222,6 +270,98 @@ fn builtin_db_property_keys(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
         .into_iter()
         .map(|k| str_row("propertyKey", k))
         .collect())
+}
+
+/// Implementation of the `apoc.create.node(labels, props)` write
+/// builtin. Constructs a [`Node`] from the args, persists it via
+/// `writer.put_node`, and yields a single row with the new node
+/// under the `node` column. Both args may be Null (Neo4j allows
+/// `apoc.create.node(null, null)` — yields an empty unlabeled
+/// node), but a non-null first arg must be a list of strings and
+/// a non-null second arg must be a map.
+#[cfg(feature = "apoc-create")]
+fn apoc_create_node(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<ProcRow>> {
+    let labels = match &args[0] {
+        Value::Null | Value::Property(Property::Null) => Vec::new(),
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::Property(Property::String(s)) => Ok(s.clone()),
+                other => Err(Error::Procedure(format!(
+                    "apoc.create.node: labels must be strings, got {other:?}"
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Value::Property(Property::List(items)) => items
+            .iter()
+            .map(|p| match p {
+                Property::String(s) => Ok(s.clone()),
+                other => Err(Error::Procedure(format!(
+                    "apoc.create.node: labels must be strings, got {other:?}"
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.create.node: first argument must be a list of strings, got {other:?}"
+            )));
+        }
+    };
+    let props: HashMap<String, Property> = match &args[1] {
+        Value::Null | Value::Property(Property::Null) => HashMap::new(),
+        Value::Map(pairs) => pairs
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), value_to_storable_property(v)?)))
+            .collect::<Result<HashMap<_, _>>>()?,
+        Value::Property(Property::Map(entries)) => entries
+            .iter()
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect(),
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.create.node: second argument must be a map, got {other:?}"
+            )));
+        }
+    };
+    let mut node = Node::new();
+    node.labels = labels;
+    // Skip null property values — matches the openCypher rule used
+    // by `CREATE (n {k: null})`: the key is treated as absent.
+    for (k, p) in props {
+        if !matches!(p, Property::Null) {
+            node.properties.insert(k, p);
+        }
+    }
+    writer.put_node(&node)?;
+    let mut row = HashMap::new();
+    row.insert("node".to_string(), Value::Node(node));
+    Ok(vec![row])
+}
+
+/// Convert a [`Value`] supplied as a procedure arg into a
+/// storable [`Property`]. Mirrors the `value_to_property` helper
+/// in `ops.rs` but lives here so procedures.rs can stay
+/// self-contained — graph elements (Node/Edge/Path) and
+/// graph-aware Maps aren't valid as stored properties.
+#[cfg(feature = "apoc-create")]
+fn value_to_storable_property(v: &Value) -> Result<Property> {
+    match v {
+        Value::Property(p) => Ok(p.clone()),
+        Value::Null => Ok(Property::Null),
+        Value::List(items) => {
+            let props = items
+                .iter()
+                .map(value_to_storable_property)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Property::List(props))
+        }
+        Value::Map(_) | Value::Node(_) | Value::Edge(_) | Value::Path { .. } => {
+            Err(Error::Procedure(
+                "apoc.create.node: property values can't be graph elements or graph-aware maps"
+                    .into(),
+            ))
+        }
+    }
 }
 
 fn values_equal_for_procedure(a: &Value, b: &Value) -> bool {
@@ -332,6 +472,29 @@ impl ProcedureRegistry {
             ],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::DbConstraints),
+        });
+        #[cfg(feature = "apoc-create")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "create".into(), "node".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "labels".into(),
+                    // List<String> declared as ANY because the type
+                    // lattice doesn't carry container parameters; the
+                    // builtin validates structure at call time.
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "props".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "node".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocCreateNode),
         });
     }
 }

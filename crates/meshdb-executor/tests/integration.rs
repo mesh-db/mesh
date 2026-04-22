@@ -9694,6 +9694,99 @@ mod apoc_create {
         let b = str_prop(&rows[0], "b");
         assert_ne!(a, b, "two apoc.create.uuid() calls should differ");
     }
+
+    #[test]
+    fn apoc_create_node_persists_labels_and_props() {
+        let (store, _d) = open_store();
+        let created = run_with_default_procs(
+            &store,
+            "CALL apoc.create.node(['Person', 'Customer'], {name: 'alice', age: 30}) \
+             YIELD node RETURN node",
+        );
+        match created[0].get("node").unwrap() {
+            Value::Node(n) => {
+                let mut labels = n.labels.clone();
+                labels.sort();
+                assert_eq!(labels, vec!["Customer".to_string(), "Person".to_string()]);
+                assert_eq!(
+                    n.properties.get("name"),
+                    Some(&Property::String("alice".into())),
+                );
+                assert_eq!(n.properties.get("age"), Some(&Property::Int64(30)));
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+        // The node should now be findable via a regular MATCH —
+        // confirming the write went through the same store path
+        // CREATE uses, not just an in-memory yield.
+        let found = run(
+            &store,
+            "MATCH (p:Person) WHERE p.name = 'alice' RETURN p.age AS a",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(int_prop(&found[0], "a"), 30);
+    }
+
+    #[test]
+    fn apoc_create_node_with_null_labels_and_props_yields_empty_node() {
+        let (store, _d) = open_store();
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.create.node(null, null) YIELD node RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => {
+                assert!(n.labels.is_empty());
+                assert!(n.properties.is_empty());
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_create_node_skips_null_property_values() {
+        let (store, _d) = open_store();
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.create.node(['T'], {a: 1, b: null, c: 'x'}) YIELD node RETURN node",
+        );
+        match rows[0].get("node").unwrap() {
+            Value::Node(n) => {
+                assert_eq!(n.properties.get("a"), Some(&Property::Int64(1)));
+                assert_eq!(n.properties.get("c"), Some(&Property::String("x".into())));
+                assert!(
+                    !n.properties.contains_key("b"),
+                    "null property should be absent, found: {:?}",
+                    n.properties.get("b")
+                );
+            }
+            other => panic!("expected Node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_create_node_rejects_non_string_label() {
+        let (store, _d) = open_store();
+        let stmt = parse("CALL apoc.create.node([1, 2], {}) YIELD node RETURN node").unwrap();
+        let p = plan(&stmt).unwrap();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let params = ParamMap::new();
+        let err = execute_with_reader_and_procs(
+            &p,
+            &store as &dyn GraphReader,
+            &store as &dyn GraphWriter,
+            &params,
+            &procs,
+        )
+        .err()
+        .expect("expected an error for non-string label");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("apoc.create.node") && msg.to_ascii_lowercase().contains("string"),
+            "expected label-type error, got: {msg}",
+        );
+    }
 }
 
 #[cfg(feature = "apoc-meta")]
