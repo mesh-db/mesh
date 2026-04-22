@@ -163,6 +163,16 @@ pub enum BuiltinProc {
     /// EdgeId. Yields the new edge as `rel`.
     #[cfg(feature = "apoc-refactor")]
     ApocRefactorSetType,
+    /// `apoc.meta.schema()` — read-only introspection that walks
+    /// the live graph and produces a single-row Map keyed by
+    /// label and relationship-type names. Each entry carries a
+    /// `count`, a `type` discriminator (`"node"` or
+    /// `"relationship"`), and a `properties` map describing each
+    /// observed property's APOC type and (for nodes) whether
+    /// it's covered by a property index. O(N) in the graph size,
+    /// same complexity class as Neo4j APOC's equivalent.
+    #[cfg(feature = "apoc-meta")]
+    ApocMetaSchema,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -221,6 +231,8 @@ impl Procedure {
             Some(BuiltinProc::DbRelationshipTypes) => builtin_db_relationship_types(reader),
             Some(BuiltinProc::DbPropertyKeys) => builtin_db_property_keys(reader),
             Some(BuiltinProc::DbConstraints) => builtin_db_constraints(reader),
+            #[cfg(feature = "apoc-meta")]
+            Some(BuiltinProc::ApocMetaSchema) => builtin_apoc_meta_schema(reader),
             #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateNode) => Err(Error::Procedure(
                 "apoc.create.node is a write procedure — call via resolve_write_rows".into(),
@@ -370,6 +382,173 @@ fn builtin_db_property_keys(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
         .into_iter()
         .map(|k| str_row("propertyKey", k))
         .collect())
+}
+
+/// Implementation of `apoc.meta.schema()` — one full graph walk,
+/// collecting per-label and per-relationship-type statistics and
+/// merging them with the registered index set into a single Map
+/// keyed by label / type name. Matches Neo4j's APOC shape closely
+/// enough that ported dashboards rendering the `value` column
+/// keep working:
+///
+/// ```text
+/// {
+///   <label>: {
+///     type: "node",
+///     count: <int>,
+///     properties: {
+///       <key>: { type: <APOC type name>, indexed: <bool> }
+///     }
+///   },
+///   <edgeType>: {
+///     type: "relationship",
+///     count: <int>,
+///     properties: {
+///       <key>: { type: <APOC type name> }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Emits a single row under the `value` column (standard APOC
+/// convention). Unlabeled nodes are omitted — Neo4j APOC does the
+/// same, since there's no natural key for that bucket.
+#[cfg(feature = "apoc-meta")]
+fn builtin_apoc_meta_schema(reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
+    use std::collections::HashSet;
+    // Per-label accumulator: count + observed (key → type set).
+    let mut label_count: HashMap<String, i64> = HashMap::new();
+    let mut label_props: HashMap<String, HashMap<String, HashSet<&'static str>>> = HashMap::new();
+    let mut edge_count: HashMap<String, i64> = HashMap::new();
+    let mut edge_props: HashMap<String, HashMap<String, HashSet<&'static str>>> = HashMap::new();
+
+    for id in reader.all_node_ids()? {
+        let node = match reader.get_node(id)? {
+            Some(n) => n,
+            None => continue,
+        };
+        for label in &node.labels {
+            *label_count.entry(label.clone()).or_insert(0) += 1;
+            let per_label = label_props.entry(label.clone()).or_default();
+            for (k, v) in &node.properties {
+                per_label
+                    .entry(k.clone())
+                    .or_default()
+                    .insert(apoc_schema_type(v));
+            }
+        }
+        for (edge_id, _) in reader.outgoing(id)? {
+            let edge = match reader.get_edge(edge_id)? {
+                Some(e) => e,
+                None => continue,
+            };
+            *edge_count.entry(edge.edge_type.clone()).or_insert(0) += 1;
+            let per_type = edge_props.entry(edge.edge_type.clone()).or_default();
+            for (k, v) in &edge.properties {
+                per_type
+                    .entry(k.clone())
+                    .or_default()
+                    .insert(apoc_schema_type(v));
+            }
+        }
+    }
+
+    // Index lookup: a property is marked `indexed: true` if any
+    // registered index mentions it (composite indexes count for
+    // each of their columns). Only node-scope indexes feed the
+    // per-label view; relationship property indexes follow the
+    // same pattern but under the edge type.
+    let mut node_indexed: HashMap<String, HashSet<String>> = HashMap::new();
+    for (label, props) in reader.list_property_indexes()? {
+        let entry = node_indexed.entry(label).or_default();
+        for p in props {
+            entry.insert(p);
+        }
+    }
+    let mut edge_indexed: HashMap<String, HashSet<String>> = HashMap::new();
+    for (edge_type, props) in reader.list_edge_property_indexes()? {
+        let entry = edge_indexed.entry(edge_type).or_default();
+        for p in props {
+            entry.insert(p);
+        }
+    }
+
+    let mut schema: HashMap<String, Property> = HashMap::new();
+    for (label, count) in label_count {
+        let props = label_props.remove(&label).unwrap_or_default();
+        let indexed = node_indexed.remove(&label).unwrap_or_default();
+        schema.insert(
+            label,
+            Property::Map(schema_entry(count, "node", props, Some(&indexed))),
+        );
+    }
+    for (edge_type, count) in edge_count {
+        let props = edge_props.remove(&edge_type).unwrap_or_default();
+        let indexed = edge_indexed.remove(&edge_type).unwrap_or_default();
+        schema.insert(
+            edge_type,
+            Property::Map(schema_entry(count, "relationship", props, Some(&indexed))),
+        );
+    }
+
+    let mut row = HashMap::new();
+    row.insert("value".to_string(), Value::Property(Property::Map(schema)));
+    Ok(vec![row])
+}
+
+/// Build one label-or-type entry in the schema map. `type_tag`
+/// is `"node"` or `"relationship"`. If a property was observed
+/// with several value kinds across rows, its `type` cell collapses
+/// those into a sorted `"STRING|INTEGER"` string — that's the
+/// convention Neo4j APOC uses for heterogeneous columns.
+#[cfg(feature = "apoc-meta")]
+fn schema_entry(
+    count: i64,
+    type_tag: &str,
+    props: HashMap<String, std::collections::HashSet<&'static str>>,
+    indexed: Option<&std::collections::HashSet<String>>,
+) -> HashMap<String, Property> {
+    let mut out: HashMap<String, Property> = HashMap::new();
+    out.insert("type".into(), Property::String(type_tag.into()));
+    out.insert("count".into(), Property::Int64(count));
+    let mut properties: HashMap<String, Property> = HashMap::new();
+    for (k, types) in props {
+        let mut sorted: Vec<&'static str> = types.into_iter().collect();
+        sorted.sort_unstable();
+        let ty = sorted.join("|");
+        let mut info: HashMap<String, Property> = HashMap::new();
+        info.insert("type".into(), Property::String(ty));
+        if let Some(idx) = indexed {
+            info.insert("indexed".into(), Property::Bool(idx.contains(&k)));
+        }
+        properties.insert(k, Property::Map(info));
+    }
+    out.insert("properties".into(), Property::Map(properties));
+    out
+}
+
+/// Upper-snake-case type name for a [`Property`], matching the
+/// spelling used by `apoc.meta.type` (e.g. `"STRING"`,
+/// `"DATE_TIME"`). Duplicates the scalar-side table in
+/// `meshdb_apoc::meta` because procedures.rs deliberately stays
+/// decoupled from meshdb-apoc.
+#[cfg(feature = "apoc-meta")]
+fn apoc_schema_type(p: &Property) -> &'static str {
+    match p {
+        Property::Null => "NULL",
+        Property::String(_) => "STRING",
+        Property::Int64(_) => "INTEGER",
+        Property::Float64(_) => "FLOAT",
+        Property::Bool(_) => "BOOLEAN",
+        Property::List(_) => "LIST",
+        Property::Map(_) => "MAP",
+        Property::DateTime { .. } => "DATE_TIME",
+        Property::LocalDateTime(_) => "LOCAL_DATE_TIME",
+        Property::Date(_) => "DATE",
+        Property::Time { .. } => "TIME",
+        Property::Duration(_) => "DURATION",
+        Property::Point(_) => "POINT",
+    }
 }
 
 /// Implementation of the `apoc.create.node(labels, props)` write
@@ -1054,6 +1233,17 @@ impl ProcedureRegistry {
             }],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::ApocCreateSetRelProperty),
+        });
+        #[cfg(feature = "apoc-meta")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "meta".into(), "schema".into()],
+            inputs: Vec::new(),
+            outputs: vec![ProcOutSpec {
+                name: "value".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocMetaSchema),
         });
         #[cfg(feature = "apoc-refactor")]
         self.register(Procedure {

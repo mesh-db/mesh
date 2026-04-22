@@ -10183,6 +10183,113 @@ mod apoc_meta {
             other => panic!("expected Map, got {other:?}"),
         }
     }
+
+    #[test]
+    fn apoc_meta_schema_reports_node_counts_and_property_types() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'alice', age: 30})");
+        run(&store, "CREATE (:Person {name: 'bob', age: 25})");
+        run(&store, "CREATE (:Widget {sku: 'abc'})");
+        let rows =
+            run_with_default_procs(&store, "CALL apoc.meta.schema() YIELD value RETURN value");
+        let Value::Property(Property::Map(m)) = rows[0].get("value").unwrap() else {
+            panic!("expected value to be a Map");
+        };
+        let Some(Property::Map(person)) = m.get("Person") else {
+            panic!(
+                "missing Person entry, got keys: {:?}",
+                m.keys().collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(person.get("type"), Some(&Property::String("node".into())));
+        assert_eq!(person.get("count"), Some(&Property::Int64(2)));
+        let Some(Property::Map(person_props)) = person.get("properties") else {
+            panic!("missing Person properties");
+        };
+        let Some(Property::Map(name_info)) = person_props.get("name") else {
+            panic!("missing Person.name info");
+        };
+        assert_eq!(
+            name_info.get("type"),
+            Some(&Property::String("STRING".into())),
+        );
+        let Some(Property::Map(age_info)) = person_props.get("age") else {
+            panic!("missing Person.age info");
+        };
+        assert_eq!(
+            age_info.get("type"),
+            Some(&Property::String("INTEGER".into())),
+        );
+        let Some(Property::Map(widget)) = m.get("Widget") else {
+            panic!("missing Widget entry");
+        };
+        assert_eq!(widget.get("count"), Some(&Property::Int64(1)));
+    }
+
+    #[test]
+    fn apoc_meta_schema_reports_relationship_counts_and_props() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (:Person {n: 1})-[:KNOWS {since: 2020}]->(:Person {n: 2})",
+        );
+        run(
+            &store,
+            "CREATE (:Person {n: 3})-[:KNOWS {since: 2021}]->(:Person {n: 4})",
+        );
+        let rows =
+            run_with_default_procs(&store, "CALL apoc.meta.schema() YIELD value RETURN value");
+        let Value::Property(Property::Map(m)) = rows[0].get("value").unwrap() else {
+            panic!("expected Map");
+        };
+        let Some(Property::Map(knows)) = m.get("KNOWS") else {
+            panic!(
+                "missing KNOWS entry, got keys: {:?}",
+                m.keys().collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(
+            knows.get("type"),
+            Some(&Property::String("relationship".into())),
+        );
+        assert_eq!(knows.get("count"), Some(&Property::Int64(2)));
+        let Some(Property::Map(props)) = knows.get("properties") else {
+            panic!("missing KNOWS properties");
+        };
+        let Some(Property::Map(since_info)) = props.get("since") else {
+            panic!("missing KNOWS.since info");
+        };
+        assert_eq!(
+            since_info.get("type"),
+            Some(&Property::String("INTEGER".into())),
+        );
+    }
+
+    #[test]
+    fn apoc_meta_schema_marks_indexed_property_true() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE INDEX FOR (n:Person) ON (n.name)");
+        run(&store, "CREATE (:Person {name: 'alice', age: 30})");
+        let rows =
+            run_with_default_procs(&store, "CALL apoc.meta.schema() YIELD value RETURN value");
+        let Value::Property(Property::Map(m)) = rows[0].get("value").unwrap() else {
+            panic!("expected Map");
+        };
+        let Property::Map(person) = m.get("Person").unwrap() else {
+            panic!("missing Person")
+        };
+        let Property::Map(props) = person.get("properties").unwrap() else {
+            panic!("missing properties")
+        };
+        let Property::Map(name_info) = props.get("name").unwrap() else {
+            panic!("missing name info")
+        };
+        assert_eq!(name_info.get("indexed"), Some(&Property::Bool(true)));
+        let Property::Map(age_info) = props.get("age").unwrap() else {
+            panic!("missing age info")
+        };
+        assert_eq!(age_info.get("indexed"), Some(&Property::Bool(false)));
+    }
 }
 
 mod apoc_agg {
