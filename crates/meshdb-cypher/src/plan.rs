@@ -47,6 +47,13 @@ pub struct PlannerContext {
     /// single-property on the seek key; composite edge seeks are a
     /// follow-up.
     pub edge_indexes: Vec<(String, Vec<String>)>,
+    /// `(label, property)` pairs corresponding to active point /
+    /// spatial indexes. Consulted by the filter-chain rewrite that
+    /// turns `WHERE point.withinbbox(var.prop, lo, hi)` into a
+    /// [`LogicalPlan::PointIndexSeek`]. Single-property by
+    /// construction — composite spatial indexes would need their
+    /// own plan variant.
+    pub point_indexes: Vec<(String, String)>,
     /// Variables bound in an enclosing query scope. Populated when
     /// planning the body of an `exists { ... }` / `count { ... }`
     /// subquery so that a first-clause `MATCH (n)-->(m)` where `n`
@@ -81,6 +88,16 @@ impl PlannerContext {
         self.edge_indexes
             .iter()
             .any(|(t, props)| t == edge_type && props.len() == 1 && props[0] == property)
+    }
+
+    /// True when a point index is registered on `(label, property)`.
+    /// Gate for the `WHERE point.withinbbox` → [`LogicalPlan::PointIndexSeek`]
+    /// rewrite — without a matching index the planner falls back to
+    /// `NodeScanByLabels` + `Filter`.
+    pub fn has_point_index(&self, label: &str, property: &str) -> bool {
+        self.point_indexes
+            .iter()
+            .any(|(l, p)| l == label && p == property)
     }
 
     /// Pick the best composite index on `label` covered by the equality
@@ -490,6 +507,26 @@ pub enum LogicalPlan {
         label: String,
         properties: Vec<String>,
         values: Vec<Expr>,
+    },
+    /// Axis-aligned bbox range query through a point / spatial
+    /// index. Emitted when a WHERE conjunct matches
+    /// `point.withinbbox(var.property, lo, hi)` and a point index is
+    /// registered on `(label, property)` — both corners must be
+    /// row-independent (literal or parameter) so they can be evaluated
+    /// once at operator open. The executor calls
+    /// `reader.nodes_in_bbox(label, property, srid, xlo, ylo, xhi, yhi)`
+    /// after evaluating the corners and extracting the SRID.
+    ///
+    /// SRID mismatch between corners short-circuits to an empty result
+    /// — `point.withinbbox` returns null in that case, which excludes
+    /// the row from a filter, so emitting no rows matches the
+    /// pre-rewrite semantics.
+    PointIndexSeek {
+        var: String,
+        label: String,
+        property: String,
+        lo: Expr,
+        hi: Expr,
     },
     /// Equality lookup through an edge property index. Relationship
     /// analogue of [`LogicalPlan::IndexSeek`]. Emitted for
@@ -1058,6 +1095,16 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
                 properties.join(",")
             ));
         }
+        LogicalPlan::PointIndexSeek {
+            var,
+            label,
+            property,
+            ..
+        } => {
+            buf.push_str(&format!(
+                "{indent}PointIndexSeek({var}:{label}.{property})\n"
+            ));
+        }
         LogicalPlan::EdgeSeek {
             edge_var,
             src_var,
@@ -1493,6 +1540,11 @@ where
             for v in values {
                 visit(v)?;
             }
+            Ok(())
+        }
+        LogicalPlan::PointIndexSeek { lo, hi, .. } => {
+            visit(lo)?;
+            visit(hi)?;
             Ok(())
         }
         LogicalPlan::EdgeSeek {
@@ -3554,6 +3606,178 @@ fn optimize_filter_chain_to_index_seek(plan: LogicalPlan, ctx: &PlannerContext) 
     rebuild_filter_chain(seek, residual)
 }
 
+/// Complement of [`optimize_filter_chain_to_index_seek`] for point /
+/// spatial indexes. Looks for a conjunct of the form
+/// `point.withinbbox(scan_var.prop, lo, hi)` with both corners
+/// row-independent, and — if a point index is registered on
+/// `(label, prop)` — rewrites to [`LogicalPlan::PointIndexSeek`]
+/// with the rest of the conjuncts preserved as a residual filter.
+///
+/// Only the first matching `withinbbox` is consumed. Multiple bbox
+/// predicates on the same node would need an intersection-of-bboxes
+/// optimization that isn't implemented yet; for now the second one
+/// stays in the residual filter and the executor re-checks it on
+/// each seeked row.
+///
+/// Chained after the equality-seek rewrite so both can fire in a
+/// single query: `WHERE n.q = 1 AND point.withinbbox(n.p, ...)`
+/// prefers the IndexSeek on `q` when that's available. The point
+/// rewrite only fires against a leaf `NodeScanByLabels`, so if the
+/// equality rewrite already consumed the scan, the point check bails
+/// cleanly and the withinbbox stays in the residual.
+fn optimize_filter_chain_to_point_index_seek(
+    plan: LogicalPlan,
+    ctx: &PlannerContext,
+) -> LogicalPlan {
+    if !matches!(plan, LogicalPlan::Filter { .. }) {
+        return plan;
+    }
+
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    let mut current = plan;
+    while let LogicalPlan::Filter { input, predicate } = current {
+        push_conjuncts(predicate, &mut conjuncts);
+        current = *input;
+    }
+
+    let (scan_var, scan_label) = match &current {
+        LogicalPlan::NodeScanByLabels { var, labels } if labels.len() == 1 => {
+            (var.clone(), labels[0].clone())
+        }
+        _ => return rebuild_filter_chain(current, conjuncts),
+    };
+
+    let mut consumed: Option<(usize, String, Expr, Expr)> = None;
+    for (i, c) in conjuncts.iter().enumerate() {
+        if let Some((prop, lo, hi)) = extract_point_withinbbox(c, &scan_var) {
+            if ctx.has_point_index(&scan_label, &prop) {
+                consumed = Some((i, prop, lo, hi));
+                break;
+            }
+        }
+    }
+
+    let Some((idx, property, lo, hi)) = consumed else {
+        return rebuild_filter_chain(current, conjuncts);
+    };
+
+    let seek = LogicalPlan::PointIndexSeek {
+        var: scan_var,
+        label: scan_label,
+        property,
+        lo,
+        hi,
+    };
+    let residual: Vec<Expr> = conjuncts
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx)
+        .map(|(_, c)| c)
+        .collect();
+    rebuild_filter_chain(seek, residual)
+}
+
+/// Recognize `point.withinbbox(scan_var.prop, lo, hi)` as a
+/// candidate for `PointIndexSeek`. Returns the indexed property name
+/// plus the two corner expressions, or `None` when:
+///
+/// - the call isn't `point.withinbbox` (case-insensitive),
+/// - the first argument isn't `scan_var.<ident>`,
+/// - either corner references row state.
+///
+/// The corner check accepts arbitrary row-independent expressions
+/// (not just `Literal` / `Parameter` like the equality-seek rewrite
+/// does), so the common `point({x: 1, y: 2})` constructor call form
+/// is eligible. The operator evaluates corners once at open, so
+/// pure-but-non-trivial expressions (map literals, scalar calls on
+/// params) are cheap.
+fn extract_point_withinbbox(c: &Expr, scan_var: &str) -> Option<(String, Expr, Expr)> {
+    use crate::ast::CallArgs;
+    let Expr::Call { name, args } = c else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("point.withinbbox") {
+        return None;
+    }
+    let CallArgs::Exprs(args) = args else {
+        return None;
+    };
+    if args.len() != 3 {
+        return None;
+    }
+    let prop = match &args[0] {
+        Expr::Property { var, key } if var == scan_var => key.clone(),
+        _ => return None,
+    };
+    if expr_references_row_state(&args[1]) || expr_references_row_state(&args[2]) {
+        return None;
+    }
+    Some((prop, args[1].clone(), args[2].clone()))
+}
+
+/// `true` when `e` could read values from the currently-streaming
+/// row. Looser than [`expr_is_row_independent`]: map/list/call/etc.
+/// forms are allowed as long as their children are also
+/// row-independent. Used by the point-index rewrite so
+/// `point({x: 0, y: 0})` literal corners can be lifted out of the
+/// filter. Unknown shapes return `true` to stay on the safe side —
+/// a conservative "no" on rewrite, rather than a wrong plan.
+fn expr_references_row_state(e: &Expr) -> bool {
+    use crate::ast::CallArgs;
+    match e {
+        Expr::Identifier(_) | Expr::Property { .. } | Expr::PropertyAccess { .. } => true,
+        Expr::Literal(_) | Expr::Parameter(_) => false,
+        Expr::Not(a) => expr_references_row_state(a),
+        Expr::IsNull { inner, .. } => expr_references_row_state(inner),
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            expr_references_row_state(a) || expr_references_row_state(b)
+        }
+        Expr::Compare { left, right, .. } => {
+            expr_references_row_state(left) || expr_references_row_state(right)
+        }
+        Expr::IndexAccess { base, index } => {
+            expr_references_row_state(base) || expr_references_row_state(index)
+        }
+        Expr::SliceAccess { base, start, end } => {
+            expr_references_row_state(base)
+                || start.as_deref().map_or(false, expr_references_row_state)
+                || end.as_deref().map_or(false, expr_references_row_state)
+        }
+        Expr::HasLabels { expr, .. } => expr_references_row_state(expr),
+        Expr::InList { element, list } => {
+            expr_references_row_state(element) || expr_references_row_state(list)
+        }
+        Expr::Call { args, .. } => match args {
+            CallArgs::Star => false,
+            CallArgs::Exprs(a) | CallArgs::DistinctExprs(a) => {
+                a.iter().any(expr_references_row_state)
+            }
+        },
+        Expr::Case {
+            scrutinee,
+            branches,
+            else_expr,
+        } => {
+            scrutinee
+                .as_deref()
+                .map_or(false, expr_references_row_state)
+                || branches
+                    .iter()
+                    .any(|(c, r)| expr_references_row_state(c) || expr_references_row_state(r))
+                || else_expr
+                    .as_deref()
+                    .map_or(false, expr_references_row_state)
+        }
+        Expr::List(items) => items.iter().any(expr_references_row_state),
+        Expr::Map(pairs) => pairs.iter().any(|(_, v)| expr_references_row_state(v)),
+        // Unhandled shapes (comprehensions, reduce, pattern predicates,
+        // subquery exprs): treat as row-referencing. Widening this set
+        // is safe but unnecessary — the point corners in real queries
+        // are literals, parameters, or the `point({...})` constructor.
+        _ => true,
+    }
+}
+
 /// Extract `(key, value)` from a conjunct that's a row-independent
 /// equality on `scan_var.key`, in either argument order. `None` for
 /// anything else — that includes equalities whose value side isn't
@@ -4124,7 +4348,12 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 // a later MATCH with a WHERE on an indexed
                 // property still gets the IndexSeek lowering.
                 let current = plan.expect("MATCH produced a plan");
-                plan = Some(optimize_filter_chain_to_index_seek(current, ctx));
+                let current = optimize_filter_chain_to_index_seek(current, ctx);
+                // Point-index rewrite runs second so it sees the
+                // post-IndexSeek plan; if the equality seek already
+                // consumed the leaf NodeScanByLabels, the withinbbox
+                // stays in the residual filter above the seek.
+                plan = Some(optimize_filter_chain_to_point_index_seek(current, ctx));
             }
             ReadingClause::OptionalMatch(o) => {
                 let current = match plan.take() {

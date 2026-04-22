@@ -855,6 +855,19 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             properties.clone(),
             values.clone(),
         )),
+        LogicalPlan::PointIndexSeek {
+            var,
+            label,
+            property,
+            lo,
+            hi,
+        } => Box::new(PointIndexSeekOp::new(
+            var.clone(),
+            label.clone(),
+            property.clone(),
+            lo.clone(),
+            hi.clone(),
+        )),
         LogicalPlan::EdgeSeek {
             edge_var,
             src_var,
@@ -2499,6 +2512,84 @@ impl Operator for IndexSeekOp {
             }
         }
         Ok(None)
+    }
+}
+
+/// Physical operator for [`LogicalPlan::PointIndexSeek`]. Evaluates
+/// the two corner expressions once on first `next()`, extracts the
+/// `(srid, x, y)` from each, and drives
+/// `reader.nodes_in_bbox(label, property, srid, xlo, ylo, xhi, yhi)`.
+///
+/// SRID mismatch between the two corners short-circuits to empty —
+/// the unoptimized `point.withinbbox(n.p, lo, hi)` returns null on a
+/// corner SRID mismatch, which excludes the row from a filter, and
+/// "no rows" is the same observable outcome. Non-Point or null
+/// corners fall into the same bucket, same reason.
+struct PointIndexSeekOp {
+    var: String,
+    label: String,
+    property: String,
+    lo_expr: Expr,
+    hi_expr: Expr,
+    results: Option<Vec<NodeId>>,
+    cursor: usize,
+}
+
+impl PointIndexSeekOp {
+    fn new(var: String, label: String, property: String, lo_expr: Expr, hi_expr: Expr) -> Self {
+        Self {
+            var,
+            label,
+            property,
+            lo_expr,
+            hi_expr,
+            results: None,
+            cursor: 0,
+        }
+    }
+}
+
+impl Operator for PointIndexSeekOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.results.is_none() {
+            let empty = Row::new();
+            let lo_val = eval_expr(&self.lo_expr, &ctx.eval_ctx(&empty))?;
+            let hi_val = eval_expr(&self.hi_expr, &ctx.eval_ctx(&empty))?;
+            let lo_pt = extract_point(&lo_val);
+            let hi_pt = extract_point(&hi_val);
+            let ids = match (lo_pt, hi_pt) {
+                (Some(lo), Some(hi)) if lo.srid == hi.srid => ctx.store.nodes_in_bbox(
+                    &self.label,
+                    &self.property,
+                    lo.srid,
+                    lo.x,
+                    lo.y,
+                    hi.x,
+                    hi.y,
+                )?,
+                // Any null / non-point / SRID mismatch → no rows.
+                _ => Vec::new(),
+            };
+            self.results = Some(ids);
+        }
+        let ids = self.results.as_ref().unwrap();
+        while self.cursor < ids.len() {
+            let id = ids[self.cursor];
+            self.cursor += 1;
+            if let Some(node) = ctx.store.get_node(id)? {
+                let mut row = Row::new();
+                row.insert(self.var.clone(), Value::Node(node));
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn extract_point(v: &Value) -> Option<meshdb_core::Point> {
+    match v {
+        Value::Property(Property::Point(p)) => Some(*p),
+        _ => None,
     }
 }
 

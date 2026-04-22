@@ -2417,6 +2417,19 @@ impl StorageEngine for RocksDbStorageEngine {
         RocksDbStorageEngine::list_point_indexes(self)
     }
 
+    fn nodes_in_bbox(
+        &self,
+        label: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<NodeId>> {
+        RocksDbStorageEngine::nodes_in_bbox(self, label, property, srid, xlo, ylo, xhi, yhi)
+    }
+
     fn create_property_constraint(
         &self,
         name: Option<&str>,

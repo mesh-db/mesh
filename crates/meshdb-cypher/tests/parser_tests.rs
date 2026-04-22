@@ -1287,6 +1287,91 @@ fn create_point_index_rejects_composite_property_list() {
     assert!(parse("CREATE POINT INDEX FOR (c:City) ON (c.lon, c.lat)").is_err());
 }
 
+// ---------------------------------------------------------------
+// PointIndexSeek rewrite: planner-level assertions.
+// ---------------------------------------------------------------
+
+fn ctx_with_point_index(label: &str, prop: &str) -> PlannerContext {
+    PlannerContext {
+        indexes: Vec::new(),
+        edge_indexes: Vec::new(),
+        point_indexes: vec![(label.into(), prop.into())],
+        outer_bindings: Vec::new(),
+    }
+}
+
+#[test]
+fn withinbbox_with_registered_point_index_rewrites_to_seek() {
+    let stmt = parse(
+        "MATCH (c:City) \
+         WHERE point.withinbbox(c.loc, point({x:0,y:0}), point({x:10,y:10})) \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(
+        rendered.contains("PointIndexSeek(c:City.loc)"),
+        "plan should use PointIndexSeek, got:\n{rendered}",
+    );
+    // The withinbbox conjunct must be gone from the residual —
+    // storage's nodes_in_bbox applies the exact filter, so re-checking
+    // it in a Filter above the seek would be wasted work.
+    assert!(
+        !rendered.contains("withinbbox"),
+        "withinbbox should be consumed, got:\n{rendered}",
+    );
+}
+
+#[test]
+fn withinbbox_without_point_index_stays_as_filter() {
+    let stmt = parse(
+        "MATCH (c:City) \
+         WHERE point.withinbbox(c.loc, point({x:0,y:0}), point({x:10,y:10})) \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &PlannerContext::default()).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(
+        !rendered.contains("PointIndexSeek"),
+        "no index → no rewrite, got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("NodeScanByLabels"),
+        "fallback scan required, got:\n{rendered}",
+    );
+}
+
+#[test]
+fn withinbbox_preserves_unrelated_conjuncts() {
+    // A non-spatial conjunct alongside withinbbox must survive the
+    // rewrite as a residual Filter above the PointIndexSeek.
+    let stmt = parse(
+        "MATCH (c:City) \
+         WHERE point.withinbbox(c.loc, point({x:0,y:0}), point({x:10,y:10})) \
+           AND c.population > 1000 \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
+    let rendered = format_plan(&plan);
+    assert!(rendered.contains("PointIndexSeek"));
+    // The > predicate must stay — it's not something the seek handles.
+    assert!(
+        rendered.contains("Filter"),
+        "residual Filter lost the non-bbox conjunct:\n{rendered}",
+    );
+}
+
+#[test]
+fn withinbbox_with_parameterized_corners_rewrites() {
+    // $lo / $hi are row-independent so the rewrite should still fire.
+    let stmt = parse("MATCH (c:City) WHERE point.withinbbox(c.loc, $lo, $hi) RETURN c").unwrap();
+    let plan = plan_with_context(&stmt, &ctx_with_point_index("City", "loc")).unwrap();
+    assert!(format_plan(&plan).contains("PointIndexSeek(c:City.loc)"));
+}
+
 #[test]
 fn drop_edge_index_parses_composite_property_list() {
     match parse("DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since, r.weight)").unwrap() {
@@ -1562,6 +1647,7 @@ fn ctx_with_index(label: &str, prop: &str) -> PlannerContext {
     PlannerContext {
         indexes: vec![(label.into(), vec![prop.into()])],
         edge_indexes: Vec::new(),
+        point_indexes: Vec::new(),
         outer_bindings: Vec::new(),
     }
 }
@@ -1573,6 +1659,7 @@ fn ctx_with_composite_index(label: &str, props: &[&str]) -> PlannerContext {
             props.iter().map(|s| (*s).to_string()).collect(),
         )],
         edge_indexes: Vec::new(),
+        point_indexes: Vec::new(),
         outer_bindings: Vec::new(),
     }
 }
@@ -1837,6 +1924,7 @@ fn ctx_with_edge_index(edge_type: &str, prop: &str) -> PlannerContext {
     PlannerContext {
         indexes: Vec::new(),
         edge_indexes: vec![(edge_type.into(), vec![prop.into()])],
+        point_indexes: Vec::new(),
         outer_bindings: Vec::new(),
     }
 }

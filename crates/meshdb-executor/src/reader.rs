@@ -87,6 +87,43 @@ pub trait GraphReader: Send + Sync {
     fn list_point_indexes(&self) -> Result<Vec<(String, String)>> {
         Ok(Vec::new())
     }
+    /// Axis-aligned bounding-box range query over the point index
+    /// `(label, property)`. Returns every node carrying `label`
+    /// whose `property` is a `Property::Point` under `srid` that
+    /// falls inside `[xlo..xhi] × [ylo..yhi]`.
+    ///
+    /// Default impl does the naive scan (iterate `nodes_by_label`,
+    /// filter in memory) so that readers that don't maintain a
+    /// spatial index — or that haven't wired a native range query —
+    /// stay correct, just slow. Partitioned readers inherit this
+    /// default and get cluster-wide correctness through the
+    /// scatter-gather `nodes_by_label` underneath. The
+    /// storage-backed blanket overrides with the Z-order seek.
+    fn nodes_in_bbox(
+        &self,
+        label: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<NodeId>> {
+        let (lox, hix) = if xlo <= xhi { (xlo, xhi) } else { (xhi, xlo) };
+        let (loy, hiy) = if ylo <= yhi { (ylo, yhi) } else { (yhi, ylo) };
+        let mut result: Vec<NodeId> = Vec::new();
+        for id in self.nodes_by_label(label)? {
+            let Some(node) = self.get_node(id)? else {
+                continue;
+            };
+            if let Some(Property::Point(p)) = node.properties.get(property) {
+                if p.srid == srid && p.x >= lox && p.x <= hix && p.y >= loy && p.y <= hiy {
+                    result.push(id);
+                }
+            }
+        }
+        Ok(result)
+    }
     /// Snapshot every registered constraint visible through this
     /// reader, for `SHOW CONSTRAINTS` and `db.constraints()`. Default
     /// impl returns empty; storage-backed readers override.
@@ -179,6 +216,23 @@ impl<T: StorageEngine> GraphReader for T {
             .collect())
     }
 
+    fn nodes_in_bbox(
+        &self,
+        label: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<NodeId>> {
+        // Storage-backed readers go through the Z-order seek path;
+        // skip the default naive scan.
+        Ok(StorageEngine::nodes_in_bbox(
+            self, label, property, srid, xlo, ylo, xhi, yhi,
+        )?)
+    }
+
     fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
         Ok(StorageEngine::list_property_constraints(self))
     }
@@ -259,6 +313,21 @@ impl GraphReader for StorageReaderAdapter<'_> {
             .into_iter()
             .map(|s| (s.label, s.property))
             .collect())
+    }
+
+    fn nodes_in_bbox(
+        &self,
+        label: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<NodeId>> {
+        Ok(self
+            .0
+            .nodes_in_bbox(label, property, srid, xlo, ylo, xhi, yhi)?)
     }
 
     fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {

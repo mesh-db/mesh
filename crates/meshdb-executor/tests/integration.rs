@@ -3907,6 +3907,11 @@ fn run_with_ctx(store: &Store, q: &str) -> Vec<Row> {
             .into_iter()
             .map(|s| (s.edge_type, s.properties))
             .collect(),
+        point_indexes: store
+            .list_point_indexes()
+            .into_iter()
+            .map(|s| (s.label, s.property))
+            .collect(),
     };
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
     let plan = plan_with_context(&stmt, &ctx).unwrap_or_else(|e| panic!("plan {q}: {e}"));
@@ -3934,6 +3939,11 @@ fn run_with_ctx_params(store: &Store, q: &str, params: &ParamMap) -> Vec<Row> {
             .list_edge_property_indexes()
             .into_iter()
             .map(|s| (s.edge_type, s.properties))
+            .collect(),
+        point_indexes: store
+            .list_point_indexes()
+            .into_iter()
+            .map(|s| (s.label, s.property))
             .collect(),
     };
     let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
@@ -4051,6 +4061,100 @@ fn drop_point_index_empties_show_point_indexes() {
     assert_eq!(drop_rows.len(), 1);
     assert_eq!(str_prop(&drop_rows[0], "state"), "dropped");
     assert!(run(&store, "SHOW POINT INDEXES").is_empty());
+}
+
+#[test]
+fn withinbbox_query_returns_points_inside_bbox() {
+    // End-to-end bbox query going through the PointIndexSeek rewrite.
+    // Three cities; the bbox encloses Berlin only.
+    let (store, _d) = open_store();
+    run_with_ctx(&store, "CREATE POINT INDEX FOR (c:City) ON (c.loc)");
+    run_with_ctx(
+        &store,
+        "CREATE (:City {name: 'Berlin', loc: point({x: 13.4, y: 52.5})})",
+    );
+    run_with_ctx(
+        &store,
+        "CREATE (:City {name: 'NYC', loc: point({x: -73.9, y: 40.7})})",
+    );
+    run_with_ctx(
+        &store,
+        "CREATE (:City {name: 'Tokyo', loc: point({x: 139.7, y: 35.7})})",
+    );
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (c:City) \
+         WHERE point.withinbbox(c.loc, point({x: 10.0, y: 50.0}), point({x: 20.0, y: 55.0})) \
+         RETURN c.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "Berlin");
+}
+
+#[test]
+fn withinbbox_returns_same_rows_with_and_without_index() {
+    // Rewrite must preserve semantics. Run the same query against the
+    // post-CREATE-POINT-INDEX store (rewrite fires) vs a parallel
+    // store with no index (rewrite doesn't fire) and confirm the
+    // result set matches.
+    let (indexed, _d1) = open_store();
+    let (scan_only, _d2) = open_store();
+    for store in [&indexed, &scan_only] {
+        run_with_ctx(
+            store,
+            "CREATE (:City {name: 'A', loc: point({x: 1.0, y: 1.0})})",
+        );
+        run_with_ctx(
+            store,
+            "CREATE (:City {name: 'B', loc: point({x: 9.0, y: 9.0})})",
+        );
+        run_with_ctx(
+            store,
+            "CREATE (:City {name: 'C', loc: point({x: 20.0, y: 20.0})})",
+        );
+    }
+    run_with_ctx(&indexed, "CREATE POINT INDEX FOR (c:City) ON (c.loc)");
+
+    let q = "MATCH (c:City) \
+             WHERE point.withinbbox(c.loc, point({x: 0.0, y: 0.0}), point({x: 10.0, y: 10.0})) \
+             RETURN c.name AS name";
+    let mut indexed_names: Vec<String> = run_with_ctx(&indexed, q)
+        .iter()
+        .map(|r| str_prop(r, "name"))
+        .collect();
+    let mut scan_names: Vec<String> = run_with_ctx(&scan_only, q)
+        .iter()
+        .map(|r| str_prop(r, "name"))
+        .collect();
+    indexed_names.sort();
+    scan_names.sort();
+    assert_eq!(indexed_names, scan_names);
+    assert_eq!(indexed_names, vec!["A".to_string(), "B".to_string()]);
+}
+
+#[test]
+fn withinbbox_residual_conjunct_still_applies() {
+    // Rewrite consumes the withinbbox conjunct but a sibling
+    // predicate must still filter the seek output.
+    let (store, _d) = open_store();
+    run_with_ctx(&store, "CREATE POINT INDEX FOR (c:City) ON (c.loc)");
+    run_with_ctx(
+        &store,
+        "CREATE (:City {name: 'A', pop: 500,  loc: point({x: 1.0, y: 1.0})})",
+    );
+    run_with_ctx(
+        &store,
+        "CREATE (:City {name: 'B', pop: 5000, loc: point({x: 2.0, y: 2.0})})",
+    );
+    let rows = run_with_ctx(
+        &store,
+        "MATCH (c:City) \
+         WHERE point.withinbbox(c.loc, point({x: 0.0, y: 0.0}), point({x: 10.0, y: 10.0})) \
+           AND c.pop > 1000 \
+         RETURN c.name AS name",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_prop(&rows[0], "name"), "B");
 }
 
 #[test]

@@ -356,6 +356,23 @@ pub trait StorageEngine: Send + Sync {
     /// Snapshot the currently-registered point indexes.
     fn list_point_indexes(&self) -> Vec<PointIndexSpec>;
 
+    /// Axis-aligned bounding-box range query over the point index
+    /// `(label, property)` under `srid`. Entries tagged with a
+    /// different SRID are scoped out by the index key prefix, so
+    /// cross-SRID rows never leak. A missing index returns empty
+    /// rather than erroring — matches the soft-fail contract of
+    /// [`Self::nodes_by_property`].
+    fn nodes_in_bbox(
+        &self,
+        label: &str,
+        property: &str,
+        srid: i32,
+        xlo: f64,
+        ylo: f64,
+        xhi: f64,
+        yhi: f64,
+    ) -> Result<Vec<NodeId>>;
+
     // --- Constraint DDL ---
 
     /// Declare a new property constraint. If `name` is `None`, the
