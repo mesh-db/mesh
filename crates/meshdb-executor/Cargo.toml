@@ -10,6 +10,7 @@ description = "Physical operators and query execution for Mesh"
 meshdb-core = { workspace = true }
 meshdb-storage = { workspace = true }
 meshdb-cypher = { workspace = true }
+meshdb-apoc = { workspace = true, optional = true }
 serde = { workspace = true }
 thiserror.workspace = true
 chrono.workspace = true
@@ -19,3 +20,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# APOC-compatible scalar functions (and later procedures) under the
+# `apoc.*` namespace. Off by default to keep minimal builds lean;
+# users who want the extra surface build with `--features apoc`.
+default = []
+apoc = ["dep:meshdb-apoc"]

@@ -8980,3 +8980,152 @@ fn constraint_persists_across_reopen() {
     assert_eq!(shown.len(), 1);
     assert_eq!(str_prop(&shown[0], "name"), "persist_me");
 }
+
+// ---------------------------------------------------------------
+// APOC scalar functions (feature-gated).
+//
+// The entire module compiles only when `--features apoc` is on;
+// a minus-build with no APOC support passes the workspace test
+// suite without running these.
+// ---------------------------------------------------------------
+
+#[cfg(feature = "apoc")]
+mod apoc_coll {
+    use super::*;
+
+    fn int_list(row: &Row, key: &str) -> Vec<i64> {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::List(items)) => items
+                .iter()
+                .filter_map(|p| match p {
+                    Property::Int64(n) => Some(*n),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected Property::List, got {other:?}"),
+        }
+    }
+
+    fn bool_prop(row: &Row, key: &str) -> bool {
+        match row.get(key).expect("key missing") {
+            Value::Property(Property::Bool(b)) => *b,
+            other => panic!("expected Bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_coll_sum_on_integer_list() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.sum([1, 2, 3]) AS total");
+        assert_eq!(int_prop(&rows[0], "total"), 6);
+    }
+
+    #[test]
+    fn apoc_coll_avg_returns_float() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.avg([1, 2, 3, 4]) AS m");
+        match rows[0].get("m").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 2.5),
+            other => panic!("expected Float64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_coll_max_min_on_mixed_numeric() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.max([1, 3.5, 2]) AS hi, apoc.coll.min([1, 3.5, 2]) AS lo",
+        );
+        match rows[0].get("hi").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 3.5),
+            other => panic!("hi: expected Float64, got {other:?}"),
+        }
+        match rows[0].get("lo").unwrap() {
+            Value::Property(Property::Float64(f)) => assert_eq!(*f, 1.0),
+            other => panic!("lo: expected Float64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apoc_coll_to_set_dedupes_preserving_order() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.toSet([1, 2, 1, 3, 2]) AS s");
+        assert_eq!(int_list(&rows[0], "s"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn apoc_coll_sort_ascending_and_descending() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.sort([3, 1, 2]) AS up, apoc.coll.sortDesc([3, 1, 2]) AS down",
+        );
+        assert_eq!(int_list(&rows[0], "up"), vec![1, 2, 3]);
+        assert_eq!(int_list(&rows[0], "down"), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn apoc_coll_reverse_reverses_items() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.reverse([1, 2, 3]) AS r");
+        assert_eq!(int_list(&rows[0], "r"), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn apoc_coll_contains_hit_and_miss() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.contains([1, 2, 3], 2) AS hit, \
+                    apoc.coll.contains([1, 2, 3], 9) AS miss",
+        );
+        assert_eq!(bool_prop(&rows[0], "hit"), true);
+        assert_eq!(bool_prop(&rows[0], "miss"), false);
+    }
+
+    #[test]
+    fn apoc_coll_set_operations() {
+        let (store, _d) = open_store();
+        let rows = run(
+            &store,
+            "RETURN apoc.coll.union([1, 2, 3], [3, 4]) AS u, \
+                    apoc.coll.intersection([1, 2, 3], [2, 3, 5]) AS i, \
+                    apoc.coll.subtract([1, 2, 3], [2]) AS s",
+        );
+        assert_eq!(int_list(&rows[0], "u"), vec![1, 2, 3, 4]);
+        assert_eq!(int_list(&rows[0], "i"), vec![2, 3]);
+        assert_eq!(int_list(&rows[0], "s"), vec![1, 3]);
+    }
+
+    #[test]
+    fn apoc_coll_flatten_one_level() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN apoc.coll.flatten([[1, 2], [3, 4], 5]) AS f");
+        assert_eq!(int_list(&rows[0], "f"), vec![1, 2, 3, 4, 5]);
+    }
+
+    /// Sanity-check the non-apoc name goes through the native
+    /// dispatcher even with the feature on (no shadowing).
+    #[test]
+    fn native_scalars_still_resolve_with_feature_on() {
+        let (store, _d) = open_store();
+        let rows = run(&store, "RETURN size([1, 2, 3]) AS n");
+        assert_eq!(int_prop(&rows[0], "n"), 3);
+    }
+}
+
+#[cfg(not(feature = "apoc"))]
+#[test]
+fn apoc_scalar_without_feature_surfaces_unknown_function_error() {
+    let (store, _d) = open_store();
+    let stmt = parse("RETURN apoc.coll.sum([1, 2, 3]) AS total").unwrap();
+    let p = plan(&stmt).unwrap();
+    let err = execute(&p, &store).unwrap_err();
+    assert!(
+        err.to_string()
+            .to_ascii_lowercase()
+            .contains("apoc.coll.sum"),
+        "expected unknown-function error for apoc.coll.sum without the feature, got: {err}",
+    );
+}

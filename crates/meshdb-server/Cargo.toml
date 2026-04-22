@@ -45,3 +45,11 @@ reqwest = { version = "0.12", default-features = false }
 bcrypt = { workspace = true }
 rcgen = "0.13"
 rustls-pki-types = "1"
+
+[features]
+# Passthrough for the executor's `apoc` feature. `cargo install
+# meshdb-server --features apoc` (or `cargo build -p meshdb-server
+# --features apoc`) turns on the APOC-compatible scalar functions
+# and procedures. Default builds stay lean.
+default = []
+apoc = ["meshdb-executor/apoc"]

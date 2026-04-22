@@ -643,7 +643,7 @@ list_comp = {
 list_comp_where = { kw_where ~ expression }
 list_comp_proj = { "|" ~ expression }
 
-function_call = { identifier ~ ("." ~ identifier)? ~ "(" ~ fn_args? ~ ")" }
+function_call = { identifier ~ ("." ~ identifier)* ~ "(" ~ fn_args? ~ ")" }
 fn_args = { count_star | fn_arg_list }
 count_star = { "*" }
 fn_arg_list = { kw_distinct? ~ expression ~ ("," ~ expression)* }

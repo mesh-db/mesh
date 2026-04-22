@@ -1,0 +1,11 @@
+[package]
+name = "meshdb-apoc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "APOC-compatible procedures and scalar functions for Mesh Cypher"
+
+[dependencies]
+meshdb-core = { workspace = true }
+thiserror.workspace = true

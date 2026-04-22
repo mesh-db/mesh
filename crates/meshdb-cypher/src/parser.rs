@@ -2575,17 +2575,23 @@ fn build_expression(pair: Pair<Rule>) -> Result<Expr> {
         Rule::literal => Ok(Expr::Literal(build_literal(pair)?)),
         Rule::function_call => {
             let mut inner = pair.into_inner();
-            // Collect identifiers to build function name (may include namespace dot)
+            // Collect identifiers to build the qualified function
+            // name. Single-level (`distance`), one-level namespace
+            // (`point.distance`), and multi-level APOC-style names
+            // (`apoc.coll.sum`) all lower through the same loop —
+            // the grammar allows zero or more `.<ident>` suffixes
+            // after the first identifier.
             let first = inner
                 .next()
                 .ok_or_else(|| Error::Parse("function call missing name".into()))?;
             let mut name = parse_ident(first.as_str());
-            // Check if next token is another identifier (namespace form: ns.func)
             let mut next = inner.next();
-            if let Some(ref p) = next {
+            while let Some(ref p) = next {
                 if p.as_rule() == Rule::identifier {
                     name = format!("{}.{}", name, parse_ident(p.as_str()));
                     next = inner.next();
+                } else {
+                    break;
                 }
             }
             let args = match next {
