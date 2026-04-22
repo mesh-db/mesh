@@ -1197,6 +1197,20 @@ impl RocksDbStorageEngine {
             return Ok(());
         }
 
+        // Reject the drop if a UNIQUE or NODE KEY constraint on the
+        // same `(label, properties)` is registered — enforcement for
+        // those kinds runs a seek through this exact index, so
+        // silently removing it would collapse the uniqueness check
+        // to "always passes" without producing any user-visible
+        // signal. `DROP CONSTRAINT` is the right prerequisite.
+        if let Some(constraint) = find_constraint_backing_node_index(
+            &self.constraints.read().expect("constraints lock poisoned"),
+            label,
+            properties,
+        ) {
+            return Err(Error::IndexInUse { constraint });
+        }
+
         let meta_cf = self.cf(CF_INDEX_META)?;
         let prop_cf = self.cf(CF_PROPERTY_INDEX)?;
         let mut batch = WriteBatch::default();
@@ -1324,6 +1338,19 @@ impl RocksDbStorageEngine {
             .expect("edge_indexes lock poisoned");
         if !guard.contains(&spec) {
             return Ok(());
+        }
+
+        // Same rationale as the node-side drop guard: a UNIQUE
+        // constraint on this relationship type + property seeks
+        // through this exact index during enforcement, so silently
+        // removing it would defeat the check. Require
+        // `DROP CONSTRAINT` first.
+        if let Some(constraint) = find_constraint_backing_edge_index(
+            &self.constraints.read().expect("constraints lock poisoned"),
+            edge_type,
+            properties,
+        ) {
+            return Err(Error::IndexInUse { constraint });
         }
 
         let meta_cf = self.cf(CF_EDGE_INDEX_META)?;
@@ -1555,6 +1582,46 @@ fn default_constraint_name(
         target = scope.target(),
         kind_tag = kind.name_tag(),
     )
+}
+
+/// Return the name of a UNIQUE or NODE KEY constraint whose backing
+/// index is exactly `(label, properties)`, or `None` if no such
+/// constraint is registered. The enforcement paths for both kinds seek
+/// through that index — dropping it silently defeats the check — so
+/// `drop_property_index_composite` consults this helper before
+/// removing any entries.
+fn find_constraint_backing_node_index(
+    constraints: &[PropertyConstraintSpec],
+    label: &str,
+    properties: &[String],
+) -> Option<String> {
+    constraints
+        .iter()
+        .filter(|c| matches!(&c.scope, ConstraintScope::Node(l) if l == label))
+        .filter(|c| {
+            matches!(
+                c.kind,
+                PropertyConstraintKind::Unique | PropertyConstraintKind::NodeKey
+            )
+        })
+        .find(|c| c.properties.as_slice() == properties)
+        .map(|c| c.name.clone())
+}
+
+/// Relationship-scope mirror of
+/// [`find_constraint_backing_node_index`]. NODE KEY is node-only, so
+/// only UNIQUE can back an edge index.
+fn find_constraint_backing_edge_index(
+    constraints: &[PropertyConstraintSpec],
+    edge_type: &str,
+    properties: &[String],
+) -> Option<String> {
+    constraints
+        .iter()
+        .filter(|c| matches!(&c.scope, ConstraintScope::Relationship(t) if t == edge_type))
+        .filter(|c| matches!(c.kind, PropertyConstraintKind::Unique))
+        .find(|c| c.properties.as_slice() == properties)
+        .map(|c| c.name.clone())
 }
 
 /// Scan existing nodes and verify that `spec` holds. Called on

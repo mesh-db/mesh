@@ -1127,3 +1127,106 @@ fn single_property_index_via_composite_api_matches_legacy_api() {
     assert_eq!(via_composite, via_legacy);
     assert_eq!(via_composite.len(), 1);
 }
+
+// ---------------------------------------------------------------
+// Drop-index-through-backing-constraint guard.
+//
+// UNIQUE and NODE KEY both auto-provision a property index and
+// enforce through it. If `DROP INDEX` removed that index while the
+// constraint was still live, subsequent duplicate inserts would pass
+// silently — the seek that drives enforcement would return "nothing"
+// for every lookup. The guard below forces `DROP CONSTRAINT` first.
+// ---------------------------------------------------------------
+
+#[test]
+fn drop_index_rejected_when_backing_node_key_constraint() {
+    let (store, _dir) = tmp_store();
+    store
+        .create_property_constraint(
+            Some("pk_person"),
+            &ConstraintScope::Node("Person".into()),
+            &["first".to_string(), "last".to_string()],
+            PropertyConstraintKind::NodeKey,
+            false,
+        )
+        .unwrap();
+    let err = store
+        .drop_property_index_composite("Person", &["first".to_string(), "last".to_string()])
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("pk_person"),
+        "expected constraint name in error, got: {err}",
+    );
+}
+
+#[test]
+fn drop_index_rejected_when_backing_unique_constraint() {
+    let (store, _dir) = tmp_store();
+    store
+        .create_property_constraint(
+            Some("u_person_email"),
+            &ConstraintScope::Node("Person".into()),
+            &["email".to_string()],
+            PropertyConstraintKind::Unique,
+            false,
+        )
+        .unwrap();
+    let err = store.drop_property_index("Person", "email").unwrap_err();
+    assert!(
+        err.to_string().contains("u_person_email"),
+        "expected constraint name in error, got: {err}",
+    );
+}
+
+#[test]
+fn drop_edge_index_rejected_when_backing_unique_constraint() {
+    let (store, _dir) = tmp_store();
+    store
+        .create_property_constraint(
+            Some("u_knows_since"),
+            &ConstraintScope::Relationship("KNOWS".into()),
+            &["since".to_string()],
+            PropertyConstraintKind::Unique,
+            false,
+        )
+        .unwrap();
+    let err = store
+        .drop_edge_property_index("KNOWS", "since")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("u_knows_since"),
+        "expected constraint name in error, got: {err}",
+    );
+}
+
+#[test]
+fn drop_index_succeeds_after_drop_constraint() {
+    // The prescribed escape hatch: `DROP CONSTRAINT` first, then the
+    // backing index is free to drop.
+    let (store, _dir) = tmp_store();
+    store
+        .create_property_constraint(
+            Some("pk_person"),
+            &ConstraintScope::Node("Person".into()),
+            &["first".to_string(), "last".to_string()],
+            PropertyConstraintKind::NodeKey,
+            false,
+        )
+        .unwrap();
+    store.drop_property_constraint("pk_person", false).unwrap();
+    store
+        .drop_property_index_composite("Person", &["first".to_string(), "last".to_string()])
+        .unwrap();
+    assert!(store.list_property_indexes().is_empty());
+}
+
+#[test]
+fn drop_index_succeeds_when_no_backing_constraint() {
+    // A plain user-created index with no constraint over it drops
+    // freely — the guard only fires when the exact (label,
+    // properties) tuple carries a UNIQUE/NODE KEY constraint.
+    let (store, _dir) = tmp_store();
+    store.create_property_index("Person", "nickname").unwrap();
+    store.drop_property_index("Person", "nickname").unwrap();
+    assert!(store.list_property_indexes().is_empty());
+}

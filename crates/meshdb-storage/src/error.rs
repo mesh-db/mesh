@@ -74,6 +74,18 @@ pub enum Error {
         property: String,
         details: String,
     },
+
+    /// `DROP INDEX` targeted a property index that backs an active
+    /// `UNIQUE` or `NODE KEY` constraint. Without this guard, dropping
+    /// the backing index silently defeats the constraint — the
+    /// enforcement path seeks through the same index, so a missing
+    /// index collapses the uniqueness check to "always passes". The
+    /// caller must `DROP CONSTRAINT` first.
+    #[error(
+        "cannot drop property index: it backs active constraint `{constraint}`; \
+         drop the constraint first"
+    )]
+    IndexInUse { constraint: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
