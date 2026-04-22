@@ -259,15 +259,13 @@ fn try_execute_ddl(
 ) -> Result<Option<Vec<Row>>> {
     match plan {
         LogicalPlan::CreatePropertyIndex { label, properties } => {
-            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-            writer.create_property_index(label, &refs)?;
+            writer.create_property_index(label, properties)?;
             Ok(Some(vec![node_index_ddl_ack_row(
                 "created", label, properties,
             )]))
         }
         LogicalPlan::DropPropertyIndex { label, properties } => {
-            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-            writer.drop_property_index(label, &refs)?;
+            writer.drop_property_index(label, properties)?;
             Ok(Some(vec![node_index_ddl_ack_row(
                 "dropped", label, properties,
             )]))
@@ -276,8 +274,7 @@ fn try_execute_ddl(
             edge_type,
             properties,
         } => {
-            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-            writer.create_edge_property_index(edge_type, &refs)?;
+            writer.create_edge_property_index(edge_type, properties)?;
             Ok(Some(vec![edge_index_ddl_ack_row(
                 "created", edge_type, properties,
             )]))
@@ -286,8 +283,7 @@ fn try_execute_ddl(
             edge_type,
             properties,
         } => {
-            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-            writer.drop_edge_property_index(edge_type, &refs)?;
+            writer.drop_edge_property_index(edge_type, properties)?;
             Ok(Some(vec![edge_index_ddl_ack_row(
                 "dropped", edge_type, properties,
             )]))
@@ -299,11 +295,11 @@ fn try_execute_ddl(
             // node-scoped and edge-scoped indexes land in the same
             // row stream, distinguished by the `scope` column.
             let mut rows: Vec<Row> = Vec::new();
-            for (label, property) in reader.list_property_indexes()? {
-                rows.push(show_index_row("NODE", label, property));
+            for (label, properties) in reader.list_property_indexes()? {
+                rows.push(show_index_row("NODE", label, properties));
             }
-            for (edge_type, property) in reader.list_edge_property_indexes()? {
-                rows.push(show_index_row("RELATIONSHIP", edge_type, property));
+            for (edge_type, properties) in reader.list_edge_property_indexes()? {
+                rows.push(show_index_row("RELATIONSHIP", edge_type, properties));
             }
             Ok(Some(rows))
         }
@@ -492,13 +488,14 @@ fn properties_list_value(properties: &[String]) -> Value {
     )
 }
 
-/// Row shape for `SHOW INDEXES` output. Columns:
-/// `scope` ("NODE" / "RELATIONSHIP"), `label` (the scope target —
-/// label for node, edge type for relationship; kept for
-/// backwards-compat), `property`, and `state`. `label` and
-/// `edge_type` carry the same string when `scope == "RELATIONSHIP"`
-/// so clients can read either column.
-fn show_index_row(scope: &str, target: String, property: String) -> Row {
+/// Row shape for `SHOW INDEXES` output. Columns: `scope`
+/// (`"NODE"` / `"RELATIONSHIP"`), `label` (scope target — label for
+/// node, edge type for relationship; kept for backwards-compat),
+/// `property` (comma-joined preview of the properties for composite
+/// specs), `properties` (full list — authoritative), and `state`.
+/// `label` and `edge_type` carry the same string when
+/// `scope == "RELATIONSHIP"` so clients can read either column.
+fn show_index_row(scope: &str, target: String, properties: Vec<String>) -> Row {
     let mut row = Row::default();
     row.insert(
         "scope".into(),
@@ -516,8 +513,9 @@ fn show_index_row(scope: &str, target: String, property: String) -> Row {
     }
     row.insert(
         "property".into(),
-        Value::Property(Property::String(property)),
+        Value::Property(Property::String(properties.join(","))),
     );
+    row.insert("properties".into(), properties_list_value(&properties));
     row.insert(
         "state".into(),
         Value::Property(Property::String("online".into())),
@@ -2402,10 +2400,9 @@ impl Operator for IndexSeekOp {
                 };
                 values.push(property);
             }
-            let prop_refs: Vec<&str> = self.properties.iter().map(String::as_str).collect();
             let ids = ctx
                 .store
-                .nodes_by_properties(&self.label, &prop_refs, &values)?;
+                .nodes_by_properties(&self.label, &self.properties, &values)?;
             self.results = Some(ids);
         }
         let ids = self.results.as_ref().unwrap();

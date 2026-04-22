@@ -875,12 +875,12 @@ fn composite_property_index_backfills_matching_nodes() {
         .unwrap();
 
     store
-        .create_property_index_composite("P", &["first", "last"])
+        .create_property_index_composite("P", &["first".to_string(), "last".to_string()])
         .unwrap();
     let hits = store
         .nodes_by_properties(
             "P",
-            &["first", "last"],
+            &["first".to_string(), "last".to_string()],
             &[
                 Property::String("Ada".into()),
                 Property::String("Lovelace".into()),
@@ -896,7 +896,7 @@ fn composite_property_index_skips_partial_tuples() {
     // entry — composite indexes are all-or-nothing on the tuple.
     let (store, _dir) = tmp_store();
     store
-        .create_property_index_composite("P", &["first", "last"])
+        .create_property_index_composite("P", &["first".to_string(), "last".to_string()])
         .unwrap();
     // Partial: only `first` is set.
     store
@@ -905,7 +905,7 @@ fn composite_property_index_skips_partial_tuples() {
     let hits = store
         .nodes_by_properties(
             "P",
-            &["first", "last"],
+            &["first".to_string(), "last".to_string()],
             &[
                 Property::String("Ada".into()),
                 Property::String("Lovelace".into()),
@@ -919,7 +919,7 @@ fn composite_property_index_skips_partial_tuples() {
 fn composite_property_index_tracks_put_updates() {
     let (store, _dir) = tmp_store();
     store
-        .create_property_index_composite("P", &["a", "b"])
+        .create_property_index_composite("P", &["a".to_string(), "b".to_string()])
         .unwrap();
     let mut n = Node::new()
         .with_label("P")
@@ -929,7 +929,11 @@ fn composite_property_index_tracks_put_updates() {
     store.put_node(&n).unwrap();
     assert_eq!(
         store
-            .nodes_by_properties("P", &["a", "b"], &[Property::Int64(1), Property::Int64(2)])
+            .nodes_by_properties(
+                "P",
+                &["a".to_string(), "b".to_string()],
+                &[Property::Int64(1), Property::Int64(2)]
+            )
             .unwrap(),
         vec![id]
     );
@@ -938,12 +942,20 @@ fn composite_property_index_tracks_put_updates() {
     n.properties.insert("b".into(), Property::Int64(99));
     store.put_node(&n).unwrap();
     assert!(store
-        .nodes_by_properties("P", &["a", "b"], &[Property::Int64(1), Property::Int64(2)])
+        .nodes_by_properties(
+            "P",
+            &["a".to_string(), "b".to_string()],
+            &[Property::Int64(1), Property::Int64(2)]
+        )
         .unwrap()
         .is_empty());
     assert_eq!(
         store
-            .nodes_by_properties("P", &["a", "b"], &[Property::Int64(1), Property::Int64(99)])
+            .nodes_by_properties(
+                "P",
+                &["a".to_string(), "b".to_string()],
+                &[Property::Int64(1), Property::Int64(99)]
+            )
             .unwrap(),
         vec![id]
     );
@@ -953,7 +965,7 @@ fn composite_property_index_tracks_put_updates() {
 fn composite_property_index_detach_delete_sweeps_entries() {
     let (store, _dir) = tmp_store();
     store
-        .create_property_index_composite("P", &["a", "b"])
+        .create_property_index_composite("P", &["a".to_string(), "b".to_string()])
         .unwrap();
     let n = Node::new()
         .with_label("P")
@@ -964,7 +976,11 @@ fn composite_property_index_detach_delete_sweeps_entries() {
     store.detach_delete_node(id).unwrap();
 
     let hits = store
-        .nodes_by_properties("P", &["a", "b"], &[Property::Int64(1), Property::Int64(2)])
+        .nodes_by_properties(
+            "P",
+            &["a".to_string(), "b".to_string()],
+            &[Property::Int64(1), Property::Int64(2)],
+        )
         .unwrap();
     assert!(hits.is_empty());
 }
@@ -973,7 +989,7 @@ fn composite_property_index_detach_delete_sweeps_entries() {
 fn composite_property_index_drop_clears_entries() {
     let (store, _dir) = tmp_store();
     store
-        .create_property_index_composite("P", &["a", "b"])
+        .create_property_index_composite("P", &["a".to_string(), "b".to_string()])
         .unwrap();
     store
         .put_node(
@@ -984,7 +1000,7 @@ fn composite_property_index_drop_clears_entries() {
         )
         .unwrap();
     store
-        .drop_property_index_composite("P", &["a", "b"])
+        .drop_property_index_composite("P", &["a".to_string(), "b".to_string()])
         .unwrap();
     assert!(store.list_property_indexes().is_empty());
 }
@@ -1004,12 +1020,12 @@ fn composite_edge_index_backfills_and_seeks() {
         )
         .unwrap();
     store
-        .create_edge_property_index_composite("KNOWS", &["since", "weight"])
+        .create_edge_property_index_composite("KNOWS", &["since".to_string(), "weight".to_string()])
         .unwrap();
     let hits = store
         .edges_by_properties(
             "KNOWS",
-            &["since", "weight"],
+            &["since".to_string(), "weight".to_string()],
             &[Property::Int64(2020), Property::Int64(5)],
         )
         .unwrap();
@@ -1096,10 +1112,14 @@ fn single_property_index_via_composite_api_matches_legacy_api() {
         .put_node(&Node::new().with_label("P").with_property("name", "Ada"))
         .unwrap();
     store
-        .create_property_index_composite("P", &["name"])
+        .create_property_index_composite("P", &["name".to_string()])
         .unwrap();
     let via_composite = store
-        .nodes_by_properties("P", &["name"], &[Property::String("Ada".into())])
+        .nodes_by_properties(
+            "P",
+            &["name".to_string()],
+            &[Property::String("Ada".into())],
+        )
         .unwrap();
     let via_legacy = store
         .nodes_by_property("P", "name", &Property::String("Ada".into()))

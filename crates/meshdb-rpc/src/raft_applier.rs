@@ -110,36 +110,28 @@ impl GraphStateMachine for StoreGraphApplier {
                 }
                 Ok(())
             }
-            GraphCommand::CreateIndex { label, properties } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                self.store
-                    .create_property_index_composite(label, &refs)
-                    .map_err(|e| e.to_string())
-            }
-            GraphCommand::DropIndex { label, properties } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                self.store
-                    .drop_property_index_composite(label, &refs)
-                    .map_err(|e| e.to_string())
-            }
+            GraphCommand::CreateIndex { label, properties } => self
+                .store
+                .create_property_index_composite(label, properties)
+                .map_err(|e| e.to_string()),
+            GraphCommand::DropIndex { label, properties } => self
+                .store
+                .drop_property_index_composite(label, properties)
+                .map_err(|e| e.to_string()),
             GraphCommand::CreateEdgeIndex {
                 edge_type,
                 properties,
-            } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                self.store
-                    .create_edge_property_index_composite(edge_type, &refs)
-                    .map_err(|e| e.to_string())
-            }
+            } => self
+                .store
+                .create_edge_property_index_composite(edge_type, properties)
+                .map_err(|e| e.to_string()),
             GraphCommand::DropEdgeIndex {
                 edge_type,
                 properties,
-            } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                self.store
-                    .drop_edge_property_index_composite(edge_type, &refs)
-                    .map_err(|e| e.to_string())
-            }
+            } => self
+                .store
+                .drop_edge_property_index_composite(edge_type, properties)
+                .map_err(|e| e.to_string()),
             GraphCommand::CreateConstraint {
                 name,
                 scope,
@@ -455,36 +447,24 @@ fn apply_ddl_and_collect(
             GraphCommand::DeleteEdge(id) => out.push(GraphMutation::DeleteEdge(*id)),
             GraphCommand::DetachDeleteNode(id) => out.push(GraphMutation::DetachDeleteNode(*id)),
             GraphCommand::Batch(inner) => apply_ddl_and_collect(inner, store, out)?,
-            GraphCommand::CreateIndex { label, properties } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                store
-                    .create_property_index_composite(label, &refs)
-                    .map_err(|e| e.to_string())?
-            }
-            GraphCommand::DropIndex { label, properties } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                store
-                    .drop_property_index_composite(label, &refs)
-                    .map_err(|e| e.to_string())?
-            }
+            GraphCommand::CreateIndex { label, properties } => store
+                .create_property_index_composite(label, properties)
+                .map_err(|e| e.to_string())?,
+            GraphCommand::DropIndex { label, properties } => store
+                .drop_property_index_composite(label, properties)
+                .map_err(|e| e.to_string())?,
             GraphCommand::CreateEdgeIndex {
                 edge_type,
                 properties,
-            } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                store
-                    .create_edge_property_index_composite(edge_type, &refs)
-                    .map_err(|e| e.to_string())?
-            }
+            } => store
+                .create_edge_property_index_composite(edge_type, properties)
+                .map_err(|e| e.to_string())?,
             GraphCommand::DropEdgeIndex {
                 edge_type,
                 properties,
-            } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                store
-                    .drop_edge_property_index_composite(edge_type, &refs)
-                    .map_err(|e| e.to_string())?
-            }
+            } => store
+                .drop_edge_property_index_composite(edge_type, properties)
+                .map_err(|e| e.to_string())?,
             GraphCommand::CreateConstraint {
                 name,
                 scope,

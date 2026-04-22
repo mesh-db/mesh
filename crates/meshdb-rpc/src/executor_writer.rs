@@ -87,28 +87,28 @@ impl GraphWriter for RaftGraphWriter {
         self.propose(GraphCommand::DetachDeleteNode(id))
     }
 
-    fn create_property_index(&self, label: &str, properties: &[&str]) -> ExecResult<()> {
+    fn create_property_index(&self, label: &str, properties: &[String]) -> ExecResult<()> {
         self.propose(GraphCommand::CreateIndex {
             label: label.to_string(),
             properties: properties.iter().map(|p| p.to_string()).collect(),
         })
     }
 
-    fn drop_property_index(&self, label: &str, properties: &[&str]) -> ExecResult<()> {
+    fn drop_property_index(&self, label: &str, properties: &[String]) -> ExecResult<()> {
         self.propose(GraphCommand::DropIndex {
             label: label.to_string(),
             properties: properties.iter().map(|p| p.to_string()).collect(),
         })
     }
 
-    fn create_edge_property_index(&self, edge_type: &str, properties: &[&str]) -> ExecResult<()> {
+    fn create_edge_property_index(&self, edge_type: &str, properties: &[String]) -> ExecResult<()> {
         self.propose(GraphCommand::CreateEdgeIndex {
             edge_type: edge_type.to_string(),
             properties: properties.iter().map(|p| p.to_string()).collect(),
         })
     }
 
-    fn drop_edge_property_index(&self, edge_type: &str, properties: &[&str]) -> ExecResult<()> {
+    fn drop_edge_property_index(&self, edge_type: &str, properties: &[String]) -> ExecResult<()> {
         self.propose(GraphCommand::DropEdgeIndex {
             edge_type: edge_type.to_string(),
             properties: properties.iter().map(|p| p.to_string()).collect(),
@@ -227,7 +227,7 @@ impl GraphWriter for BufferingGraphWriter {
         Ok(())
     }
 
-    fn create_property_index(&self, label: &str, properties: &[&str]) -> ExecResult<()> {
+    fn create_property_index(&self, label: &str, properties: &[String]) -> ExecResult<()> {
         self.buffer.lock().unwrap().push(GraphCommand::CreateIndex {
             label: label.to_string(),
             properties: properties.iter().map(|p| p.to_string()).collect(),
@@ -235,7 +235,7 @@ impl GraphWriter for BufferingGraphWriter {
         Ok(())
     }
 
-    fn drop_property_index(&self, label: &str, properties: &[&str]) -> ExecResult<()> {
+    fn drop_property_index(&self, label: &str, properties: &[String]) -> ExecResult<()> {
         self.buffer.lock().unwrap().push(GraphCommand::DropIndex {
             label: label.to_string(),
             properties: properties.iter().map(|p| p.to_string()).collect(),
@@ -243,7 +243,7 @@ impl GraphWriter for BufferingGraphWriter {
         Ok(())
     }
 
-    fn create_edge_property_index(&self, edge_type: &str, properties: &[&str]) -> ExecResult<()> {
+    fn create_edge_property_index(&self, edge_type: &str, properties: &[String]) -> ExecResult<()> {
         self.buffer
             .lock()
             .unwrap()
@@ -254,7 +254,7 @@ impl GraphWriter for BufferingGraphWriter {
         Ok(())
     }
 
-    fn drop_edge_property_index(&self, edge_type: &str, properties: &[&str]) -> ExecResult<()> {
+    fn drop_edge_property_index(&self, edge_type: &str, properties: &[String]) -> ExecResult<()> {
         self.buffer
             .lock()
             .unwrap()

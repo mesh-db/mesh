@@ -196,13 +196,13 @@ impl<'a> GraphReader for OverlayGraphReader<'a> {
         Ok(result.into_iter().collect())
     }
 
-    fn list_property_indexes(&self) -> ExecResult<Vec<(String, String)>> {
+    fn list_property_indexes(&self) -> ExecResult<Vec<(String, Vec<String>)>> {
         // Index DDL lives on the store, not in the per-tx overlay,
         // so read-through to the base is correct even mid-tx.
         self.base.list_property_indexes()
     }
 
-    fn list_edge_property_indexes(&self) -> ExecResult<Vec<(String, String)>> {
+    fn list_edge_property_indexes(&self) -> ExecResult<Vec<(String, Vec<String>)>> {
         // Same rationale as `list_property_indexes`: edge-index
         // DDL is a store-level concern; the overlay never shadows
         // it, so read-through is correct.
@@ -268,19 +268,20 @@ impl<'a> GraphReader for OverlayGraphReader<'a> {
         for id in &self.overlay.deleted_edges {
             result.remove(id);
         }
-        result.retain(|id| {
-            // A base edge whose endpoint the overlay detached is no
-            // longer visible through any read. Fetch the edge to
-            // check endpoints; a base read that fails at this point
-            // is treated as "no endpoint info" and the edge drops.
-            match self.base.get_edge(*id) {
+        // Detach-delete cascade: a base edge whose endpoint the
+        // overlay detached is no longer visible. Only fetch each
+        // base edge when the detached-nodes set is non-empty — in
+        // the common case (no DETACH DELETE in this tx) skip the
+        // per-id get_edge calls entirely.
+        if !self.overlay.deleted_nodes.is_empty() {
+            result.retain(|id| match self.base.get_edge(*id) {
                 Ok(Some(edge)) => {
                     !self.overlay.deleted_nodes.contains(&edge.source)
                         && !self.overlay.deleted_nodes.contains(&edge.target)
                 }
                 _ => false,
-            }
-        });
+            });
+        }
         for id in self.overlay.put_edges.keys() {
             result.remove(id);
         }

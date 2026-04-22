@@ -976,27 +976,19 @@ fn apply_ddl_to_store(
 ) -> std::result::Result<(), meshdb_storage::Error> {
     match cmd {
         GraphCommand::CreateIndex { label, properties } => {
-            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-            store.create_property_index_composite(label, &refs)
+            store.create_property_index_composite(label, properties)
         }
         GraphCommand::DropIndex { label, properties } => {
-            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-            store.drop_property_index_composite(label, &refs)
+            store.drop_property_index_composite(label, properties)
         }
         GraphCommand::CreateEdgeIndex {
             edge_type,
             properties,
-        } => {
-            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-            store.create_edge_property_index_composite(edge_type, &refs)
-        }
+        } => store.create_edge_property_index_composite(edge_type, properties),
         GraphCommand::DropEdgeIndex {
             edge_type,
             properties,
-        } => {
-            let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-            store.drop_edge_property_index_composite(edge_type, &refs)
-        }
+        } => store.drop_edge_property_index_composite(edge_type, properties),
         GraphCommand::CreateConstraint {
             name,
             scope,
@@ -1301,26 +1293,22 @@ fn apply_ddl_commands(
     for cmd in cmds {
         match cmd {
             GraphCommand::CreateIndex { label, properties } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                store.create_property_index_composite(label, &refs)?;
+                store.create_property_index_composite(label, properties)?;
             }
             GraphCommand::DropIndex { label, properties } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                store.drop_property_index_composite(label, &refs)?;
+                store.drop_property_index_composite(label, properties)?;
             }
             GraphCommand::CreateEdgeIndex {
                 edge_type,
                 properties,
             } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                store.create_edge_property_index_composite(edge_type, &refs)?;
+                store.create_edge_property_index_composite(edge_type, properties)?;
             }
             GraphCommand::DropEdgeIndex {
                 edge_type,
                 properties,
             } => {
-                let refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-                store.drop_edge_property_index_composite(edge_type, &refs)?;
+                store.drop_edge_property_index_composite(edge_type, properties)?;
             }
             GraphCommand::CreateConstraint {
                 name,
@@ -2047,9 +2035,8 @@ impl MeshWrite for MeshService {
         // unused — DDL replicates via `propose_graph` instead.
         let req = request.into_inner();
         let props = decoded_index_properties(&req.properties, &req.property)?;
-        let refs: Vec<&str> = props.iter().map(String::as_str).collect();
         self.store
-            .create_property_index_composite(&req.label, &refs)
+            .create_property_index_composite(&req.label, &props)
             .map_err(internal)?;
         Ok(Response::new(CreatePropertyIndexResponse {}))
     }
@@ -2061,9 +2048,8 @@ impl MeshWrite for MeshService {
     ) -> Result<Response<DropPropertyIndexResponse>, Status> {
         let req = request.into_inner();
         let props = decoded_index_properties(&req.properties, &req.property)?;
-        let refs: Vec<&str> = props.iter().map(String::as_str).collect();
         self.store
-            .drop_property_index_composite(&req.label, &refs)
+            .drop_property_index_composite(&req.label, &props)
             .map_err(internal)?;
         Ok(Response::new(DropPropertyIndexResponse {}))
     }
@@ -2075,9 +2061,8 @@ impl MeshWrite for MeshService {
     ) -> Result<Response<CreateEdgePropertyIndexResponse>, Status> {
         let req = request.into_inner();
         let props = decoded_index_properties(&req.properties, &req.property)?;
-        let refs: Vec<&str> = props.iter().map(String::as_str).collect();
         self.store
-            .create_edge_property_index_composite(&req.edge_type, &refs)
+            .create_edge_property_index_composite(&req.edge_type, &props)
             .map_err(internal)?;
         Ok(Response::new(CreateEdgePropertyIndexResponse {}))
     }
@@ -2089,9 +2074,8 @@ impl MeshWrite for MeshService {
     ) -> Result<Response<DropEdgePropertyIndexResponse>, Status> {
         let req = request.into_inner();
         let props = decoded_index_properties(&req.properties, &req.property)?;
-        let refs: Vec<&str> = props.iter().map(String::as_str).collect();
         self.store
-            .drop_edge_property_index_composite(&req.edge_type, &refs)
+            .drop_edge_property_index_composite(&req.edge_type, &props)
             .map_err(internal)?;
         Ok(Response::new(DropEdgePropertyIndexResponse {}))
     }

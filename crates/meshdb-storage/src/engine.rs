@@ -41,17 +41,6 @@ pub struct PropertyIndexSpec {
     pub properties: Vec<String>,
 }
 
-impl PropertyIndexSpec {
-    /// Convenience accessor for the first property. Useful for
-    /// tuple-based external APIs (like `SHOW INDEXES`) that predate
-    /// composite support and still expect a single string per row.
-    /// Panics on an empty spec — the storage layer never constructs
-    /// one, so an empty spec would indicate a corrupt on-disk entry.
-    pub fn first_property(&self) -> &str {
-        &self.properties[0]
-    }
-}
-
 /// Relationship-scope analogue of [`PropertyIndexSpec`]. Same
 /// `properties: Vec<String>` shape, same composite semantics, same
 /// byte-level on-disk compatibility for length-1 entries.
@@ -59,13 +48,6 @@ impl PropertyIndexSpec {
 pub struct EdgePropertyIndexSpec {
     pub edge_type: String,
     pub properties: Vec<String>,
-}
-
-impl EdgePropertyIndexSpec {
-    /// See [`PropertyIndexSpec::first_property`].
-    pub fn first_property(&self) -> &str {
-        &self.properties[0]
-    }
 }
 
 /// Kind of single-property constraint. `Unique` comes from
@@ -286,7 +268,7 @@ pub trait StorageEngine: Send + Sync {
     fn nodes_by_properties(
         &self,
         label: &str,
-        properties: &[&str],
+        properties: &[String],
         values: &[Property],
     ) -> Result<Vec<NodeId>>;
 
@@ -311,9 +293,9 @@ pub trait StorageEngine: Send + Sync {
     /// a tuple index over `(label, properties...)`. Single-property
     /// callers should use [`Self::create_property_index`] which
     /// delegates here with a length-1 slice.
-    fn create_property_index_composite(&self, label: &str, properties: &[&str]) -> Result<()>;
+    fn create_property_index_composite(&self, label: &str, properties: &[String]) -> Result<()>;
     /// Composite form of [`Self::drop_property_index`].
-    fn drop_property_index_composite(&self, label: &str, properties: &[&str]) -> Result<()>;
+    fn drop_property_index_composite(&self, label: &str, properties: &[String]) -> Result<()>;
     fn list_property_indexes(&self) -> Vec<PropertyIndexSpec>;
 
     /// Declare a new `(edge_type, property)` single-property equality
@@ -329,13 +311,13 @@ pub trait StorageEngine: Send + Sync {
     fn create_edge_property_index_composite(
         &self,
         edge_type: &str,
-        properties: &[&str],
+        properties: &[String],
     ) -> Result<()>;
     /// Composite form of [`Self::drop_edge_property_index`].
     fn drop_edge_property_index_composite(
         &self,
         edge_type: &str,
-        properties: &[&str],
+        properties: &[String],
     ) -> Result<()>;
     /// Snapshot the currently-registered edge property indexes.
     fn list_edge_property_indexes(&self) -> Vec<EdgePropertyIndexSpec>;

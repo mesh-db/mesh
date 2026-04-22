@@ -42,11 +42,11 @@ pub trait GraphReader: Send + Sync {
     fn nodes_by_properties(
         &self,
         label: &str,
-        properties: &[&str],
+        properties: &[String],
         values: &[Property],
     ) -> Result<Vec<NodeId>> {
         if properties.len() == 1 && values.len() == 1 {
-            return self.nodes_by_property(label, properties[0], &values[0]);
+            return self.nodes_by_property(label, &properties[0], &values[0]);
         }
         Ok(Vec::new())
     }
@@ -70,14 +70,14 @@ pub trait GraphReader: Send + Sync {
     /// Default impl returns empty — the storage-backed reader
     /// overrides via the blanket impl, and partitioned/overlay
     /// readers delegate to their bases.
-    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+    fn list_property_indexes(&self) -> Result<Vec<(String, Vec<String>)>> {
         Ok(Vec::new())
     }
     /// Relationship-scope analogue of [`Self::list_property_indexes`].
     /// Returns `(edge_type, property)` pairs for every registered
     /// edge property index. Default impl returns empty; overlay
     /// and partitioned readers delegate to their bases.
-    fn list_edge_property_indexes(&self) -> Result<Vec<(String, String)>> {
+    fn list_edge_property_indexes(&self) -> Result<Vec<(String, Vec<String>)>> {
         Ok(Vec::new())
     }
     /// Snapshot every registered constraint visible through this
@@ -132,7 +132,7 @@ impl<T: StorageEngine> GraphReader for T {
     fn nodes_by_properties(
         &self,
         label: &str,
-        properties: &[&str],
+        properties: &[String],
         values: &[Property],
     ) -> Result<Vec<NodeId>> {
         Ok(StorageEngine::nodes_by_properties(
@@ -151,17 +151,17 @@ impl<T: StorageEngine> GraphReader for T {
         )?)
     }
 
-    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+    fn list_property_indexes(&self) -> Result<Vec<(String, Vec<String>)>> {
         Ok(StorageEngine::list_property_indexes(self)
             .into_iter()
-            .map(|mut s| (s.label, s.properties.remove(0)))
+            .map(|s| (s.label, s.properties))
             .collect())
     }
 
-    fn list_edge_property_indexes(&self) -> Result<Vec<(String, String)>> {
+    fn list_edge_property_indexes(&self) -> Result<Vec<(String, Vec<String>)>> {
         Ok(StorageEngine::list_edge_property_indexes(self)
             .into_iter()
-            .map(|mut s| (s.edge_type, s.properties.remove(0)))
+            .map(|s| (s.edge_type, s.properties))
             .collect())
     }
 
@@ -220,21 +220,21 @@ impl GraphReader for StorageReaderAdapter<'_> {
         Ok(self.0.edges_by_property(edge_type, property, value)?)
     }
 
-    fn list_property_indexes(&self) -> Result<Vec<(String, String)>> {
+    fn list_property_indexes(&self) -> Result<Vec<(String, Vec<String>)>> {
         Ok(self
             .0
             .list_property_indexes()
             .into_iter()
-            .map(|mut s| (s.label, s.properties.remove(0)))
+            .map(|s| (s.label, s.properties))
             .collect())
     }
 
-    fn list_edge_property_indexes(&self) -> Result<Vec<(String, String)>> {
+    fn list_edge_property_indexes(&self) -> Result<Vec<(String, Vec<String>)>> {
         Ok(self
             .0
             .list_edge_property_indexes()
             .into_iter()
-            .map(|mut s| (s.edge_type, s.properties.remove(0)))
+            .map(|s| (s.edge_type, s.properties))
             .collect())
     }
 

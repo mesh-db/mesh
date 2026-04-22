@@ -187,23 +187,31 @@ pub(crate) fn encode_index_tuple(
 /// pre-composite layout. Partial-prefix seeks (a length-K prefix of
 /// a length-N index) use `property_index_composite_value_prefix`
 /// against the same interleaved encoding.
-pub(crate) fn property_index_composite_key(
+pub(crate) fn property_index_composite_key<P, V>(
     label: &str,
-    prop_keys: &[&str],
-    value_bytes_list: &[&[u8]],
+    prop_keys: &[P],
+    value_bytes_list: &[V],
     node: NodeId,
-) -> Vec<u8> {
+) -> Vec<u8>
+where
+    P: AsRef<str>,
+    V: AsRef<[u8]>,
+{
     build_property_index_composite_key(label, prop_keys, value_bytes_list, node.as_bytes())
 }
 
 /// Prefix that selects every index entry for a specific
 /// `(label, properties..., values...)` tuple. Used by
 /// `nodes_by_properties` to iterate the matching node ids.
-pub(crate) fn property_index_composite_value_prefix(
+pub(crate) fn property_index_composite_value_prefix<P, V>(
     label: &str,
-    prop_keys: &[&str],
-    value_bytes_list: &[&[u8]],
-) -> Vec<u8> {
+    prop_keys: &[P],
+    value_bytes_list: &[V],
+) -> Vec<u8>
+where
+    P: AsRef<str>,
+    V: AsRef<[u8]>,
+{
     build_property_index_composite_value_prefix(label, prop_keys, value_bytes_list)
 }
 
@@ -448,20 +456,28 @@ pub(crate) fn node_id_from_property_index_key(
 /// Relationship-scope analogue of [`property_index_composite_key`].
 /// Lives in its own column family so the iterator range scans stay
 /// tight and the two index families can be dropped independently.
-pub(crate) fn edge_property_index_composite_key(
+pub(crate) fn edge_property_index_composite_key<P, V>(
     edge_type: &str,
-    prop_keys: &[&str],
-    value_bytes_list: &[&[u8]],
+    prop_keys: &[P],
+    value_bytes_list: &[V],
     edge: EdgeId,
-) -> Vec<u8> {
+) -> Vec<u8>
+where
+    P: AsRef<str>,
+    V: AsRef<[u8]>,
+{
     build_property_index_composite_key(edge_type, prop_keys, value_bytes_list, edge.as_bytes())
 }
 
-pub(crate) fn edge_property_index_composite_value_prefix(
+pub(crate) fn edge_property_index_composite_value_prefix<P, V>(
     edge_type: &str,
-    prop_keys: &[&str],
-    value_bytes_list: &[&[u8]],
-) -> Vec<u8> {
+    prop_keys: &[P],
+    value_bytes_list: &[V],
+) -> Vec<u8>
+where
+    P: AsRef<str>,
+    V: AsRef<[u8]>,
+{
     build_property_index_composite_value_prefix(edge_type, prop_keys, value_bytes_list)
 }
 
@@ -496,12 +512,16 @@ pub(crate) fn edge_id_from_property_index_key(
 /// Length-1 inputs produce byte-identical output to the
 /// pre-composite layout — the interleaved form is equivalent to
 /// the old `[name][prop][value][id]` when N=1.
-fn build_property_index_composite_key(
+fn build_property_index_composite_key<P, V>(
     name: &str,
-    prop_keys: &[&str],
-    value_bytes_list: &[&[u8]],
+    prop_keys: &[P],
+    value_bytes_list: &[V],
     id_bytes: &[u8; ID_LEN],
-) -> Vec<u8> {
+) -> Vec<u8>
+where
+    P: AsRef<str>,
+    V: AsRef<[u8]>,
+{
     debug_assert_eq!(
         prop_keys.len(),
         value_bytes_list.len(),
@@ -509,8 +529,8 @@ fn build_property_index_composite_key(
     );
     let name_bytes = name.as_bytes();
     let name_len = u16::try_from(name_bytes.len()).expect("label/type length fits in u16");
-    let props_total: usize = prop_keys.iter().map(|p| p.len()).sum();
-    let values_total: usize = value_bytes_list.iter().map(|v| v.len()).sum();
+    let props_total: usize = prop_keys.iter().map(|p| p.as_ref().len()).sum();
+    let values_total: usize = value_bytes_list.iter().map(|v| v.as_ref().len()).sum();
     let mut key = Vec::with_capacity(
         LEN_PREFIX
             + name_bytes.len()
@@ -523,13 +543,14 @@ fn build_property_index_composite_key(
     key.extend_from_slice(&name_len.to_be_bytes());
     key.extend_from_slice(name_bytes);
     for (prop, value) in prop_keys.iter().zip(value_bytes_list.iter()) {
-        let prop_bytes = prop.as_bytes();
+        let prop_bytes = prop.as_ref().as_bytes();
         let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
         key.extend_from_slice(&prop_len.to_be_bytes());
         key.extend_from_slice(prop_bytes);
-        let value_len = u32::try_from(value.len()).expect("value length fits in u32");
+        let value_bytes = value.as_ref();
+        let value_len = u32::try_from(value_bytes.len()).expect("value length fits in u32");
         key.extend_from_slice(&value_len.to_be_bytes());
-        key.extend_from_slice(value);
+        key.extend_from_slice(value_bytes);
     }
     key.extend_from_slice(id_bytes);
     key
@@ -540,16 +561,20 @@ fn build_property_index_composite_key(
 /// slice lengths. A length-K prefix of a composite index's property
 /// list is a real byte prefix of the full key, so partial-tuple
 /// seeks use this directly with `iterator_cf(From(prefix, Forward))`.
-fn build_property_index_composite_value_prefix(
+fn build_property_index_composite_value_prefix<P, V>(
     name: &str,
-    prop_keys: &[&str],
-    value_bytes_list: &[&[u8]],
-) -> Vec<u8> {
+    prop_keys: &[P],
+    value_bytes_list: &[V],
+) -> Vec<u8>
+where
+    P: AsRef<str>,
+    V: AsRef<[u8]>,
+{
     debug_assert_eq!(prop_keys.len(), value_bytes_list.len());
     let name_bytes = name.as_bytes();
     let name_len = u16::try_from(name_bytes.len()).expect("label/type length fits in u16");
-    let props_total: usize = prop_keys.iter().map(|p| p.len()).sum();
-    let values_total: usize = value_bytes_list.iter().map(|v| v.len()).sum();
+    let props_total: usize = prop_keys.iter().map(|p| p.as_ref().len()).sum();
+    let values_total: usize = value_bytes_list.iter().map(|v| v.as_ref().len()).sum();
     let mut key = Vec::with_capacity(
         LEN_PREFIX
             + name_bytes.len()
@@ -561,13 +586,14 @@ fn build_property_index_composite_value_prefix(
     key.extend_from_slice(&name_len.to_be_bytes());
     key.extend_from_slice(name_bytes);
     for (prop, value) in prop_keys.iter().zip(value_bytes_list.iter()) {
-        let prop_bytes = prop.as_bytes();
+        let prop_bytes = prop.as_ref().as_bytes();
         let prop_len = u16::try_from(prop_bytes.len()).expect("prop key length fits in u16");
         key.extend_from_slice(&prop_len.to_be_bytes());
         key.extend_from_slice(prop_bytes);
-        let value_len = u32::try_from(value.len()).expect("value length fits in u32");
+        let value_bytes = value.as_ref();
+        let value_len = u32::try_from(value_bytes.len()).expect("value length fits in u32");
         key.extend_from_slice(&value_len.to_be_bytes());
-        key.extend_from_slice(value);
+        key.extend_from_slice(value_bytes);
     }
     key
 }
