@@ -825,30 +825,72 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                                     body_stmt = Some(build_union_query(child)?);
                                 }
                                 Rule::in_transactions_suffix => {
-                                    // Default batch size when `OF n ROWS` is
-                                    // omitted matches Neo4j 5: 1000.
+                                    // Default batch size when `OF n ROWS`
+                                    // is omitted matches Neo4j 5: 1000.
+                                    // Default error mode without `ON ERROR
+                                    // <mode>` is FAIL.
                                     let mut size = crate::ast::DEFAULT_IN_TRANSACTIONS_BATCH_SIZE;
+                                    let mut mode = crate::ast::OnErrorMode::Fail;
                                     for grand in child.into_inner() {
-                                        if grand.as_rule() == Rule::in_transactions_batch {
-                                            for leaf in grand.into_inner() {
-                                                if leaf.as_rule() == Rule::nn_integer {
-                                                    size = leaf.as_str().parse().map_err(|e| {
-                                                        Error::Parse(format!(
-                                                            "IN TRANSACTIONS OF batch size: {e}"
-                                                        ))
-                                                    })?;
-                                                    if size <= 0 {
-                                                        return Err(Error::Parse(
-                                                            "IN TRANSACTIONS OF batch size must be positive"
-                                                                .into(),
-                                                        ));
+                                        match grand.as_rule() {
+                                            Rule::in_transactions_batch => {
+                                                for leaf in grand.into_inner() {
+                                                    if leaf.as_rule() == Rule::nn_integer {
+                                                        size = leaf
+                                                            .as_str()
+                                                            .parse()
+                                                            .map_err(|e| {
+                                                                Error::Parse(format!(
+                                                                    "IN TRANSACTIONS OF batch size: {e}"
+                                                                ))
+                                                            })?;
+                                                        if size <= 0 {
+                                                            return Err(Error::Parse(
+                                                                "IN TRANSACTIONS OF batch size must be positive"
+                                                                    .into(),
+                                                            ));
+                                                        }
                                                     }
                                                 }
                                             }
+                                            Rule::in_transactions_on_error => {
+                                                for leaf in grand.into_inner() {
+                                                    if leaf.as_rule() == Rule::on_error_mode {
+                                                        let kw = leaf
+                                                            .into_inner()
+                                                            .next()
+                                                            .ok_or_else(|| {
+                                                                Error::Parse(
+                                                                    "ON ERROR missing mode keyword"
+                                                                        .into(),
+                                                                )
+                                                            })?;
+                                                        mode = match kw.as_rule() {
+                                                            Rule::kw_fail => {
+                                                                crate::ast::OnErrorMode::Fail
+                                                            }
+                                                            Rule::kw_continue => {
+                                                                crate::ast::OnErrorMode::Continue
+                                                            }
+                                                            Rule::kw_break => {
+                                                                crate::ast::OnErrorMode::Break
+                                                            }
+                                                            r => {
+                                                                return Err(Error::Parse(format!(
+                                                                    "unexpected ON ERROR mode: {r:?}"
+                                                                )))
+                                                            }
+                                                        };
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
                                         }
                                     }
-                                    in_tx =
-                                        Some(crate::ast::InTransactionsConfig { batch_size: size });
+                                    in_tx = Some(crate::ast::InTransactionsConfig {
+                                        batch_size: size,
+                                        error_mode: mode,
+                                    });
                                 }
                                 _ => {}
                             }

@@ -2648,3 +2648,147 @@ async fn call_in_transactions_each_batch_sees_prior_batch_writes() {
     };
     assert_eq!(c, 4);
 }
+
+#[tokio::test]
+async fn call_in_transactions_on_error_continue_skips_failed_batch() {
+    // UNIQUE constraint + a duplicate value in the input list
+    // forces one batch to fail. With ON ERROR CONTINUE the
+    // statement should commit the other 3 batches and report
+    // overall success.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+
+    service
+        .execute_cypher_local(
+            "CREATE CONSTRAINT k_uniq FOR (n:K) REQUIRE n.k IS UNIQUE".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    service
+        .execute_cypher_local("CREATE (:K {k: 99})".into(), ParamMap::new())
+        .await
+        .unwrap();
+
+    // Batch size 1 means each row is its own batch. The 99
+    // collides with the pre-existing node; the other three
+    // batches (1, 2, 4) should commit independently.
+    service
+        .execute_cypher_local(
+            "UNWIND [1, 2, 99, 4] AS x \
+             CALL { WITH x CREATE (:K {k: x}) } IN TRANSACTIONS OF 1 ROWS ON ERROR CONTINUE"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("ON ERROR CONTINUE must report success");
+
+    let rows = service
+        .execute_cypher_local("MATCH (n:K) RETURN count(n) AS c".into(), ParamMap::new())
+        .await
+        .unwrap();
+    let c = match rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    // Pre-existing 99 + 3 new (1, 2, 4) = 4. The 99 batch
+    // failed and was skipped.
+    assert_eq!(c, 4, "CONTINUE should skip the duplicate batch");
+}
+
+#[tokio::test]
+async fn call_in_transactions_on_error_break_halts_after_failure() {
+    // Same setup but with BREAK: the duplicate halts processing.
+    // Earlier batches (1, 2) are committed; later batches (4)
+    // are not attempted.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+
+    service
+        .execute_cypher_local(
+            "CREATE CONSTRAINT k_uniq FOR (n:K) REQUIRE n.k IS UNIQUE".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    service
+        .execute_cypher_local("CREATE (:K {k: 99})".into(), ParamMap::new())
+        .await
+        .unwrap();
+
+    service
+        .execute_cypher_local(
+            "UNWIND [1, 2, 99, 4] AS x \
+             CALL { WITH x CREATE (:K {k: x}) } IN TRANSACTIONS OF 1 ROWS ON ERROR BREAK"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("ON ERROR BREAK must report success on prior commits");
+
+    let rows = service
+        .execute_cypher_local("MATCH (n:K) RETURN count(n) AS c".into(), ParamMap::new())
+        .await
+        .unwrap();
+    let c = match rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    // Pre-existing 99 + 2 committed (1, 2) before the failing
+    // 99 halted further batches = 3.
+    assert_eq!(c, 3, "BREAK should commit pre-failure batches and stop");
+}
+
+#[tokio::test]
+async fn call_in_transactions_on_error_fail_propagates() {
+    // Default ON ERROR FAIL behaviour: statement returns error.
+    // Earlier batches still committed (Neo4j semantics — "earlier
+    // batches stay durably persisted, the failed one is rolled
+    // back, no later batches are attempted").
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+
+    service
+        .execute_cypher_local(
+            "CREATE CONSTRAINT k_uniq FOR (n:K) REQUIRE n.k IS UNIQUE".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    service
+        .execute_cypher_local("CREATE (:K {k: 99})".into(), ParamMap::new())
+        .await
+        .unwrap();
+
+    let err = service
+        .execute_cypher_local(
+            "UNWIND [1, 2, 99, 4] AS x \
+             CALL { WITH x CREATE (:K {k: x}) } IN TRANSACTIONS OF 1 ROWS"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .err()
+        .expect("default FAIL mode must return an error");
+    let msg = err.message().to_lowercase();
+    assert!(
+        msg.contains("constraint") || msg.contains("unique") || msg.contains("k_uniq"),
+        "expected constraint-violation message, got: {}",
+        err.message(),
+    );
+
+    // 1 + 2 committed before the failure; 4 not attempted; 99
+    // pre-existed.
+    let rows = service
+        .execute_cypher_local("MATCH (n:K) RETURN count(n) AS c".into(), ParamMap::new())
+        .await
+        .unwrap();
+    let c = match rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    assert_eq!(c, 3, "FAIL keeps pre-failure commits durable");
+}

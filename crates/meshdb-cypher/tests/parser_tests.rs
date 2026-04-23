@@ -3241,6 +3241,51 @@ fn call_in_transactions_of_n_rows_parses_explicit_size() {
 }
 
 #[test]
+fn call_in_transactions_default_error_mode_is_fail() {
+    let s = parse("MATCH (n) CALL { WITH n SET n:Marked } IN TRANSACTIONS").unwrap();
+    let m = unwrap_match(s);
+    let mut mode: Option<meshdb_cypher::OnErrorMode> = None;
+    for c in &m.clauses {
+        if let meshdb_cypher::ReadingClause::CallInTransactions(_, cfg) = c {
+            mode = Some(cfg.error_mode);
+        }
+    }
+    assert_eq!(mode, Some(meshdb_cypher::OnErrorMode::Fail));
+}
+
+#[test]
+fn call_in_transactions_on_error_modes_parse() {
+    for (src, expected) in [
+        (
+            "MATCH (n) CALL { WITH n SET n:M } IN TRANSACTIONS ON ERROR CONTINUE",
+            meshdb_cypher::OnErrorMode::Continue,
+        ),
+        (
+            "MATCH (n) CALL { WITH n SET n:M } IN TRANSACTIONS ON ERROR BREAK",
+            meshdb_cypher::OnErrorMode::Break,
+        ),
+        (
+            "MATCH (n) CALL { WITH n SET n:M } IN TRANSACTIONS ON ERROR FAIL",
+            meshdb_cypher::OnErrorMode::Fail,
+        ),
+        (
+            "MATCH (n) CALL { WITH n SET n:M } IN TRANSACTIONS OF 50 ROWS ON ERROR CONTINUE",
+            meshdb_cypher::OnErrorMode::Continue,
+        ),
+    ] {
+        let s = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+        let m = unwrap_match(s);
+        let mut mode: Option<meshdb_cypher::OnErrorMode> = None;
+        for c in &m.clauses {
+            if let meshdb_cypher::ReadingClause::CallInTransactions(_, cfg) = c {
+                mode = Some(cfg.error_mode);
+            }
+        }
+        assert_eq!(mode, Some(expected), "src: {src}");
+    }
+}
+
+#[test]
 fn call_in_transactions_zero_or_negative_rows_rejected() {
     let err = parse("MATCH (n) CALL { WITH n SET n:X } IN TRANSACTIONS OF 0 ROWS").err();
     assert!(err.is_some(), "batch size of 0 should be a parse error",);

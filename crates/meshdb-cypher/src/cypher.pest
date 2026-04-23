@@ -245,14 +245,25 @@ call_subquery = { kw_call ~ "{" ~ union_query ~ "}" ~ in_transactions_suffix? }
 // Optional Neo4j 5 batched-write suffix:
 //   CALL { ... } IN TRANSACTIONS
 //   CALL { ... } IN TRANSACTIONS OF 100 ROWS
+//   CALL { ... } IN TRANSACTIONS ON ERROR { FAIL | CONTINUE | BREAK }
+//   CALL { ... } IN TRANSACTIONS OF 100 ROWS ON ERROR CONTINUE
 // When present, the body runs in batches of `batch_size` input rows
 // and each batch commits as an independent transaction. Default
-// batch size when `OF n ROWS` is omitted is 1000 (matching Neo4j).
-in_transactions_suffix = { kw_in ~ kw_transactions ~ in_transactions_batch? }
+// batch size when `OF n ROWS` is omitted is 1000 (matching Neo4j);
+// default error mode is FAIL.
+in_transactions_suffix = {
+    kw_in ~ kw_transactions ~ in_transactions_batch? ~ in_transactions_on_error?
+}
 in_transactions_batch = { kw_of ~ nn_integer ~ kw_rows }
+in_transactions_on_error = { kw_on ~ kw_error ~ on_error_mode }
+on_error_mode = { kw_fail | kw_continue | kw_break }
 kw_transactions = @{ ^"transactions" ~ !id_cont }
 kw_of = @{ ^"of" ~ !id_cont }
 kw_rows = @{ ^"rows" ~ !id_cont }
+kw_error = @{ ^"error" ~ !id_cont }
+kw_fail = @{ ^"fail" ~ !id_cont }
+kw_continue = @{ ^"continue" ~ !id_cont }
+kw_break = @{ ^"break" ~ !id_cont }
 
 // A procedure call, either standalone (`CALL ns.name[(args)] [YIELD ...]`)
 // or appearing mid-query as a reading clause. The grammar doesn't

@@ -305,13 +305,35 @@ pub enum ReadingClause {
     Foreach(ForeachClause),
 }
 
-/// `IN TRANSACTIONS [OF n ROWS]` configuration, attached to a
-/// `CALL { } IN TRANSACTIONS` reading clause. `batch_size` is the
-/// number of input rows per committed batch — Neo4j defaults to
-/// 1000 when the `OF` clause is omitted.
+/// `IN TRANSACTIONS [OF n ROWS] [ON ERROR mode]` configuration,
+/// attached to a `CALL { } IN TRANSACTIONS` reading clause.
+/// `batch_size` is the number of input rows per committed batch
+/// (Neo4j defaults to 1000); `error_mode` controls behaviour when
+/// a batch's body or commit fails.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InTransactionsConfig {
     pub batch_size: i64,
+    pub error_mode: OnErrorMode,
+}
+
+/// Behaviour when a batch fails during `CALL { } IN TRANSACTIONS`.
+/// Default is `Fail` — matches Neo4j 5 and the absence of an
+/// `ON ERROR` clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnErrorMode {
+    /// Surface the failure to the caller. Earlier batches stay
+    /// durably committed; the failed batch is rolled back; no
+    /// further batches are attempted. Default.
+    Fail,
+    /// Skip the failed batch and proceed with the next one. The
+    /// statement reports success at the end. Useful for bulk
+    /// migrations where a few bad rows shouldn't abort the run.
+    Continue,
+    /// Stop processing on the first failure and report success
+    /// with whatever batches already committed. Like Continue
+    /// for the failure itself, but no later batches are
+    /// attempted.
+    Break,
 }
 
 /// Default batch size used when `CALL { } IN TRANSACTIONS` is

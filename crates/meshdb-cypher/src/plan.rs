@@ -362,19 +362,22 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         body: Box<LogicalPlan>,
     },
-    /// `CALL { ... } IN TRANSACTIONS [OF n ROWS]` — same per-input-
-    /// row body semantics as [`Self::CallSubquery`] but with
-    /// transactional batching. The executor pulls `batch_size`
-    /// input rows, runs the body for each (writing into a fresh
-    /// per-batch buffer), commits the batch as its own
-    /// transaction, and moves on. Output rows from the body are
-    /// aggregated across all batches and returned to the caller.
+    /// `CALL { ... } IN TRANSACTIONS [OF n ROWS] [ON ERROR mode]`
+    /// — same per-input-row body semantics as
+    /// [`Self::CallSubquery`] but with transactional batching.
+    /// The executor pulls `batch_size` input rows, runs the body
+    /// for each (writing into a fresh per-batch buffer), commits
+    /// the batch as its own transaction, and moves on.
+    /// `error_mode` controls behaviour when a batch's body or
+    /// commit fails (FAIL = propagate, CONTINUE = skip and move
+    /// on, BREAK = stop and report success on what committed).
     /// Running this inside an explicit Bolt transaction is a
     /// runtime error — caught at the server-side dispatch layer.
     CallSubqueryInTransactions {
         input: Box<LogicalPlan>,
         body: Box<LogicalPlan>,
         batch_size: i64,
+        error_mode: crate::ast::OnErrorMode,
     },
     /// Per-input-row left-join wrapper used by `apply_optional_match`
     /// when the OPTIONAL MATCH body is a multi-hop pattern. Runs
@@ -1176,9 +1179,10 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             input,
             body,
             batch_size,
+            error_mode,
         } => {
             buf.push_str(&format!(
-                "{indent}CallSubqueryInTransactions(batch_size={batch_size})\n"
+                "{indent}CallSubqueryInTransactions(batch_size={batch_size}, on_error={error_mode:?})\n"
             ));
             buf.push_str(&format!("{indent}  body:\n"));
             format_plan_inner(body, buf, depth + 2);
@@ -5102,6 +5106,7 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     input: Box::new(current),
                     body: Box::new(body_plan),
                     batch_size: cfg.batch_size,
+                    error_mode: cfg.error_mode,
                 });
                 // Same outer-scope projection as the non-batched
                 // variant — the body's RETURN columns become

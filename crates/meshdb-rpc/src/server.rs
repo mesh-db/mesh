@@ -495,12 +495,13 @@ impl MeshService {
                  this case earlier",
             ));
         }
-        let (input_plan, body_plan, batch_size) = match plan {
+        let (input_plan, body_plan, batch_size, error_mode) = match plan {
             meshdb_cypher::LogicalPlan::CallSubqueryInTransactions {
                 input,
                 body,
                 batch_size,
-            } => (*input, *body, batch_size),
+                error_mode,
+            } => (*input, *body, batch_size, error_mode),
             _ => {
                 return Err(Status::failed_precondition(
                     "CALL { ... } IN TRANSACTIONS must be the top-level clause of the \
@@ -557,7 +558,7 @@ impl MeshService {
             let store = self.store.clone();
             let routing = self.routing.clone();
             let params = params.clone();
-            let outcome = tokio::task::spawn_blocking(
+            let outcome_result = tokio::task::spawn_blocking(
                 move || -> std::result::Result<
                     (Vec<meshdb_executor::Row>, Vec<GraphCommand>),
                     meshdb_executor::Error,
@@ -603,16 +604,65 @@ impl MeshService {
             .await
             .map_err(|e| {
                 Status::internal(format!("batch {batch_idx} executor panicked: {e}"))
-            })?
-            .map_err(|e| {
-                Status::internal(format!("batch {batch_idx} execution failed: {e}"))
             })?;
 
-            let (batch_output, batch_commands) = outcome;
-            // Commit this batch independently. Failure aborts
-            // remaining batches; earlier batches stay persisted.
-            self.commit_buffered_commands(batch_commands).await?;
-            all_output.extend(batch_output);
+            // Body execution result: error here means a row in
+            // the batch failed (parse, type, constraint, etc.).
+            // No commit was attempted, so nothing landed.
+            let (batch_output, batch_commands) = match outcome_result {
+                Ok(out) => out,
+                Err(e) => match error_mode {
+                    meshdb_cypher::OnErrorMode::Fail => {
+                        return Err(Status::internal(format!(
+                            "batch {batch_idx} execution failed: {e}"
+                        )));
+                    }
+                    meshdb_cypher::OnErrorMode::Continue => {
+                        tracing::warn!(
+                            batch = batch_idx,
+                            error = %e,
+                            "ON ERROR CONTINUE — body execution failed; skipping batch"
+                        );
+                        continue;
+                    }
+                    meshdb_cypher::OnErrorMode::Break => {
+                        tracing::warn!(
+                            batch = batch_idx,
+                            error = %e,
+                            "ON ERROR BREAK — body execution failed; halting"
+                        );
+                        break;
+                    }
+                },
+            };
+
+            // Commit attempt: failure here means the body
+            // succeeded but the underlying commit
+            // (single-node / Raft / 2PC) couldn't persist.
+            match self.commit_buffered_commands(batch_commands).await {
+                Ok(()) => {
+                    all_output.extend(batch_output);
+                }
+                Err(e) => match error_mode {
+                    meshdb_cypher::OnErrorMode::Fail => return Err(e),
+                    meshdb_cypher::OnErrorMode::Continue => {
+                        tracing::warn!(
+                            batch = batch_idx,
+                            error = %e.message(),
+                            "ON ERROR CONTINUE — commit failed; skipping batch"
+                        );
+                        continue;
+                    }
+                    meshdb_cypher::OnErrorMode::Break => {
+                        tracing::warn!(
+                            batch = batch_idx,
+                            error = %e.message(),
+                            "ON ERROR BREAK — commit failed; halting"
+                        );
+                        break;
+                    }
+                },
+            }
         }
         // v1 supports CALL { } IN TRANSACTIONS only as the
         // top-level write-only clause (no terminal RETURN /
