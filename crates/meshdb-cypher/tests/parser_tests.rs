@@ -2417,6 +2417,7 @@ fn three_match_stages_parse() {
             ReadingClause::Merge(_) => "G",
             ReadingClause::Unwind(_) => "U",
             ReadingClause::Call(_) => "C",
+            ReadingClause::CallInTransactions(_, _) => "CIT",
             ReadingClause::CallProcedure(_) => "CP",
             ReadingClause::LoadCsv(_) => "L",
             ReadingClause::Create(_) => "CR",
@@ -3203,4 +3204,44 @@ fn exists_subquery_with_var_length_plans_successfully() {
     )
     .unwrap();
     plan(&s).expect("var-length in EXISTS subquery should plan");
+}
+
+#[test]
+fn call_in_transactions_default_batch_parses() {
+    let s = parse("MATCH (n:Person) CALL { WITH n SET n:Marked } IN TRANSACTIONS RETURN n")
+        .expect("IN TRANSACTIONS without OF clause should parse");
+    let m = unwrap_match(s);
+    let mut saw_in_tx = false;
+    for c in &m.clauses {
+        if let meshdb_cypher::ReadingClause::CallInTransactions(_, cfg) = c {
+            assert_eq!(
+                cfg.batch_size,
+                meshdb_cypher::DEFAULT_IN_TRANSACTIONS_BATCH_SIZE,
+                "default batch size should match Neo4j 5",
+            );
+            saw_in_tx = true;
+        }
+    }
+    assert!(saw_in_tx, "expected a CallInTransactions reading clause");
+}
+
+#[test]
+fn call_in_transactions_of_n_rows_parses_explicit_size() {
+    let s =
+        parse("MATCH (n:Person) CALL { WITH n SET n:Marked } IN TRANSACTIONS OF 250 ROWS RETURN n")
+            .expect("IN TRANSACTIONS OF n ROWS should parse");
+    let m = unwrap_match(s);
+    let mut size: Option<i64> = None;
+    for c in &m.clauses {
+        if let meshdb_cypher::ReadingClause::CallInTransactions(_, cfg) = c {
+            size = Some(cfg.batch_size);
+        }
+    }
+    assert_eq!(size, Some(250));
+}
+
+#[test]
+fn call_in_transactions_zero_or_negative_rows_rejected() {
+    let err = parse("MATCH (n) CALL { WITH n SET n:X } IN TRANSACTIONS OF 0 ROWS").err();
+    assert!(err.is_some(), "batch size of 0 should be a parse error",);
 }

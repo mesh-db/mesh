@@ -491,7 +491,7 @@ where
                 };
                 use tracing::Instrument;
                 match service
-                    .execute_cypher_in_tx(query, param_map, buffered.clone())
+                    .execute_cypher_in_tx(query, param_map, buffered.clone(), true)
                     .instrument(run_span)
                     .await
                 {

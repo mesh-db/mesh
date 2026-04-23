@@ -277,6 +277,15 @@ pub enum ReadingClause {
     /// input row. Correlated subqueries import outer bindings via
     /// `WITH var1, var2` as the first clause inside the body.
     Call(Box<Statement>),
+    /// `CALL { read_stmt } IN TRANSACTIONS [OF n ROWS]` — Neo4j 5
+    /// batched-write form. Same per-row body semantics as
+    /// [`Self::Call`], but input rows are grouped into batches and
+    /// each batch commits as its own transaction. Default batch
+    /// size is 1000 when `OF n ROWS` is omitted. Parsed only at
+    /// the top level of an auto-commit query — running this inside
+    /// an explicit Bolt transaction is a runtime error since the
+    /// per-batch commits conflict with the enclosing one.
+    CallInTransactions(Box<Statement>, InTransactionsConfig),
     /// `CALL ns.name[(args)] YIELD cols` — mid-query invocation of
     /// a registered procedure. Unlike the standalone
     /// [`Statement::CallProcedure`] form, in-query calls require an
@@ -295,6 +304,19 @@ pub enum ReadingClause {
     /// Mid-query `FOREACH (...)` — applies mutations to each element.
     Foreach(ForeachClause),
 }
+
+/// `IN TRANSACTIONS [OF n ROWS]` configuration, attached to a
+/// `CALL { } IN TRANSACTIONS` reading clause. `batch_size` is the
+/// number of input rows per committed batch — Neo4j defaults to
+/// 1000 when the `OF` clause is omitted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InTransactionsConfig {
+    pub batch_size: i64,
+}
+
+/// Default batch size used when `CALL { } IN TRANSACTIONS` is
+/// written without the `OF n ROWS` qualifier. Matches Neo4j 5.
+pub const DEFAULT_IN_TRANSACTIONS_BATCH_SIZE: i64 = 1000;
 
 /// A mid-query `UNWIND expression AS alias`. Evaluates the
 /// expression against each input row, expects the result to be a

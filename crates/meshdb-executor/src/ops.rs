@@ -186,6 +186,53 @@ pub fn execute_with_reader(
 /// procedures declared by `there exists a procedure ...` steps,
 /// and reserved for the server startup path once built-in
 /// procedures land.
+/// Run `plan` once for a caller-supplied "outer" row that's
+/// folded into the operator pipeline as a seed. Used by
+/// `CALL { ... } IN TRANSACTIONS` to evaluate the body once per
+/// input row (with the row's bindings visible inside the body)
+/// while letting the caller batch writes across multiple
+/// invocations into a shared `BufferingGraphWriter`.
+///
+/// The `seed` row is threaded into every operator's
+/// `outer_rows` list, mirroring what `CallSubqueryOp` does
+/// internally for the non-batched form. Pass `None` to invoke
+/// without a seed (equivalent to
+/// [`execute_with_reader_and_procs`]).
+pub fn execute_with_seed(
+    plan: &LogicalPlan,
+    seed: Option<&Row>,
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    params: &ParamMap,
+    procedures: &ProcedureRegistry,
+) -> Result<Vec<Row>> {
+    crate::eval::reset_statement_time();
+    if let Some(rows) = try_execute_ddl(plan, reader, writer)? {
+        return Ok(rows);
+    }
+    let suppress_output = is_write_only_plan(plan);
+    let mut op = build_op_inner(plan, seed);
+    let tombstones = Tombstones::default();
+    let outer_rows: Vec<&Row> = seed.into_iter().collect();
+    let ctx = ExecCtx {
+        store: reader,
+        writer,
+        params,
+        procedures,
+        outer_rows: &outer_rows,
+        tombstones: &tombstones,
+    };
+    let mut rows = Vec::new();
+    while let Some(row) = op.next(&ctx)? {
+        rows.push(row);
+    }
+    if suppress_output {
+        Ok(Vec::new())
+    } else {
+        Ok(rows)
+    }
+}
+
 pub fn execute_with_reader_and_procs(
     plan: &LogicalPlan,
     reader: &dyn GraphReader,
@@ -291,6 +338,12 @@ fn plan_contains_writes(plan: &LogicalPlan) -> bool {
         CallSubquery { input, body } | OptionalApply { input, body, .. } => {
             plan_contains_writes(input) || plan_contains_writes(body)
         }
+        // CALL ... IN TRANSACTIONS commits each batch internally, so
+        // its writes don't leak into a surrounding LimitOp's drain
+        // logic — but the input subtree can still be write-bearing
+        // (e.g. a preceding CREATE before the CALL). Recurse only
+        // into the input.
+        CallSubqueryInTransactions { input, .. } => plan_contains_writes(input),
 
         // Variants whose `input` is optional (top-level producer
         // when `None`).
@@ -773,6 +826,22 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
         )),
         LogicalPlan::CallSubquery { input, body } => {
             Box::new(CallSubqueryOp::new(child!(input), (**body).clone()))
+        }
+        LogicalPlan::CallSubqueryInTransactions { .. } => {
+            // CALL ... IN TRANSACTIONS commits each batch in its
+            // own transaction, which the operator pipeline can't
+            // do (it has no commit handle). The dispatcher above
+            // (`MeshService::execute_cypher_in_tx`) detects this
+            // variant before calling `build_op` and routes to a
+            // batched-execution path. Reaching this arm means
+            // the dispatcher was bypassed — fail loudly so the
+            // missing wiring surfaces in tests instead of
+            // silently degrading to a single big transaction.
+            panic!(
+                "LogicalPlan::CallSubqueryInTransactions reached `build_op` — the server-side \
+                 dispatcher (execute_cypher_in_tx) must intercept this variant and route to \
+                 batched execution"
+            )
         }
         LogicalPlan::OptionalApply {
             input,

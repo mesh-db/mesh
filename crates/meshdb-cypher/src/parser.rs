@@ -817,12 +817,50 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                         }));
                     }
                     Rule::call_subquery => {
-                        let body = inner
-                            .into_inner()
-                            .find(|p| p.as_rule() == Rule::union_query)
-                            .ok_or_else(|| Error::Parse("CALL missing body".into()))?;
-                        let stmt = build_union_query(body)?;
-                        clauses.push(ReadingClause::Call(Box::new(stmt)));
+                        let mut body_stmt: Option<Statement> = None;
+                        let mut in_tx: Option<crate::ast::InTransactionsConfig> = None;
+                        for child in inner.into_inner() {
+                            match child.as_rule() {
+                                Rule::union_query => {
+                                    body_stmt = Some(build_union_query(child)?);
+                                }
+                                Rule::in_transactions_suffix => {
+                                    // Default batch size when `OF n ROWS` is
+                                    // omitted matches Neo4j 5: 1000.
+                                    let mut size = crate::ast::DEFAULT_IN_TRANSACTIONS_BATCH_SIZE;
+                                    for grand in child.into_inner() {
+                                        if grand.as_rule() == Rule::in_transactions_batch {
+                                            for leaf in grand.into_inner() {
+                                                if leaf.as_rule() == Rule::nn_integer {
+                                                    size = leaf.as_str().parse().map_err(|e| {
+                                                        Error::Parse(format!(
+                                                            "IN TRANSACTIONS OF batch size: {e}"
+                                                        ))
+                                                    })?;
+                                                    if size <= 0 {
+                                                        return Err(Error::Parse(
+                                                            "IN TRANSACTIONS OF batch size must be positive"
+                                                                .into(),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    in_tx =
+                                        Some(crate::ast::InTransactionsConfig { batch_size: size });
+                                }
+                                _ => {}
+                            }
+                        }
+                        let stmt =
+                            body_stmt.ok_or_else(|| Error::Parse("CALL missing body".into()))?;
+                        match in_tx {
+                            Some(cfg) => {
+                                clauses.push(ReadingClause::CallInTransactions(Box::new(stmt), cfg))
+                            }
+                            None => clauses.push(ReadingClause::Call(Box::new(stmt))),
+                        }
                     }
                     Rule::call_procedure => {
                         let pc = build_procedure_call(inner)?;

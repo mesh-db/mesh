@@ -362,6 +362,20 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         body: Box<LogicalPlan>,
     },
+    /// `CALL { ... } IN TRANSACTIONS [OF n ROWS]` — same per-input-
+    /// row body semantics as [`Self::CallSubquery`] but with
+    /// transactional batching. The executor pulls `batch_size`
+    /// input rows, runs the body for each (writing into a fresh
+    /// per-batch buffer), commits the batch as its own
+    /// transaction, and moves on. Output rows from the body are
+    /// aggregated across all batches and returned to the caller.
+    /// Running this inside an explicit Bolt transaction is a
+    /// runtime error — caught at the server-side dispatch layer.
+    CallSubqueryInTransactions {
+        input: Box<LogicalPlan>,
+        body: Box<LogicalPlan>,
+        batch_size: i64,
+    },
     /// Per-input-row left-join wrapper used by `apply_optional_match`
     /// when the OPTIONAL MATCH body is a multi-hop pattern. Runs
     /// `body` as a fresh sub-plan seeded with each outer row, then:
@@ -1158,6 +1172,19 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             buf.push_str(&format!("{indent}  input:\n"));
             format_plan_inner(input, buf, depth + 2);
         }
+        LogicalPlan::CallSubqueryInTransactions {
+            input,
+            body,
+            batch_size,
+        } => {
+            buf.push_str(&format!(
+                "{indent}CallSubqueryInTransactions(batch_size={batch_size})\n"
+            ));
+            buf.push_str(&format!("{indent}  body:\n"));
+            format_plan_inner(body, buf, depth + 2);
+            buf.push_str(&format!("{indent}  input:\n"));
+            format_plan_inner(input, buf, depth + 2);
+        }
         LogicalPlan::OptionalApply {
             input,
             body,
@@ -1737,6 +1764,7 @@ where
         | LogicalPlan::MergeEdge { input, .. }
         | LogicalPlan::Foreach { input, .. }
         | LogicalPlan::CallSubquery { input, .. }
+        | LogicalPlan::CallSubqueryInTransactions { input, .. }
         | LogicalPlan::OptionalApply { input, .. }
         | LogicalPlan::LoadCsv {
             input: Some(input), ..
@@ -5061,6 +5089,32 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     }
                 }
             }
+            ReadingClause::CallInTransactions(body_stmt, cfg) => {
+                let body_plan = plan_with_context(body_stmt, ctx)?;
+                let current = match plan.take() {
+                    Some(p) => p,
+                    None => LogicalPlan::Unwind {
+                        var: "__call_seed".to_string(),
+                        expr: Expr::List(vec![Expr::Literal(Literal::Integer(0))]),
+                    },
+                };
+                plan = Some(LogicalPlan::CallSubqueryInTransactions {
+                    input: Box::new(current),
+                    body: Box::new(body_plan),
+                    batch_size: cfg.batch_size,
+                });
+                // Same outer-scope projection as the non-batched
+                // variant — the body's RETURN columns become
+                // bindings the caller can reference downstream.
+                if let Some(cols) = call_subquery_output_columns(body_stmt)? {
+                    for name in cols {
+                        if bound_vars.contains_key(&name) {
+                            return Err(Error::Plan(format!("variable '{name}' already defined")));
+                        }
+                        bound_vars.insert(name, VarType::Scalar);
+                    }
+                }
+            }
             ReadingClause::CallProcedure(pc) => {
                 // Embedded CALL — reaches this arm only when the
                 // enclosing MatchStmt has either more than one
@@ -5448,6 +5502,12 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                 | crate::ast::ReadingClause::Delete(_)
                 | crate::ast::ReadingClause::Remove(_)
                 | crate::ast::ReadingClause::Foreach(_)
+                // CALL { ... } IN TRANSACTIONS is a write-bearing
+                // clause in its own right — its body batches and
+                // commits writes per chunk, so the statement
+                // doesn't need a separate trailing mutation/
+                // RETURN to be valid.
+                | crate::ast::ReadingClause::CallInTransactions(_, _)
         )
     });
 

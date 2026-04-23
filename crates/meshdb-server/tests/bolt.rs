@@ -998,6 +998,42 @@ async fn bolt_tx_multiple_runs_with_pulls_between_each() {
     goodbye(sock).await;
 }
 
+#[tokio::test]
+async fn bolt_tx_call_in_transactions_rejected_inside_explicit_tx() {
+    // CALL { ... } IN TRANSACTIONS commits each batch in its
+    // own transaction. Allowing it inside an explicit BEGIN /
+    // COMMIT block would silently break the explicit-tx
+    // semantics, so the server must reject the RUN with a
+    // protocol-level failure.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+    begin_tx(&mut sock).await;
+    write_message(
+        &mut sock,
+        &BoltMessage::Run {
+            query: "UNWIND [1, 2] AS x \
+                    CALL { WITH x CREATE (:Forbidden {n: x}) } IN TRANSACTIONS"
+                .into(),
+            params: BoltValue::Map(vec![]),
+            extra: BoltValue::Map(vec![]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let reply = BoltMessage::decode(&read_message(&mut sock).await.unwrap()).unwrap();
+    let failure_msg = match &reply {
+        BoltMessage::Failure { metadata } => format!("{metadata:?}"),
+        other => panic!("expected Failure, got {other:?}"),
+    };
+    assert!(
+        failure_msg.to_lowercase().contains("transactions"),
+        "failure should mention IN TRANSACTIONS: {failure_msg}",
+    );
+    // Drop the failed connection — the Bolt FSM is now in
+    // Failed state and any further messages are Ignored.
+}
+
 // ---------------------------------------------------------------
 // Bolt auth validation
 // ---------------------------------------------------------------

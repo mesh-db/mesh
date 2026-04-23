@@ -285,9 +285,12 @@ impl MeshService {
         query: String,
         params: meshdb_executor::ParamMap,
     ) -> std::result::Result<(Vec<meshdb_executor::Row>, Vec<GraphCommand>), Status> {
-        // Equivalent to running an explicit tx with an empty
-        // accumulator — no previously-buffered writes to overlay.
-        self.execute_cypher_in_tx(query, params, Vec::new()).await
+        // Auto-commit path — equivalent to running an explicit tx
+        // with an empty accumulator and no surrounding Bolt tx,
+        // so `CALL ... IN TRANSACTIONS` is allowed and gets
+        // dispatched to the batched-commit path internally.
+        self.execute_cypher_in_tx(query, params, Vec::new(), false)
+            .await
     }
 
     /// Run a Cypher query with a read-your-writes overlay derived
@@ -311,6 +314,7 @@ impl MeshService {
         query: String,
         params: meshdb_executor::ParamMap,
         prev_commands: Vec<GraphCommand>,
+        in_explicit_tx: bool,
     ) -> std::result::Result<(Vec<meshdb_executor::Row>, Vec<GraphCommand>), Status> {
         let statement = meshdb_cypher::parse(&query).map_err(bad_request)?;
 
@@ -356,6 +360,27 @@ impl MeshService {
         };
         let plan =
             meshdb_cypher::plan_with_context(&statement, &planner_ctx).map_err(bad_request)?;
+
+        // CALL { ... } IN TRANSACTIONS commits each batch
+        // independently, which conflicts with an enclosing
+        // explicit transaction (whose whole point is one atomic
+        // commit at the end). Reject early with a clear error so
+        // clients see a protocol-level failure rather than
+        // mysterious partial commits. Auto-commit callers
+        // (`execute_cypher_buffered`) pass `in_explicit_tx =
+        // false` and route to the batched-execution path.
+        if plan_contains_in_transactions(&plan) {
+            if in_explicit_tx {
+                return Err(Status::failed_precondition(
+                    "CALL { ... } IN TRANSACTIONS is not allowed inside an explicit \
+                     transaction (BEGIN / COMMIT). Run the statement as auto-commit \
+                     instead.",
+                ));
+            }
+            return self
+                .execute_call_in_transactions(plan, params, prev_commands)
+                .await;
+        }
 
         // Metric increments. The mode label is set once per query
         // and reused for both the counter and the latency
@@ -434,6 +459,177 @@ impl MeshService {
 
         Ok((rows, commands))
     }
+
+    /// Execute a plan whose top-level node is
+    /// [`meshdb_cypher::LogicalPlan::CallSubqueryInTransactions`].
+    /// Drains the input subtree once, then runs the body for
+    /// each input row in batches of `batch_size`, committing
+    /// each batch as its own transaction.
+    ///
+    /// Each batch:
+    ///   1. Fresh `BufferingGraphWriter`.
+    ///   2. For every input row in the chunk, run the body via
+    ///      [`meshdb_executor::execute_with_seed`] (which folds
+    ///      the row into the operator pipeline as outer-scope).
+    ///   3. Merge body outputs with their outer rows.
+    ///   4. Commit the writer's accumulated commands through
+    ///      [`Self::commit_buffered_commands`].
+    ///
+    /// On commit failure, the remainder of the IN TRANSACTIONS
+    /// run aborts; already-committed batches stay durably
+    /// persisted — matches Neo4j 5's default `ON ERROR FAIL`.
+    ///
+    /// `prev_commands` must be empty (the auto-commit caller
+    /// passes `Vec::new()`); if it isn't, that's a wiring bug
+    /// surfaced as a protocol-level failure.
+    async fn execute_call_in_transactions(
+        &self,
+        plan: meshdb_cypher::LogicalPlan,
+        params: meshdb_executor::ParamMap,
+        prev_commands: Vec<GraphCommand>,
+    ) -> std::result::Result<(Vec<meshdb_executor::Row>, Vec<GraphCommand>), Status> {
+        if !prev_commands.is_empty() {
+            return Err(Status::failed_precondition(
+                "CALL { ... } IN TRANSACTIONS dispatched with a non-empty buffered \
+                 command set — the in-explicit-tx check upstream should have rejected \
+                 this case earlier",
+            ));
+        }
+        let (input_plan, body_plan, batch_size) = match plan {
+            meshdb_cypher::LogicalPlan::CallSubqueryInTransactions {
+                input,
+                body,
+                batch_size,
+            } => (*input, *body, batch_size),
+            _ => {
+                return Err(Status::failed_precondition(
+                    "CALL { ... } IN TRANSACTIONS must be the top-level clause of the \
+                     statement; nested or composed forms aren't supported yet",
+                ));
+            }
+        };
+
+        // Drain the input plan into a Vec<Row>. Run on a
+        // blocking thread because the operator pipeline is sync.
+        let input_rows: Vec<meshdb_executor::Row> = {
+            let store = self.store.clone();
+            let routing = self.routing.clone();
+            let input_plan = input_plan;
+            let params = params.clone();
+            tokio::task::spawn_blocking(
+                move || -> std::result::Result<_, meshdb_executor::Error> {
+                    let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
+                    let writer = BufferingGraphWriter::new();
+                    let mut procs = ProcedureRegistry::new();
+                    procs.register_defaults();
+                    if let Some(r) = routing.as_ref() {
+                        let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
+                        meshdb_executor::execute_with_reader_and_procs(
+                            &input_plan,
+                            &partitioned as &dyn GraphReader,
+                            &writer as &dyn GraphWriter,
+                            &params,
+                            &procs,
+                        )
+                    } else {
+                        meshdb_executor::execute_with_reader_and_procs(
+                            &input_plan,
+                            &storage_reader as &dyn GraphReader,
+                            &writer as &dyn GraphWriter,
+                            &params,
+                            &procs,
+                        )
+                    }
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("input drain panicked: {e}")))?
+            .map_err(|e| Status::internal(format!("input drain failed: {e}")))?
+        };
+
+        let mut all_output: Vec<meshdb_executor::Row> = Vec::new();
+        let bs = batch_size.max(1) as usize;
+        let mut batch_idx: usize = 0;
+        for chunk in input_rows.chunks(bs) {
+            batch_idx += 1;
+            let chunk_rows: Vec<meshdb_executor::Row> = chunk.to_vec();
+            let body_plan = body_plan.clone();
+            let store = self.store.clone();
+            let routing = self.routing.clone();
+            let params = params.clone();
+            let outcome = tokio::task::spawn_blocking(
+                move || -> std::result::Result<
+                    (Vec<meshdb_executor::Row>, Vec<GraphCommand>),
+                    meshdb_executor::Error,
+                > {
+                    let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
+                    let writer = BufferingGraphWriter::new();
+                    let mut procs = ProcedureRegistry::new();
+                    procs.register_defaults();
+                    let mut batch_output: Vec<meshdb_executor::Row> = Vec::new();
+                    for outer_row in chunk_rows {
+                        let body_rows = if let Some(r) = routing.as_ref() {
+                            let partitioned =
+                                PartitionedGraphReader::new(store.clone(), r.clone());
+                            meshdb_executor::execute_with_seed(
+                                &body_plan,
+                                Some(&outer_row),
+                                &partitioned as &dyn GraphReader,
+                                &writer as &dyn GraphWriter,
+                                &params,
+                                &procs,
+                            )?
+                        } else {
+                            meshdb_executor::execute_with_seed(
+                                &body_plan,
+                                Some(&outer_row),
+                                &storage_reader as &dyn GraphReader,
+                                &writer as &dyn GraphWriter,
+                                &params,
+                                &procs,
+                            )?
+                        };
+                        for body_row in body_rows {
+                            let mut merged = outer_row.clone();
+                            for (k, v) in body_row {
+                                merged.insert(k, v);
+                            }
+                            batch_output.push(merged);
+                        }
+                    }
+                    Ok((batch_output, writer.into_commands()))
+                },
+            )
+            .await
+            .map_err(|e| {
+                Status::internal(format!("batch {batch_idx} executor panicked: {e}"))
+            })?
+            .map_err(|e| {
+                Status::internal(format!("batch {batch_idx} execution failed: {e}"))
+            })?;
+
+            let (batch_output, batch_commands) = outcome;
+            // Commit this batch independently. Failure aborts
+            // remaining batches; earlier batches stay persisted.
+            self.commit_buffered_commands(batch_commands).await?;
+            all_output.extend(batch_output);
+        }
+        // v1 supports CALL { } IN TRANSACTIONS only as the
+        // top-level write-only clause (no terminal RETURN /
+        // post-CALL projection), so the body's emitted rows
+        // never surface to the caller — same as a top-level
+        // CREATE without RETURN. Return an empty row set; the
+        // batched commits already landed via
+        // `commit_buffered_commands`. Drop the accumulated
+        // outputs; future revisions can route them through a
+        // post-batch projection when we lift the restriction.
+        let _ = all_output;
+        Ok((Vec::new(), Vec::new()))
+    }
+
+    /// True when `plan` carries a `CallSubqueryInTransactions`
+    /// node anywhere in its tree — used by `execute_cypher_in_tx`
+    /// to detect the IN TRANSACTIONS form before dispatching.
 
     /// Commit a batch of `GraphCommand`s through the active backend.
     /// Used by both the auto-commit single-RUN path and the Bolt
@@ -1125,6 +1321,53 @@ pub(crate) fn apply_prepared_batch(
     store.apply_batch(&flat)
 }
 
+/// True when `plan` carries a `CallSubqueryInTransactions`
+/// node anywhere in its tree. Used by `execute_cypher_in_tx`
+/// to detect the IN TRANSACTIONS form and route to
+/// [`MeshService::execute_call_in_transactions`].
+fn plan_contains_in_transactions(plan: &meshdb_cypher::LogicalPlan) -> bool {
+    use meshdb_cypher::LogicalPlan as P;
+    match plan {
+        P::CallSubqueryInTransactions { .. } => true,
+        P::Filter { input, .. }
+        | P::Project { input, .. }
+        | P::Aggregate { input, .. }
+        | P::Distinct { input }
+        | P::OrderBy { input, .. }
+        | P::Skip { input, .. }
+        | P::Limit { input, .. }
+        | P::Delete { input, .. }
+        | P::SetProperty { input, .. }
+        | P::EdgeExpand { input, .. }
+        | P::OptionalEdgeExpand { input, .. }
+        | P::VarLengthExpand { input, .. }
+        | P::MergeEdge { input, .. }
+        | P::UnwindChain { input, .. }
+        | P::Remove { input, .. }
+        | P::Foreach { input, .. }
+        | P::CallSubquery { input, .. }
+        | P::Identity { input }
+        | P::CoalesceNullRow { input, .. }
+        | P::BindPath { input, .. }
+        | P::ShortestPath { input, .. } => plan_contains_in_transactions(input),
+        P::CartesianProduct { left, right } => {
+            plan_contains_in_transactions(left) || plan_contains_in_transactions(right)
+        }
+        P::Union { branches, .. } => branches.iter().any(plan_contains_in_transactions),
+        P::OptionalApply { input, body, .. } => {
+            plan_contains_in_transactions(input) || plan_contains_in_transactions(body)
+        }
+        P::CreatePath { input, .. }
+        | P::MergeNode { input, .. }
+        | P::ProcedureCall { input, .. }
+        | P::LoadCsv { input, .. } => input
+            .as_deref()
+            .map(plan_contains_in_transactions)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// Count the number of `IndexSeek` plan nodes in `plan`,
 /// recursively. Used by `execute_cypher_in_tx` to bump the
 /// `meshdb_cypher_index_seeks_total` counter once per query — cheap
@@ -1154,6 +1397,7 @@ fn count_index_seeks(plan: &meshdb_cypher::LogicalPlan) -> u64 {
         | P::Remove { input, .. }
         | P::Foreach { input, .. }
         | P::CallSubquery { input, .. }
+        | P::CallSubqueryInTransactions { input, .. }
         | P::Identity { input }
         | P::CoalesceNullRow { input, .. }
         | P::LoadCsv {
