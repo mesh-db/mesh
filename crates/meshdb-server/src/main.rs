@@ -244,6 +244,8 @@ mod tests {
             bolt_tls: None,
             grpc_tls: None,
             mode: None,
+            #[cfg(feature = "apoc-load")]
+            apoc_import: None,
         };
         cli.apply_to(&mut cfg);
         assert!(!cfg.bootstrap);
@@ -265,6 +267,8 @@ mod tests {
             bolt_tls: None,
             grpc_tls: None,
             mode: None,
+            #[cfg(feature = "apoc-load")]
+            apoc_import: None,
         };
         cli.apply_to(&mut cfg);
         assert_eq!(cfg.listen_address, "0.0.0.0:9000"); // overridden

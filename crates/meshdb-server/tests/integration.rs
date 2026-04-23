@@ -104,6 +104,8 @@ async fn spawn_single_node_server() -> Harness {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let service = meshdb_server::build_service(&config).unwrap();
@@ -160,6 +162,8 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         bolt_tls: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -174,6 +178,8 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         bolt_tls: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let service_a = meshdb_server::build_service(&config_a).unwrap();
@@ -548,6 +554,8 @@ async fn build_components_single_node_has_no_raft() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_none());
@@ -579,6 +587,8 @@ async fn build_components_multi_peer_builds_raft() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_some());
@@ -613,6 +623,8 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
         bolt_tls: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_none());
@@ -667,6 +679,8 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -681,6 +695,8 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -832,6 +848,8 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -846,6 +864,8 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1044,6 +1064,8 @@ async fn peer_restart_recovers_persistent_raft_state() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1058,6 +1080,8 @@ async fn peer_restart_recovers_persistent_raft_state() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1193,6 +1217,8 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1207,6 +1233,8 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1345,6 +1373,8 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1359,6 +1389,8 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1592,6 +1624,8 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b1 = ServerConfig {
         self_id: 2,
@@ -1606,6 +1640,8 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1703,6 +1739,8 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let listener_b2 = TcpListener::bind(addr_b).await.unwrap();
@@ -1846,6 +1884,8 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1860,6 +1900,8 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -2023,6 +2065,8 @@ async fn cypher_merge_replicates_through_raft() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2037,6 +2081,8 @@ async fn cypher_merge_replicates_through_raft() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -2179,6 +2225,8 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2193,6 +2241,8 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -2338,6 +2388,8 @@ async fn two_peer_raft_replicates_via_server_components() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2352,6 +2404,8 @@ async fn two_peer_raft_replicates_via_server_components() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     // Build components for both peers.
@@ -2470,6 +2524,8 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
         bolt_tls: None,
         grpc_tls: None,
         mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
     };
 
     let service = meshdb_server::build_service(&config).unwrap();
