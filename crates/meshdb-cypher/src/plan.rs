@@ -378,6 +378,12 @@ pub enum LogicalPlan {
         body: Box<LogicalPlan>,
         batch_size: i64,
         error_mode: crate::ast::OnErrorMode,
+        /// `REPORT STATUS AS <var>` — when set, the dispatcher
+        /// emits one status-Map row per batch (bound to this
+        /// variable name) instead of forwarding the body's
+        /// emitted rows. The status map carries `started`,
+        /// `committed`, `errorMessage`, and `transactionId`.
+        report_status_as: Option<String>,
     },
     /// Per-input-row left-join wrapper used by `apply_optional_match`
     /// when the OPTIONAL MATCH body is a multi-hop pattern. Runs
@@ -1180,9 +1186,14 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             body,
             batch_size,
             error_mode,
+            report_status_as,
         } => {
+            let report_str = report_status_as
+                .as_deref()
+                .map(|v| format!(", report_status_as={v}"))
+                .unwrap_or_default();
             buf.push_str(&format!(
-                "{indent}CallSubqueryInTransactions(batch_size={batch_size}, on_error={error_mode:?})\n"
+                "{indent}CallSubqueryInTransactions(batch_size={batch_size}, on_error={error_mode:?}{report_str})\n"
             ));
             buf.push_str(&format!("{indent}  body:\n"));
             format_plan_inner(body, buf, depth + 2);
@@ -5107,7 +5118,17 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                     body: Box::new(body_plan),
                     batch_size: cfg.batch_size,
                     error_mode: cfg.error_mode,
+                    report_status_as: cfg.report_status_as.clone(),
                 });
+                // When `REPORT STATUS AS var` is present, publish
+                // `var` into the outer scope so a downstream
+                // RETURN / WITH can reference `var.committed` etc.
+                if let Some(name) = &cfg.report_status_as {
+                    if bound_vars.contains_key(name) {
+                        return Err(Error::Plan(format!("variable '{name}' already defined")));
+                    }
+                    bound_vars.insert(name.clone(), VarType::Scalar);
+                }
                 // Same outer-scope projection as the non-batched
                 // variant — the body's RETURN columns become
                 // bindings the caller can reference downstream.

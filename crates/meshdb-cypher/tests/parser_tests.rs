@@ -3286,6 +3286,35 @@ fn call_in_transactions_on_error_modes_parse() {
 }
 
 #[test]
+fn call_in_transactions_report_status_parses_var_name() {
+    let s = parse(
+        "UNWIND [1, 2] AS x \
+         CALL { WITH x CREATE (:T {n: x}) } IN TRANSACTIONS OF 1 ROWS REPORT STATUS AS s \
+         RETURN s",
+    )
+    .expect("REPORT STATUS AS s should parse");
+    let m = unwrap_match(s);
+    let mut got: Option<String> = None;
+    for c in &m.clauses {
+        if let meshdb_cypher::ReadingClause::CallInTransactions(_, cfg) = c {
+            got = cfg.report_status_as.clone();
+        }
+    }
+    assert_eq!(got.as_deref(), Some("s"));
+}
+
+#[test]
+fn call_in_transactions_report_status_combines_with_on_error() {
+    parse(
+        "UNWIND [1] AS x \
+         CALL { WITH x CREATE (:T {n: x}) } \
+         IN TRANSACTIONS OF 10 ROWS ON ERROR CONTINUE REPORT STATUS AS s \
+         RETURN s",
+    )
+    .expect("OF + ON ERROR + REPORT STATUS should compose");
+}
+
+#[test]
 fn call_in_transactions_zero_or_negative_rows_rejected() {
     let err = parse("MATCH (n) CALL { WITH n SET n:X } IN TRANSACTIONS OF 0 ROWS").err();
     assert!(err.is_some(), "batch size of 0 should be a parse error",);

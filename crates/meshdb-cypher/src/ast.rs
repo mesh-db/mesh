@@ -305,15 +305,18 @@ pub enum ReadingClause {
     Foreach(ForeachClause),
 }
 
-/// `IN TRANSACTIONS [OF n ROWS] [ON ERROR mode]` configuration,
-/// attached to a `CALL { } IN TRANSACTIONS` reading clause.
-/// `batch_size` is the number of input rows per committed batch
-/// (Neo4j defaults to 1000); `error_mode` controls behaviour when
-/// a batch's body or commit fails.
+/// `IN TRANSACTIONS [OF n ROWS] [ON ERROR mode] [REPORT STATUS AS var]`
+/// configuration, attached to a `CALL { } IN TRANSACTIONS`
+/// reading clause. `batch_size` is the number of input rows per
+/// committed batch (Neo4j defaults to 1000); `error_mode` controls
+/// behaviour when a batch's body or commit fails;
+/// `report_status_as` swaps the body's emitted rows for one
+/// status-Map row per batch bound to the supplied variable name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InTransactionsConfig {
     pub batch_size: i64,
     pub error_mode: OnErrorMode,
+    pub report_status_as: Option<String>,
 }
 
 /// Behaviour when a batch fails during `CALL { } IN TRANSACTIONS`.

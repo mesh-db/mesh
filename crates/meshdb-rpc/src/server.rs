@@ -502,16 +502,16 @@ impl MeshService {
         // to evaluate any wrapping clauses (Project / OrderBy /
         // Limit / Aggregate / Filter) on top of the
         // batched-and-committed body output rows.
-        let (input_plan, body_plan, batch_size, error_mode) = match find_in_transactions_node(&plan)
-        {
-            Some(parts) => parts,
-            None => {
-                return Err(Status::failed_precondition(
-                    "execute_call_in_transactions called on a plan without an \
+        let (input_plan, body_plan, batch_size, error_mode, report_status_as) =
+            match find_in_transactions_node(&plan) {
+                Some(parts) => parts,
+                None => {
+                    return Err(Status::failed_precondition(
+                        "execute_call_in_transactions called on a plan without an \
                          IN TRANSACTIONS node — the dispatcher upstream miswired this",
-                ));
-            }
-        };
+                    ));
+                }
+            };
 
         // Drain the input plan into a Vec<Row>. Run on a
         // blocking thread because the operator pipeline is sync.
@@ -620,34 +620,44 @@ impl MeshService {
                 Status::internal(format!("batch {batch_idx} executor panicked: {e}"))
             })?;
 
+            // Mint a fresh transaction id for the batch — used
+            // by the REPORT STATUS row when set, and harmlessly
+            // unused otherwise.
+            let tx_id = uuid::Uuid::now_v7().to_string();
+
             // Body execution result: error here means a row in
             // the batch failed (parse, type, constraint, etc.).
             // No commit was attempted, so nothing landed.
             let (batch_output, batch_commands) = match outcome_result {
                 Ok(out) => out,
-                Err(e) => match error_mode {
-                    meshdb_cypher::OnErrorMode::Fail => {
-                        return Err(Status::internal(format!(
-                            "batch {batch_idx} execution failed: {e}"
-                        )));
+                Err(e) => {
+                    if let Some(var) = report_status_as.as_deref() {
+                        all_output.push(make_status_row(var, &tx_id, false, Some(&e.to_string())));
                     }
-                    meshdb_cypher::OnErrorMode::Continue => {
-                        tracing::warn!(
-                            batch = batch_idx,
-                            error = %e,
-                            "ON ERROR CONTINUE — body execution failed; skipping batch"
-                        );
-                        continue;
+                    match error_mode {
+                        meshdb_cypher::OnErrorMode::Fail => {
+                            return Err(Status::internal(format!(
+                                "batch {batch_idx} execution failed: {e}"
+                            )));
+                        }
+                        meshdb_cypher::OnErrorMode::Continue => {
+                            tracing::warn!(
+                                batch = batch_idx,
+                                error = %e,
+                                "ON ERROR CONTINUE — body execution failed; skipping batch"
+                            );
+                            continue;
+                        }
+                        meshdb_cypher::OnErrorMode::Break => {
+                            tracing::warn!(
+                                batch = batch_idx,
+                                error = %e,
+                                "ON ERROR BREAK — body execution failed; halting"
+                            );
+                            break;
+                        }
                     }
-                    meshdb_cypher::OnErrorMode::Break => {
-                        tracing::warn!(
-                            batch = batch_idx,
-                            error = %e,
-                            "ON ERROR BREAK — body execution failed; halting"
-                        );
-                        break;
-                    }
-                },
+                }
             };
 
             // Commit attempt: failure here means the body
@@ -655,27 +665,36 @@ impl MeshService {
             // (single-node / Raft / 2PC) couldn't persist.
             match self.commit_buffered_commands(batch_commands).await {
                 Ok(()) => {
-                    all_output.extend(batch_output);
+                    if let Some(var) = report_status_as.as_deref() {
+                        all_output.push(make_status_row(var, &tx_id, true, None));
+                    } else {
+                        all_output.extend(batch_output);
+                    }
                 }
-                Err(e) => match error_mode {
-                    meshdb_cypher::OnErrorMode::Fail => return Err(e),
-                    meshdb_cypher::OnErrorMode::Continue => {
-                        tracing::warn!(
-                            batch = batch_idx,
-                            error = %e.message(),
-                            "ON ERROR CONTINUE — commit failed; skipping batch"
-                        );
-                        continue;
+                Err(e) => {
+                    if let Some(var) = report_status_as.as_deref() {
+                        all_output.push(make_status_row(var, &tx_id, false, Some(e.message())));
                     }
-                    meshdb_cypher::OnErrorMode::Break => {
-                        tracing::warn!(
-                            batch = batch_idx,
-                            error = %e.message(),
-                            "ON ERROR BREAK — commit failed; halting"
-                        );
-                        break;
+                    match error_mode {
+                        meshdb_cypher::OnErrorMode::Fail => return Err(e),
+                        meshdb_cypher::OnErrorMode::Continue => {
+                            tracing::warn!(
+                                batch = batch_idx,
+                                error = %e.message(),
+                                "ON ERROR CONTINUE — commit failed; skipping batch"
+                            );
+                            continue;
+                        }
+                        meshdb_cypher::OnErrorMode::Break => {
+                            tracing::warn!(
+                                batch = batch_idx,
+                                error = %e.message(),
+                                "ON ERROR BREAK — commit failed; halting"
+                            );
+                            break;
+                        }
                     }
-                },
+                }
             }
         }
         // Fold the accumulated body output back into the
@@ -1427,6 +1446,37 @@ pub(crate) fn apply_prepared_batch(
     store.apply_batch(&flat)
 }
 
+/// Build the `REPORT STATUS AS <var>` row for a single batch:
+/// one Row with `var → Map { started, committed, errorMessage,
+/// transactionId }`. Mirrors Neo4j 5's status surface.
+/// `started` is always true since we only invoke this once the
+/// batch is dispatched; `committed` reflects the actual commit
+/// outcome; `errorMessage` is null on success.
+fn make_status_row(
+    var: &str,
+    tx_id: &str,
+    committed: bool,
+    error_message: Option<&str>,
+) -> meshdb_executor::Row {
+    use meshdb_core::Property;
+    let mut status: std::collections::HashMap<String, Property> =
+        std::collections::HashMap::with_capacity(4);
+    status.insert("started".into(), Property::Bool(true));
+    status.insert("committed".into(), Property::Bool(committed));
+    status.insert("transactionId".into(), Property::String(tx_id.into()));
+    let err_prop = match error_message {
+        Some(s) => Property::String(s.into()),
+        None => Property::Null,
+    };
+    status.insert("errorMessage".into(), err_prop);
+    let mut row = meshdb_executor::Row::new();
+    row.insert(
+        var.to_string(),
+        meshdb_executor::Value::Property(Property::Map(status)),
+    );
+    row
+}
+
 /// Find the (single) `CallSubqueryInTransactions` node in
 /// `plan` and return clones of its input plan, body plan,
 /// batch size, and error mode. The dispatcher uses these to
@@ -1440,6 +1490,7 @@ fn find_in_transactions_node(
     meshdb_cypher::LogicalPlan,
     i64,
     meshdb_cypher::OnErrorMode,
+    Option<String>,
 )> {
     use meshdb_cypher::LogicalPlan as P;
     match plan {
@@ -1448,11 +1499,13 @@ fn find_in_transactions_node(
             body,
             batch_size,
             error_mode,
+            report_status_as,
         } => Some((
             (**input).clone(),
             (**body).clone(),
             *batch_size,
             *error_mode,
+            report_status_as.clone(),
         )),
         P::Filter { input, .. }
         | P::Project { input, .. }

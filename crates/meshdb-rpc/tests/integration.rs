@@ -2896,3 +2896,139 @@ async fn call_in_transactions_with_limit_truncates_output_only() {
     };
     assert_eq!(c, 4, "LIMIT applies to output rows only, not writes");
 }
+
+#[tokio::test]
+async fn call_in_transactions_report_status_emits_one_row_per_batch() {
+    // 5 input rows × batch size 2 = 3 batches. With REPORT
+    // STATUS AS s, the output is 3 rows (one per batch), each
+    // carrying the s map.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let rows = service
+        .execute_cypher_local(
+            "UNWIND [1, 2, 3, 4, 5] AS x \
+             CALL { WITH x CREATE (:Statused {n: x}) } \
+             IN TRANSACTIONS OF 2 ROWS REPORT STATUS AS s \
+             RETURN s.committed AS committed, s.errorMessage AS err"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("REPORT STATUS query should succeed");
+    assert_eq!(rows.len(), 3, "one row per batch (5 rows / 2 = 3 batches)");
+    for row in &rows {
+        match row.get("committed").unwrap() {
+            Value::Property(Property::Bool(true)) => {}
+            other => panic!("expected committed=true, got {other:?}"),
+        }
+        match row.get("err").unwrap() {
+            Value::Property(Property::Null) | Value::Null => {}
+            other => panic!("expected null errorMessage, got {other:?}"),
+        }
+    }
+    // Writes still landed.
+    let count_rows = service
+        .execute_cypher_local(
+            "MATCH (n:Statused) RETURN count(n) AS c".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let c = match count_rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    assert_eq!(c, 5);
+}
+
+#[tokio::test]
+async fn call_in_transactions_report_status_marks_failed_batch() {
+    // ON ERROR CONTINUE + REPORT STATUS: failed batch shows
+    // committed=false with a populated errorMessage; successful
+    // batches show committed=true.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+
+    service
+        .execute_cypher_local(
+            "CREATE CONSTRAINT k_uniq FOR (n:K) REQUIRE n.k IS UNIQUE".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    service
+        .execute_cypher_local("CREATE (:K {k: 99})".into(), ParamMap::new())
+        .await
+        .unwrap();
+
+    let rows = service
+        .execute_cypher_local(
+            "UNWIND [1, 2, 99, 4] AS x \
+             CALL { WITH x CREATE (:K {k: x}) } \
+             IN TRANSACTIONS OF 1 ROWS ON ERROR CONTINUE REPORT STATUS AS s \
+             RETURN s.committed AS committed, s.errorMessage AS err"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("CONTINUE + REPORT STATUS should succeed overall");
+    // 4 batches (one per input row), one of which failed.
+    assert_eq!(rows.len(), 4);
+    let mut committed_count = 0;
+    let mut failed_with_err = 0;
+    for row in &rows {
+        match row.get("committed").unwrap() {
+            Value::Property(Property::Bool(true)) => committed_count += 1,
+            Value::Property(Property::Bool(false)) => {
+                if matches!(
+                    row.get("err").unwrap(),
+                    Value::Property(Property::String(_))
+                ) {
+                    failed_with_err += 1;
+                }
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+    }
+    assert_eq!(committed_count, 3, "3 batches should commit (1, 2, 4)");
+    assert_eq!(
+        failed_with_err, 1,
+        "1 batch should report failure with a non-null errorMessage",
+    );
+}
+
+#[tokio::test]
+async fn call_in_transactions_report_status_transaction_ids_unique() {
+    // Each batch mints its own transactionId. The status row's
+    // transactionId field should be a non-empty string and
+    // distinct across batches.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let rows = service
+        .execute_cypher_local(
+            "UNWIND [1, 2, 3] AS x \
+             CALL { WITH x CREATE (:T {n: x}) } \
+             IN TRANSACTIONS OF 1 ROWS REPORT STATUS AS s \
+             RETURN s.transactionId AS tx"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let mut ids: Vec<String> = Vec::new();
+    for row in &rows {
+        match row.get("tx").unwrap() {
+            Value::Property(Property::String(s)) => {
+                assert!(!s.is_empty(), "transactionId should not be empty");
+                ids.push(s.clone());
+            }
+            other => panic!("expected String transactionId, got {other:?}"),
+        }
+    }
+    let unique: std::collections::HashSet<_> = ids.iter().cloned().collect();
+    assert_eq!(unique.len(), 3, "transactionIds should be unique per batch");
+}

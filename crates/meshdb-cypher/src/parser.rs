@@ -828,9 +828,11 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                                     // Default batch size when `OF n ROWS`
                                     // is omitted matches Neo4j 5: 1000.
                                     // Default error mode without `ON ERROR
-                                    // <mode>` is FAIL.
+                                    // <mode>` is FAIL. `REPORT STATUS AS
+                                    // var` is opt-in.
                                     let mut size = crate::ast::DEFAULT_IN_TRANSACTIONS_BATCH_SIZE;
                                     let mut mode = crate::ast::OnErrorMode::Fail;
+                                    let mut report_var: Option<String> = None;
                                     for grand in child.into_inner() {
                                         match grand.as_rule() {
                                             Rule::in_transactions_batch => {
@@ -884,12 +886,21 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt> {
                                                     }
                                                 }
                                             }
+                                            Rule::in_transactions_report => {
+                                                for leaf in grand.into_inner() {
+                                                    if leaf.as_rule() == Rule::identifier {
+                                                        report_var =
+                                                            Some(parse_ident(leaf.as_str()));
+                                                    }
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }
                                     in_tx = Some(crate::ast::InTransactionsConfig {
                                         batch_size: size,
                                         error_mode: mode,
+                                        report_status_as: report_var,
                                     });
                                 }
                                 _ => {}
