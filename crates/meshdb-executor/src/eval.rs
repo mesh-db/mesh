@@ -4771,6 +4771,18 @@ fn call_scalar(name: &str, args: &CallArgs, ctx: &EvalCtx) -> Result<Value> {
         }
 
         _ => {
+            // APOC path scalars handled ahead of the generic APOC
+            // dispatcher because they operate on Node / Edge /
+            // Path values that can't round-trip through
+            // `Property`. Each feature is independent — `apoc-path`
+            // enables both the path procedures and path scalars.
+            #[cfg(feature = "apoc-path")]
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "apoc.path.create" | "apoc.path.slice" | "apoc.path.combine" | "apoc.path.elements"
+            ) {
+                return call_apoc_path_scalar(name, arg_exprs, ctx);
+            }
             // APOC scalar dispatcher — feature-gated so builds
             // without `--features apoc` see the usual "unknown
             // function" error for apoc.* names. When the feature
@@ -4830,6 +4842,207 @@ fn call_apoc_scalar(name: &str, arg_exprs: &[Expr], ctx: &EvalCtx) -> Result<Val
         ))),
         Err(meshdb_apoc::ApocError::TypeMismatch { .. }) => Err(Error::TypeMismatch),
     }
+}
+
+/// Dispatcher for the `apoc.path.*` scalar family. Unlike the
+/// `meshdb-apoc`-routed scalars, these functions take and
+/// return graph-element values (`Node`, `Edge`, `Path`) that
+/// can't round-trip through `Property`, so they live here in
+/// `eval.rs` where full `Value` access is available. Each
+/// function follows Neo4j APOC's arity and argument shape.
+#[cfg(feature = "apoc-path")]
+fn call_apoc_path_scalar(name: &str, arg_exprs: &[Expr], ctx: &EvalCtx) -> Result<Value> {
+    let args: Vec<Value> = arg_exprs
+        .iter()
+        .map(|a| eval_expr(a, ctx))
+        .collect::<Result<Vec<_>>>()?;
+    match name.to_ascii_lowercase().as_str() {
+        "apoc.path.create" => apoc_path_create(&args),
+        "apoc.path.slice" => apoc_path_slice(&args),
+        "apoc.path.combine" => apoc_path_combine(&args),
+        "apoc.path.elements" => apoc_path_elements(&args),
+        other => Err(Error::UnknownScalarFunction(other.into())),
+    }
+}
+
+/// `apoc.path.create(startNode, [rels])` — assemble a `Path`
+/// from a start node and a list of relationships that chain from
+/// the start. Each successive edge must start at the current
+/// end node; violations return `TypeMismatch`. A null or empty
+/// rels list produces a zero-hop path containing just the start.
+#[cfg(feature = "apoc-path")]
+fn apoc_path_create(args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::UnknownScalarFunction(format!(
+            "apoc.path.create expects 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let start = match &args[0] {
+        Value::Node(n) => n.clone(),
+        Value::Null | Value::Property(Property::Null) => {
+            return Err(Error::TypeMismatch);
+        }
+        _ => return Err(Error::TypeMismatch),
+    };
+    let rels: Vec<meshdb_core::Edge> = match &args[1] {
+        Value::Null | Value::Property(Property::Null) => Vec::new(),
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::Edge(e) => Ok(e.clone()),
+                _ => Err(Error::TypeMismatch),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => return Err(Error::TypeMismatch),
+    };
+    let mut nodes = vec![start];
+    let mut edges: Vec<meshdb_core::Edge> = Vec::with_capacity(rels.len());
+    for rel in rels {
+        let current_end = nodes.last().expect("nodes is non-empty").id;
+        // Accept the edge traversed in either direction — the
+        // `create` scalar is documented as "here are the rels in
+        // order", not "here's a strict outgoing chain".
+        let next_id = if rel.source == current_end {
+            rel.target
+        } else if rel.target == current_end {
+            rel.source
+        } else {
+            return Err(Error::TypeMismatch);
+        };
+        // We only have the EdgeId / NodeId pair here; the
+        // caller is expected to have already resolved the full
+        // node values, but since we hold edges not stored
+        // node-handles we need to build a placeholder Node with
+        // just the id. apoc.path.create in Neo4j reconstructs
+        // from graph state — without a reader we fall back to
+        // a Node with only the id set, matching the minimum
+        // shape the Value::Path invariant needs. Callers that
+        // want full node properties should use
+        // apoc.path.expand instead.
+        let placeholder = meshdb_core::Node {
+            id: next_id,
+            labels: Vec::new(),
+            properties: Default::default(),
+        };
+        nodes.push(placeholder);
+        edges.push(rel);
+    }
+    Ok(Value::Path { nodes, edges })
+}
+
+/// `apoc.path.slice(path, offset, length)` — extract a subpath.
+/// `offset` is the number of hops to skip from the start;
+/// `length` is the number of hops to include. Negative values
+/// clamp to 0 / path-length per Neo4j APOC. Returns a Path.
+#[cfg(feature = "apoc-path")]
+fn apoc_path_slice(args: &[Value]) -> Result<Value> {
+    if args.len() != 3 {
+        return Err(Error::UnknownScalarFunction(format!(
+            "apoc.path.slice expects 3 arguments, got {}",
+            args.len()
+        )));
+    }
+    let (nodes, edges) = match &args[0] {
+        Value::Path { nodes, edges } => (nodes.clone(), edges.clone()),
+        Value::Null | Value::Property(Property::Null) => return Ok(Value::Null),
+        _ => return Err(Error::TypeMismatch),
+    };
+    let offset = match &args[1] {
+        Value::Null | Value::Property(Property::Null) => 0,
+        Value::Property(Property::Int64(n)) => (*n).max(0) as usize,
+        _ => return Err(Error::TypeMismatch),
+    };
+    let length = match &args[2] {
+        Value::Null | Value::Property(Property::Null) => edges.len().saturating_sub(offset),
+        Value::Property(Property::Int64(n)) if *n < 0 => edges.len().saturating_sub(offset),
+        Value::Property(Property::Int64(n)) => (*n) as usize,
+        _ => return Err(Error::TypeMismatch),
+    };
+    let edge_start = offset.min(edges.len());
+    let edge_end = (edge_start + length).min(edges.len());
+    let node_start = edge_start;
+    let node_end = edge_end + 1;
+    let new_nodes = nodes[node_start..node_end.min(nodes.len())].to_vec();
+    let new_edges = edges[edge_start..edge_end].to_vec();
+    Ok(Value::Path {
+        nodes: new_nodes,
+        edges: new_edges,
+    })
+}
+
+/// `apoc.path.combine(path1, path2)` — concatenate two paths
+/// where the last node of `path1` is the first node of `path2`.
+/// Mismatched endpoints return `TypeMismatch` (matches APOC's
+/// hard-fail behaviour — no implicit zero-hop bridge). A null
+/// input propagates as null.
+#[cfg(feature = "apoc-path")]
+fn apoc_path_combine(args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::UnknownScalarFunction(format!(
+            "apoc.path.combine expects 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let (n1, e1) = match &args[0] {
+        Value::Path { nodes, edges } => (nodes.clone(), edges.clone()),
+        Value::Null | Value::Property(Property::Null) => return Ok(args[1].clone()),
+        _ => return Err(Error::TypeMismatch),
+    };
+    let (n2, e2) = match &args[1] {
+        Value::Path { nodes, edges } => (nodes.clone(), edges.clone()),
+        Value::Null | Value::Property(Property::Null) => {
+            return Ok(Value::Path {
+                nodes: n1,
+                edges: e1,
+            });
+        }
+        _ => return Err(Error::TypeMismatch),
+    };
+    // Endpoints must match. Without endpoints (empty `n1` or
+    // `n2`) the operation is meaningless — reject.
+    let last_first = match (n1.last(), n2.first()) {
+        (Some(a), Some(b)) if a.id == b.id => true,
+        _ => false,
+    };
+    if !last_first {
+        return Err(Error::TypeMismatch);
+    }
+    // Drop the duplicated joining node (n2[0]) and splice the
+    // remaining nodes + all edges together.
+    let mut nodes = n1;
+    nodes.extend(n2.into_iter().skip(1));
+    let mut edges = e1;
+    edges.extend(e2);
+    Ok(Value::Path { nodes, edges })
+}
+
+/// `apoc.path.elements(path)` — decompose a path into a flat list
+/// of alternating `Node`, `Edge`, `Node`, `Edge`, ..., `Node`.
+/// A zero-hop path yields a one-element list containing just the
+/// single node. Returns `Value::List` (executor map-style list
+/// so Node/Edge values pass through without coercion).
+#[cfg(feature = "apoc-path")]
+fn apoc_path_elements(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(Error::UnknownScalarFunction(format!(
+            "apoc.path.elements expects 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let (nodes, edges) = match &args[0] {
+        Value::Path { nodes, edges } => (nodes.clone(), edges.clone()),
+        Value::Null | Value::Property(Property::Null) => return Ok(Value::Null),
+        _ => return Err(Error::TypeMismatch),
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(nodes.len() + edges.len());
+    for (i, n) in nodes.iter().enumerate() {
+        out.push(Value::Node(n.clone()));
+        if i < edges.len() {
+            out.push(Value::Edge(edges[i].clone()));
+        }
+    }
+    Ok(Value::List(out))
 }
 
 /// Unwrap a `Value` into a `Property`, recursively handling nested

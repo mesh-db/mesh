@@ -11328,4 +11328,191 @@ mod apoc_path {
             "subgraphNodes and spanningTree should report the same reach-set size"
         );
     }
+
+    // --- scalars ---
+
+    #[test]
+    fn scalar_path_elements_alternates_node_edge() {
+        let (store, _d) = chain_of_four();
+        // Path: Ada → Bob → Cara (2 hops). elements() returns
+        // [n0, e0, n1, e1, n2] — a 5-element list.
+        let rows = run(
+            &store,
+            "MATCH p = (:Person {name: 'Ada'})-[:KNOWS*2]->(:Person {name: 'Cara'}) \
+             RETURN apoc.path.elements(p) AS elems",
+        );
+        assert_eq!(rows.len(), 1);
+        match rows[0].get("elems") {
+            Some(Value::List(items)) => {
+                assert_eq!(items.len(), 5);
+                // Positions 0, 2, 4 are Nodes; 1, 3 are Edges.
+                assert!(matches!(items[0], Value::Node(_)));
+                assert!(matches!(items[1], Value::Edge(_)));
+                assert!(matches!(items[2], Value::Node(_)));
+                assert!(matches!(items[3], Value::Edge(_)));
+                assert!(matches!(items[4], Value::Node(_)));
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_path_elements_zero_hop_returns_single_node() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'Solo'})");
+        // A zero-hop path from a single-node MATCH — elements()
+        // returns a 1-element list with just that node.
+        let rows = run(
+            &store,
+            "MATCH p = (:Person {name: 'Solo'}) RETURN apoc.path.elements(p) AS elems",
+        );
+        assert_eq!(rows.len(), 1);
+        match rows[0].get("elems") {
+            Some(Value::List(items)) => {
+                assert_eq!(items.len(), 1);
+                assert!(matches!(items[0], Value::Node(_)));
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_path_slice_extracts_subpath() {
+        let (store, _d) = chain_of_four();
+        // Slice the 3-hop Ada→Bob→Cara→Dan starting at offset 1
+        // for 1 hop — yields the single-edge Bob→Cara segment.
+        let rows = run(
+            &store,
+            "MATCH p = (:Person {name: 'Ada'})-[:KNOWS*3]->(:Person {name: 'Dan'}) \
+             RETURN apoc.path.slice(p, 1, 1) AS sub",
+        );
+        assert_eq!(rows.len(), 1);
+        match rows[0].get("sub") {
+            Some(Value::Path { nodes, edges }) => {
+                assert_eq!(nodes.len(), 2, "1-hop subpath has 2 nodes");
+                assert_eq!(edges.len(), 1);
+                assert_eq!(
+                    nodes[0].properties.get("name"),
+                    Some(&Property::String("Bob".into()))
+                );
+                assert_eq!(
+                    nodes[1].properties.get("name"),
+                    Some(&Property::String("Cara".into()))
+                );
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_path_slice_null_length_takes_rest() {
+        let (store, _d) = chain_of_four();
+        // Pass null for length: take from offset to end.
+        let rows = run(
+            &store,
+            "MATCH p = (:Person {name: 'Ada'})-[:KNOWS*3]->(:Person {name: 'Dan'}) \
+             RETURN apoc.path.slice(p, 1, null) AS sub",
+        );
+        match rows[0].get("sub") {
+            Some(Value::Path { nodes, edges }) => {
+                assert_eq!(nodes.len(), 3, "offset 1 through end: 2 hops / 3 nodes");
+                assert_eq!(edges.len(), 2);
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_path_slice_null_input_propagates() {
+        let (store, _d) = chain_of_four();
+        // Null path — should return null.
+        let rows = run(&store, "RETURN apoc.path.slice(null, 0, 1) AS sub");
+        assert!(matches!(rows[0].get("sub"), Some(Value::Null) | None));
+    }
+
+    #[test]
+    fn scalar_path_combine_joins_two_paths() {
+        let (store, _d) = chain_of_four();
+        // p1: Ada→Bob. p2: Bob→Cara. Combined: Ada→Bob→Cara.
+        let rows = run(
+            &store,
+            "MATCH p1 = (:Person {name: 'Ada'})-[:KNOWS]->(:Person {name: 'Bob'}) \
+             MATCH p2 = (:Person {name: 'Bob'})-[:KNOWS]->(:Person {name: 'Cara'}) \
+             RETURN apoc.path.combine(p1, p2) AS joined",
+        );
+        match rows[0].get("joined") {
+            Some(Value::Path { nodes, edges }) => {
+                assert_eq!(nodes.len(), 3);
+                assert_eq!(edges.len(), 2);
+                let names: Vec<String> = nodes
+                    .iter()
+                    .map(|n| match n.properties.get("name") {
+                        Some(Property::String(s)) => s.clone(),
+                        _ => "?".into(),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["Ada", "Bob", "Cara"]);
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_path_combine_rejects_endpoint_mismatch() {
+        let (store, _d) = chain_of_four();
+        // p1 ends at Bob, p2 starts at Cara — endpoints don't
+        // match, should fail.
+        let stmt = parse(
+            "MATCH p1 = (:Person {name: 'Ada'})-[:KNOWS]->(:Person {name: 'Bob'}) \
+             MATCH p2 = (:Person {name: 'Cara'})-[:KNOWS]->(:Person {name: 'Dan'}) \
+             RETURN apoc.path.combine(p1, p2) AS joined",
+        )
+        .unwrap();
+        let p = plan(&stmt).unwrap();
+        let err = execute(&p, &store).unwrap_err();
+        assert!(
+            matches!(err, meshdb_executor::Error::TypeMismatch),
+            "expected TypeMismatch on endpoint mismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_path_create_from_node_and_edge_list() {
+        let (store, _d) = chain_of_four();
+        // Pull out an edge from the graph, then reconstruct the
+        // single-hop path via create().
+        let rows = run(
+            &store,
+            "MATCH (a:Person {name: 'Ada'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
+             RETURN apoc.path.create(a, [r]) AS p",
+        );
+        match rows[0].get("p") {
+            Some(Value::Path { nodes, edges }) => {
+                assert_eq!(nodes.len(), 2);
+                assert_eq!(edges.len(), 1);
+                assert_eq!(
+                    nodes[0].properties.get("name"),
+                    Some(&Property::String("Ada".into()))
+                );
+                assert_eq!(edges[0].edge_type, "KNOWS");
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_path_create_empty_rels_yields_zero_hop_path() {
+        let (store, _d) = chain_of_four();
+        let rows = run(
+            &store,
+            "MATCH (a:Person {name: 'Ada'}) RETURN apoc.path.create(a, []) AS p",
+        );
+        match rows[0].get("p") {
+            Some(Value::Path { nodes, edges }) => {
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(edges.len(), 0);
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
 }
