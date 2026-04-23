@@ -1,39 +1,52 @@
 //! Implementation of the `apoc.trigger.*` procedure family.
 //!
-//! Triggers are Cypher snippets that fire automatically after a
-//! commit succeeds. Each trigger receives the transaction's
-//! diff as a set of well-known parameters:
+//! Triggers are Cypher snippets that fire on commit boundaries.
+//! Each trigger receives the transaction's diff as a set of
+//! well-known parameters that mirror Neo4j APOC's surface:
 //!
-//! * `$createdNodes` — list of `Node` values created in the tx
-//! * `$createdRelationships` — list of `Edge` values created
-//! * `$deletedNodes` — list of `Node` values deleted
-//! * `$deletedRelationships` — list of `Edge` values deleted
+//! * `$createdNodes` / `$createdRelationships` — newly-created
+//!   elements (id wasn't in the store pre-tx)
+//! * `$deletedNodes` / `$deletedRelationships` — deleted
+//!   elements, captured pre-tx so the trigger sees their final
+//!   shape before deletion
+//! * `$assignedNodeProperties` /
+//!   `$assignedRelationshipProperties` — property changes on
+//!   existing elements, list of `{key, old, new, node|relationship}`
+//! * `$removedNodeProperties` /
+//!   `$removedRelationshipProperties` — property removals,
+//!   list of `{key, old, node|relationship}`
+//! * `$assignedLabels` / `$removedLabels` — label changes on
+//!   existing nodes, list of `{label, node}`
 //!
-//! The Cypher body can reference these parameters like any
-//! other parameter. Triggers run in their own transaction —
-//! their writes commit independently of the triggering write,
-//! matching Neo4j APOC's `phase: 'after'` semantics.
+//! All four phases work — `before` (pre-commit; errors abort
+//! the tx; trigger writes commit atomically with the user's
+//! writes), `after` (post-commit, sync; recurses through the
+//! cluster commit path so trigger writes replicate),
+//! `afterAsync` (post-commit, spawned in a background tokio
+//! task so it doesn't block the response), and `rollback`
+//! (fires when the commit fails, including before-trigger
+//! aborts).
 //!
-//! # V1 scope (this release)
+//! # Procedure surface
 //!
-//! Procedures: `install`, `drop`, `list`. Phase: `after` only.
-//! Storage: per-node (no cluster replication). Recursion: a
-//! thread-local "in trigger" flag suppresses re-firing while a
-//! trigger's own writes commit.
+//! Five procedures: `install` / `drop` / `list` / `start` /
+//! `stop`. Install/drop emit `GraphCommand::InstallTrigger` /
+//! `DropTrigger` so the cluster commit machinery replicates
+//! the registry across every peer (Raft log + routing-mode
+//! DDL fan-out). Firing is leader/coordinator-only — exactly
+//! one peer per logical commit fires.
 //!
-//! # Deferred (documented in CLAUDE.md)
+//! Recursion safety has two layers: the thread-local
+//! `SUPPRESSING` flag catches the sync-call path, and the
+//! `from_trigger: bool` parameter on `commit_buffered_commands`
+//! catches the async-recursive cluster commit path. Either
+//! alone is sufficient; both together close every observed
+//! self-firing scenario.
 //!
-//! * `before` / `afterAsync` / `rollback` phases
-//! * `pause` / `resume` (via `apoc.trigger.start` / `stop`)
-//! * Property-change params (`$assignedNodeProperties` etc)
-//! * `apoc.trigger.show(databaseName)`
-//! * Cluster replication of trigger registration — Raft and
-//!   routing modes currently install per-peer, which means
-//!   different peers could disagree about the trigger set
-//!   under partial failure. Operators running clusters should
-//!   manually keep registrations in sync.
-//! * Multi-database support (`databaseName` arg accepted but
-//!   ignored — Mesh is single-db today).
+//! # Multi-db
+//!
+//! `databaseName` is accepted on every procedure but ignored —
+//! Mesh is single-db today. Callers can pass any string.
 
 use crate::error::{Error, Result};
 use crate::procedures::{ProcRow, ProcedureRegistry};
@@ -55,7 +68,8 @@ use std::sync::{Arc, RwLock};
 pub struct TriggerSpec {
     pub name: String,
     pub query: String,
-    /// `phase`. Always `"after"` in this release.
+    /// `phase`. One of `"before"` / `"after"` / `"afterAsync"` /
+    /// `"rollback"`.
     pub phase: String,
     /// Pre-evaluated extra params from the install-time `config`
     /// map's `params` entry. Captured at install time to keep
@@ -64,6 +78,13 @@ pub struct TriggerSpec {
     /// Wall-clock millis since UNIX epoch when the trigger was
     /// registered.
     pub installed_at_ms: i64,
+    /// `true` when paused via `apoc.trigger.stop`. Paused
+    /// triggers stay in the registry (and replicate) but are
+    /// skipped on every commit until `apoc.trigger.start` flips
+    /// the flag back. Defaults to `false` for backward
+    /// compatibility with pre-pause stored specs.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// In-memory cache + persistent backing of the trigger
@@ -221,23 +242,76 @@ pub fn is_suppressed() -> bool {
     SUPPRESSING.with(|s| s.get())
 }
 
-/// Per-tx diff handed to a trigger as four `$created*` /
-/// `$deleted*` params. The two pairs are independent — a trigger
-/// can choose to inspect any subset. Computed in `meshdb-rpc`
-/// (where `GraphCommand` lives) and passed in to
-/// [`fire_after_triggers`].
+/// One property-change record (assignment or removal) emitted
+/// per (element, key) tuple touched by the tx. The `element`
+/// field is a `Value::Node` or `Value::Edge` depending on
+/// scope so the trigger body can inspect the wider shape.
+#[derive(Debug, Clone)]
+pub struct PropertyChange {
+    pub key: String,
+    pub old: Option<Property>,
+    pub new: Option<Property>,
+    pub element: Value,
+}
+
+/// One label-change record (assignment or removal). `element`
+/// is always a `Value::Node` since labels are node-scope.
+#[derive(Debug, Clone)]
+pub struct LabelChange {
+    pub label: String,
+    pub element: Value,
+}
+
+/// Per-tx diff handed to a trigger as `$created*` / `$deleted*` /
+/// `$assigned*` / `$removed*` params. Computed in `meshdb-rpc`
+/// (where `GraphCommand` lives) and passed in to the firing
+/// helpers. `into_param_map` shapes the lists into Neo4j APOC's
+/// expected param surface.
 #[derive(Debug, Default)]
 pub struct TriggerDiff {
     pub created_nodes: Vec<Node>,
     pub created_relationships: Vec<Edge>,
     pub deleted_nodes: Vec<Node>,
     pub deleted_relationships: Vec<Edge>,
+    pub assigned_node_properties: Vec<PropertyChange>,
+    pub removed_node_properties: Vec<PropertyChange>,
+    pub assigned_relationship_properties: Vec<PropertyChange>,
+    pub removed_relationship_properties: Vec<PropertyChange>,
+    pub assigned_labels: Vec<LabelChange>,
+    pub removed_labels: Vec<LabelChange>,
 }
 
 impl TriggerDiff {
+    /// Deep-clone the diff. Used by call sites that need to fan
+    /// the same diff out to multiple firing phases (e.g.
+    /// after-sync + afterAsync) since `into_param_map` consumes
+    /// `self`.
+    pub fn clone_diff(&self) -> Self {
+        Self {
+            created_nodes: self.created_nodes.clone(),
+            created_relationships: self.created_relationships.clone(),
+            deleted_nodes: self.deleted_nodes.clone(),
+            deleted_relationships: self.deleted_relationships.clone(),
+            assigned_node_properties: self.assigned_node_properties.clone(),
+            removed_node_properties: self.removed_node_properties.clone(),
+            assigned_relationship_properties: self.assigned_relationship_properties.clone(),
+            removed_relationship_properties: self.removed_relationship_properties.clone(),
+            assigned_labels: self.assigned_labels.clone(),
+            removed_labels: self.removed_labels.clone(),
+        }
+    }
+
     /// Convert the diff into a [`ParamMap`] suitable for
-    /// passing to `execute_with_reader_and_procs`. The four
-    /// keys match what Neo4j APOC's trigger system exposes.
+    /// passing to `execute_with_reader_and_procs`. The keys
+    /// match what Neo4j APOC's trigger system exposes:
+    /// `createdNodes` / `createdRelationships` /
+    /// `deletedNodes` / `deletedRelationships` (lists),
+    /// `assignedNodeProperties` / `removedNodeProperties` /
+    /// `assignedRelationshipProperties` /
+    /// `removedRelationshipProperties` (lists of
+    /// `{key, old, new, node|relationship}` maps), and
+    /// `assignedLabels` / `removedLabels` (lists of
+    /// `{label, node}` maps).
     pub fn into_param_map(self, extra: &HashMap<String, Property>) -> ParamMap {
         let mut params: ParamMap = HashMap::new();
         params.insert(
@@ -266,6 +340,30 @@ impl TriggerDiff {
                     .collect(),
             ),
         );
+        params.insert(
+            "assignedNodeProperties".into(),
+            property_changes_to_value(self.assigned_node_properties, "node"),
+        );
+        params.insert(
+            "removedNodeProperties".into(),
+            property_changes_to_value(self.removed_node_properties, "node"),
+        );
+        params.insert(
+            "assignedRelationshipProperties".into(),
+            property_changes_to_value(self.assigned_relationship_properties, "relationship"),
+        );
+        params.insert(
+            "removedRelationshipProperties".into(),
+            property_changes_to_value(self.removed_relationship_properties, "relationship"),
+        );
+        params.insert(
+            "assignedLabels".into(),
+            label_changes_to_value(self.assigned_labels),
+        );
+        params.insert(
+            "removedLabels".into(),
+            label_changes_to_value(self.removed_labels),
+        );
         for (k, p) in extra {
             params.insert(k.clone(), Value::Property(p.clone()));
         }
@@ -273,12 +371,139 @@ impl TriggerDiff {
     }
 }
 
-/// Fire every registered trigger against the given diff. Errors
-/// from individual triggers are logged but don't propagate —
-/// the original tx has already committed, and aborting other
-/// triggers because one failed isn't useful.
-pub fn fire_after_triggers(
+/// Lower a list of [`PropertyChange`] entries to a `Value::List`
+/// of `Value::Map` records with the keys Neo4j APOC expects:
+/// `key`, `old`, `new`, and the element under either `node` or
+/// `relationship` depending on scope.
+fn property_changes_to_value(changes: Vec<PropertyChange>, element_key: &str) -> Value {
+    Value::List(
+        changes
+            .into_iter()
+            .map(|c| {
+                let mut entry: HashMap<String, Value> = HashMap::new();
+                entry.insert("key".into(), Value::Property(Property::String(c.key)));
+                entry.insert(
+                    "old".into(),
+                    c.old.map(Value::Property).unwrap_or(Value::Null),
+                );
+                entry.insert(
+                    "new".into(),
+                    c.new.map(Value::Property).unwrap_or(Value::Null),
+                );
+                entry.insert(element_key.to_string(), c.element);
+                Value::Map(entry)
+            })
+            .collect(),
+    )
+}
+
+/// Lower a list of [`LabelChange`] entries to a `Value::List`
+/// of `Value::Map` records with `label` and `node` keys —
+/// matching Neo4j APOC's `assignedLabels` / `removedLabels`
+/// shape.
+fn label_changes_to_value(changes: Vec<LabelChange>) -> Value {
+    Value::List(
+        changes
+            .into_iter()
+            .map(|c| {
+                let mut entry: HashMap<String, Value> = HashMap::new();
+                entry.insert("label".into(), Value::Property(Property::String(c.label)));
+                entry.insert("node".into(), c.element);
+                Value::Map(entry)
+            })
+            .collect(),
+    )
+}
+
+/// Fire every registered before-phase trigger against the
+/// pre-commit diff. Returns Ok if every trigger ran cleanly,
+/// Err with the offending message if one failed — propagated
+/// to abort the originator's commit. Trigger writes are
+/// buffered into the supplied writer so the caller can merge
+/// them into the prepared command batch.
+///
+/// Unlike after-firing, before-firing stops at the first error:
+/// the user's commit hasn't happened yet, so a failing before-
+/// trigger cleanly aborts everything.
+pub fn fire_before_triggers(
     registry: &TriggerRegistry,
+    diff: TriggerDiff,
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    procedures: &ProcedureRegistry,
+) -> Result<()> {
+    if registry.is_empty() {
+        return Ok(());
+    }
+    if is_suppressed() {
+        return Ok(());
+    }
+    let triggers: Vec<TriggerSpec> = registry
+        .list()
+        .into_iter()
+        .filter(|t| !t.paused && t.phase == "before")
+        .collect();
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    let extras: Vec<HashMap<String, Property>> =
+        triggers.iter().map(|t| t.extra_params.clone()).collect();
+    let diff_clones: Vec<TriggerDiff> = (0..triggers.len()).map(|_| diff.clone_diff()).collect();
+    let mut first_error: Option<Error> = None;
+    with_suppression(|| {
+        for ((trigger, extra), diff) in triggers
+            .iter()
+            .zip(extras.iter())
+            .zip(diff_clones.into_iter())
+        {
+            let params = diff.into_param_map(extra);
+            let stmt = match meshdb_cypher::parse(&trigger.query) {
+                Ok(s) => s,
+                Err(e) => {
+                    first_error = Some(Error::Procedure(format!(
+                        "before-trigger '{}' parse error: {e}",
+                        trigger.name
+                    )));
+                    return;
+                }
+            };
+            let plan = match meshdb_cypher::plan(&stmt) {
+                Ok(p) => p,
+                Err(e) => {
+                    first_error = Some(Error::Procedure(format!(
+                        "before-trigger '{}' plan error: {e}",
+                        trigger.name
+                    )));
+                    return;
+                }
+            };
+            if let Err(e) = crate::ops::execute_with_reader_and_procs(
+                &plan, reader, writer, &params, procedures,
+            ) {
+                first_error = Some(Error::Procedure(format!(
+                    "before-trigger '{}' aborted commit: {e}",
+                    trigger.name
+                )));
+                return;
+            }
+        }
+    });
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Fire every registered trigger of `phase` against the given
+/// diff. Errors are logged and swallowed — the original tx has
+/// already committed (for `after` / `afterAsync` / `rollback`)
+/// or already aborted (for `rollback`), so a failing trigger
+/// can't undo anything. Used as the workhorse for the three
+/// non-blocking phases; `before` has its own entry point with
+/// abort semantics.
+pub fn fire_phase_triggers(
+    registry: &TriggerRegistry,
+    phase: &str,
     diff: TriggerDiff,
     reader: &dyn GraphReader,
     writer: &dyn GraphWriter,
@@ -290,18 +515,17 @@ pub fn fire_after_triggers(
     if is_suppressed() {
         return;
     }
-    let triggers = registry.list();
+    let triggers: Vec<TriggerSpec> = registry
+        .list()
+        .into_iter()
+        .filter(|t| !t.paused && t.phase == phase)
+        .collect();
+    if triggers.is_empty() {
+        return;
+    }
     let extras: Vec<HashMap<String, Property>> =
         triggers.iter().map(|t| t.extra_params.clone()).collect();
-    // Move out of `diff` once: each trigger needs its own clone.
-    let diff_clones: Vec<TriggerDiff> = (0..triggers.len())
-        .map(|_| TriggerDiff {
-            created_nodes: diff.created_nodes.clone(),
-            created_relationships: diff.created_relationships.clone(),
-            deleted_nodes: diff.deleted_nodes.clone(),
-            deleted_relationships: diff.deleted_relationships.clone(),
-        })
-        .collect();
+    let diff_clones: Vec<TriggerDiff> = (0..triggers.len()).map(|_| diff.clone_diff()).collect();
     with_suppression(|| {
         for ((trigger, extra), diff) in triggers
             .iter()
@@ -314,6 +538,7 @@ pub fn fire_after_triggers(
                 Err(e) => {
                     tracing::warn!(
                         trigger = %trigger.name,
+                        phase = phase,
                         error = %e,
                         "trigger Cypher failed to parse — skipping"
                     );
@@ -325,6 +550,7 @@ pub fn fire_after_triggers(
                 Err(e) => {
                     tracing::warn!(
                         trigger = %trigger.name,
+                        phase = phase,
                         error = %e,
                         "trigger Cypher failed to plan — skipping"
                     );
@@ -336,12 +562,26 @@ pub fn fire_after_triggers(
             ) {
                 tracing::warn!(
                     trigger = %trigger.name,
+                    phase = phase,
                     error = %e,
                     "trigger body returned an error — skipping"
                 );
             }
         }
     });
+}
+
+/// Fire every registered after-phase trigger. Backwards-compat
+/// shim for callers that haven't migrated to
+/// [`fire_phase_triggers`] yet.
+pub fn fire_after_triggers(
+    registry: &TriggerRegistry,
+    diff: TriggerDiff,
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    procedures: &ProcedureRegistry,
+) {
+    fire_phase_triggers(registry, "after", diff, reader, writer, procedures);
 }
 
 /// Helper: wall-clock millis since the UNIX epoch. Used to
@@ -397,9 +637,13 @@ pub fn install_call(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<Proc
     } else {
         "after".to_string()
     };
-    if phase != "after" {
+    if !matches!(
+        phase.as_str(),
+        "before" | "after" | "afterAsync" | "rollback"
+    ) {
         return Err(Error::Procedure(format!(
-            "apoc.trigger.install: only the 'after' phase is supported in this release, got {phase:?}"
+            "apoc.trigger.install: phase must be one of \
+             'before' / 'after' / 'afterAsync' / 'rollback', got {phase:?}"
         )));
     }
     let extra_params: HashMap<String, Property> = if args.len() > 4 {
@@ -436,6 +680,7 @@ pub fn install_call(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<Proc
         phase,
         extra_params,
         installed_at_ms: now_ms(),
+        paused: false,
     };
     let blob = serde_json::to_vec(&spec)
         .map_err(|e| Error::Procedure(format!("apoc.trigger.install: encoding spec: {e}")))?;
@@ -450,6 +695,59 @@ pub fn install_call(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<Proc
     // existed under the same name. Callers that need the
     // before/after pair can `apoc.trigger.list` first.
     row.insert("previous".into(), Value::Null);
+    Ok(vec![row])
+}
+
+/// `apoc.trigger.start(databaseName, name)` — un-pause a
+/// previously stopped trigger. Looks up the existing spec
+/// through the registry, sets `paused = false`, and re-emits
+/// the spec via the writer so the cluster commit replicates
+/// the unpause. Errors if the trigger doesn't exist.
+pub fn start_call(
+    registry: &TriggerRegistry,
+    writer: &dyn GraphWriter,
+    args: &[Value],
+) -> Result<Vec<ProcRow>> {
+    set_paused(registry, writer, args, false, "apoc.trigger.start")
+}
+
+/// `apoc.trigger.stop(databaseName, name)` — pause a registered
+/// trigger. Mirrors `start_call`; sets `paused = true`.
+pub fn stop_call(
+    registry: &TriggerRegistry,
+    writer: &dyn GraphWriter,
+    args: &[Value],
+) -> Result<Vec<ProcRow>> {
+    set_paused(registry, writer, args, true, "apoc.trigger.stop")
+}
+
+/// Shared body for start_call / stop_call.
+fn set_paused(
+    registry: &TriggerRegistry,
+    writer: &dyn GraphWriter,
+    args: &[Value],
+    paused: bool,
+    proc_name: &'static str,
+) -> Result<Vec<ProcRow>> {
+    if args.len() < 2 {
+        return Err(Error::Procedure(format!(
+            "{proc_name}: expects (databaseName, name)"
+        )));
+    }
+    let _db = expect_string(&args[0], "first argument (databaseName)")?;
+    let name = expect_string(&args[1], "second argument (name)")?;
+    let mut spec = registry
+        .list()
+        .into_iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| Error::Procedure(format!("{proc_name}: no trigger named '{name}'")))?;
+    spec.paused = paused;
+    let blob = serde_json::to_vec(&spec)
+        .map_err(|e| Error::Procedure(format!("{proc_name}: encoding spec: {e}")))?;
+    writer.install_trigger(&name, &blob)?;
+    let mut row: ProcRow = HashMap::new();
+    row.insert("name".into(), Value::Property(Property::String(name)));
+    row.insert("paused".into(), Value::Property(Property::Bool(paused)));
     Ok(vec![row])
 }
 
@@ -493,6 +791,10 @@ pub fn list_call(registry: &TriggerRegistry) -> Result<Vec<ProcRow>> {
             row.insert(
                 "installed_at".into(),
                 Value::Property(Property::Int64(spec.installed_at_ms)),
+            );
+            row.insert(
+                "paused".into(),
+                Value::Property(Property::Bool(spec.paused)),
             );
             row
         })

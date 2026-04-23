@@ -92,22 +92,28 @@ fn compute_trigger_diff(
         std::collections::HashMap::new();
     for cmd in flat {
         match cmd {
-            GraphCommand::PutNode(n) => {
-                // Only classify as "created" if the id wasn't in
-                // the store pre-tx. Updates to existing nodes
-                // land in the (deferred) $assignedNodeProperties
-                // bucket in Neo4j — we skip them for V1.
-                let is_new = store.get_node(n.id).map(|o| o.is_none()).unwrap_or(true);
-                if is_new {
+            GraphCommand::PutNode(n) => match store.get_node(n.id) {
+                Ok(Some(prev)) => {
+                    diff_node_changes(&prev, n, &mut diff);
+                }
+                Ok(None) => {
                     created_nodes.insert(n.id, n.clone());
                 }
-            }
-            GraphCommand::PutEdge(e) => {
-                let is_new = store.get_edge(e.id).map(|o| o.is_none()).unwrap_or(true);
-                if is_new {
+                Err(_) => {
+                    created_nodes.insert(n.id, n.clone());
+                }
+            },
+            GraphCommand::PutEdge(e) => match store.get_edge(e.id) {
+                Ok(Some(prev)) => {
+                    diff_edge_changes(&prev, e, &mut diff);
+                }
+                Ok(None) => {
                     created_edges.insert(e.id, e.clone());
                 }
-            }
+                Err(_) => {
+                    created_edges.insert(e.id, e.clone());
+                }
+            },
             GraphCommand::DeleteEdge(id) => {
                 if let Ok(Some(prev)) = store.get_edge(*id) {
                     diff.deleted_relationships.push(prev);
@@ -117,8 +123,6 @@ fn compute_trigger_diff(
                 if let Ok(Some(prev)) = store.get_node(*id) {
                     diff.deleted_nodes.push(prev);
                 }
-                // DetachDelete also removes incident edges; the
-                // pre-commit adjacency tells us which.
                 if let Ok(outs) = store.outgoing(*id) {
                     for (eid, _) in outs {
                         if let Ok(Some(e)) = store.get_edge(eid) {
@@ -140,6 +144,94 @@ fn compute_trigger_diff(
     diff.created_nodes = created_nodes.into_values().collect();
     diff.created_relationships = created_edges.into_values().collect();
     diff
+}
+
+/// Compare pre-tx and post-tx node values, pushing per-property
+/// and per-label change records to the diff. Used by
+/// [`compute_trigger_diff`] for `PutNode`s targeting existing
+/// ids — these are property/label updates rather than creates.
+#[cfg(feature = "apoc-trigger")]
+fn diff_node_changes(
+    prev: &meshdb_core::Node,
+    next: &meshdb_core::Node,
+    diff: &mut meshdb_executor::apoc_trigger::TriggerDiff,
+) {
+    use meshdb_executor::apoc_trigger::{LabelChange, PropertyChange};
+    use meshdb_executor::Value;
+    let element = Value::Node(next.clone());
+    // Properties: detect added, changed, and removed keys.
+    for (key, new_val) in &next.properties {
+        let old_val = prev.properties.get(key);
+        if old_val != Some(new_val) {
+            diff.assigned_node_properties.push(PropertyChange {
+                key: key.clone(),
+                old: old_val.cloned(),
+                new: Some(new_val.clone()),
+                element: element.clone(),
+            });
+        }
+    }
+    for (key, old_val) in &prev.properties {
+        if !next.properties.contains_key(key) {
+            diff.removed_node_properties.push(PropertyChange {
+                key: key.clone(),
+                old: Some(old_val.clone()),
+                new: None,
+                element: element.clone(),
+            });
+        }
+    }
+    // Labels: O(n*m) is fine — label sets are tiny.
+    for label in &next.labels {
+        if !prev.labels.iter().any(|l| l == label) {
+            diff.assigned_labels.push(LabelChange {
+                label: label.clone(),
+                element: element.clone(),
+            });
+        }
+    }
+    for label in &prev.labels {
+        if !next.labels.iter().any(|l| l == label) {
+            diff.removed_labels.push(LabelChange {
+                label: label.clone(),
+                element: element.clone(),
+            });
+        }
+    }
+}
+
+/// Edge counterpart of [`diff_node_changes`]. Edges don't have
+/// labels, so only the property side fires.
+#[cfg(feature = "apoc-trigger")]
+fn diff_edge_changes(
+    prev: &meshdb_core::Edge,
+    next: &meshdb_core::Edge,
+    diff: &mut meshdb_executor::apoc_trigger::TriggerDiff,
+) {
+    use meshdb_executor::apoc_trigger::PropertyChange;
+    use meshdb_executor::Value;
+    let element = Value::Edge(next.clone());
+    for (key, new_val) in &next.properties {
+        let old_val = prev.properties.get(key);
+        if old_val != Some(new_val) {
+            diff.assigned_relationship_properties.push(PropertyChange {
+                key: key.clone(),
+                old: old_val.cloned(),
+                new: Some(new_val.clone()),
+                element: element.clone(),
+            });
+        }
+    }
+    for (key, old_val) in &prev.properties {
+        if !next.properties.contains_key(key) {
+            diff.removed_relationship_properties.push(PropertyChange {
+                key: key.clone(),
+                old: Some(old_val.clone()),
+                new: None,
+                element: element.clone(),
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1230,8 +1322,42 @@ impl MeshService {
         &self,
         commands: Vec<GraphCommand>,
     ) -> std::result::Result<(), Status> {
+        self.commit_buffered_commands_inner(commands, false).await
+    }
+
+    /// Internal entry point. `from_trigger` flips on for the
+    /// recursive commit that follows trigger firing — it
+    /// suppresses further trigger evaluation so a trigger's own
+    /// writes don't infinitely re-fire. External callers always
+    /// hit the public wrapper above with `from_trigger = false`.
+    async fn commit_buffered_commands_inner(
+        &self,
+        #[cfg_attr(not(feature = "apoc-trigger"), allow(unused_mut))] mut commands: Vec<
+            GraphCommand,
+        >,
+        from_trigger: bool,
+    ) -> std::result::Result<(), Status> {
+        let _ = from_trigger;
         if commands.is_empty() {
             return Ok(());
+        }
+        // Before-phase triggers fire here, ahead of any commit
+        // path. Their writes get appended to the prepared batch
+        // so they commit atomically with the user's writes; if
+        // a before-trigger errors, the whole commit aborts —
+        // and the rollback-phase triggers fire as part of the
+        // abort path.
+        #[cfg(feature = "apoc-trigger")]
+        if !from_trigger {
+            if let Some(diff) = self.snapshot_trigger_diff(&commands) {
+                match self.fire_before_triggers_collect_writes(&diff) {
+                    Ok(extra) => commands.extend(extra),
+                    Err(e) => {
+                        self.fire_rollback_triggers(Some(diff)).await;
+                        return Err(Status::aborted(e.to_string()));
+                    }
+                }
+            }
         }
         if let Some(routing) = &self.routing {
             // Schema DDL isn't keyed to a partition and doesn't fit
@@ -1255,34 +1381,48 @@ impl MeshService {
                 coordinator = coordinator.with_log(log);
             }
             #[cfg(feature = "apoc-trigger")]
-            let routing_diff = self.snapshot_trigger_diff(&graph);
+            let routing_diff = if from_trigger {
+                None
+            } else {
+                self.snapshot_trigger_diff(&graph)
+            };
             match coordinator.run(graph).await {
                 Ok(()) => {
                     crate::metrics::TWO_PHASE_COMMIT_TOTAL
                         .with_label_values(&["committed"])
                         .inc();
                     // Routing-mode trigger firing — only the
-                    // coordinator (us) fires, matching the
-                    // single-node and Raft modes' "originator
-                    // fires once" semantics. Trigger writes land
-                    // local for V2; cluster replication of
-                    // trigger-induced writes is the still-deferred
-                    // piece flagged in CLAUDE.md.
+                    // coordinator (us) fires. Trigger-induced
+                    // writes go through this same commit path
+                    // recursively (with `from_trigger = true` so
+                    // they don't re-fire), so they replicate
+                    // through the same 2PC machinery the
+                    // originator's writes did.
                     #[cfg(feature = "apoc-trigger")]
-                    self.fire_triggers_after_single_node_commit(routing_diff);
+                    if !from_trigger {
+                        self.fire_post_commit_triggers(routing_diff).await;
+                    }
                     return Ok(());
                 }
                 Err(e) => {
                     crate::metrics::TWO_PHASE_COMMIT_TOTAL
                         .with_label_values(&["aborted"])
                         .inc();
+                    #[cfg(feature = "apoc-trigger")]
+                    if !from_trigger {
+                        self.fire_rollback_triggers(routing_diff).await;
+                    }
                     return Err(e);
                 }
             }
         }
         if let Some(raft) = &self.raft {
             #[cfg(feature = "apoc-trigger")]
-            let raft_diff = self.snapshot_trigger_diff(&commands);
+            let raft_diff = if from_trigger {
+                None
+            } else {
+                self.snapshot_trigger_diff(&commands)
+            };
             let entry = if commands.len() == 1 {
                 commands.into_iter().next().unwrap()
             } else {
@@ -1293,14 +1433,17 @@ impl MeshService {
                     crate::metrics::RAFT_PROPOSALS_TOTAL
                         .with_label_values(&["committed"])
                         .inc();
-                    // Raft-mode trigger firing — only this peer
-                    // (the proposer; non-leaders forward and so
-                    // never reach this branch) fires. Followers
-                    // see the propagated commit through their own
-                    // `StoreGraphApplier::apply` but don't fire
-                    // their own copy.
+                    // Raft-mode trigger firing — only the
+                    // proposer (us; non-leaders forward + never
+                    // reach this branch) fires. Followers see the
+                    // commit through their own
+                    // `StoreGraphApplier::apply`. Trigger writes
+                    // recurse through propose_graph so every peer
+                    // applies them through the Raft log.
                     #[cfg(feature = "apoc-trigger")]
-                    self.fire_triggers_after_single_node_commit(raft_diff);
+                    if !from_trigger {
+                        self.fire_post_commit_triggers(raft_diff).await;
+                    }
                     Ok(())
                 }
                 Err(ClusterError::ForwardToLeader {
@@ -1310,6 +1453,9 @@ impl MeshService {
                     crate::metrics::RAFT_PROPOSALS_TOTAL
                         .with_label_values(&["forwarded"])
                         .inc();
+                    // Forwarding doesn't count as a rollback — the
+                    // commit hasn't actually failed; the client
+                    // will retry against the leader.
                     Err(Status::failed_precondition(format!(
                         "raft leader is at {addr}; reconnect and retry there"
                     )))
@@ -1318,6 +1464,10 @@ impl MeshService {
                     crate::metrics::RAFT_PROPOSALS_TOTAL
                         .with_label_values(&["failed"])
                         .inc();
+                    #[cfg(feature = "apoc-trigger")]
+                    if !from_trigger {
+                        self.fire_rollback_triggers(raft_diff).await;
+                    }
                     Err(raft_propose_failed(e))
                 }
             };
@@ -1325,14 +1475,18 @@ impl MeshService {
         // Single-node: apply the batch directly through the store's
         // atomic apply_batch helper (one rocksdb WriteBatch).
         // Triggers fire AFTER the commit succeeds — see
-        // `fire_triggers_after_single_node_commit` for the
-        // pre-commit diff snapshot + post-commit firing dance.
+        // `fire_triggers_after_commit` for the pre-commit diff
+        // snapshot + post-commit firing dance.
         #[cfg(feature = "apoc-trigger")]
-        let trigger_diff = self.snapshot_trigger_diff(&commands);
-        apply_prepared_batch(self.store.as_ref(), &commands).map_err(internal)?;
-        // Trigger DDL (install / drop) inside the batch: refresh
-        // the local registry cache so the firing path below
-        // sees the new set immediately.
+        let trigger_diff = if from_trigger {
+            None
+        } else {
+            self.snapshot_trigger_diff(&commands)
+        };
+        let apply_result = apply_prepared_batch(self.store.as_ref(), &commands);
+        // Refresh the trigger registry first whether the apply
+        // succeeded or failed — trigger DDL is idempotent and the
+        // registry's view should match storage in either case.
         #[cfg(feature = "apoc-trigger")]
         {
             let touched_triggers = commands.iter().any(|c| {
@@ -1347,9 +1501,22 @@ impl MeshService {
                 }
             }
         }
-        #[cfg(feature = "apoc-trigger")]
-        self.fire_triggers_after_single_node_commit(trigger_diff);
-        Ok(())
+        match apply_result {
+            Ok(()) => {
+                #[cfg(feature = "apoc-trigger")]
+                if !from_trigger {
+                    self.fire_post_commit_triggers(trigger_diff).await;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                #[cfg(feature = "apoc-trigger")]
+                if !from_trigger {
+                    self.fire_rollback_triggers(trigger_diff).await;
+                }
+                Err(internal(e))
+            }
+        }
     }
 
     /// Compute the trigger diff against the pre-commit store state.
@@ -1375,21 +1542,170 @@ impl MeshService {
         Some(compute_trigger_diff(self.store.as_ref(), commands))
     }
 
-    /// Fire all registered after-phase triggers against a diff
-    /// captured before the commit. Runs synchronously on the
-    /// calling thread so the thread-local suppression guard
-    /// applies to the trigger's own writes. Failures are logged
-    /// and swallowed — the originating transaction has already
-    /// committed, so an erroring trigger doesn't undo user work.
+    /// Fire every registered before-phase trigger against the
+    /// pre-commit diff. Returns Ok with the trigger writes the
+    /// caller should merge into the prepared batch, or Err if
+    /// any trigger errors — aborting the commit.
     ///
-    /// V1 only fires in single-node mode; Raft and Routing
-    /// callers skip this path. Per-node firing in clustered
-    /// deployments needs a separate design: decide whether every
-    /// peer fires its own copy (double-execution) or only the
-    /// leader / coordinator (consistency-vs-availability
-    /// tradeoffs). Tracked in CLAUDE.md.
+    /// Sync — before-phase triggers run inline as part of the
+    /// commit path, so the caller stays in `&self`.
     #[cfg(feature = "apoc-trigger")]
-    fn fire_triggers_after_single_node_commit(
+    fn fire_before_triggers_collect_writes(
+        &self,
+        diff: &meshdb_executor::apoc_trigger::TriggerDiff,
+    ) -> std::result::Result<Vec<GraphCommand>, meshdb_executor::Error> {
+        let factory = &self.procedure_registry_factory;
+        let procedures = factory();
+        let Some(trig) = procedures.trigger_registry().cloned() else {
+            return Ok(Vec::new());
+        };
+        let storage_reader =
+            meshdb_executor::StorageReaderAdapter(self.store.as_ref() as &dyn StorageEngine);
+        let writer = BufferingGraphWriter::new();
+        // Clone the diff so the original snapshot stays available
+        // for the after-fire later.
+        let diff_clone = diff.clone_diff();
+        meshdb_executor::apoc_trigger::fire_before_triggers(
+            &trig,
+            diff_clone,
+            &storage_reader as &dyn meshdb_executor::GraphReader,
+            &writer as &dyn meshdb_executor::GraphWriter,
+            &procedures,
+        )?;
+        Ok(writer.into_commands())
+    }
+
+    /// Combined after-phase + afterAsync trigger firing dispatch.
+    /// Runs the synchronous after-phase (which awaits any
+    /// trigger-induced cluster commits) and then spawns
+    /// afterAsync in the background. Called from each commit
+    /// branch's success arm.
+    #[cfg(feature = "apoc-trigger")]
+    async fn fire_post_commit_triggers(
+        &self,
+        diff: Option<meshdb_executor::apoc_trigger::TriggerDiff>,
+    ) {
+        let Some(diff) = diff else { return };
+        // Clone fields for the spawned afterAsync arm; the sync
+        // after-phase consumes the original diff.
+        let async_diff = diff.clone_diff();
+        self.fire_triggers_after_commit(Some(diff)).await;
+        self.spawn_after_async_triggers(async_diff);
+    }
+
+    /// Fire registered `afterAsync`-phase triggers against a
+    /// snapshot of the diff. Spawns a background task — does
+    /// NOT block the originator's response. The clone of
+    /// `MeshService` is cheap (every internal field is `Arc`).
+    #[cfg(feature = "apoc-trigger")]
+    fn spawn_after_async_triggers(&self, diff: meshdb_executor::apoc_trigger::TriggerDiff) {
+        let factory = &self.procedure_registry_factory;
+        let procedures = factory();
+        let Some(trig) = procedures.trigger_registry().cloned() else {
+            return;
+        };
+        // Quick check: nothing registered for this phase, skip
+        // the spawn cost entirely.
+        if !trig
+            .list()
+            .iter()
+            .any(|t| !t.paused && t.phase == "afterAsync")
+        {
+            return;
+        }
+        let svc = self.clone();
+        tokio::spawn(async move {
+            let storage_reader =
+                meshdb_executor::StorageReaderAdapter(svc.store.as_ref() as &dyn StorageEngine);
+            let writer = BufferingGraphWriter::new();
+            let factory = &svc.procedure_registry_factory;
+            let procedures = factory();
+            let trig = match procedures.trigger_registry().cloned() {
+                Some(t) => t,
+                None => return,
+            };
+            meshdb_executor::apoc_trigger::fire_phase_triggers(
+                &trig,
+                "afterAsync",
+                diff,
+                &storage_reader as &dyn meshdb_executor::GraphReader,
+                &writer as &dyn meshdb_executor::GraphWriter,
+                &procedures,
+            );
+            // Commit any writes via the cluster commit path with
+            // from_trigger=true to suppress further firing.
+            let cmds = writer.into_commands();
+            if !cmds.is_empty() {
+                if let Err(e) = svc.commit_buffered_commands_inner(cmds, true).await {
+                    tracing::warn!(
+                        error = %e,
+                        "afterAsync trigger writes failed to commit"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Fire registered `rollback`-phase triggers against the
+    /// pre-commit diff snapshot. Synchronous — runs in the same
+    /// task that handled the failing commit so the response
+    /// surface stays predictable. Errors from the trigger body
+    /// are logged and swallowed; we don't want a flaky rollback
+    /// trigger to mask the real commit failure that's about to
+    /// be returned.
+    #[cfg(feature = "apoc-trigger")]
+    async fn fire_rollback_triggers(
+        &self,
+        diff: Option<meshdb_executor::apoc_trigger::TriggerDiff>,
+    ) {
+        let Some(diff) = diff else { return };
+        let factory = &self.procedure_registry_factory;
+        let procedures = factory();
+        let Some(trig) = procedures.trigger_registry().cloned() else {
+            return;
+        };
+        let storage_reader =
+            meshdb_executor::StorageReaderAdapter(self.store.as_ref() as &dyn StorageEngine);
+        let writer = BufferingGraphWriter::new();
+        meshdb_executor::apoc_trigger::fire_phase_triggers(
+            &trig,
+            "rollback",
+            diff,
+            &storage_reader as &dyn meshdb_executor::GraphReader,
+            &writer as &dyn meshdb_executor::GraphWriter,
+            &procedures,
+        );
+        // Rollback triggers may write (e.g., to an audit log).
+        // Those writes commit through the normal cluster path so
+        // they reach every peer.
+        let cmds = writer.into_commands();
+        if !cmds.is_empty() {
+            let inner_fut = Box::pin(self.commit_buffered_commands_inner(cmds, true));
+            if let Err(e) = inner_fut.await {
+                tracing::warn!(
+                    error = %e,
+                    "rollback trigger writes failed to commit"
+                );
+            }
+        }
+    }
+
+    /// Fire all registered after-phase triggers against a diff
+    /// captured before the commit. Runs the trigger Cypher
+    /// synchronously then commits any trigger-induced writes
+    /// recursively through `commit_buffered_commands_inner`
+    /// with `from_trigger = true`, so cluster-mode trigger
+    /// writes ride through the same Raft / 2PC machinery the
+    /// originating commit did.
+    ///
+    /// Failures during firing or the recursive commit are logged
+    /// and swallowed — the originating transaction has already
+    /// committed; an erroring trigger doesn't undo user work.
+    /// The from_trigger flag prevents the inner commit from
+    /// re-evaluating triggers, closing the obvious infinite-fire
+    /// loop.
+    #[cfg(feature = "apoc-trigger")]
+    async fn fire_triggers_after_commit(
         &self,
         diff: Option<meshdb_executor::apoc_trigger::TriggerDiff>,
     ) {
@@ -1410,13 +1726,15 @@ impl MeshService {
             &procedures,
         );
         // Trigger bodies that wrote now have buffered commands
-        // in `writer`. Commit them via the same direct path used
-        // above; the suppression flag inside `fire_after_triggers`
-        // is per-thread so it stays in effect through this commit
-        // — preventing any further trigger firing from these writes.
+        // in `writer`. Recurse through commit_buffered_commands
+        // so cluster modes replicate the writes; the
+        // `from_trigger = true` flag suppresses further firing.
+        // Box::pin'd because async-fn recursion needs explicit
+        // future indirection — we self-call.
         let cmds = writer.into_commands();
         if !cmds.is_empty() {
-            if let Err(e) = apply_prepared_batch(self.store.as_ref(), &cmds) {
+            let inner_fut = Box::pin(self.commit_buffered_commands_inner(cmds, true));
+            if let Err(e) = inner_fut.await {
                 tracing::warn!(
                     error = %e,
                     "committing trigger-induced writes failed"

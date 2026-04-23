@@ -290,6 +290,16 @@ pub enum BuiltinProc {
     /// trigger.
     #[cfg(feature = "apoc-trigger")]
     ApocTriggerList,
+    /// `apoc.trigger.start(databaseName, name)` — un-pause a
+    /// previously stopped trigger. The change replicates
+    /// across the cluster like install/drop.
+    #[cfg(feature = "apoc-trigger")]
+    ApocTriggerStart,
+    /// `apoc.trigger.stop(databaseName, name)` — pause a
+    /// registered trigger. Paused triggers stay in the
+    /// registry (and replicate) but are skipped on every commit.
+    #[cfg(feature = "apoc-trigger")]
+    ApocTriggerStop,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -375,7 +385,12 @@ impl Procedure {
             #[cfg(feature = "apoc-cypher")]
             Some(BuiltinProc::ApocCypherRun | BuiltinProc::ApocCypherDoIt) => true,
             #[cfg(feature = "apoc-trigger")]
-            Some(BuiltinProc::ApocTriggerInstall | BuiltinProc::ApocTriggerDrop) => true,
+            Some(
+                BuiltinProc::ApocTriggerInstall
+                | BuiltinProc::ApocTriggerDrop
+                | BuiltinProc::ApocTriggerStart
+                | BuiltinProc::ApocTriggerStop,
+            ) => true,
             _ => false,
         }
     }
@@ -547,12 +562,15 @@ impl Procedure {
                     .map(ProcRows::Eager)
             }
             #[cfg(feature = "apoc-trigger")]
-            Some(BuiltinProc::ApocTriggerInstall | BuiltinProc::ApocTriggerDrop) => {
-                Err(Error::Procedure(
-                    "apoc.trigger.install/drop are write builtins — must go through resolve_write_rows"
-                        .into(),
-                ))
-            }
+            Some(
+                BuiltinProc::ApocTriggerInstall
+                | BuiltinProc::ApocTriggerDrop
+                | BuiltinProc::ApocTriggerStart
+                | BuiltinProc::ApocTriggerStop,
+            ) => Err(Error::Procedure(
+                "apoc.trigger.install/drop/start/stop are write builtins — must go through resolve_write_rows"
+                    .into(),
+            )),
             #[cfg(feature = "apoc-trigger")]
             Some(BuiltinProc::ApocTriggerList) => {
                 let registry = procedures.trigger_registry().ok_or_else(|| {
@@ -628,6 +646,20 @@ impl Procedure {
             }
             #[cfg(feature = "apoc-trigger")]
             Some(BuiltinProc::ApocTriggerDrop) => crate::apoc_trigger::drop_call(writer, args),
+            #[cfg(feature = "apoc-trigger")]
+            Some(BuiltinProc::ApocTriggerStart) => {
+                let registry = procedures.trigger_registry().ok_or_else(|| {
+                    Error::Procedure("apoc.trigger.start: no trigger registry attached".into())
+                })?;
+                crate::apoc_trigger::start_call(registry, writer, args)
+            }
+            #[cfg(feature = "apoc-trigger")]
+            Some(BuiltinProc::ApocTriggerStop) => {
+                let registry = procedures.trigger_registry().ok_or_else(|| {
+                    Error::Procedure("apoc.trigger.stop: no trigger registry attached".into())
+                })?;
+                crate::apoc_trigger::stop_call(registry, writer, args)
+            }
             _ => Err(Error::Procedure("procedure is not a write builtin".into())),
         }
     }
@@ -2023,10 +2055,44 @@ impl ProcedureRegistry {
                         name: "installed_at".into(),
                         ty: ProcType::Integer,
                     },
+                    ProcOutSpec {
+                        name: "paused".into(),
+                        ty: ProcType::Boolean,
+                    },
                 ],
                 rows: Vec::new(),
                 builtin: Some(BuiltinProc::ApocTriggerList),
             });
+            for (fn_name, variant) in [
+                ("start", BuiltinProc::ApocTriggerStart),
+                ("stop", BuiltinProc::ApocTriggerStop),
+            ] {
+                self.register(Procedure {
+                    qualified_name: vec!["apoc".into(), "trigger".into(), fn_name.into()],
+                    inputs: vec![
+                        ProcArgSpec {
+                            name: "databaseName".into(),
+                            ty: ProcType::String,
+                        },
+                        ProcArgSpec {
+                            name: "name".into(),
+                            ty: ProcType::String,
+                        },
+                    ],
+                    outputs: vec![
+                        ProcOutSpec {
+                            name: "name".into(),
+                            ty: ProcType::String,
+                        },
+                        ProcOutSpec {
+                            name: "paused".into(),
+                            ty: ProcType::Boolean,
+                        },
+                    ],
+                    rows: Vec::new(),
+                    builtin: Some(variant),
+                });
+            }
         }
     }
 }

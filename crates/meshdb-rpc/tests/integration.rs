@@ -3668,15 +3668,12 @@ mod apoc_trigger {
     }
 
     #[tokio::test]
-    async fn trigger_rejects_before_phase_for_now() {
+    async fn trigger_install_rejects_unknown_phase() {
         let (svc, _store, _d) = spawn_service_with_triggers();
-        // Exercising the install-time validation — we error
-        // loudly on unsupported phases rather than silently
-        // accepting one that won't fire.
-        let (_rows, cmds) = svc
+        let err = svc
             .execute_cypher_in_tx(
                 "CALL apoc.trigger.install('meshdb', 'x', 'RETURN 1', \
-                   {phase: 'before'}, null) \
+                   {phase: 'invalid_phase'}, null) \
                  YIELD name RETURN name"
                     .to_string(),
                 ParamMap::new(),
@@ -3684,22 +3681,146 @@ mod apoc_trigger {
                 false,
             )
             .await
-            .map_err(|e| e.to_string())
-            .map(|ok| ok)
-            .unwrap_or_else(|e| {
-                assert!(
-                    e.contains("only the 'after' phase"),
-                    "expected after-only rejection, got: {e}"
-                );
-                // Short-circuit — we got the error we wanted.
-                (Vec::new(), Vec::new())
-            });
-        // If we got here without error, the install should NOT
-        // have been accepted. Drain commands so the harness
-        // doesn't leak, then fail.
-        if !cmds.is_empty() {
-            panic!("install should have rejected phase=before before producing commands");
-        }
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("phase must be one of"),
+            "expected unknown-phase rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn before_trigger_can_abort_commit_via_error() {
+        let (svc, store, _d) = spawn_service_with_triggers();
+        // Install a before-trigger that errors on Forbidden labels.
+        // Cypher's only "raise" mechanism is to evaluate an
+        // expression that errors at runtime — divide by zero
+        // suffices.
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'forbidder', \
+               'UNWIND $createdNodes AS n \
+                WITH n WHERE \"Forbidden\" IN labels(n) \
+                RETURN 1 / 0', \
+               {phase: 'before'}, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        // Allowed creates succeed.
+        run(&svc, "CREATE (:Allowed {name: 'ok'})").await;
+        let allowed_count = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "Allowed"))
+            .count();
+        assert_eq!(allowed_count, 1);
+        // A Forbidden create should abort the commit.
+        let err = svc
+            .execute_cypher_in_tx(
+                "CREATE (:Forbidden {name: 'no'})".to_string(),
+                ParamMap::new(),
+                Vec::new(),
+                false,
+            )
+            .await;
+        let err = match err {
+            Ok((_, cmds)) => svc.commit_buffered_commands(cmds).await.unwrap_err(),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("before-trigger"),
+            "expected before-trigger abort, got: {err}"
+        );
+        // Verify the Forbidden node was NOT created.
+        let forbidden_count = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "Forbidden"))
+            .count();
+        assert_eq!(
+            forbidden_count, 0,
+            "before-trigger abort should have prevented the Forbidden node"
+        );
+    }
+
+    #[tokio::test]
+    async fn before_trigger_writes_commit_with_user_writes() {
+        let (svc, store, _d) = spawn_service_with_triggers();
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'audit', \
+               'UNWIND $createdNodes AS n \
+                WITH n WHERE \"Person\" IN labels(n) \
+                CREATE (:Audit {who: n.name})', \
+               {phase: 'before'}, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        run(&svc, "CREATE (:Person {name: 'Ada'})").await;
+        let audit = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "Audit"))
+            .collect::<Vec<_>>();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit[0].properties.get("who"),
+            Some(&Property::String("Ada".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_stop_pauses_firing_until_start() {
+        let (svc, store, _d) = spawn_service_with_triggers();
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'pausable', \
+               'UNWIND $createdNodes AS n \
+                WITH n WHERE \"Source\" IN labels(n) \
+                CREATE (:Marker {name: n.name})', \
+               null, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        run(&svc, "CREATE (:Source {name: 'first'})").await;
+        let initial = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "Marker"))
+            .count();
+        assert_eq!(initial, 1);
+        run(
+            &svc,
+            "CALL apoc.trigger.stop('meshdb', 'pausable') \
+             YIELD name, paused RETURN name, paused",
+        )
+        .await;
+        run(&svc, "CREATE (:Source {name: 'second'})").await;
+        let after_stop = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "Marker"))
+            .count();
+        assert_eq!(after_stop, 1, "stopped trigger should not have fired");
+        run(
+            &svc,
+            "CALL apoc.trigger.start('meshdb', 'pausable') \
+             YIELD name, paused RETURN name, paused",
+        )
+        .await;
+        run(&svc, "CREATE (:Source {name: 'third'})").await;
+        let after_start = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "Marker"))
+            .count();
+        assert_eq!(after_start, 2, "restarted trigger should fire");
     }
 
     /// Spawn a 2-peer routing-mode cluster where both peers have
@@ -3846,6 +3967,132 @@ mod apoc_trigger {
         svc_a.commit_buffered_commands(cmds).await.unwrap();
         assert!(store_a.list_triggers().unwrap().is_empty());
         assert!(store_b.list_triggers().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn after_async_trigger_fires_in_background() {
+        let (svc, store, _d) = spawn_service_with_triggers();
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'asyncMark', \
+               'UNWIND $createdNodes AS n \
+                WITH n WHERE \"Source\" IN labels(n) \
+                CREATE (:AsyncMarker {name: n.name})', \
+               {phase: 'afterAsync'}, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        run(&svc, "CREATE (:Source {name: 'first'})").await;
+        // afterAsync runs in tokio::spawn — give it a moment to
+        // commit. The recursive commit goes through the same
+        // single-node apply, which is fast, so a brief sleep is
+        // enough on the test machine.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let markers = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "AsyncMarker"))
+            .count();
+        assert_eq!(markers, 1, "afterAsync trigger should have fired");
+    }
+
+    #[tokio::test]
+    async fn rollback_trigger_fires_when_commit_fails() {
+        let (svc, store, _d) = spawn_service_with_triggers();
+        // Install the rollback-phase trigger first; if we
+        // installed the before-error trigger first, it would
+        // abort the install commit of the rollback trigger
+        // itself. Then install a before-trigger that errors on
+        // any commit involving a Trigger label — narrow enough
+        // not to fire on subsequent installs / drops.
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'logRollback', \
+               'CREATE (:RollbackLog {note: \"saw an abort\"})', \
+               {phase: 'rollback'}, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'forbidAnything', \
+               'UNWIND $createdNodes AS n \
+                WITH n WHERE \"Anything\" IN labels(n) \
+                RETURN 1 / 0', \
+               {phase: 'before'}, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        // Attempt a commit that the before-trigger will abort.
+        let attempt = svc
+            .execute_cypher_in_tx(
+                "CREATE (:Anything)".to_string(),
+                ParamMap::new(),
+                Vec::new(),
+                false,
+            )
+            .await;
+        let _err = match attempt {
+            Ok((_, cmds)) => svc.commit_buffered_commands(cmds).await.unwrap_err(),
+            Err(e) => e,
+        };
+        // Rollback trigger should have written its log entry.
+        let logs = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "RollbackLog"))
+            .count();
+        assert_eq!(logs, 1, "rollback trigger should have fired on the abort");
+    }
+
+    #[tokio::test]
+    async fn trigger_sees_assigned_node_properties_and_labels() {
+        let (svc, store, _d) = spawn_service_with_triggers();
+        run(&svc, "CREATE (:Person {name: 'Ada'})").await;
+        // Install AFTER seeding so the create doesn't fire it.
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'changeAudit', \
+               'UNWIND $assignedNodeProperties AS change \
+                CREATE (:PropAudit {key: change.key}) \
+                WITH 1 AS _ \
+                UNWIND $assignedLabels AS lc \
+                CREATE (:LabelAudit {label: lc.label})', \
+               null, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        // SET adds a property and a label to an existing node.
+        run(
+            &svc,
+            "MATCH (p:Person {name: 'Ada'}) SET p.age = 30, p:Member",
+        )
+        .await;
+        let prop_audits = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "PropAudit"))
+            .collect::<Vec<_>>();
+        // age was the only assignment.
+        assert_eq!(prop_audits.len(), 1);
+        assert_eq!(
+            prop_audits[0].properties.get("key"),
+            Some(&Property::String("age".into()))
+        );
+        let label_audits = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "LabelAudit"))
+            .collect::<Vec<_>>();
+        assert_eq!(label_audits.len(), 1);
+        assert_eq!(
+            label_audits[0].properties.get("label"),
+            Some(&Property::String("Member".into()))
+        );
     }
 
     #[tokio::test]
