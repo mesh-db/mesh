@@ -1,3 +1,16 @@
+// The combination of tonic's generated types, deeply-nested
+// async fns with `#[tracing::instrument]`, and the
+// async-recursive trigger fire path (commit_buffered_commands
+// → fire_triggers_after_commit → commit_buffered_commands_inner)
+// pushes rustc's per-query layout computation past the default
+// 128 depth on at least the CI toolchain — manifests as
+// `error: queries overflow the depth limit!` on the
+// `execute_cypher` async block. The compiler suggests exactly
+// this attribute; bumping it once for the crate keeps adding
+// new `#[tracing::instrument]` sites from surprising the next
+// CI run.
+#![recursion_limit = "256"]
+
 pub mod proto {
     tonic::include_proto!("mesh");
 }

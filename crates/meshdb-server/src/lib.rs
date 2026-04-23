@@ -1,3 +1,11 @@
+// Bolt's deeply-nested async dispatch (HELLO → BEGIN → RUN →
+// PULL → COMMIT, each its own `#[tracing::instrument]`-decorated
+// async fn) plus the trigger-fire-recursion now plumbed through
+// `meshdb-rpc` blows the default 128 query depth on stable rustc.
+// Bumping for the same reason as `meshdb-rpc::lib` — the
+// compiler's suggested fix.
+#![recursion_limit = "256"]
+
 pub mod bolt;
 pub mod config;
 pub mod metrics;
