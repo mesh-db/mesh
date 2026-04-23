@@ -1084,7 +1084,7 @@ fn execute_collect_subquery(body: &meshdb_cypher::Statement, ctx: &EvalCtx) -> R
     }
     let plan = meshdb_cypher::plan_with_context(body, &planner_ctx)
         .map_err(|e| Error::Unsupported(e.to_string()))?;
-    let mut op = crate::ops::build_op_inner(&plan, Some(ctx.row));
+    let mut op = crate::ops::build_op_inner(&plan, Some(ctx.row), &mut None);
     let noop = crate::ops::NoOpWriter;
     let tombstones = crate::ops::Tombstones::default();
     let exec_ctx = crate::ops::ExecCtx {
@@ -1160,7 +1160,7 @@ fn execute_subquery_body(body: &meshdb_cypher::Statement, ctx: &EvalCtx) -> Resu
     // We achieve this by building the operator with the outer
     // row as seed — if the plan's leaf is SeedRow (from a WITH *
     // or bare match), it emits the outer row.
-    let mut op = crate::ops::build_op_inner(&plan, Some(ctx.row));
+    let mut op = crate::ops::build_op_inner(&plan, Some(ctx.row), &mut None);
     let noop = crate::ops::NoOpWriter;
     let tombstones = crate::ops::Tombstones::default();
     let exec_ctx = crate::ops::ExecCtx {

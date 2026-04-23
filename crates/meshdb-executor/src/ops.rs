@@ -211,7 +211,7 @@ pub fn execute_with_seed(
         return Ok(rows);
     }
     let suppress_output = is_write_only_plan(plan);
-    let mut op = build_op_inner(plan, seed);
+    let mut op = build_op_inner(plan, seed, &mut None);
     let tombstones = Tombstones::default();
     let outer_rows: Vec<&Row> = seed.into_iter().collect();
     let ctx = ExecCtx {
@@ -220,6 +220,53 @@ pub fn execute_with_seed(
         params,
         procedures,
         outer_rows: &outer_rows,
+        tombstones: &tombstones,
+    };
+    let mut rows = Vec::new();
+    while let Some(row) = op.next(&ctx)? {
+        rows.push(row);
+    }
+    if suppress_output {
+        Ok(Vec::new())
+    } else {
+        Ok(rows)
+    }
+}
+
+/// Run `plan` with a pre-materialised set of rows substituted
+/// for the (single) `LogicalPlan::CallSubqueryInTransactions`
+/// node in the tree. Used by
+/// `MeshService::execute_call_in_transactions` to fold its
+/// already-batched-and-committed body output back into the
+/// regular pipeline so wrapping clauses (Project / OrderBy /
+/// Limit / Aggregate / Filter) can run untouched.
+///
+/// Panics at build time if the plan doesn't contain exactly one
+/// IN TRANSACTIONS node. The dispatcher detects the wrapping
+/// shape before calling this, so reaching that panic indicates a
+/// wiring bug.
+pub fn execute_with_in_tx_substitute(
+    plan: &LogicalPlan,
+    in_tx_rows: Vec<Row>,
+    reader: &dyn GraphReader,
+    writer: &dyn GraphWriter,
+    params: &ParamMap,
+    procedures: &ProcedureRegistry,
+) -> Result<Vec<Row>> {
+    crate::eval::reset_statement_time();
+    if let Some(rows) = try_execute_ddl(plan, reader, writer)? {
+        return Ok(rows);
+    }
+    let suppress_output = is_write_only_plan(plan);
+    let mut substitute = Some(in_tx_rows);
+    let mut op = build_op_inner(plan, None, &mut substitute);
+    let tombstones = Tombstones::default();
+    let ctx = ExecCtx {
+        store: reader,
+        writer,
+        params,
+        procedures,
+        outer_rows: &[],
         tombstones: &tombstones,
     };
     let mut rows = Vec::new();
@@ -761,13 +808,31 @@ fn show_index_row(scope: &str, target: String, properties: Vec<String>) -> Row {
 }
 
 fn build_op(plan: &LogicalPlan) -> Box<dyn Operator> {
-    build_op_inner(plan, None)
+    build_op_inner(plan, None, &mut None)
 }
 
-pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn Operator> {
+/// Build the operator tree for `plan`. `seed` is the optional
+/// outer row threaded into operators that can consume one (used
+/// by `CallSubqueryOp` for per-row body evaluation).
+///
+/// `in_tx_substitute` lets the caller pre-materialize the rows
+/// that a `CallSubqueryInTransactions` node would normally
+/// produce and inject them as a `RowsLiteralOp` instead. Used by
+/// `MeshService::execute_call_in_transactions` to fold its
+/// already-batched-and-committed outputs back into the regular
+/// pipeline so wrapping clauses (Project / OrderBy / Limit /
+/// Aggregate / Filter) can run untouched. When `None` and a
+/// `CallSubqueryInTransactions` node is encountered, the
+/// operator panics — this surfaces missing dispatcher wiring at
+/// build time instead of as a silent semantic regression.
+pub(crate) fn build_op_inner(
+    plan: &LogicalPlan,
+    seed: Option<&Row>,
+    in_tx_substitute: &mut Option<Vec<Row>>,
+) -> Box<dyn Operator> {
     macro_rules! child {
         ($p:expr) => {
-            build_op_inner($p, seed)
+            build_op_inner($p, seed, in_tx_substitute)
         };
     }
     match plan {
@@ -831,17 +896,26 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             // CALL ... IN TRANSACTIONS commits each batch in its
             // own transaction, which the operator pipeline can't
             // do (it has no commit handle). The dispatcher above
-            // (`MeshService::execute_cypher_in_tx`) detects this
-            // variant before calling `build_op` and routes to a
-            // batched-execution path. Reaching this arm means
-            // the dispatcher was bypassed — fail loudly so the
-            // missing wiring surfaces in tests instead of
-            // silently degrading to a single big transaction.
-            panic!(
-                "LogicalPlan::CallSubqueryInTransactions reached `build_op` — the server-side \
-                 dispatcher (execute_cypher_in_tx) must intercept this variant and route to \
-                 batched execution"
-            )
+            // (`MeshService::execute_cypher_in_tx`) does the
+            // batched execution itself, then folds the resulting
+            // rows back into the pipeline by passing them via
+            // `in_tx_substitute`. We swap a `RowsLiteralOp` in
+            // place of the IN TRANSACTIONS node so any wrapping
+            // Project / OrderBy / Limit / etc. operators run
+            // untouched against those pre-materialized rows.
+            //
+            // Reaching this arm with `in_tx_substitute = None`
+            // means the dispatcher was bypassed — panic loudly
+            // so the missing wiring surfaces at build time.
+            match in_tx_substitute.take() {
+                Some(rows) => Box::new(RowsLiteralOp::new(rows)),
+                None => panic!(
+                    "LogicalPlan::CallSubqueryInTransactions reached `build_op` without a \
+                     row substitute — the server-side dispatcher \
+                     (execute_cypher_in_tx → execute_call_in_transactions) must inject one \
+                     before invoking the operator pipeline"
+                ),
+            }
         }
         LogicalPlan::OptionalApply {
             input,
@@ -2197,7 +2271,7 @@ impl Operator for CallSubqueryOp {
                 Some(r) => r,
                 None => return Ok(None),
             };
-            let mut body_op = build_op_inner(&self.body_plan, Some(&outer_row));
+            let mut body_op = build_op_inner(&self.body_plan, Some(&outer_row), &mut None);
             let mut results = Vec::new();
             while let Some(body_row) = body_op.next(ctx)? {
                 let mut merged = outer_row.clone();
@@ -2253,7 +2327,7 @@ impl Operator for OptionalApplyOp {
                 Some(r) => r,
                 None => return Ok(None),
             };
-            let mut body_op = build_op_inner(&self.body_plan, Some(&outer_row));
+            let mut body_op = build_op_inner(&self.body_plan, Some(&outer_row), &mut None);
             // Push the outer row onto `outer_rows` so Filter /
             // eval_expr inside the body can resolve outer
             // bindings (`OPTIONAL MATCH ... WHERE outer_var = x`).
@@ -6415,5 +6489,34 @@ fn expr_to_count(val: Value) -> Result<i64> {
         // InvalidArgumentType — they'd only be valid after an
         // explicit cast, which the user must write themselves.
         _ => Err(Error::TypeMismatch),
+    }
+}
+
+/// Trivial source operator that yields a fixed list of rows in
+/// order. Used by [`execute_with_in_tx_substitute`] to inject
+/// the pre-materialised batched-execution outputs from a
+/// `CALL { } IN TRANSACTIONS` into the regular operator pipeline
+/// so wrapping clauses (Project, OrderBy, Limit, Aggregate, …)
+/// can run untouched.
+struct RowsLiteralOp {
+    rows: Vec<Row>,
+    cursor: usize,
+}
+
+impl RowsLiteralOp {
+    fn new(rows: Vec<Row>) -> Self {
+        Self { rows, cursor: 0 }
+    }
+}
+
+impl Operator for RowsLiteralOp {
+    fn next(&mut self, _ctx: &ExecCtx) -> Result<Option<Row>> {
+        if self.cursor < self.rows.len() {
+            let row = self.rows[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
     }
 }

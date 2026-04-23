@@ -2792,3 +2792,107 @@ async fn call_in_transactions_on_error_fail_propagates() {
     };
     assert_eq!(c, 3, "FAIL keeps pre-failure commits durable");
 }
+
+#[tokio::test]
+async fn call_in_transactions_with_trailing_return_surfaces_outer_rows() {
+    // The wrapping `RETURN x` projects from the outer-row
+    // bindings (the UNWIND value) and should yield one row per
+    // input row after batched execution.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let rows = service
+        .execute_cypher_local(
+            "UNWIND [10, 20, 30] AS x \
+             CALL { WITH x CREATE (:Reported {n: x}) } IN TRANSACTIONS OF 1 ROWS \
+             RETURN x ORDER BY x"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("post-CALL RETURN should surface outer rows");
+    assert_eq!(rows.len(), 3, "one row per input value");
+    let mut got: Vec<i64> = rows
+        .iter()
+        .map(|r| match r.get("x").unwrap() {
+            Value::Property(Property::Int64(n)) => *n,
+            other => panic!("expected Int64, got {other:?}"),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![10, 20, 30]);
+
+    // Confirm the writes also landed.
+    let count_rows = service
+        .execute_cypher_local(
+            "MATCH (n:Reported) RETURN count(n) AS c".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let c = match count_rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    assert_eq!(c, 3);
+}
+
+#[tokio::test]
+async fn call_in_transactions_with_aggregate_count_returns_total() {
+    // `RETURN count(*)` after IN TRANSACTIONS should count the
+    // outer rows that flowed through. Tests the Aggregate
+    // operator running on top of the substituted RowsLiteralOp.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let rows = service
+        .execute_cypher_local(
+            "UNWIND [1, 2, 3, 4, 5] AS x \
+             CALL { WITH x CREATE (:Counted {n: x}) } IN TRANSACTIONS OF 2 ROWS \
+             RETURN count(*) AS total"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("post-CALL count(*) should aggregate over outer rows");
+    assert_eq!(rows.len(), 1);
+    let total = match rows[0].get("total").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("expected Int64 total, got {other:?}"),
+    };
+    assert_eq!(total, 5);
+}
+
+#[tokio::test]
+async fn call_in_transactions_with_limit_truncates_output_only() {
+    // `LIMIT 2` after IN TRANSACTIONS should only affect the
+    // returned row count — all writes still land because the
+    // batched commits happen before the post-CALL pipeline runs.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let rows = service
+        .execute_cypher_local(
+            "UNWIND [1, 2, 3, 4] AS x \
+             CALL { WITH x CREATE (:Limited {n: x}) } IN TRANSACTIONS OF 1 ROWS \
+             RETURN x ORDER BY x LIMIT 2"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("post-CALL LIMIT should truncate but not block writes");
+    assert_eq!(rows.len(), 2);
+    // All 4 writes landed regardless of LIMIT.
+    let count_rows = service
+        .execute_cypher_local(
+            "MATCH (n:Limited) RETURN count(n) AS c".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let c = match count_rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    assert_eq!(c, 4, "LIMIT applies to output rows only, not writes");
+}

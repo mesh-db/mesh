@@ -482,6 +482,7 @@ impl MeshService {
     /// `prev_commands` must be empty (the auto-commit caller
     /// passes `Vec::new()`); if it isn't, that's a wiring bug
     /// surfaced as a protocol-level failure.
+    #[allow(clippy::too_many_lines)]
     async fn execute_call_in_transactions(
         &self,
         plan: meshdb_cypher::LogicalPlan,
@@ -495,17 +496,19 @@ impl MeshService {
                  this case earlier",
             ));
         }
-        let (input_plan, body_plan, batch_size, error_mode) = match plan {
-            meshdb_cypher::LogicalPlan::CallSubqueryInTransactions {
-                input,
-                body,
-                batch_size,
-                error_mode,
-            } => (*input, *body, batch_size, error_mode),
-            _ => {
+        // Locate the IN TRANSACTIONS node anywhere in the plan
+        // tree. Cloning so the original plan tree stays intact —
+        // we'll reuse it later via execute_with_in_tx_substitute
+        // to evaluate any wrapping clauses (Project / OrderBy /
+        // Limit / Aggregate / Filter) on top of the
+        // batched-and-committed body output rows.
+        let (input_plan, body_plan, batch_size, error_mode) = match find_in_transactions_node(&plan)
+        {
+            Some(parts) => parts,
+            None => {
                 return Err(Status::failed_precondition(
-                    "CALL { ... } IN TRANSACTIONS must be the top-level clause of the \
-                     statement; nested or composed forms aren't supported yet",
+                    "execute_call_in_transactions called on a plan without an \
+                         IN TRANSACTIONS node — the dispatcher upstream miswired this",
                 ));
             }
         };
@@ -590,12 +593,23 @@ impl MeshService {
                                 &procs,
                             )?
                         };
-                        for body_row in body_rows {
-                            let mut merged = outer_row.clone();
-                            for (k, v) in body_row {
-                                merged.insert(k, v);
+                        if body_rows.is_empty() {
+                            // Write-only body (CREATE / SET / DELETE / etc.
+                            // with no RETURN) emits zero rows. IN
+                            // TRANSACTIONS has FOREACH-like semantics —
+                            // the outer row still passes through so that
+                            // any wrapping `RETURN x` after the CALL
+                            // surfaces one row per input row, matching
+                            // Neo4j 5.
+                            batch_output.push(outer_row);
+                        } else {
+                            for body_row in body_rows {
+                                let mut merged = outer_row.clone();
+                                for (k, v) in body_row {
+                                    merged.insert(k, v);
+                                }
+                                batch_output.push(merged);
                             }
-                            batch_output.push(merged);
                         }
                     }
                     Ok((batch_output, writer.into_commands()))
@@ -664,17 +678,59 @@ impl MeshService {
                 },
             }
         }
-        // v1 supports CALL { } IN TRANSACTIONS only as the
-        // top-level write-only clause (no terminal RETURN /
-        // post-CALL projection), so the body's emitted rows
-        // never surface to the caller — same as a top-level
-        // CREATE without RETURN. Return an empty row set; the
-        // batched commits already landed via
-        // `commit_buffered_commands`. Drop the accumulated
-        // outputs; future revisions can route them through a
-        // post-batch projection when we lift the restriction.
-        let _ = all_output;
-        Ok((Vec::new(), Vec::new()))
+        // Fold the accumulated body output back into the
+        // wrapping plan via execute_with_in_tx_substitute. The
+        // executor builds the operator tree for `plan` and,
+        // when it reaches the IN TRANSACTIONS node, substitutes
+        // a `RowsLiteralOp` over `all_output` instead of
+        // panicking. Wrapping clauses (Project / OrderBy /
+        // Limit / Aggregate / Filter) run untouched, so
+        // queries like
+        //   UNWIND ... CALL { ... } IN TRANSACTIONS RETURN ...
+        // surface the projected rows to the caller.
+        //
+        // For the bare-form `CALL { ... } IN TRANSACTIONS` with
+        // no wrapping clause, the plan tree IS the
+        // CallSubqueryInTransactions node — the substitute path
+        // yields all_output directly, and the write-only
+        // suppression check inside execute_with_in_tx_substitute
+        // (`is_write_only_plan`) drops them, matching pre-
+        // surfacing behaviour.
+        let store = self.store.clone();
+        let routing = self.routing.clone();
+        let plan_for_substitution = plan;
+        let final_rows = tokio::task::spawn_blocking(
+            move || -> std::result::Result<Vec<meshdb_executor::Row>, meshdb_executor::Error> {
+                let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
+                let writer = BufferingGraphWriter::new();
+                let mut procs = ProcedureRegistry::new();
+                procs.register_defaults();
+                if let Some(r) = routing.as_ref() {
+                    let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
+                    meshdb_executor::execute_with_in_tx_substitute(
+                        &plan_for_substitution,
+                        all_output,
+                        &partitioned as &dyn GraphReader,
+                        &writer as &dyn GraphWriter,
+                        &params,
+                        &procs,
+                    )
+                } else {
+                    meshdb_executor::execute_with_in_tx_substitute(
+                        &plan_for_substitution,
+                        all_output,
+                        &storage_reader as &dyn GraphReader,
+                        &writer as &dyn GraphWriter,
+                        &params,
+                        &procs,
+                    )
+                }
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(format!("post-batch projection panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("post-batch projection failed: {e}")))?;
+        Ok((final_rows, Vec::new()))
     }
 
     /// True when `plan` carries a `CallSubqueryInTransactions`
@@ -1369,6 +1425,52 @@ pub(crate) fn apply_prepared_batch(
         return Ok(());
     }
     store.apply_batch(&flat)
+}
+
+/// Find the (single) `CallSubqueryInTransactions` node in
+/// `plan` and return clones of its input plan, body plan,
+/// batch size, and error mode. The dispatcher uses these to
+/// drive the per-batch loop independently of the wrapping
+/// clauses (Project / OrderBy / etc.) that surround the IN
+/// TRANSACTIONS node in the original plan tree.
+fn find_in_transactions_node(
+    plan: &meshdb_cypher::LogicalPlan,
+) -> Option<(
+    meshdb_cypher::LogicalPlan,
+    meshdb_cypher::LogicalPlan,
+    i64,
+    meshdb_cypher::OnErrorMode,
+)> {
+    use meshdb_cypher::LogicalPlan as P;
+    match plan {
+        P::CallSubqueryInTransactions {
+            input,
+            body,
+            batch_size,
+            error_mode,
+        } => Some((
+            (**input).clone(),
+            (**body).clone(),
+            *batch_size,
+            *error_mode,
+        )),
+        P::Filter { input, .. }
+        | P::Project { input, .. }
+        | P::Aggregate { input, .. }
+        | P::Distinct { input }
+        | P::OrderBy { input, .. }
+        | P::Skip { input, .. }
+        | P::Limit { input, .. }
+        | P::Identity { input }
+        | P::CoalesceNullRow { input, .. }
+        | P::UnwindChain { input, .. }
+        | P::BindPath { input, .. }
+        | P::ShortestPath { input, .. } => find_in_transactions_node(input),
+        // Other variants don't normally wrap an IN TRANSACTIONS
+        // node in practice — and even if they did, the planner
+        // would reject the resulting structure as ill-formed.
+        _ => None,
+    }
 }
 
 /// True when `plan` carries a `CallSubqueryInTransactions`
