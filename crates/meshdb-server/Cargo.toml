@@ -47,14 +47,17 @@ rcgen = "0.13"
 rustls-pki-types = "1"
 
 [features]
-# APOC-compatible scalars are split per namespace. Pick the subset
-# you want or turn everything on with `--features apoc`. Default
-# builds stay lean.
+# APOC-compatible scalars and procedures ship enabled by
+# default — the `apoc` umbrella feature pulls in every
+# namespace meshdb-executor knows about. Build with
+# `--no-default-features` to opt out, optionally re-enabling
+# specific namespaces:
 #
-# Examples:
-#   cargo install meshdb-server --features apoc        # everything
-#   cargo install meshdb-server --features apoc-coll   # just apoc.coll.*
-default = []
+#   cargo install meshdb-server                                          # full APOC (default)
+#   cargo install meshdb-server --no-default-features                    # no APOC at all
+#   cargo install meshdb-server --no-default-features --features apoc-coll
+#                                                                        # just apoc.coll.*
+default = ["apoc"]
 apoc-coll = ["meshdb-executor/apoc-coll"]
 apoc-text = ["meshdb-executor/apoc-text"]
 apoc-map = ["meshdb-executor/apoc-map"]

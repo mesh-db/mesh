@@ -316,15 +316,17 @@ and spatial `Point` (Cartesian 2D/3D, WGS-84 2D/3D, EPSG-tagged).
 ### APOC compatibility
 
 Mesh ships an APOC-compatible surface in the standalone `meshdb-apoc`
-crate. Each namespace is gated behind a Cargo feature so default builds
-pay nothing; turn on the umbrella `apoc` feature to get everything, or
-opt in per-namespace:
+crate, enabled by default. The default-features build of
+`meshdb-server` includes the full APOC namespace set; embedded callers
+wanting a slimmer binary can opt out:
 
 ```sh
-cargo install meshdb-server --version 0.1.0-alpha.6 --features apoc
-# or just the namespaces you need:
+cargo install meshdb-server --version 0.1.0-alpha.6
+# trim it back: no APOC at all
+cargo install meshdb-server --version 0.1.0-alpha.6 --no-default-features
+# or just specific namespaces
 cargo install meshdb-server --version 0.1.0-alpha.6 \
-  --features apoc-coll,apoc-text,apoc-create
+  --no-default-features --features apoc-coll,apoc-text,apoc-create
 ```
 
 Shipped today:

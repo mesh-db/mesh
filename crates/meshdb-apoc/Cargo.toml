@@ -18,11 +18,15 @@ chrono = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [features]
-# Per-namespace opt-in. Each feature gates the module that
-# implements that `apoc.<namespace>.*` surface, so a build with
-# `--features coll` compiles only the collection helpers and
-# leaves every other namespace as an unknown-function error.
-default = []
+# Defaults to the full surface — depending on `meshdb-apoc`
+# without `default-features = false` gets every shipped
+# namespace compiled in. Embedded callers wanting a slimmer
+# build can disable defaults and pick specific namespaces.
+# Each feature gates the module that implements that
+# `apoc.<namespace>.*` surface; a `--no-default-features`
+# build with no per-namespace opt-ins leaves every namespace
+# as an unknown-function error.
+default = ["full"]
 
 # `apoc.coll.*` — sum / avg / max / min / toSet / sort / sortDesc /
 # reverse / contains / union / intersection / subtract / flatten.

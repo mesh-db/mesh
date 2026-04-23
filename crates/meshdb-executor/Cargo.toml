@@ -22,13 +22,13 @@ uuid.workspace = true
 tempfile = "3"
 
 [features]
-# APOC-compatible scalars are split into per-namespace sub-features
-# so users can compile in exactly the subset they need. Turning on
-# any sub-feature activates the executor-side adapter via the
-# private `__apoc` marker; the umbrella `apoc` feature pulls in
-# every shipped namespace and is the convenience knob for "just
-# give me all of APOC".
-default = []
+# APOC-compatible scalars and procedures ship enabled by
+# default — the `apoc` umbrella feature pulls in every shipped
+# namespace. Embedded callers wanting a slimmer build use
+# `default-features = false` and re-enable specific apoc-*
+# sub-features as needed; turning on any one of them activates
+# the executor-side adapter via the private `__apoc` marker.
+default = ["apoc"]
 
 # Private marker — any `apoc-*` sub-feature depends on it so the
 # adapter code in `eval.rs` only compiles when something actually
