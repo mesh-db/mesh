@@ -381,6 +381,21 @@ impl MeshService {
                 .execute_call_in_transactions(plan, params, prev_commands)
                 .await;
         }
+        // apoc.periodic.iterate has the same explicit-tx
+        // restriction as IN TRANSACTIONS for the same reason —
+        // each batch commits independently.
+        if plan_contains_apoc_periodic_iterate(&plan) {
+            if in_explicit_tx {
+                return Err(Status::failed_precondition(
+                    "apoc.periodic.iterate is not allowed inside an explicit \
+                     transaction (BEGIN / COMMIT). Run the statement as auto-commit \
+                     instead.",
+                ));
+            }
+            return self
+                .execute_apoc_periodic_iterate(plan, params, prev_commands)
+                .await;
+        }
 
         // Metric increments. The mode label is set once per query
         // and reused for both the counter and the latency
@@ -755,6 +770,240 @@ impl MeshService {
     /// True when `plan` carries a `CallSubqueryInTransactions`
     /// node anywhere in its tree — used by `execute_cypher_in_tx`
     /// to detect the IN TRANSACTIONS form before dispatching.
+
+    /// Execute a plan whose top-level node is (or wraps) an
+    /// [`meshdb_cypher::LogicalPlan::ApocPeriodicIterate`].
+    /// Drains the iterate plan into rows, then for each batch
+    /// runs the action plan once per input row with the row's
+    /// columns injected as `$<column>` parameters, committing
+    /// each batch as its own transaction (ON ERROR
+    /// CONTINUE-style — failed batches are recorded but don't
+    /// abort the run). Aggregates per-batch outcomes into a
+    /// single APOC-shape result row that gets folded back into
+    /// any wrapping plan via the substitute mechanism.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_apoc_periodic_iterate(
+        &self,
+        plan: meshdb_cypher::LogicalPlan,
+        params: meshdb_executor::ParamMap,
+        prev_commands: Vec<GraphCommand>,
+    ) -> std::result::Result<(Vec<meshdb_executor::Row>, Vec<GraphCommand>), Status> {
+        if !prev_commands.is_empty() {
+            return Err(Status::failed_precondition(
+                "apoc.periodic.iterate dispatched with a non-empty buffered command set \
+                 — the in-explicit-tx check upstream should have rejected this case",
+            ));
+        }
+        let (iterate_plan, action_plan, batch_size, extra_params_exprs) =
+            match find_apoc_periodic_iterate_node(&plan) {
+                Some(parts) => parts,
+                None => {
+                    return Err(Status::failed_precondition(
+                        "execute_apoc_periodic_iterate called on a plan without an \
+                         ApocPeriodicIterate node — the dispatcher upstream miswired this",
+                    ));
+                }
+            };
+
+        // Evaluate any `params` config entries once at start
+        // against the existing `params` ParamMap so per-row
+        // execution sees a stable extra-param baseline.
+        let extra_params: meshdb_executor::ParamMap = {
+            let store = self.store.clone();
+            let routing = self.routing.clone();
+            let base_params = params.clone();
+            tokio::task::spawn_blocking(
+                move || -> std::result::Result<meshdb_executor::ParamMap, meshdb_executor::Error> {
+                    eval_extra_params(&extra_params_exprs, &base_params, &store, routing.as_ref())
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("extra_params eval panicked: {e}")))?
+            .map_err(|e| Status::internal(format!("extra_params eval failed: {e}")))?
+        };
+
+        // Drain the iterate query into Vec<Row>. Iterate runs
+        // read-only — its writes (if any, e.g. side-effect
+        // procedures) go to a throwaway BufferingGraphWriter
+        // that's never committed, matching Neo4j semantics.
+        let input_rows: Vec<meshdb_executor::Row> = {
+            let store = self.store.clone();
+            let routing = self.routing.clone();
+            let iterate_plan = iterate_plan;
+            let params = params.clone();
+            tokio::task::spawn_blocking(
+                move || -> std::result::Result<_, meshdb_executor::Error> {
+                    let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
+                    let writer = BufferingGraphWriter::new();
+                    let mut procs = ProcedureRegistry::new();
+                    procs.register_defaults();
+                    if let Some(r) = routing.as_ref() {
+                        let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
+                        meshdb_executor::execute_with_reader_and_procs(
+                            &iterate_plan,
+                            &partitioned as &dyn GraphReader,
+                            &writer as &dyn GraphWriter,
+                            &params,
+                            &procs,
+                        )
+                    } else {
+                        meshdb_executor::execute_with_reader_and_procs(
+                            &iterate_plan,
+                            &storage_reader as &dyn GraphReader,
+                            &writer as &dyn GraphWriter,
+                            &params,
+                            &procs,
+                        )
+                    }
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("apoc.periodic.iterate iterate panicked: {e}")))?
+            .map_err(|e| Status::internal(format!("apoc.periodic.iterate iterate failed: {e}")))?
+        };
+
+        let started_at = std::time::Instant::now();
+        let mut batches_count: i64 = 0;
+        let mut total: i64 = 0;
+        let mut committed_ops: i64 = 0;
+        let mut failed_ops: i64 = 0;
+        let mut failed_batches: i64 = 0;
+        let mut error_messages: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let bs = batch_size.max(1) as usize;
+
+        for chunk in input_rows.chunks(bs) {
+            batches_count += 1;
+            let chunk_size = chunk.len() as i64;
+            total += chunk_size;
+            let chunk_rows: Vec<meshdb_executor::Row> = chunk.to_vec();
+            let action_plan = action_plan.clone();
+            let store = self.store.clone();
+            let routing = self.routing.clone();
+            let extra_params = extra_params.clone();
+
+            let outcome = tokio::task::spawn_blocking(
+                move || -> std::result::Result<Vec<GraphCommand>, meshdb_executor::Error> {
+                    let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
+                    let writer = BufferingGraphWriter::new();
+                    let mut procs = ProcedureRegistry::new();
+                    procs.register_defaults();
+                    for row in chunk_rows {
+                        // Per-row ParamMap: extra_params first
+                        // (lower precedence), then iterate row
+                        // overrides on key collision.
+                        let mut row_params = extra_params.clone();
+                        for (k, v) in row {
+                            row_params.insert(k, v);
+                        }
+                        if let Some(r) = routing.as_ref() {
+                            let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
+                            meshdb_executor::execute_with_reader_and_procs(
+                                &action_plan,
+                                &partitioned as &dyn GraphReader,
+                                &writer as &dyn GraphWriter,
+                                &row_params,
+                                &procs,
+                            )?;
+                        } else {
+                            meshdb_executor::execute_with_reader_and_procs(
+                                &action_plan,
+                                &storage_reader as &dyn GraphReader,
+                                &writer as &dyn GraphWriter,
+                                &row_params,
+                                &procs,
+                            )?;
+                        }
+                    }
+                    Ok(writer.into_commands())
+                },
+            )
+            .await
+            .map_err(|e| {
+                Status::internal(format!("batch {batches_count} executor panicked: {e}"))
+            })?;
+
+            match outcome {
+                Ok(commands) => match self.commit_buffered_commands(commands).await {
+                    Ok(()) => {
+                        committed_ops += chunk_size;
+                    }
+                    Err(e) => {
+                        failed_ops += chunk_size;
+                        failed_batches += 1;
+                        *error_messages.entry(e.message().to_string()).or_insert(0) += 1;
+                        tracing::warn!(
+                            batch = batches_count,
+                            error = %e.message(),
+                            "apoc.periodic.iterate — commit failed; counting as failed batch"
+                        );
+                    }
+                },
+                Err(e) => {
+                    failed_ops += chunk_size;
+                    failed_batches += 1;
+                    *error_messages.entry(e.to_string()).or_insert(0) += 1;
+                    tracing::warn!(
+                        batch = batches_count,
+                        error = %e,
+                        "apoc.periodic.iterate — action failed; counting as failed batch"
+                    );
+                }
+            }
+        }
+        let time_taken = started_at.elapsed().as_millis() as i64;
+
+        // Build the standard APOC result row.
+        let result_row = build_apoc_periodic_iterate_row(
+            batches_count,
+            total,
+            committed_ops,
+            failed_ops,
+            failed_batches,
+            time_taken,
+            &error_messages,
+        );
+
+        // Fold back into the wrapping plan via the substitute
+        // mechanism. The plan's ApocPeriodicIterate node gets
+        // swapped for a RowsLiteralOp yielding our single
+        // result row, and any wrapping clauses run untouched.
+        let store = self.store.clone();
+        let routing = self.routing.clone();
+        let plan_for_substitution = plan;
+        let final_rows = tokio::task::spawn_blocking(
+            move || -> std::result::Result<Vec<meshdb_executor::Row>, meshdb_executor::Error> {
+                let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
+                let writer = BufferingGraphWriter::new();
+                let mut procs = ProcedureRegistry::new();
+                procs.register_defaults();
+                if let Some(r) = routing.as_ref() {
+                    let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
+                    meshdb_executor::execute_with_in_tx_substitute(
+                        &plan_for_substitution,
+                        vec![result_row],
+                        &partitioned as &dyn GraphReader,
+                        &writer as &dyn GraphWriter,
+                        &params,
+                        &procs,
+                    )
+                } else {
+                    meshdb_executor::execute_with_in_tx_substitute(
+                        &plan_for_substitution,
+                        vec![result_row],
+                        &storage_reader as &dyn GraphReader,
+                        &writer as &dyn GraphWriter,
+                        &params,
+                        &procs,
+                    )
+                }
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(format!("apoc.periodic.iterate projection panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("apoc.periodic.iterate projection failed: {e}")))?;
+        Ok((final_rows, Vec::new()))
+    }
 
     /// Commit a batch of `GraphCommand`s through the active backend.
     /// Used by both the auto-commit single-RUN path and the Bolt
@@ -1446,6 +1695,143 @@ pub(crate) fn apply_prepared_batch(
     store.apply_batch(&flat)
 }
 
+/// Find the (single) `ApocPeriodicIterate` node in `plan` and
+/// return clones of its iterate plan, action plan, batch size,
+/// and extra-params expressions. The dispatcher uses these to
+/// drive the per-batch loop independently of any wrapping
+/// clauses (Project / OrderBy / Limit / etc.) that surround
+/// the procedure call site in the original plan tree.
+fn find_apoc_periodic_iterate_node(
+    plan: &meshdb_cypher::LogicalPlan,
+) -> Option<(
+    meshdb_cypher::LogicalPlan,
+    meshdb_cypher::LogicalPlan,
+    i64,
+    std::collections::HashMap<String, meshdb_cypher::Expr>,
+)> {
+    use meshdb_cypher::LogicalPlan as P;
+    match plan {
+        P::ApocPeriodicIterate {
+            iterate,
+            action,
+            batch_size,
+            extra_params,
+        } => Some((
+            (**iterate).clone(),
+            (**action).clone(),
+            *batch_size,
+            extra_params.clone(),
+        )),
+        P::Filter { input, .. }
+        | P::Project { input, .. }
+        | P::Aggregate { input, .. }
+        | P::Distinct { input }
+        | P::OrderBy { input, .. }
+        | P::Skip { input, .. }
+        | P::Limit { input, .. }
+        | P::Identity { input }
+        | P::CoalesceNullRow { input, .. }
+        | P::UnwindChain { input, .. }
+        | P::BindPath { input, .. }
+        | P::ShortestPath { input, .. } => find_apoc_periodic_iterate_node(input),
+        _ => None,
+    }
+}
+
+/// Evaluate the `params` config map's expressions once, against
+/// the calling query's existing param map. Returns a fresh
+/// ParamMap suitable for merging with each input row's
+/// bindings. Uses a lightweight execute path because the
+/// expressions are typically literals/parameters — running them
+/// via the full operator pipeline would be overkill, but reusing
+/// `execute_with_reader_and_procs` keeps the eval consistent.
+fn eval_extra_params(
+    exprs: &std::collections::HashMap<String, meshdb_cypher::Expr>,
+    base_params: &meshdb_executor::ParamMap,
+    store: &std::sync::Arc<dyn StorageEngine>,
+    routing: Option<&std::sync::Arc<Routing>>,
+) -> std::result::Result<meshdb_executor::ParamMap, meshdb_executor::Error> {
+    if exprs.is_empty() {
+        return Ok(base_params.clone());
+    }
+    // Wrap each (name, expr) in a synthetic `RETURN <expr> AS <name>`
+    // statement plan so the executor evaluates it correctly. We
+    // build one synthetic Project + SeedRow per binding — small
+    // overhead, never benchmarked because `params` lists are
+    // typically tiny.
+    let mut out = base_params.clone();
+    for (name, expr) in exprs {
+        let plan = meshdb_cypher::LogicalPlan::Project {
+            input: Box::new(meshdb_cypher::LogicalPlan::SeedRow),
+            items: vec![meshdb_cypher::ReturnItem {
+                expr: expr.clone(),
+                alias: Some(name.clone()),
+                raw_text: None,
+            }],
+        };
+        let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
+        let writer = BufferingGraphWriter::new();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let rows = if let Some(r) = routing {
+            let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
+            meshdb_executor::execute_with_reader_and_procs(
+                &plan,
+                &partitioned as &dyn GraphReader,
+                &writer as &dyn GraphWriter,
+                base_params,
+                &procs,
+            )?
+        } else {
+            meshdb_executor::execute_with_reader_and_procs(
+                &plan,
+                &storage_reader as &dyn GraphReader,
+                &writer as &dyn GraphWriter,
+                base_params,
+                &procs,
+            )?
+        };
+        if let Some(row) = rows.into_iter().next() {
+            if let Some(value) = row.get(name).cloned() {
+                out.insert(name.clone(), value);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Build the standard 8-column apoc.periodic.iterate result
+/// row from accumulated batch counters.
+fn build_apoc_periodic_iterate_row(
+    batches: i64,
+    total: i64,
+    committed_ops: i64,
+    failed_ops: i64,
+    failed_batches: i64,
+    time_taken_ms: i64,
+    error_messages: &std::collections::HashMap<String, i64>,
+) -> meshdb_executor::Row {
+    use meshdb_core::Property;
+    let mut row = meshdb_executor::Row::new();
+    let v = |p: Property| meshdb_executor::Value::Property(p);
+    row.insert("batches".into(), v(Property::Int64(batches)));
+    row.insert("total".into(), v(Property::Int64(total)));
+    row.insert(
+        "committedOperations".into(),
+        v(Property::Int64(committed_ops)),
+    );
+    row.insert("failedOperations".into(), v(Property::Int64(failed_ops)));
+    row.insert("failedBatches".into(), v(Property::Int64(failed_batches)));
+    row.insert("timeTaken".into(), v(Property::Int64(time_taken_ms)));
+    row.insert("wasTerminated".into(), v(Property::Bool(false)));
+    let err_map: std::collections::HashMap<String, Property> = error_messages
+        .iter()
+        .map(|(k, n)| (k.clone(), Property::Int64(*n)))
+        .collect();
+    row.insert("errorMessages".into(), v(Property::Map(err_map)));
+    row
+}
+
 /// Build the `REPORT STATUS AS <var>` row for a single batch:
 /// one Row with `var → Map { started, committed, errorMessage,
 /// transactionId }`. Mirrors Neo4j 5's status surface.
@@ -1523,6 +1909,36 @@ fn find_in_transactions_node(
         // node in practice — and even if they did, the planner
         // would reject the resulting structure as ill-formed.
         _ => None,
+    }
+}
+
+/// True when `plan` carries an `ApocPeriodicIterate` node
+/// anywhere in its tree. Used by `execute_cypher_in_tx` to
+/// route `apoc.periodic.iterate` calls to a custom batched
+/// dispatcher rather than the regular operator pipeline (which
+/// would panic at `build_op` because the variant requires a
+/// row substitute).
+fn plan_contains_apoc_periodic_iterate(plan: &meshdb_cypher::LogicalPlan) -> bool {
+    use meshdb_cypher::LogicalPlan as P;
+    match plan {
+        P::ApocPeriodicIterate { .. } => true,
+        P::Filter { input, .. }
+        | P::Project { input, .. }
+        | P::Aggregate { input, .. }
+        | P::Distinct { input }
+        | P::OrderBy { input, .. }
+        | P::Skip { input, .. }
+        | P::Limit { input, .. }
+        | P::Identity { input }
+        | P::CoalesceNullRow { input, .. }
+        | P::EdgeExpand { input, .. }
+        | P::OptionalEdgeExpand { input, .. }
+        | P::VarLengthExpand { input, .. }
+        | P::MergeEdge { input, .. }
+        | P::UnwindChain { input, .. }
+        | P::BindPath { input, .. }
+        | P::ShortestPath { input, .. } => plan_contains_apoc_periodic_iterate(input),
+        _ => false,
     }
 }
 
@@ -1615,6 +2031,9 @@ fn count_index_seeks(plan: &meshdb_cypher::LogicalPlan) -> u64 {
         P::MergeNode { input, .. } => input.as_deref().map(count_index_seeks).unwrap_or(0),
         P::ProcedureCall { input, .. } => input.as_deref().map(count_index_seeks).unwrap_or(0),
         P::OptionalApply { input, body, .. } => count_index_seeks(input) + count_index_seeks(body),
+        P::ApocPeriodicIterate {
+            iterate, action, ..
+        } => count_index_seeks(iterate) + count_index_seeks(action),
         P::NodeScanAll { .. }
         | P::NodeScanByLabels { .. }
         | P::Unwind { .. }

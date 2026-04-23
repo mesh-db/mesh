@@ -391,6 +391,12 @@ fn plan_contains_writes(plan: &LogicalPlan) -> bool {
         // (e.g. a preceding CREATE before the CALL). Recurse only
         // into the input.
         CallSubqueryInTransactions { input, .. } => plan_contains_writes(input),
+        // apoc.periodic.iterate is fully self-contained: both
+        // iterate and action subtrees are run by the dispatcher,
+        // not by the surrounding operator pipeline. From a
+        // wrapping LimitOp's perspective, no writes pass
+        // through this node.
+        ApocPeriodicIterate { .. } => false,
 
         // Variants whose `input` is optional (top-level producer
         // when `None`).
@@ -892,17 +898,20 @@ pub(crate) fn build_op_inner(
         LogicalPlan::CallSubquery { input, body } => {
             Box::new(CallSubqueryOp::new(child!(input), (**body).clone()))
         }
-        LogicalPlan::CallSubqueryInTransactions { .. } => {
-            // CALL ... IN TRANSACTIONS commits each batch in its
-            // own transaction, which the operator pipeline can't
-            // do (it has no commit handle). The dispatcher above
+        LogicalPlan::CallSubqueryInTransactions { .. }
+        | LogicalPlan::ApocPeriodicIterate { .. } => {
+            // CALL ... IN TRANSACTIONS and apoc.periodic.iterate
+            // both commit each batch in its own transaction,
+            // which the operator pipeline can't do (it has no
+            // commit handle). The dispatcher above
             // (`MeshService::execute_cypher_in_tx`) does the
-            // batched execution itself, then folds the resulting
-            // rows back into the pipeline by passing them via
-            // `in_tx_substitute`. We swap a `RowsLiteralOp` in
-            // place of the IN TRANSACTIONS node so any wrapping
-            // Project / OrderBy / Limit / etc. operators run
-            // untouched against those pre-materialized rows.
+            // batched execution itself, then folds the
+            // resulting rows back into the pipeline by passing
+            // them via `in_tx_substitute`. We swap a
+            // `RowsLiteralOp` in place of the batched node so
+            // any wrapping Project / OrderBy / Limit / etc.
+            // operators run untouched against those
+            // pre-materialized rows.
             //
             // Reaching this arm with `in_tx_substitute = None`
             // means the dispatcher was bypassed — panic loudly
@@ -910,10 +919,11 @@ pub(crate) fn build_op_inner(
             match in_tx_substitute.take() {
                 Some(rows) => Box::new(RowsLiteralOp::new(rows)),
                 None => panic!(
-                    "LogicalPlan::CallSubqueryInTransactions reached `build_op` without a \
-                     row substitute — the server-side dispatcher \
-                     (execute_cypher_in_tx → execute_call_in_transactions) must inject one \
-                     before invoking the operator pipeline"
+                    "Batched-commit LogicalPlan variant reached `build_op` without a row \
+                     substitute — the server-side dispatcher \
+                     (execute_cypher_in_tx → execute_call_in_transactions / \
+                     execute_apoc_periodic_iterate) must inject one before invoking the \
+                     operator pipeline"
                 ),
             }
         }

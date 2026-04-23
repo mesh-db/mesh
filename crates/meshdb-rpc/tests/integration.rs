@@ -3032,3 +3032,182 @@ async fn call_in_transactions_report_status_transaction_ids_unique() {
     let unique: std::collections::HashSet<_> = ids.iter().cloned().collect();
     assert_eq!(unique.len(), 3, "transactionIds should be unique per batch");
 }
+
+// ---------------------------------------------------------------
+// apoc.periodic.iterate — APOC's batched-migration procedure.
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn apoc_periodic_iterate_basic_creates_all_target_nodes() {
+    // Iterate over a small UNWIND list, action creates one node
+    // per row. The iterate's RETURN columns become $-params for
+    // the action.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let rows = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [1, 2, 3, 4, 5] AS x RETURN x',\
+                'CREATE (:ApocBatched {n: $x})',\
+                {batchSize: 2}\
+            ) YIELD batches, total, committedOperations, failedOperations, failedBatches \
+             RETURN batches, total, committedOperations, failedOperations, failedBatches"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("apoc.periodic.iterate should succeed");
+    assert_eq!(rows.len(), 1, "apoc.periodic.iterate emits one summary row");
+    let r = &rows[0];
+    let int_col = |name: &str| match r.get(name).unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("expected Int64 for {name}, got {other:?}"),
+    };
+    // 5 rows / batchSize 2 = 3 batches (2, 2, 1).
+    assert_eq!(int_col("batches"), 3);
+    assert_eq!(int_col("total"), 5);
+    assert_eq!(int_col("committedOperations"), 5);
+    assert_eq!(int_col("failedOperations"), 0);
+    assert_eq!(int_col("failedBatches"), 0);
+    // Verify writes landed.
+    let count_rows = service
+        .execute_cypher_local(
+            "MATCH (n:ApocBatched) RETURN count(n) AS c".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let c = match count_rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("got {other:?}"),
+    };
+    assert_eq!(c, 5);
+}
+
+#[tokio::test]
+async fn apoc_periodic_iterate_continues_past_failed_batch() {
+    // UNIQUE constraint + duplicate value in the iterate stream.
+    // apoc.periodic.iterate uses ON ERROR CONTINUE-style
+    // semantics by default — failed batches counted, run
+    // proceeds.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    service
+        .execute_cypher_local(
+            "CREATE CONSTRAINT k_uniq FOR (n:ApocK) REQUIRE n.k IS UNIQUE".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    service
+        .execute_cypher_local("CREATE (:ApocK {k: 99})".into(), ParamMap::new())
+        .await
+        .unwrap();
+    let rows = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [1, 2, 99, 4] AS x RETURN x',\
+                'CREATE (:ApocK {k: $x})',\
+                {batchSize: 1}\
+            ) YIELD batches, total, committedOperations, failedOperations, failedBatches, errorMessages \
+             RETURN batches, total, committedOperations, failedOperations, failedBatches, errorMessages"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("CONTINUE-style iterate should succeed overall");
+    let r = &rows[0];
+    let int_col = |name: &str| match r.get(name).unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("got {other:?}"),
+    };
+    assert_eq!(int_col("batches"), 4);
+    assert_eq!(int_col("total"), 4);
+    // 3 batches commit (1, 2, 4), 1 fails (99).
+    assert_eq!(int_col("committedOperations"), 3);
+    assert_eq!(int_col("failedOperations"), 1);
+    assert_eq!(int_col("failedBatches"), 1);
+    // errorMessages is a Map keyed by error string — there's
+    // at least one entry covering the constraint violation.
+    match r.get("errorMessages").unwrap() {
+        Value::Property(Property::Map(m)) => {
+            assert!(!m.is_empty(), "errorMessages should be non-empty");
+            let any_const = m.keys().any(|k| {
+                let kl = k.to_lowercase();
+                kl.contains("constraint") || kl.contains("unique") || kl.contains("k_uniq")
+            });
+            assert!(
+                any_const,
+                "expected constraint-related error key, got {:?}",
+                m.keys().collect::<Vec<_>>()
+            );
+        }
+        other => panic!("expected Map, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn apoc_periodic_iterate_extra_params_merge_with_iterate_columns() {
+    // config.params provides an extra `multiplier` parameter
+    // alongside the iterate row's `x` column.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [10, 20, 30] AS x RETURN x',\
+                'CREATE (:Scaled {n: $x * $multiplier})',\
+                {batchSize: 10, params: {multiplier: 7}}\
+            ) YIELD batches RETURN batches"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("config.params should be honored");
+    let scaled = service
+        .execute_cypher_local(
+            "MATCH (n:Scaled) RETURN n.n AS v ORDER BY v".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let got: Vec<i64> = scaled
+        .iter()
+        .map(|r| match r.get("v").unwrap() {
+            Value::Property(Property::Int64(n)) => *n,
+            other => panic!("got {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec![70, 140, 210]);
+}
+
+#[tokio::test]
+async fn apoc_periodic_iterate_rejects_unknown_yield_column() {
+    // Asking for a YIELD column the procedure doesn't produce
+    // is a plan-time error.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let err = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'RETURN 1 AS x',\
+                'CREATE (:T)',\
+                {}\
+            ) YIELD frobnicated RETURN frobnicated"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .err()
+        .expect("unknown YIELD column should error");
+    let msg = err.message().to_lowercase();
+    assert!(
+        msg.contains("output column") && msg.contains("frobnicated"),
+        "expected unknown-column message, got: {}",
+        err.message(),
+    );
+}

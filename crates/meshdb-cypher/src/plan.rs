@@ -385,6 +385,28 @@ pub enum LogicalPlan {
         /// `committed`, `errorMessage`, and `transactionId`.
         report_status_as: Option<String>,
     },
+    /// `apoc.periodic.iterate(iterateQuery, actionQuery,
+    /// {batchSize, params})` — the Neo4j APOC procedure for
+    /// batched migrations. Synthesised at planning time when a
+    /// `CALL apoc.periodic.iterate(...)` is recognised: both
+    /// query strings are parsed and planned eagerly, and the
+    /// dispatcher runs the action once per row of the iterate
+    /// query's output (with that row's RETURN columns injected
+    /// as `$param` values) in `batch_size` batches with
+    /// ON ERROR CONTINUE-style semantics. Always emits exactly
+    /// one result row carrying the standard APOC columns
+    /// (`batches`, `total`, `committedOperations`,
+    /// `failedOperations`, `failedBatches`, `errorMessages`,
+    /// `timeTaken`, `wasTerminated`).
+    ApocPeriodicIterate {
+        iterate: Box<LogicalPlan>,
+        action: Box<LogicalPlan>,
+        batch_size: i64,
+        /// Extra params merged into the per-row `$param` map
+        /// (the Neo4j `params` config option). The iterate
+        /// row's bindings take precedence on key collision.
+        extra_params: std::collections::HashMap<String, crate::ast::Expr>,
+    },
     /// Per-input-row left-join wrapper used by `apply_optional_match`
     /// when the OPTIONAL MATCH body is a multi-hop pattern. Runs
     /// `body` as a fresh sub-plan seeded with each outer row, then:
@@ -1200,6 +1222,20 @@ fn format_plan_inner(plan: &LogicalPlan, buf: &mut String, depth: usize) {
             buf.push_str(&format!("{indent}  input:\n"));
             format_plan_inner(input, buf, depth + 2);
         }
+        LogicalPlan::ApocPeriodicIterate {
+            iterate,
+            action,
+            batch_size,
+            ..
+        } => {
+            buf.push_str(&format!(
+                "{indent}ApocPeriodicIterate(batch_size={batch_size})\n"
+            ));
+            buf.push_str(&format!("{indent}  iterate:\n"));
+            format_plan_inner(iterate, buf, depth + 2);
+            buf.push_str(&format!("{indent}  action:\n"));
+            format_plan_inner(action, buf, depth + 2);
+        }
         LogicalPlan::OptionalApply {
             input,
             body,
@@ -1838,6 +1874,11 @@ where
         | LogicalPlan::CreatePropertyConstraint { .. }
         | LogicalPlan::DropPropertyConstraint { .. }
         | LogicalPlan::ShowPropertyConstraints => Ok(()),
+        // ApocPeriodicIterate carries fully-planned subtrees;
+        // it doesn't expose its own scoped expressions to the
+        // outer scope, so the walker stops here. The dispatcher
+        // walks the subtrees independently when it runs them.
+        LogicalPlan::ApocPeriodicIterate { .. } => Ok(()),
     }
 }
 
@@ -2095,6 +2136,153 @@ fn union_branch_columns(stmt: &Statement) -> Result<Vec<String>> {
 /// `None` means the body's projection is `RETURN *` or an untyped
 /// CALL without YIELD — the outer scope extension is skipped because
 /// the column set can't be derived from the AST alone.
+/// Standard set of column names that
+/// [`LogicalPlan::ApocPeriodicIterate`] yields. Mirrors the
+/// Neo4j 5 surface so an apoc-aware client's YIELD list works
+/// unchanged. The dispatcher always emits exactly these columns
+/// in the result row.
+pub const APOC_PERIODIC_ITERATE_COLUMNS: &[&str] = &[
+    "batches",
+    "total",
+    "committedOperations",
+    "failedOperations",
+    "failedBatches",
+    "errorMessages",
+    "timeTaken",
+    "wasTerminated",
+];
+
+/// Plan-time rewrite of a `CALL apoc.periodic.iterate(iterateQ,
+/// actionQ, config)` procedure call into the dedicated
+/// [`LogicalPlan::ApocPeriodicIterate`] variant. Validates the
+/// arg shapes (3 args, both query args literal strings, config
+/// is a literal map), parses + plans both query strings as
+/// independent sub-statements, and extracts `batchSize` and
+/// `params` from the config map.
+fn build_apoc_periodic_iterate(
+    pc: &crate::ast::ProcedureCall,
+    ctx: &PlannerContext,
+) -> Result<LogicalPlan> {
+    use crate::ast::{Expr, Literal};
+    let args = pc.args.as_ref().ok_or_else(|| {
+        Error::Plan(
+            "apoc.periodic.iterate requires (iterateQuery, actionQuery, config) args".into(),
+        )
+    })?;
+    if args.len() != 3 {
+        return Err(Error::Plan(format!(
+            "apoc.periodic.iterate expects 3 arguments (iterateQuery, actionQuery, \
+             config), got {}",
+            args.len()
+        )));
+    }
+    let iterate_str = expect_string_literal(&args[0], "iterateQuery (arg 1)")?;
+    let action_str = expect_string_literal(&args[1], "actionQuery (arg 2)")?;
+    let config_entries = expect_map_literal(&args[2], "config (arg 3)")?;
+
+    let mut batch_size: i64 = 10000;
+    let mut extra_params: std::collections::HashMap<String, Expr> =
+        std::collections::HashMap::new();
+    for (key, value) in &config_entries {
+        match key.as_str() {
+            "batchSize" => {
+                batch_size = match value {
+                    Expr::Literal(Literal::Integer(n)) if *n > 0 => *n,
+                    _ => {
+                        return Err(Error::Plan(
+                            "apoc.periodic.iterate config.batchSize must be a positive \
+                             integer literal"
+                                .into(),
+                        ));
+                    }
+                };
+            }
+            "params" => {
+                // The `params` config value is itself a map of
+                // extra param-name → expression bindings. We
+                // accept any literal map here; the dispatcher
+                // evaluates each binding once at execution
+                // start.
+                let pairs = expect_map_literal(value, "config.params")?;
+                for (k, v) in pairs {
+                    extra_params.insert(k, v);
+                }
+            }
+            // Silently accept Neo4j-only options (parallel,
+            // concurrency, iterateList, retries, failedParams)
+            // for forward-compatibility — this MVP commit only
+            // honors batchSize + params; the other knobs land
+            // in follow-up commits.
+            "parallel" | "concurrency" | "iterateList" | "retries" | "failedParams" => {}
+            other => {
+                return Err(Error::Plan(format!(
+                    "apoc.periodic.iterate: unknown config key {other:?}"
+                )));
+            }
+        }
+    }
+
+    // Parse + plan the iterate query.
+    let iterate_stmt = crate::parse(&iterate_str)
+        .map_err(|e| Error::Plan(format!("apoc.periodic.iterate iterateQuery: {e}")))?;
+    let iterate_plan = plan_with_context(&iterate_stmt, ctx)
+        .map_err(|e| Error::Plan(format!("apoc.periodic.iterate iterateQuery: {e}")))?;
+    // Parse + plan the action query. Action is run with a
+    // fresh PlannerContext (no outer bindings); per-row
+    // values flow in via `$param` substitution at execute time.
+    let action_stmt = crate::parse(&action_str)
+        .map_err(|e| Error::Plan(format!("apoc.periodic.iterate actionQuery: {e}")))?;
+    let action_plan = plan_with_context(&action_stmt, ctx)
+        .map_err(|e| Error::Plan(format!("apoc.periodic.iterate actionQuery: {e}")))?;
+
+    // YIELD validation: every requested column must be in the
+    // standard apoc result set, otherwise the executor would
+    // emit Null silently.
+    if let Some(crate::ast::YieldSpec::Items(items)) = &pc.yield_spec {
+        for yi in items {
+            if !APOC_PERIODIC_ITERATE_COLUMNS.contains(&yi.column.as_str()) {
+                return Err(Error::Plan(format!(
+                    "apoc.periodic.iterate has no output column {:?}; available: {:?}",
+                    yi.column, APOC_PERIODIC_ITERATE_COLUMNS
+                )));
+            }
+        }
+    }
+
+    Ok(LogicalPlan::ApocPeriodicIterate {
+        iterate: Box::new(iterate_plan),
+        action: Box::new(action_plan),
+        batch_size,
+        extra_params,
+    })
+}
+
+/// Helper: extract a literal-string expression's value or fail
+/// with a precise error citing the arg position.
+fn expect_string_literal(expr: &crate::ast::Expr, position: &str) -> Result<String> {
+    use crate::ast::{Expr, Literal};
+    match expr {
+        Expr::Literal(Literal::String(s)) => Ok(s.clone()),
+        _ => Err(Error::Plan(format!(
+            "apoc.periodic.iterate: {position} must be a string literal"
+        ))),
+    }
+}
+
+/// Helper: extract a literal-map expression's entries.
+fn expect_map_literal(
+    expr: &crate::ast::Expr,
+    position: &str,
+) -> Result<Vec<(String, crate::ast::Expr)>> {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Map(entries) => Ok(entries.clone()),
+        _ => Err(Error::Plan(format!(
+            "apoc.periodic.iterate: {position} must be a map literal"
+        ))),
+    }
+}
+
 fn call_subquery_output_columns(stmt: &Statement) -> Result<Option<Vec<String>>> {
     match stmt {
         Statement::Match(m) => {
@@ -5205,6 +5393,22 @@ fn plan_match(stmt: &MatchStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
                         // in-query CALL. Defer the check to the
                         // executor, where the registry is in scope.
                     }
+                }
+                // Apoc.periodic.iterate gets rewritten at plan
+                // time into a custom variant the dispatcher
+                // handles directly. Validates here so the
+                // ill-formed call surfaces as a plan error
+                // instead of a runtime registry miss.
+                if pc.qualified_name == ["apoc", "periodic", "iterate"] {
+                    let current_input = plan.take();
+                    let aip = build_apoc_periodic_iterate(pc, ctx)?;
+                    // The procedure call sits at the seam: any
+                    // upstream `current_input` is discarded — the
+                    // procedure is its own row producer and emits
+                    // exactly one summary row.
+                    drop(current_input);
+                    plan = Some(aip);
+                    continue;
                 }
                 plan = Some(LogicalPlan::ProcedureCall {
                     input: plan.take().map(Box::new),
