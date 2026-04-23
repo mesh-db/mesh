@@ -416,6 +416,18 @@ pub enum LogicalPlan {
         /// (default in Neo4j); 0 disables capture; positive
         /// values cap the per-error sample list length.
         failed_params_cap: i64,
+        /// `iterateList` config: when true, the action runs
+        /// ONCE per batch with the batch's input rows passed
+        /// as a single list parameter `$_batch` (each element
+        /// is a Map of the row's RETURN columns). The action
+        /// is expected to `UNWIND $_batch AS row` to process.
+        /// When false (default), the action runs once per
+        /// input row with the row's columns as `$column`
+        /// params. Defaults to false here for ergonomic
+        /// reasons — `$column` substitution is the simpler
+        /// mental model — but users following Neo4j-flavour
+        /// migration scripts can flip it on.
+        iterate_list: bool,
     },
     /// Per-input-row left-join wrapper used by `apply_optional_match`
     /// when the OPTIONAL MATCH body is a multi-hop pattern. Runs
@@ -2200,6 +2212,7 @@ fn build_apoc_periodic_iterate(
         std::collections::HashMap::new();
     let mut retries: i64 = 0;
     let mut failed_params_cap: i64 = -1;
+    let mut iterate_list: bool = false;
     for (key, value) in &config_entries {
         match key.as_str() {
             "batchSize" => {
@@ -2252,12 +2265,22 @@ fn build_apoc_periodic_iterate(
                     }
                 };
             }
-            // Forward-compat accept for options we don't yet
-            // honor (parallel / concurrency / iterateList);
-            // commit 3 of the apoc.periodic.iterate series
-            // implements iterateList, parallel/concurrency
-            // remain out of scope.
-            "parallel" | "concurrency" | "iterateList" => {}
+            "iterateList" => {
+                iterate_list = match value {
+                    Expr::Literal(Literal::Boolean(b)) => *b,
+                    _ => {
+                        return Err(Error::Plan(
+                            "apoc.periodic.iterate config.iterateList must be a boolean \
+                             literal"
+                                .into(),
+                        ));
+                    }
+                };
+            }
+            // Forward-compat accept for options Mesh doesn't
+            // execute against — Mesh has no parallel-action
+            // dispatch path.
+            "parallel" | "concurrency" => {}
             other => {
                 return Err(Error::Plan(format!(
                     "apoc.periodic.iterate: unknown config key {other:?}"
@@ -2300,6 +2323,7 @@ fn build_apoc_periodic_iterate(
         extra_params,
         retries,
         failed_params_cap,
+        iterate_list,
     })
 }
 

@@ -3395,3 +3395,95 @@ async fn apoc_periodic_iterate_failed_params_zero_disables_capture() {
         "failedParams=0 should disable capture entirely, got {fp:?}",
     );
 }
+
+#[tokio::test]
+async fn apoc_periodic_iterate_list_mode_runs_action_once_per_batch() {
+    // iterateList=true: action receives `$_batch` as a list of
+    // row-Maps and is invoked ONCE per batch. The action body
+    // unwraps via UNWIND $_batch AS row, then accesses
+    // row.<column> directly. With batchSize=2 over 5 rows,
+    // there are 3 batches and the action runs 3 times — but
+    // the writes still cover all 5 input rows.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let rows = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [1, 2, 3, 4, 5] AS x RETURN x',\
+                'UNWIND $_batch AS row CREATE (:ListMode {n: row.x})',\
+                {batchSize: 2, iterateList: true}\
+            ) YIELD batches, total, committedOperations, updateStatistics \
+             RETURN batches, total, committedOperations, updateStatistics"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("iterateList=true should succeed");
+    let r = &rows[0];
+    let int_col = |name: &str| match r.get(name).unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("got {other:?}"),
+    };
+    // 3 batches (2,2,1) processing 5 rows total.
+    assert_eq!(int_col("batches"), 3);
+    assert_eq!(int_col("total"), 5);
+    assert_eq!(int_col("committedOperations"), 5);
+    // Verify all 5 nodes landed.
+    let count_rows = service
+        .execute_cypher_local(
+            "MATCH (n:ListMode) RETURN count(n) AS c".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let c = match count_rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("got {other:?}"),
+    };
+    assert_eq!(c, 5);
+    // updateStatistics should reflect the 5 nodes (regardless
+    // of how many times the action ran).
+    let upd = match r.get("updateStatistics").unwrap() {
+        Value::Property(Property::Map(m)) => m.clone(),
+        other => panic!("got {other:?}"),
+    };
+    assert_eq!(upd.get("nodesCreated"), Some(&Property::Int64(5)));
+}
+
+#[tokio::test]
+async fn apoc_periodic_iterate_list_mode_with_extra_params() {
+    // iterateList=true should still merge config.params under
+    // their declared name. The action references both the
+    // batch-scoped $_batch list AND the extra `$shift` param.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [10, 20] AS x RETURN x',\
+                'UNWIND $_batch AS row CREATE (:Shifted {v: row.x + $shift})',\
+                {batchSize: 10, iterateList: true, params: {shift: 100}}\
+            ) YIELD batches RETURN batches"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("iterateList=true + params should compose");
+    let nodes = service
+        .execute_cypher_local(
+            "MATCH (n:Shifted) RETURN n.v AS v ORDER BY v".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let got: Vec<i64> = nodes
+        .iter()
+        .map(|r| match r.get("v").unwrap() {
+            Value::Property(Property::Int64(n)) => *n,
+            other => panic!("got {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec![110, 120]);
+}

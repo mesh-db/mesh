@@ -801,6 +801,7 @@ impl MeshService {
             extra_params_exprs,
             max_retries,
             failed_params_cap,
+            iterate_list,
         ) = match find_apoc_periodic_iterate_node(&plan) {
             Some(parts) => parts,
             None => {
@@ -915,11 +916,24 @@ impl MeshService {
                         let writer = BufferingGraphWriter::new();
                         let mut procs = ProcedureRegistry::new();
                         procs.register_defaults();
-                        for row in chunk_rows {
-                            let mut row_params = extra_params.clone();
-                            for (k, v) in row {
-                                row_params.insert(k, v);
-                            }
+                        if iterate_list {
+                            // Batch-as-list mode: bind the whole
+                            // chunk to `$_batch` (a list of
+                            // row-Maps) and run the action ONCE.
+                            // The action is responsible for
+                            // `UNWIND $_batch AS row` to process
+                            // its elements.
+                            let mut params = extra_params.clone();
+                            let batch_list: Vec<meshdb_core::Property> = chunk_rows
+                                .iter()
+                                .map(|row| meshdb_core::Property::Map(row_to_property_map(row)))
+                                .collect();
+                            params.insert(
+                                "_batch".into(),
+                                meshdb_executor::Value::Property(meshdb_core::Property::List(
+                                    batch_list,
+                                )),
+                            );
                             if let Some(r) = routing.as_ref() {
                                 let partitioned =
                                     PartitionedGraphReader::new(store.clone(), r.clone());
@@ -927,7 +941,7 @@ impl MeshService {
                                     &action_plan,
                                     &partitioned as &dyn GraphReader,
                                     &writer as &dyn GraphWriter,
-                                    &row_params,
+                                    &params,
                                     &procs,
                                 )?;
                             } else {
@@ -935,9 +949,35 @@ impl MeshService {
                                     &action_plan,
                                     &storage_reader as &dyn GraphReader,
                                     &writer as &dyn GraphWriter,
-                                    &row_params,
+                                    &params,
                                     &procs,
                                 )?;
+                            }
+                        } else {
+                            for row in chunk_rows {
+                                let mut row_params = extra_params.clone();
+                                for (k, v) in row {
+                                    row_params.insert(k, v);
+                                }
+                                if let Some(r) = routing.as_ref() {
+                                    let partitioned =
+                                        PartitionedGraphReader::new(store.clone(), r.clone());
+                                    meshdb_executor::execute_with_reader_and_procs(
+                                        &action_plan,
+                                        &partitioned as &dyn GraphReader,
+                                        &writer as &dyn GraphWriter,
+                                        &row_params,
+                                        &procs,
+                                    )?;
+                                } else {
+                                    meshdb_executor::execute_with_reader_and_procs(
+                                        &action_plan,
+                                        &storage_reader as &dyn GraphReader,
+                                        &writer as &dyn GraphWriter,
+                                        &row_params,
+                                        &procs,
+                                    )?;
+                                }
                             }
                         }
                         Ok(writer.into_commands())
@@ -1758,6 +1798,7 @@ fn find_apoc_periodic_iterate_node(
     std::collections::HashMap<String, meshdb_cypher::Expr>,
     i64,
     i64,
+    bool,
 )> {
     use meshdb_cypher::LogicalPlan as P;
     match plan {
@@ -1768,6 +1809,7 @@ fn find_apoc_periodic_iterate_node(
             extra_params,
             retries,
             failed_params_cap,
+            iterate_list,
         } => Some((
             (**iterate).clone(),
             (**action).clone(),
@@ -1775,6 +1817,7 @@ fn find_apoc_periodic_iterate_node(
             extra_params.clone(),
             *retries,
             *failed_params_cap,
+            *iterate_list,
         )),
         P::Filter { input, .. }
         | P::Project { input, .. }
