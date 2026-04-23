@@ -154,6 +154,38 @@ impl TriggerRegistry {
     pub fn is_empty(&self) -> bool {
         self.inner.read().expect("trigger registry lock").is_empty()
     }
+
+    /// Reload the in-memory cache from storage. Called by the
+    /// Raft applier and the routing-mode trigger fan-out after
+    /// they apply an `InstallTrigger` / `DropTrigger` command,
+    /// so a peer that wasn't the original install/drop site
+    /// still sees the change immediately. Failures are surfaced
+    /// to the caller — the applier logs them, since by that
+    /// point the storage write has already succeeded.
+    pub fn refresh(&self) -> Result<()> {
+        let entries = self
+            .store
+            .list_triggers()
+            .map_err(|e| Error::Procedure(format!("refreshing trigger registry: {e}")))?;
+        let mut next: HashMap<String, TriggerSpec> = HashMap::new();
+        for (name, blob) in entries {
+            match serde_json::from_slice::<TriggerSpec>(&blob) {
+                Ok(spec) => {
+                    next.insert(name, spec);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        trigger = %name,
+                        error = %e,
+                        "skipping corrupt trigger spec on refresh"
+                    );
+                }
+            }
+        }
+        let mut guard = self.inner.write().expect("trigger registry lock");
+        *guard = next;
+        Ok(())
+    }
 }
 
 thread_local! {
@@ -328,7 +360,13 @@ pub fn now_ms() -> i64 {
 /// single-database today. `selector` and `config` are inspected
 /// for a `phase` (defaults to "after") and `params` (defaults to
 /// empty); other keys are ignored for forward-compat.
-pub fn install_call(registry: &TriggerRegistry, args: &[Value]) -> Result<Vec<ProcRow>> {
+///
+/// Emits the install through the writer (as a
+/// [`GraphCommand::InstallTrigger`](meshdb_cluster::GraphCommand::InstallTrigger))
+/// so the commit path replicates it across the cluster. The
+/// in-memory registry refreshes on each peer when the storage
+/// CF lands its updated entry.
+pub fn install_call(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<ProcRow>> {
     if args.len() < 3 {
         return Err(Error::Procedure(
             "apoc.trigger.install: expects (databaseName, name, statement[, selector[, config]])"
@@ -399,23 +437,29 @@ pub fn install_call(registry: &TriggerRegistry, args: &[Value]) -> Result<Vec<Pr
         extra_params,
         installed_at_ms: now_ms(),
     };
-    let prev = registry.install(spec.clone())?;
+    let blob = serde_json::to_vec(&spec)
+        .map_err(|e| Error::Procedure(format!("apoc.trigger.install: encoding spec: {e}")))?;
+    writer.install_trigger(&name, &blob)?;
     let mut row: ProcRow = HashMap::new();
     row.insert("name".into(), Value::Property(Property::String(name)));
     row.insert("query".into(), Value::Property(Property::String(query)));
     row.insert("installed".into(), Value::Property(Property::Bool(true)));
-    row.insert(
-        "previous".into(),
-        match prev {
-            Some(p) => Value::Property(Property::String(p.query)),
-            None => Value::Null,
-        },
-    );
+    // V2 drops the synchronous `previous` column: the actual
+    // apply happens through the cluster commit path, so we
+    // can't synchronously report whether a prior trigger
+    // existed under the same name. Callers that need the
+    // before/after pair can `apoc.trigger.list` first.
+    row.insert("previous".into(), Value::Null);
     Ok(vec![row])
 }
 
-/// `apoc.trigger.drop(databaseName, name)`.
-pub fn drop_call(registry: &TriggerRegistry, args: &[Value]) -> Result<Vec<ProcRow>> {
+/// `apoc.trigger.drop(databaseName, name)`. Same write-path
+/// shape as `install_call` — the drop rides through the cluster
+/// commit so every peer's storage drops the entry. The yielded
+/// `removed` column is always `true` in V2 because the actual
+/// apply happens on the leader/applier path; the install/drop
+/// procedure itself only buffers the command.
+pub fn drop_call(writer: &dyn GraphWriter, args: &[Value]) -> Result<Vec<ProcRow>> {
     if args.len() < 2 {
         return Err(Error::Procedure(
             "apoc.trigger.drop: expects (databaseName, name)".into(),
@@ -423,13 +467,10 @@ pub fn drop_call(registry: &TriggerRegistry, args: &[Value]) -> Result<Vec<ProcR
     }
     let _db = expect_string(&args[0], "first argument (databaseName)")?;
     let name = expect_string(&args[1], "second argument (name)")?;
-    let prev = registry.drop(&name)?;
+    writer.drop_trigger(&name)?;
     let mut row: ProcRow = HashMap::new();
     row.insert("name".into(), Value::Property(Property::String(name)));
-    row.insert(
-        "removed".into(),
-        Value::Property(Property::Bool(prev.is_some())),
-    );
+    row.insert("removed".into(), Value::Property(Property::Bool(true)));
     Ok(vec![row])
 }
 

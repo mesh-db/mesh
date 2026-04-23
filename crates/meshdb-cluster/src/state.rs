@@ -139,6 +139,24 @@ pub enum GraphCommand {
         name: String,
         if_exists: bool,
     },
+    /// Install (or replace) an `apoc.trigger.*` registration on
+    /// every replica. `spec_blob` is the serde-encoded
+    /// `meshdb_executor::apoc_trigger::TriggerSpec` — opaque to
+    /// the cluster crate so the encoding can evolve without
+    /// dragging the cluster surface along. Each peer's applier
+    /// calls `store.put_trigger(name, &spec_blob)` then refreshes
+    /// its in-memory `TriggerRegistry`.
+    InstallTrigger {
+        name: String,
+        spec_blob: Vec<u8>,
+    },
+    /// Drop a registered trigger on every replica. Idempotent —
+    /// dropping a name that doesn't exist is a no-op everywhere
+    /// so routing-mode rollback can re-issue a partial DROP
+    /// without erroring.
+    DropTrigger {
+        name: String,
+    },
 }
 
 /// Cluster-visible scope for a constraint. Mirrors

@@ -374,6 +374,8 @@ impl Procedure {
             // uses it because it actually writes.
             #[cfg(feature = "apoc-cypher")]
             Some(BuiltinProc::ApocCypherRun | BuiltinProc::ApocCypherDoIt) => true,
+            #[cfg(feature = "apoc-trigger")]
+            Some(BuiltinProc::ApocTriggerInstall | BuiltinProc::ApocTriggerDrop) => true,
             _ => false,
         }
     }
@@ -545,24 +547,11 @@ impl Procedure {
                     .map(ProcRows::Eager)
             }
             #[cfg(feature = "apoc-trigger")]
-            Some(BuiltinProc::ApocTriggerInstall) => {
-                let registry = procedures.trigger_registry().ok_or_else(|| {
-                    Error::Procedure(
-                        "apoc.trigger.* not available — server did not attach a trigger registry"
-                            .into(),
-                    )
-                })?;
-                crate::apoc_trigger::install_call(registry, args).map(ProcRows::Eager)
-            }
-            #[cfg(feature = "apoc-trigger")]
-            Some(BuiltinProc::ApocTriggerDrop) => {
-                let registry = procedures.trigger_registry().ok_or_else(|| {
-                    Error::Procedure(
-                        "apoc.trigger.* not available — server did not attach a trigger registry"
-                            .into(),
-                    )
-                })?;
-                crate::apoc_trigger::drop_call(registry, args).map(ProcRows::Eager)
+            Some(BuiltinProc::ApocTriggerInstall | BuiltinProc::ApocTriggerDrop) => {
+                Err(Error::Procedure(
+                    "apoc.trigger.install/drop are write builtins — must go through resolve_write_rows"
+                        .into(),
+                ))
             }
             #[cfg(feature = "apoc-trigger")]
             Some(BuiltinProc::ApocTriggerList) => {
@@ -633,6 +622,12 @@ impl Procedure {
             Some(BuiltinProc::ApocCypherDoIt) => {
                 crate::apoc_cypher::run_cypher(reader, writer, args, procedures, true)
             }
+            #[cfg(feature = "apoc-trigger")]
+            Some(BuiltinProc::ApocTriggerInstall) => {
+                crate::apoc_trigger::install_call(writer, args)
+            }
+            #[cfg(feature = "apoc-trigger")]
+            Some(BuiltinProc::ApocTriggerDrop) => crate::apoc_trigger::drop_call(writer, args),
             _ => Err(Error::Procedure("procedure is not a write builtin".into())),
         }
     }

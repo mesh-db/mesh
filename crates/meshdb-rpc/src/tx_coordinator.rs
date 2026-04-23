@@ -307,7 +307,9 @@ impl<'a> TxCoordinator<'a> {
                 | GraphCommand::CreateEdgePointIndex { .. }
                 | GraphCommand::DropEdgePointIndex { .. }
                 | GraphCommand::CreateConstraint { .. }
-                | GraphCommand::DropConstraint { .. } => {
+                | GraphCommand::DropConstraint { .. }
+                | GraphCommand::InstallTrigger { .. }
+                | GraphCommand::DropTrigger { .. } => {
                     debug_assert!(
                         false,
                         "DDL command reached the routing coordinator; \

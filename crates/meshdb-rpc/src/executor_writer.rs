@@ -193,6 +193,19 @@ impl GraphWriter for RaftGraphWriter {
         // funnel through a reader instead of this sink.
         Ok(Vec::new())
     }
+
+    fn install_trigger(&self, name: &str, spec_blob: &[u8]) -> ExecResult<()> {
+        self.propose(GraphCommand::InstallTrigger {
+            name: name.to_string(),
+            spec_blob: spec_blob.to_vec(),
+        })
+    }
+
+    fn drop_trigger(&self, name: &str) -> ExecResult<()> {
+        self.propose(GraphCommand::DropTrigger {
+            name: name.to_string(),
+        })
+    }
 }
 
 /// Executor write sink that accumulates mutations in memory instead of
@@ -392,5 +405,23 @@ impl GraphWriter for BufferingGraphWriter {
         // for `SHOW CONSTRAINTS` / `db.constraints()`. Returning
         // empty mirrors the index-side default.
         Ok(Vec::new())
+    }
+
+    fn install_trigger(&self, name: &str, spec_blob: &[u8]) -> ExecResult<()> {
+        self.buffer
+            .lock()
+            .unwrap()
+            .push(GraphCommand::InstallTrigger {
+                name: name.to_string(),
+                spec_blob: spec_blob.to_vec(),
+            });
+        Ok(())
+    }
+
+    fn drop_trigger(&self, name: &str) -> ExecResult<()> {
+        self.buffer.lock().unwrap().push(GraphCommand::DropTrigger {
+            name: name.to_string(),
+        });
+        Ok(())
     }
 }

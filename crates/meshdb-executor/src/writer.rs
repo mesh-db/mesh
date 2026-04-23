@@ -163,6 +163,28 @@ pub trait GraphWriter {
     fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
         Ok(Vec::new())
     }
+
+    /// Install (or replace) an `apoc.trigger.*` registration.
+    /// `spec_blob` is the serde-encoded trigger spec — opaque
+    /// to the writer; the storage layer just persists the
+    /// bytes. Cluster-aware writers buffer this as a
+    /// `GraphCommand::InstallTrigger` so the commit path
+    /// replicates it; direct-to-storage writers persist
+    /// immediately.
+    fn install_trigger(&self, _name: &str, _spec_blob: &[u8]) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "trigger DDL is not supported by this writer".into(),
+        ))
+    }
+
+    /// Drop a registered trigger by name. Idempotent — a
+    /// missing name is not an error so routing-mode rollback
+    /// can re-issue partially-applied DROPs.
+    fn drop_trigger(&self, _name: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "trigger DDL is not supported by this writer".into(),
+        ))
+    }
 }
 
 /// Blanket impl: any **sized** type that implements [`StorageEngine`]
@@ -285,6 +307,16 @@ impl<T: StorageEngine> GraphWriter for T {
 
     fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
         Ok(StorageEngine::list_property_constraints(self))
+    }
+
+    fn install_trigger(&self, name: &str, spec_blob: &[u8]) -> Result<()> {
+        StorageEngine::put_trigger(self, name, spec_blob)?;
+        Ok(())
+    }
+
+    fn drop_trigger(&self, name: &str) -> Result<()> {
+        StorageEngine::delete_trigger(self, name)?;
+        Ok(())
     }
 }
 
@@ -413,5 +445,15 @@ impl GraphWriter for StorageWriterAdapter<'_> {
 
     fn list_property_constraints(&self) -> Result<Vec<PropertyConstraintSpec>> {
         Ok(self.0.list_property_constraints())
+    }
+
+    fn install_trigger(&self, name: &str, spec_blob: &[u8]) -> Result<()> {
+        self.0.put_trigger(name, spec_blob)?;
+        Ok(())
+    }
+
+    fn drop_trigger(&self, name: &str) -> Result<()> {
+        self.0.delete_trigger(name)?;
+        Ok(())
     }
 }

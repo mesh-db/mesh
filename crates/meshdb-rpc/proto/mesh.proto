@@ -303,6 +303,17 @@ service MeshWrite {
   // fan-out and for rollback of a partial create.
   rpc DropPropertyConstraint(DropPropertyConstraintRequest)
       returns (DropPropertyConstraintResponse);
+  // Install (or replace) an apoc.trigger.* registration on this
+  // peer's local store. Used by the routing-mode trigger DDL
+  // fan-out: leader applies locally, then calls this RPC on
+  // every other peer in parallel. `spec_blob` is the
+  // serde-encoded TriggerSpec — opaque to the wire layer, the
+  // executor on the receiving side decodes when it next refreshes
+  // its in-memory registry.
+  rpc InstallTrigger(InstallTriggerRequest) returns (InstallTriggerResponse);
+  // Drop a registered trigger on this peer's local store.
+  // Idempotent — dropping a missing name succeeds.
+  rpc DropTrigger(DropTriggerRequest) returns (DropTriggerResponse);
   // Ask this peer whether it has a recorded decision for `txid`
   // in its coordinator log. Returns COMMITTED, ABORTED, or UNKNOWN.
   // Participants with in-doubt transactions use this on restart to
@@ -472,6 +483,17 @@ message DropPropertyConstraintRequest {
   bool if_exists = 2;
 }
 message DropPropertyConstraintResponse {}
+
+message InstallTriggerRequest {
+  string name = 1;
+  bytes spec_blob = 2;
+}
+message InstallTriggerResponse {}
+
+message DropTriggerRequest {
+  string name = 1;
+}
+message DropTriggerResponse {}
 
 // Decision status the queried peer has on record for a transaction.
 // `UNKNOWN` means "I have no entry for this txid in my coordinator

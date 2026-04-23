@@ -50,6 +50,13 @@ const ARCHIVE_VERSION: u32 = 1;
 
 pub struct StoreGraphApplier {
     store: Arc<dyn StorageEngine>,
+    /// Optional handle to the local in-memory trigger registry.
+    /// Each peer's applier holds its own copy; install/drop
+    /// commands replayed via Raft refresh the cache so the
+    /// firing path on the leader sees the same set the
+    /// followers' storage has.
+    #[cfg(feature = "apoc-trigger")]
+    trigger_registry: Option<meshdb_executor::apoc_trigger::TriggerRegistry>,
 }
 
 impl std::fmt::Debug for StoreGraphApplier {
@@ -60,7 +67,41 @@ impl std::fmt::Debug for StoreGraphApplier {
 
 impl StoreGraphApplier {
     pub fn new(store: Arc<dyn StorageEngine>) -> Self {
-        Self { store }
+        Self {
+            store,
+            #[cfg(feature = "apoc-trigger")]
+            trigger_registry: None,
+        }
+    }
+
+    /// Attach the local trigger registry so trigger DDL Raft
+    /// log entries refresh the in-memory cache after applying.
+    /// Called from `meshdb-server` startup with the same
+    /// registry instance that's wired into `MeshService`'s
+    /// procedure registry factory.
+    #[cfg(feature = "apoc-trigger")]
+    pub fn with_trigger_registry(
+        mut self,
+        registry: meshdb_executor::apoc_trigger::TriggerRegistry,
+    ) -> Self {
+        self.trigger_registry = Some(registry);
+        self
+    }
+
+    /// Refresh the local trigger registry after a trigger DDL
+    /// command has been applied to storage. Failures are logged
+    /// but never propagated — a stale cache will self-correct on
+    /// the next firing path that reads it (we re-load on every
+    /// fire to keep the surface simple). When the apoc-trigger
+    /// feature isn't compiled in, this is a no-op so the apply
+    /// arms can call it unconditionally.
+    fn notify_trigger_change(&self) {
+        #[cfg(feature = "apoc-trigger")]
+        if let Some(reg) = &self.trigger_registry {
+            if let Err(e) = reg.refresh() {
+                tracing::warn!(error = %e, "refreshing trigger registry after Raft apply failed");
+            }
+        }
     }
 }
 
@@ -107,6 +148,14 @@ impl GraphStateMachine for StoreGraphApplier {
                 apply_ddl_and_collect(cmds, self.store.as_ref(), &mut flat)?;
                 if !flat.is_empty() {
                     self.store.apply_batch(&flat).map_err(|e| e.to_string())?;
+                }
+                // Cheap defensive refresh — covers Batch entries
+                // that contain trigger DDL (rare in practice;
+                // CALL apoc.trigger.* doesn't co-mingle with
+                // graph writes in a single Cypher query, but a
+                // future caller might).
+                if batch_contains_trigger_ddl(cmds) {
+                    self.notify_trigger_change();
                 }
                 Ok(())
             }
@@ -175,6 +224,18 @@ impl GraphStateMachine for StoreGraphApplier {
                 .store
                 .drop_property_constraint(name, *if_exists)
                 .map_err(|e| e.to_string()),
+            GraphCommand::InstallTrigger { name, spec_blob } => {
+                self.store
+                    .put_trigger(name, spec_blob)
+                    .map_err(|e| e.to_string())?;
+                self.notify_trigger_change();
+                Ok(())
+            }
+            GraphCommand::DropTrigger { name } => {
+                self.store.delete_trigger(name).map_err(|e| e.to_string())?;
+                self.notify_trigger_change();
+                Ok(())
+            }
         }
     }
 
@@ -525,9 +586,28 @@ fn apply_ddl_and_collect(
             GraphCommand::DropConstraint { name, if_exists } => store
                 .drop_property_constraint(name, *if_exists)
                 .map_err(|e| e.to_string())?,
+            GraphCommand::InstallTrigger { name, spec_blob } => store
+                .put_trigger(name, spec_blob)
+                .map_err(|e| e.to_string())?,
+            GraphCommand::DropTrigger { name } => {
+                store.delete_trigger(name).map_err(|e| e.to_string())?
+            }
         }
     }
     Ok(())
+}
+
+/// `true` if any command in the recursive batch tree mutates
+/// the trigger registry. Used by the Raft applier's Batch arm
+/// to decide whether to re-read the trigger meta CF after
+/// applying — keeps the refresh cost off batches that don't
+/// touch triggers (the common case).
+fn batch_contains_trigger_ddl(cmds: &[GraphCommand]) -> bool {
+    cmds.iter().any(|c| match c {
+        GraphCommand::InstallTrigger { .. } | GraphCommand::DropTrigger { .. } => true,
+        GraphCommand::Batch(inner) => batch_contains_trigger_ddl(inner),
+        _ => false,
+    })
 }
 
 /// Bridge the cluster-crate [`ClusterConstraintKind`] into the

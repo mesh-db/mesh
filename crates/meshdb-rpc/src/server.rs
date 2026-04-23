@@ -1254,11 +1254,22 @@ impl MeshService {
             if let Some(log) = self.coordinator_log.as_deref() {
                 coordinator = coordinator.with_log(log);
             }
+            #[cfg(feature = "apoc-trigger")]
+            let routing_diff = self.snapshot_trigger_diff(&graph);
             match coordinator.run(graph).await {
                 Ok(()) => {
                     crate::metrics::TWO_PHASE_COMMIT_TOTAL
                         .with_label_values(&["committed"])
                         .inc();
+                    // Routing-mode trigger firing — only the
+                    // coordinator (us) fires, matching the
+                    // single-node and Raft modes' "originator
+                    // fires once" semantics. Trigger writes land
+                    // local for V2; cluster replication of
+                    // trigger-induced writes is the still-deferred
+                    // piece flagged in CLAUDE.md.
+                    #[cfg(feature = "apoc-trigger")]
+                    self.fire_triggers_after_single_node_commit(routing_diff);
                     return Ok(());
                 }
                 Err(e) => {
@@ -1270,6 +1281,8 @@ impl MeshService {
             }
         }
         if let Some(raft) = &self.raft {
+            #[cfg(feature = "apoc-trigger")]
+            let raft_diff = self.snapshot_trigger_diff(&commands);
             let entry = if commands.len() == 1 {
                 commands.into_iter().next().unwrap()
             } else {
@@ -1280,6 +1293,14 @@ impl MeshService {
                     crate::metrics::RAFT_PROPOSALS_TOTAL
                         .with_label_values(&["committed"])
                         .inc();
+                    // Raft-mode trigger firing — only this peer
+                    // (the proposer; non-leaders forward and so
+                    // never reach this branch) fires. Followers
+                    // see the propagated commit through their own
+                    // `StoreGraphApplier::apply` but don't fire
+                    // their own copy.
+                    #[cfg(feature = "apoc-trigger")]
+                    self.fire_triggers_after_single_node_commit(raft_diff);
                     Ok(())
                 }
                 Err(ClusterError::ForwardToLeader {
@@ -1309,6 +1330,23 @@ impl MeshService {
         #[cfg(feature = "apoc-trigger")]
         let trigger_diff = self.snapshot_trigger_diff(&commands);
         apply_prepared_batch(self.store.as_ref(), &commands).map_err(internal)?;
+        // Trigger DDL (install / drop) inside the batch: refresh
+        // the local registry cache so the firing path below
+        // sees the new set immediately.
+        #[cfg(feature = "apoc-trigger")]
+        {
+            let touched_triggers = commands.iter().any(|c| {
+                matches!(
+                    c,
+                    GraphCommand::InstallTrigger { .. } | GraphCommand::DropTrigger { .. }
+                )
+            });
+            if touched_triggers {
+                if let Some(reg) = (self.procedure_registry_factory)().trigger_registry() {
+                    let _ = reg.refresh();
+                }
+            }
+        }
         #[cfg(feature = "apoc-trigger")]
         self.fire_triggers_after_single_node_commit(trigger_diff);
         Ok(())
@@ -1410,6 +1448,24 @@ impl MeshService {
         // peer, so the caller's error is clean.
         for cmd in ddl {
             apply_ddl_to_store(cmd, self.store.as_ref()).map_err(internal)?;
+        }
+        // Refresh the local trigger registry if the batch
+        // touched it; the receiver-side RPC handler does the
+        // same on its end. Cheap (one CF iter) so we don't
+        // bother gating on whether triggers were involved.
+        #[cfg(feature = "apoc-trigger")]
+        {
+            let any_trigger = ddl.iter().any(|c| {
+                matches!(
+                    c,
+                    GraphCommand::InstallTrigger { .. } | GraphCommand::DropTrigger { .. }
+                )
+            });
+            if any_trigger {
+                if let Some(reg) = (self.procedure_registry_factory)().trigger_registry() {
+                    let _ = reg.refresh();
+                }
+            }
         }
 
         let self_id = routing.cluster().self_id();
@@ -1959,7 +2015,9 @@ pub(crate) fn flatten_commands(
             | GraphCommand::CreateEdgePointIndex { .. }
             | GraphCommand::DropEdgePointIndex { .. }
             | GraphCommand::CreateConstraint { .. }
-            | GraphCommand::DropConstraint { .. } => {}
+            | GraphCommand::DropConstraint { .. }
+            | GraphCommand::InstallTrigger { .. }
+            | GraphCommand::DropTrigger { .. } => {}
         }
     }
 }
@@ -2565,6 +2623,8 @@ fn apply_ddl_to_store(
         GraphCommand::DropConstraint { name, if_exists } => {
             store.drop_property_constraint(name, *if_exists)
         }
+        GraphCommand::InstallTrigger { name, spec_blob } => store.put_trigger(name, spec_blob),
+        GraphCommand::DropTrigger { name } => store.delete_trigger(name),
         _ => Ok(()),
     }
 }
@@ -2647,6 +2707,18 @@ fn invert_ddl(cmd: &GraphCommand) -> GraphCommand {
             // rollback; for unknown callers we return the clone so
             // the inverse is a no-op (equivalent to DROP IF EXISTS
             // on an already-absent constraint).
+            cmd.clone()
+        }
+        GraphCommand::InstallTrigger { name, .. } => {
+            GraphCommand::DropTrigger { name: name.clone() }
+        }
+        GraphCommand::DropTrigger { .. } => {
+            // Symmetric to DropConstraint: undoing a DROP needs the
+            // original spec, which the command doesn't carry.
+            // Returning the clone makes rollback a no-op (drop is
+            // idempotent on missing names) — operators who need
+            // exact rollback should snapshot the registry before
+            // issuing the DROP.
             cmd.clone()
         }
         other => other.clone(),
@@ -2772,6 +2844,19 @@ async fn try_remote_ddl_on_peer(
                     })
                     .await?;
             }
+            GraphCommand::InstallTrigger { name, spec_blob } => {
+                client
+                    .install_trigger(crate::proto::InstallTriggerRequest {
+                        name: name.clone(),
+                        spec_blob: spec_blob.clone(),
+                    })
+                    .await?;
+            }
+            GraphCommand::DropTrigger { name } => {
+                client
+                    .drop_trigger(crate::proto::DropTriggerRequest { name: name.clone() })
+                    .await?;
+            }
             _ => {}
         }
     }
@@ -2886,7 +2971,9 @@ pub(crate) fn split_ddl(cmds: Vec<GraphCommand>) -> (Vec<GraphCommand>, Vec<Grap
             | GraphCommand::CreateEdgeIndex { .. }
             | GraphCommand::DropEdgeIndex { .. }
             | GraphCommand::CreateConstraint { .. }
-            | GraphCommand::DropConstraint { .. } => ddl.push(cmd),
+            | GraphCommand::DropConstraint { .. }
+            | GraphCommand::InstallTrigger { .. }
+            | GraphCommand::DropTrigger { .. } => ddl.push(cmd),
             GraphCommand::Batch(inner) => {
                 let (nested_ddl, nested_graph) = split_ddl(inner);
                 ddl.extend(nested_ddl);
@@ -2944,6 +3031,12 @@ fn apply_ddl_commands(
             }
             GraphCommand::DropConstraint { name, if_exists } => {
                 store.drop_property_constraint(name, *if_exists)?;
+            }
+            GraphCommand::InstallTrigger { name, spec_blob } => {
+                store.put_trigger(name, spec_blob)?;
+            }
+            GraphCommand::DropTrigger { name } => {
+                store.delete_trigger(name)?;
             }
             GraphCommand::Batch(inner) => apply_ddl_commands(inner, store)?,
             _ => {}
@@ -3872,6 +3965,42 @@ impl MeshWrite for MeshService {
             .drop_property_constraint(&req.name, req.if_exists)
             .map_err(internal)?;
         Ok(Response::new(DropPropertyConstraintResponse {}))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "install_trigger"))]
+    async fn install_trigger(
+        &self,
+        request: Request<crate::proto::InstallTriggerRequest>,
+    ) -> Result<Response<crate::proto::InstallTriggerResponse>, Status> {
+        let req = request.into_inner();
+        self.store
+            .put_trigger(&req.name, &req.spec_blob)
+            .map_err(internal)?;
+        // Fire-and-forget refresh of the local trigger registry —
+        // the apply succeeded, so a stale cache here would be
+        // user-visible inconsistency. The factory closure holds
+        // the registry; we re-build a registry instance to read
+        // the field. Failures log and swallow; the next firing
+        // path will pick up the change too.
+        #[cfg(feature = "apoc-trigger")]
+        if let Some(reg) = (self.procedure_registry_factory)().trigger_registry() {
+            let _ = reg.refresh();
+        }
+        Ok(Response::new(crate::proto::InstallTriggerResponse {}))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "drop_trigger"))]
+    async fn drop_trigger(
+        &self,
+        request: Request<crate::proto::DropTriggerRequest>,
+    ) -> Result<Response<crate::proto::DropTriggerResponse>, Status> {
+        let req = request.into_inner();
+        self.store.delete_trigger(&req.name).map_err(internal)?;
+        #[cfg(feature = "apoc-trigger")]
+        if let Some(reg) = (self.procedure_registry_factory)().trigger_registry() {
+            let _ = reg.refresh();
+        }
+        Ok(Response::new(crate::proto::DropTriggerResponse {}))
     }
 
     #[tracing::instrument(skip_all, fields(rpc = "resolve_transaction", txid))]

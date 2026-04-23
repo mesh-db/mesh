@@ -111,7 +111,9 @@ impl TxOverlayState {
             | GraphCommand::CreateEdgePointIndex { .. }
             | GraphCommand::DropEdgePointIndex { .. }
             | GraphCommand::CreateConstraint { .. }
-            | GraphCommand::DropConstraint { .. } => {}
+            | GraphCommand::DropConstraint { .. }
+            | GraphCommand::InstallTrigger { .. }
+            | GraphCommand::DropTrigger { .. } => {}
         }
     }
 

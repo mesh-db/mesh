@@ -2381,6 +2381,18 @@ impl meshdb_rpc::proto::mesh_write_server::MeshWrite for StallingMeshWrite {
     ) -> Result<tonic::Response<meshdb_rpc::proto::ResolveTransactionResponse>, tonic::Status> {
         std::future::pending().await
     }
+    async fn install_trigger(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::InstallTriggerRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::InstallTriggerResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn drop_trigger(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::DropTriggerRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::DropTriggerResponse>, tonic::Status> {
+        std::future::pending().await
+    }
 }
 
 /// Spawn a two-peer cluster where peer A is a real `MeshService`
@@ -3690,9 +3702,160 @@ mod apoc_trigger {
         }
     }
 
+    /// Spawn a 2-peer routing-mode cluster where both peers have
+    /// a TriggerRegistry attached. Tests the cluster-replicated
+    /// install/drop path: CALL on peer A should reach peer B's
+    /// storage via the routing-mode DDL fan-out.
+    async fn spawn_two_peer_with_triggers() -> (
+        MeshService,
+        Arc<dyn StorageEngine>,
+        Arc<dyn StorageEngine>,
+        TempDir,
+        TempDir,
+    ) {
+        use meshdb_executor::ProcedureRegistry;
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let store_a: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_a.path()).unwrap());
+        let store_b: Arc<dyn StorageEngine> = Arc::new(Store::open(dir_b.path()).unwrap());
+
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+
+        let peers = vec![
+            Peer::new(PeerId(1), addr_a.to_string()),
+            Peer::new(PeerId(2), addr_b.to_string()),
+        ];
+        let cluster_a = Arc::new(Cluster::new(PeerId(1), 4, peers.clone()).unwrap());
+        let cluster_b = Arc::new(Cluster::new(PeerId(2), 4, peers.clone()).unwrap());
+        let routing_a = Arc::new(Routing::new(cluster_a).unwrap());
+        let routing_b = Arc::new(Routing::new(cluster_b).unwrap());
+
+        // Attach TriggerRegistry on both peers via the registry
+        // factory.
+        let registry_a = TriggerRegistry::from_storage(store_a.clone()).unwrap();
+        let registry_b = TriggerRegistry::from_storage(store_b.clone()).unwrap();
+
+        let service_a = MeshService::with_routing(store_a.clone(), routing_a)
+            .with_procedure_registry_factory(move || {
+                let mut p = ProcedureRegistry::new();
+                p.register_defaults();
+                p.set_trigger_registry(registry_a.clone());
+                p
+            });
+        let service_b = MeshService::with_routing(store_b.clone(), routing_b)
+            .with_procedure_registry_factory(move || {
+                let mut p = ProcedureRegistry::new();
+                p.register_defaults();
+                p.set_trigger_registry(registry_b.clone());
+                p
+            });
+
+        let stream_a = TcpListenerStream::new(listener_a);
+        let stream_b = TcpListenerStream::new(listener_b);
+        let svc_a_clone = service_a.clone();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(svc_a_clone.clone().into_query_server())
+                .add_service(svc_a_clone.into_write_server())
+                .serve_with_incoming(stream_a)
+                .await
+                .unwrap();
+        });
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(service_b.clone().into_query_server())
+                .add_service(service_b.into_write_server())
+                .serve_with_incoming(stream_b)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        (service_a, store_a, store_b, dir_a, dir_b)
+    }
+
+    #[tokio::test]
+    async fn trigger_install_replicates_across_routing_cluster() {
+        let (svc_a, store_a, store_b, _da, _db) = spawn_two_peer_with_triggers().await;
+        // Install via peer A — should fan out to peer B.
+        let (_rows, cmds) = svc_a
+            .execute_cypher_in_tx(
+                "CALL apoc.trigger.install('meshdb', 'auditor', \
+                   'RETURN 1', null, null) YIELD name RETURN name"
+                    .to_string(),
+                ParamMap::new(),
+                Vec::new(),
+                false,
+            )
+            .await
+            .unwrap();
+        svc_a.commit_buffered_commands(cmds).await.unwrap();
+        // Verify storage on both peers has the entry.
+        let triggers_a = store_a.list_triggers().unwrap();
+        assert_eq!(
+            triggers_a.len(),
+            1,
+            "peer A should have the installed trigger"
+        );
+        assert_eq!(triggers_a[0].0, "auditor");
+        let triggers_b = store_b.list_triggers().unwrap();
+        assert_eq!(
+            triggers_b.len(),
+            1,
+            "peer B should have received the trigger via DDL fan-out"
+        );
+        assert_eq!(triggers_b[0].0, "auditor");
+        // Verify the spec blob round-tripped intact (same bytes
+        // on both peers).
+        assert_eq!(triggers_a[0].1, triggers_b[0].1);
+    }
+
+    #[tokio::test]
+    async fn trigger_drop_replicates_across_routing_cluster() {
+        let (svc_a, store_a, store_b, _da, _db) = spawn_two_peer_with_triggers().await;
+        // Install on both peers via the fan-out.
+        let (_, cmds) = svc_a
+            .execute_cypher_in_tx(
+                "CALL apoc.trigger.install('meshdb', 'transient', \
+                   'RETURN 1', null, null) YIELD name RETURN name"
+                    .to_string(),
+                ParamMap::new(),
+                Vec::new(),
+                false,
+            )
+            .await
+            .unwrap();
+        svc_a.commit_buffered_commands(cmds).await.unwrap();
+        assert_eq!(store_a.list_triggers().unwrap().len(), 1);
+        assert_eq!(store_b.list_triggers().unwrap().len(), 1);
+        // Drop and verify the fan-out propagated.
+        let (_, cmds) = svc_a
+            .execute_cypher_in_tx(
+                "CALL apoc.trigger.drop('meshdb', 'transient') \
+                 YIELD name RETURN name"
+                    .to_string(),
+                ParamMap::new(),
+                Vec::new(),
+                false,
+            )
+            .await
+            .unwrap();
+        svc_a.commit_buffered_commands(cmds).await.unwrap();
+        assert!(store_a.list_triggers().unwrap().is_empty());
+        assert!(store_b.list_triggers().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn trigger_drop_is_idempotent_for_unknown_name() {
         let (svc, _store, _d) = spawn_service_with_triggers();
+        // V2 semantics: drop always reports `removed: true` because
+        // the actual apply happens through the cluster commit path
+        // (where we don't synchronously know whether a prior entry
+        // existed under the same name). The drop is still
+        // idempotent at the storage layer.
         let rows = run(
             &svc,
             "CALL apoc.trigger.drop('meshdb', 'nonexistent') \
@@ -3700,8 +3863,8 @@ mod apoc_trigger {
         )
         .await;
         match rows[0].get("removed") {
-            Some(Value::Property(Property::Bool(false))) => {}
-            other => panic!("expected removed=false for unknown trigger, got {other:?}"),
+            Some(Value::Property(Property::Bool(true))) => {}
+            other => panic!("expected removed=true (V2 always-true semantics), got {other:?}"),
         }
     }
 }
