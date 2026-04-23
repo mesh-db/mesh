@@ -2669,7 +2669,7 @@ impl ProcedureCallOp {
                 ));
             }
         }
-        match proc.resolve_rows(ctx.store, &args)? {
+        match proc.resolve_rows(ctx.store, &args, ctx.procedures)? {
             crate::procedures::ProcRows::Eager(rows) => {
                 // Static TCK data tables (`builtin.is_none()`)
                 // filter by input-column matching. Built-ins

@@ -112,6 +112,16 @@ pub struct ServerConfig {
     /// uses the 2PC coordinator + recovery log.
     #[serde(default)]
     pub mode: Option<ClusterMode>,
+
+    /// Configuration for `apoc.load.*` (and, in the future,
+    /// `apoc.export.*`). Omitted → every load call fails with a
+    /// message pointing at the config key. A `[apoc_import]`
+    /// section opts in, setting `enabled`, `allow_file`,
+    /// `allow_http`, `file_root`, and `url_allowlist` per the
+    /// [`ImportConfig`](meshdb_executor::ImportConfig) docs.
+    #[cfg(feature = "apoc-load")]
+    #[serde(default)]
+    pub apoc_import: Option<meshdb_executor::ImportConfig>,
 }
 
 fn default_num_partitions() -> u32 {

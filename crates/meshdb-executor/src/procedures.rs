@@ -239,6 +239,18 @@ pub enum BuiltinProc {
     /// transaction.
     #[cfg(feature = "apoc-cypher")]
     ApocCypherDoIt,
+    /// `apoc.load.json(urlOrPath [, path])` — stream the top-
+    /// level elements of a JSON document fetched from a local
+    /// file or an HTTP URL. Security gates live on the
+    /// ImportConfig attached to the ProcedureRegistry; a
+    /// missing / disabled config fails every call.
+    #[cfg(feature = "apoc-load")]
+    ApocLoadJson,
+    /// `apoc.load.csv(urlOrPath [, config])` — stream CSV rows
+    /// (lineNo, list, map) from the source. Same security
+    /// model as [`Self::ApocLoadJson`].
+    #[cfg(feature = "apoc-load")]
+    ApocLoadCsv,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -331,14 +343,23 @@ impl Procedure {
     /// procedures simply hand back their pre-populated `rows` as
     /// `Eager`; built-ins with bounded output derive their rows
     /// from the live graph (still eager, but live). Streaming
-    /// built-ins — path traversals, subgraph walks — hand back a
-    /// cursor so the executor can pull lazily and short-circuit
-    /// on downstream `LIMIT`. `args` carries the call arguments
-    /// after type coercion; today's eager builtins ignore them
-    /// (their inputs are empty), but streaming cursors use them
-    /// to seed traversal state.
-    pub fn resolve_rows(&self, reader: &dyn GraphReader, args: &[Value]) -> Result<ProcRows> {
+    /// built-ins — path traversals, subgraph walks, `apoc.load.*`
+    /// — hand back a cursor so the executor can pull lazily and
+    /// short-circuit on downstream `LIMIT`. `args` carries the
+    /// call arguments after type coercion; today's eager
+    /// builtins ignore them (their inputs are empty), but
+    /// streaming cursors use them to seed traversal state. The
+    /// procedure registry is threaded through so load cursors
+    /// can read their `ImportConfig` at construction time; most
+    /// built-ins ignore it.
+    pub fn resolve_rows(
+        &self,
+        reader: &dyn GraphReader,
+        args: &[Value],
+        procedures: &ProcedureRegistry,
+    ) -> Result<ProcRows> {
         let _ = args;
+        let _ = procedures;
         match self.builtin {
             None => Ok(ProcRows::Eager(self.rows.clone())),
             Some(BuiltinProc::DbLabels) => builtin_db_labels(reader).map(ProcRows::Eager),
@@ -416,6 +437,34 @@ impl Procedure {
                 Err(Error::Procedure(
                     "apoc.cypher.* is dispatched through resolve_write_rows — caller bug".into(),
                 ))
+            }
+            #[cfg(feature = "apoc-load")]
+            Some(BuiltinProc::ApocLoadJson) => {
+                let input =
+                    crate::apoc_load::expect_source_arg(&args[0], "first argument (urlOrPath)")?;
+                let pointer = if args.len() > 1 {
+                    crate::apoc_load::expect_optional_string(&args[1], "second argument (path)")?
+                } else {
+                    None
+                };
+                let cfg = crate::apoc_load::import_config_from_registry(procedures);
+                Ok(ProcRows::Streaming(Box::new(
+                    crate::apoc_load::LoadJsonCursor::new(cfg, input, pointer),
+                )))
+            }
+            #[cfg(feature = "apoc-load")]
+            Some(BuiltinProc::ApocLoadCsv) => {
+                let input =
+                    crate::apoc_load::expect_source_arg(&args[0], "first argument (urlOrPath)")?;
+                let csv_cfg = if args.len() > 1 {
+                    crate::apoc_load::expect_optional_config_map(&args[1])?
+                } else {
+                    None
+                };
+                let cfg = crate::apoc_load::import_config_from_registry(procedures);
+                Ok(ProcRows::Streaming(Box::new(
+                    crate::apoc_load::LoadCsvCursor::new(cfg, input, csv_cfg.as_ref()),
+                )))
             }
         }
     }
@@ -1198,6 +1247,12 @@ fn values_equal_for_procedure(a: &Value, b: &Value) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct ProcedureRegistry {
     procs: HashMap<String, Procedure>,
+    /// Runtime security config for `apoc.load.*` / (future)
+    /// `apoc.export.*`. `None` means "strict default" — every
+    /// load call fails with a message pointing at the server
+    /// config. Callers opt in via [`Self::set_import_config`].
+    #[cfg(feature = "apoc-load")]
+    import_config: Option<crate::apoc_load::ImportConfig>,
 }
 
 impl ProcedureRegistry {
@@ -1212,6 +1267,21 @@ impl ProcedureRegistry {
 
     pub fn get(&self, qualified_name: &[String]) -> Option<&Procedure> {
         self.procs.get(&qualified_name.join("."))
+    }
+
+    /// Attach the server's [`ImportConfig`] so `apoc.load.*`
+    /// knows which file paths / URLs are allowed. Without a
+    /// call to this method every load call refuses with the
+    /// "apoc.import.enabled" message.
+    #[cfg(feature = "apoc-load")]
+    pub fn set_import_config(&mut self, cfg: crate::apoc_load::ImportConfig) {
+        self.import_config = Some(cfg);
+    }
+
+    /// The currently-attached import config, if any.
+    #[cfg(feature = "apoc-load")]
+    pub fn import_config(&self) -> Option<&crate::apoc_load::ImportConfig> {
+        self.import_config.as_ref()
     }
 
     /// Register the built-in `db.labels`, `db.relationshipTypes`, and
@@ -1601,6 +1671,56 @@ impl ProcedureRegistry {
             }],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::ApocCypherDoIt),
+        });
+        #[cfg(feature = "apoc-load")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "load".into(), "json".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "urlOrPath".into(),
+                    ty: ProcType::String,
+                },
+                ProcArgSpec {
+                    name: "path".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "value".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocLoadJson),
+        });
+        #[cfg(feature = "apoc-load")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "load".into(), "csv".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "urlOrPath".into(),
+                    ty: ProcType::String,
+                },
+                ProcArgSpec {
+                    name: "config".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![
+                ProcOutSpec {
+                    name: "lineNo".into(),
+                    ty: ProcType::Integer,
+                },
+                ProcOutSpec {
+                    name: "list".into(),
+                    ty: ProcType::Any,
+                },
+                ProcOutSpec {
+                    name: "map".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocLoadCsv),
         });
     }
 }

@@ -11713,3 +11713,332 @@ mod apoc_cypher {
         assert_eq!(xs, vec![1, 2, 3, 4]);
     }
 }
+
+#[cfg(feature = "apoc-load")]
+mod apoc_load {
+    use super::*;
+    use meshdb_executor::ImportConfig;
+
+    fn registry_with_file_root(root: &std::path::Path) -> ProcedureRegistry {
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        procs.set_import_config(ImportConfig {
+            enabled: true,
+            allow_file: true,
+            allow_http: false,
+            file_root: Some(root.to_path_buf()),
+            url_allowlist: Vec::new(),
+            allow_unrestricted: false,
+        });
+        procs
+    }
+
+    fn registry_disabled() -> ProcedureRegistry {
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        procs
+    }
+
+    fn run_with_procs(
+        store: &Store,
+        q: &str,
+        procs: &ProcedureRegistry,
+    ) -> meshdb_executor::Result<Vec<Row>> {
+        let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+        let p = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+        let params = ParamMap::new();
+        execute_with_reader_and_procs(
+            &p,
+            store as &dyn GraphReader,
+            store as &dyn GraphWriter,
+            &params,
+            procs,
+        )
+    }
+
+    #[test]
+    fn load_json_refused_by_default_config() {
+        let (store, _d) = open_store();
+        let procs = registry_disabled();
+        let err = run_with_procs(
+            &store,
+            "CALL apoc.load.json('/tmp/whatever.json', null) YIELD value RETURN value",
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("apoc.import.enabled"),
+            "expected disabled-feature rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_json_refuses_file_outside_root() {
+        let (store, _d) = open_store();
+        let import_root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), br#"{"x": 1}"#).unwrap();
+        let procs = registry_with_file_root(import_root.path());
+        let q = format!(
+            "CALL apoc.load.json('{}', null) YIELD value RETURN value",
+            outside.path().display()
+        );
+        let err = run_with_procs(&store, &q, &procs).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the configured import root"),
+            "expected import-root rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_json_rejects_http_when_allow_http_false() {
+        let (store, _d) = open_store();
+        let import_root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(import_root.path());
+        let err = run_with_procs(
+            &store,
+            "CALL apoc.load.json('https://example.com/data.json', null) YIELD value RETURN value",
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("allow_http"),
+            "expected HTTP-disabled rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_json_yields_array_elements_one_per_row() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("data.json");
+        std::fs::write(
+            &path,
+            br#"[{"name":"Ada","age":30},{"name":"Bob","age":40}]"#,
+        )
+        .unwrap();
+        let procs = registry_with_file_root(root.path());
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.load.json('{}', null) YIELD value RETURN value",
+                path.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        let mut pairs: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| match r.get("value") {
+                Some(Value::Property(Property::Map(m))) => {
+                    let name = match m.get("name") {
+                        Some(Property::String(s)) => s.clone(),
+                        _ => panic!("no name"),
+                    };
+                    let age = match m.get("age") {
+                        Some(Property::Int64(n)) => *n,
+                        _ => panic!("no age"),
+                    };
+                    (name, age)
+                }
+                other => panic!("expected map, got {other:?}"),
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs, vec![("Ada".to_string(), 30), ("Bob".into(), 40)]);
+    }
+
+    #[test]
+    fn load_json_with_pointer_descends_into_document() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wrap.json");
+        std::fs::write(&path, br#"{"result":{"items":[{"x":1},{"x":2},{"x":3}]}}"#).unwrap();
+        let procs = registry_with_file_root(root.path());
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.load.json('{}', '/result/items') YIELD value RETURN value",
+                path.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn load_json_single_object_yields_one_row() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("one.json");
+        std::fs::write(&path, br#"{"hello":"world"}"#).unwrap();
+        let procs = registry_with_file_root(root.path());
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.load.json('{}', null) YIELD value RETURN value",
+                path.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        match rows[0].get("value") {
+            Some(Value::Property(Property::Map(m))) => {
+                assert_eq!(m.get("hello"), Some(&Property::String("world".into())));
+            }
+            other => panic!("expected map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_json_pointer_missing_surfaces_error() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tiny.json");
+        std::fs::write(&path, br#"{"a":1}"#).unwrap();
+        let procs = registry_with_file_root(root.path());
+        let err = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.load.json('{}', '/missing/path') YIELD value RETURN value",
+                path.display()
+            ),
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("did not resolve"),
+            "expected pointer-miss error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_csv_yields_header_map_and_list_per_row() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("data.csv");
+        std::fs::write(&path, b"name,age\nAda,30\nBob,40\n").unwrap();
+        let procs = registry_with_file_root(root.path());
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.load.csv('{}', null) YIELD lineNo, list, map RETURN lineNo, list, map",
+                path.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(int_prop(&rows[0], "lineNo"), 1);
+        match rows[0].get("list") {
+            Some(Value::Property(Property::List(items))) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], Property::String("Ada".into()));
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+        match rows[0].get("map") {
+            Some(Value::Property(Property::Map(m))) => {
+                assert_eq!(m.get("name"), Some(&Property::String("Ada".into())));
+                assert_eq!(m.get("age"), Some(&Property::String("30".into())));
+            }
+            other => panic!("expected map, got {other:?}"),
+        }
+        assert_eq!(int_prop(&rows[1], "lineNo"), 2);
+    }
+
+    #[test]
+    fn load_csv_without_headers_leaves_map_empty() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("noheader.csv");
+        std::fs::write(&path, b"Ada,30\nBob,40\n").unwrap();
+        let procs = registry_with_file_root(root.path());
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.load.csv('{}', {{header: false}}) YIELD lineNo, list, map \
+                 RETURN lineNo, list, map",
+                path.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        match rows[0].get("map") {
+            Some(Value::Property(Property::Map(m))) => assert!(m.is_empty()),
+            other => panic!("expected empty map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_csv_respects_custom_separator() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("semi.csv");
+        std::fs::write(&path, b"name;age\nAda;30\n").unwrap();
+        let procs = registry_with_file_root(root.path());
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.load.csv('{}', {{sep: ';'}}) YIELD lineNo, list, map \
+                 RETURN lineNo, list, map",
+                path.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        match rows[0].get("list") {
+            Some(Value::Property(Property::List(items))) => {
+                assert_eq!(items[0], Property::String("Ada".into()));
+                assert_eq!(items[1], Property::String("30".into()));
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_csv_downstream_limit_short_circuits_the_stream() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("big.csv");
+        std::fs::write(&path, b"id,x\n1,a\n2,b\n3,c\n4,d\n5,e\n").unwrap();
+        let procs = registry_with_file_root(root.path());
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.load.csv('{}', null) YIELD lineNo, map \
+                 RETURN lineNo, map LIMIT 2",
+                path.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn load_csv_missing_file_surfaces_clear_error() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let err = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.load.csv('{}', null) YIELD lineNo RETURN lineNo",
+                root.path().join("nope.csv").display()
+            ),
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("apoc.load"),
+            "expected apoc.load prefixed error, got: {err}"
+        );
+    }
+}

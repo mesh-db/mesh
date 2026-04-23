@@ -45,12 +45,34 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
     );
 
     match config.resolved_mode() {
-        ClusterMode::Single => Ok(MeshService::new(store)),
+        ClusterMode::Single => Ok(apply_apoc_import(MeshService::new(store), config)),
         ClusterMode::Routing => Ok(build_routing_service(config, store)?),
         ClusterMode::Raft => Err(anyhow!(
             "Raft mode requires async bootstrap; call build_components instead"
         )),
     }
+}
+
+/// Bake the operator-configured [`ImportConfig`] (if any) into the
+/// service's procedure-registry factory. Leaves the factory at its
+/// default when `apoc_import` is absent or when the `apoc-load`
+/// feature isn't compiled in — in both cases `apoc.load.*` calls
+/// land on the strict-disabled default and refuse with a message
+/// pointing at the config key.
+#[allow(unused_variables)]
+fn apply_apoc_import(service: MeshService, config: &ServerConfig) -> MeshService {
+    #[cfg(feature = "apoc-load")]
+    {
+        if let Some(cfg) = config.apoc_import.clone() {
+            return service.with_procedure_registry_factory(move || {
+                let mut p = meshdb_executor::ProcedureRegistry::new();
+                p.register_defaults();
+                p.set_import_config(cfg.clone());
+                p
+            });
+        }
+    }
+    service
 }
 
 /// Shared routing-mode assembly used by both `build_service` (sync)
@@ -83,9 +105,12 @@ fn build_routing_service(
         ParticipantLog::open(participant_log_path(&config.data_dir))
             .context("opening participant log")?,
     );
-    Ok(MeshService::with_routing_and_log(store, routing, Some(log))
-        .with_participant_log(Some(participant_log))
-        .with_client_tls(client_tls))
+    Ok(apply_apoc_import(
+        MeshService::with_routing_and_log(store, routing, Some(log))
+            .with_participant_log(Some(participant_log))
+            .with_client_tls(client_tls),
+        config,
+    ))
 }
 
 /// Build the [`tonic::transport::ClientTlsConfig`] used for outgoing
@@ -141,7 +166,7 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
     match config.resolved_mode() {
         ClusterMode::Single => {
             return Ok(ServerComponents {
-                service: MeshService::new(store),
+                service: apply_apoc_import(MeshService::new(store), config),
                 raft: None,
                 raft_service: None,
             });
@@ -205,7 +230,10 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
 
     // The MeshService routes writes through Raft so every replica's local
     // store ends up consistent.
-    let service = MeshService::with_raft(store, raft.clone()).with_client_tls(client_tls);
+    let service = apply_apoc_import(
+        MeshService::with_raft(store, raft.clone()).with_client_tls(client_tls),
+        config,
+    );
 
     Ok(ServerComponents {
         service,

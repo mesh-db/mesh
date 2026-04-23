@@ -1,5 +1,7 @@
 #[cfg(feature = "apoc-cypher")]
 mod apoc_cypher;
+#[cfg(feature = "apoc-load")]
+mod apoc_load;
 #[cfg(feature = "apoc-path")]
 mod apoc_path;
 mod error;
@@ -10,6 +12,8 @@ mod reader;
 mod value;
 mod writer;
 
+#[cfg(feature = "apoc-load")]
+pub use apoc_load::ImportConfig;
 pub use error::{Error, Result};
 pub use ops::{
     execute, execute_with_in_tx_substitute, execute_with_reader, execute_with_reader_and_procs,

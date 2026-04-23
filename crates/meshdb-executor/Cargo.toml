@@ -12,6 +12,13 @@ meshdb-storage = { workspace = true }
 meshdb-cypher = { workspace = true }
 meshdb-apoc = { workspace = true, optional = true }
 serde = { workspace = true }
+# `apoc.load.*` / `apoc.export.*` pull these in via the
+# `apoc-load` feature. Kept optional so slim builds (no
+# `apoc-load`) don't compile a ~40-crate HTTP/JSON/CSV stack
+# they'll never exercise.
+serde_json = { workspace = true, optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+csv = { version = "1.3", optional = true }
 thiserror.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
@@ -68,6 +75,15 @@ apoc-path = []
 # outer buffer for atomic commit, and nested procedure calls
 # resolve against the same registry.
 apoc-cypher = []
+# `apoc.load.*` — read JSON / CSV from a local file or HTTP URL
+# and stream the records as Cypher rows. Ships disabled by
+# default at runtime via ImportConfig (strict opt-in per
+# import-root directory and URL allowlist) — compiling in the
+# feature only enables the procedures; they still refuse to run
+# until the server config opts in explicitly. Pulls in the
+# `serde_json`, `csv`, and `reqwest` (blocking + rustls-tls)
+# deps that slim builds don't need.
+apoc-load = ["dep:serde_json", "dep:csv", "dep:reqwest"]
 
 # Umbrella: every shipped namespace. Add new sub-features here as
 # they land so `--features apoc` keeps meaning "everything".
@@ -84,4 +100,5 @@ apoc = [
     "apoc-refactor",
     "apoc-path",
     "apoc-cypher",
+    "apoc-load",
 ]

@@ -44,6 +44,19 @@ use std::sync::Arc;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
 
+/// Default registry factory. Constructs a fresh `ProcedureRegistry`
+/// with the built-ins registered — matches the behaviour that
+/// existed before [`MeshService::with_procedure_registry_factory`]
+/// existed, so call sites that don't need a custom registry don't
+/// have to think about it.
+fn default_registry_factory() -> Arc<dyn Fn() -> ProcedureRegistry + Send + Sync> {
+    Arc::new(|| {
+        let mut p = ProcedureRegistry::new();
+        p.register_defaults();
+        p
+    })
+}
+
 #[derive(Clone)]
 pub struct MeshService {
     store: Arc<dyn StorageEngine>,
@@ -77,6 +90,15 @@ pub struct MeshService {
     /// exists for the callsites that construct endpoints from a bare
     /// `&str` address rather than looking them up in `Routing`.
     client_tls: Option<ClientTlsConfig>,
+    /// Factory for the per-request `ProcedureRegistry`. Default
+    /// registers the built-ins that ship unconditionally
+    /// (`db.labels()` and the APOC features that compiled in).
+    /// meshdb-server overrides this at startup to splice in the
+    /// operator-configured [`ImportConfig`] for `apoc.load.*`,
+    /// without any feature-gated surface leaking into
+    /// `MeshService` itself. Arc so cheap-to-clone for the
+    /// spawned per-request closures.
+    procedure_registry_factory: Arc<dyn Fn() -> ProcedureRegistry + Send + Sync>,
 }
 
 impl MeshService {
@@ -91,6 +113,7 @@ impl MeshService {
             participant_log: None,
             tx_timeouts: crate::TxCoordinatorTimeouts::default(),
             client_tls: None,
+            procedure_registry_factory: default_registry_factory(),
         }
     }
 
@@ -118,6 +141,7 @@ impl MeshService {
             participant_log: None,
             tx_timeouts: crate::TxCoordinatorTimeouts::default(),
             client_tls: None,
+            procedure_registry_factory: default_registry_factory(),
         }
     }
 
@@ -153,7 +177,21 @@ impl MeshService {
             participant_log: None,
             tx_timeouts: crate::TxCoordinatorTimeouts::default(),
             client_tls: None,
+            procedure_registry_factory: default_registry_factory(),
         }
+    }
+
+    /// Override the per-request [`ProcedureRegistry`] factory. The
+    /// closure is called every time a Cypher query needs a
+    /// registry; meshdb-server uses this to bake the operator-
+    /// configured `ImportConfig` in without leaking an apoc-load
+    /// cfg cascade into `MeshService`.
+    pub fn with_procedure_registry_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> ProcedureRegistry + Send + Sync + 'static,
+    {
+        self.procedure_registry_factory = Arc::new(factory);
+        self
     }
 
     /// Set the client TLS config used for ad-hoc gRPC endpoints built
@@ -423,6 +461,7 @@ impl MeshService {
         let store = self.store.clone();
         let routing = self.routing.clone();
         let exec_params = params;
+        let registry_factory = self.procedure_registry_factory.clone();
 
         let (rows, commands) = tokio::task::spawn_blocking(
             move || -> std::result::Result<
@@ -437,8 +476,7 @@ impl MeshService {
                 // for in-tx RUNs so the executor sees the prior writes.
                 let overlay = crate::TxOverlayState::from_commands(&prev_commands);
 
-                let mut procs = ProcedureRegistry::new();
-                procs.register_defaults();
+                let procs = registry_factory();
                 let rows = if let Some(r) = routing.as_ref() {
                     // Routing mode: reads go through a partitioned
                     // reader. Single-node and Raft modes use the local
@@ -535,12 +573,12 @@ impl MeshService {
             let routing = self.routing.clone();
             let input_plan = input_plan;
             let params = params.clone();
+            let registry_factory = self.procedure_registry_factory.clone();
             tokio::task::spawn_blocking(
                 move || -> std::result::Result<_, meshdb_executor::Error> {
                     let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
                     let writer = BufferingGraphWriter::new();
-                    let mut procs = ProcedureRegistry::new();
-                    procs.register_defaults();
+                    let procs = registry_factory();
                     if let Some(r) = routing.as_ref() {
                         let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
                         meshdb_executor::execute_with_reader_and_procs(
@@ -576,6 +614,7 @@ impl MeshService {
             let store = self.store.clone();
             let routing = self.routing.clone();
             let params = params.clone();
+            let registry_factory = self.procedure_registry_factory.clone();
             let outcome_result = tokio::task::spawn_blocking(
                 move || -> std::result::Result<
                     (Vec<meshdb_executor::Row>, Vec<GraphCommand>),
@@ -583,8 +622,7 @@ impl MeshService {
                 > {
                     let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
                     let writer = BufferingGraphWriter::new();
-                    let mut procs = ProcedureRegistry::new();
-                    procs.register_defaults();
+                    let procs = registry_factory();
                     let mut batch_output: Vec<meshdb_executor::Row> = Vec::new();
                     for outer_row in chunk_rows {
                         let body_rows = if let Some(r) = routing.as_ref() {
@@ -733,12 +771,12 @@ impl MeshService {
         let store = self.store.clone();
         let routing = self.routing.clone();
         let plan_for_substitution = plan;
+        let registry_factory = self.procedure_registry_factory.clone();
         let final_rows = tokio::task::spawn_blocking(
             move || -> std::result::Result<Vec<meshdb_executor::Row>, meshdb_executor::Error> {
                 let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
                 let writer = BufferingGraphWriter::new();
-                let mut procs = ProcedureRegistry::new();
-                procs.register_defaults();
+                let procs = registry_factory();
                 if let Some(r) = routing.as_ref() {
                     let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
                     meshdb_executor::execute_with_in_tx_substitute(
@@ -838,12 +876,12 @@ impl MeshService {
             let routing = self.routing.clone();
             let iterate_plan = iterate_plan;
             let params = params.clone();
+            let registry_factory = self.procedure_registry_factory.clone();
             tokio::task::spawn_blocking(
                 move || -> std::result::Result<_, meshdb_executor::Error> {
                     let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
                     let writer = BufferingGraphWriter::new();
-                    let mut procs = ProcedureRegistry::new();
-                    procs.register_defaults();
+                    let procs = registry_factory();
                     if let Some(r) = routing.as_ref() {
                         let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
                         meshdb_executor::execute_with_reader_and_procs(
@@ -909,13 +947,13 @@ impl MeshService {
                 let store = self.store.clone();
                 let routing = self.routing.clone();
                 let extra_params = extra_params.clone();
+                let registry_factory = self.procedure_registry_factory.clone();
                 let outcome_result = tokio::task::spawn_blocking(
                     move || -> std::result::Result<Vec<GraphCommand>, meshdb_executor::Error> {
                         let storage_reader =
                             StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
                         let writer = BufferingGraphWriter::new();
-                        let mut procs = ProcedureRegistry::new();
-                        procs.register_defaults();
+                        let procs = registry_factory();
                         if iterate_list {
                             // Batch-as-list mode: bind the whole
                             // chunk to `$_batch` (a list of
@@ -1059,12 +1097,12 @@ impl MeshService {
         let store = self.store.clone();
         let routing = self.routing.clone();
         let plan_for_substitution = plan;
+        let registry_factory = self.procedure_registry_factory.clone();
         let final_rows = tokio::task::spawn_blocking(
             move || -> std::result::Result<Vec<meshdb_executor::Row>, meshdb_executor::Error> {
                 let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
                 let writer = BufferingGraphWriter::new();
-                let mut procs = ProcedureRegistry::new();
-                procs.register_defaults();
+                let procs = registry_factory();
                 if let Some(r) = routing.as_ref() {
                     let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
                     meshdb_executor::execute_with_in_tx_substitute(
