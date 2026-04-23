@@ -1794,15 +1794,26 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
 
     // And a Cypher MATCH should see most of the Markers (some may have
     // been written after the snapshot and replayed via AppendEntries).
-    let resp = query_b
-        .execute_cypher(ExecuteCypherRequest {
-            query: "MATCH (n:Marker) RETURN n".into(),
-            params_json: vec![],
-        })
-        .await
-        .unwrap();
-    let rows: serde_json::Value = serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
-    let count = rows.as_array().map(|a| a.len()).unwrap_or(0);
+    // Poll: under heavy CI load, tail-of-log replay lags the snapshot
+    // apply — the single-shot version of this read went flaky when
+    // `found_pinned` passed on the snapshot alone and tail replay
+    // hadn't landed the later CREATEs yet.
+    let mut count = 0;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let resp = query_b
+            .execute_cypher(ExecuteCypherRequest {
+                query: "MATCH (n:Marker) RETURN n".into(),
+                params_json: vec![],
+            })
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&resp.into_inner().rows_json).unwrap();
+        count = rows.as_array().map(|a| a.len()).unwrap_or(0);
+        if count >= 20 {
+            break;
+        }
+    }
     assert!(
         count >= 20,
         "wiped follower should rebuild most of the graph from snapshot + tail-of-log replay, got {count}"
