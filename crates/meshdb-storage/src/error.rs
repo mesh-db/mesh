@@ -86,6 +86,14 @@ pub enum Error {
          drop the constraint first"
     )]
     IndexInUse { constraint: String },
+
+    /// A storage operation that the backing engine doesn't
+    /// support reached the trait. Lets default trait impls (e.g.
+    /// the trigger-registry methods) return a clear error
+    /// without forcing every backend to implement every
+    /// optional surface.
+    #[error("operation not supported by this backend: {0}")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

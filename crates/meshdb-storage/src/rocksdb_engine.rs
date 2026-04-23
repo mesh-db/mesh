@@ -53,6 +53,12 @@ const CF_POINT_INDEX: &str = "point_index";
 const CF_POINT_INDEX_META: &str = "point_index_meta";
 const CF_EDGE_POINT_INDEX: &str = "edge_point_index";
 const CF_EDGE_POINT_INDEX_META: &str = "edge_point_index_meta";
+/// Persisted `apoc.trigger.*` registry. Keyed by trigger name
+/// (UTF-8 bytes), valued by the JSON-encoded trigger spec
+/// (cypher / selector / config / installed_at). Local-only in
+/// this release — the trigger registry doesn't replicate
+/// across cluster peers, so each node holds its own set.
+const CF_TRIGGER_META: &str = "trigger_meta";
 
 const ALL_CFS: &[&str] = &[
     CF_NODES,
@@ -70,6 +76,7 @@ const ALL_CFS: &[&str] = &[
     CF_POINT_INDEX_META,
     CF_EDGE_POINT_INDEX,
     CF_EDGE_POINT_INDEX_META,
+    CF_TRIGGER_META,
 ];
 
 const EMPTY: &[u8] = &[];
@@ -2876,6 +2883,33 @@ impl StorageEngine for RocksDbStorageEngine {
 
     fn list_property_constraints(&self) -> Vec<PropertyConstraintSpec> {
         RocksDbStorageEngine::list_property_constraints(self)
+    }
+
+    fn put_trigger(&self, name: &str, value: &[u8]) -> Result<()> {
+        let cf = self.cf(CF_TRIGGER_META)?;
+        self.db
+            .put_cf(cf, name.as_bytes(), value)
+            .map_err(Error::from)
+    }
+
+    fn delete_trigger(&self, name: &str) -> Result<()> {
+        let cf = self.cf(CF_TRIGGER_META)?;
+        self.db.delete_cf(cf, name.as_bytes()).map_err(Error::from)
+    }
+
+    fn list_triggers(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let cf = self.cf(CF_TRIGGER_META)?;
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        for entry in iter {
+            let (k, v) = entry.map_err(Error::from)?;
+            // Names are stored as raw UTF-8 bytes — anything else
+            // would be a corruption since `put_trigger` only
+            // accepts `&str`. Lossy decode is defensive.
+            let name = String::from_utf8_lossy(&k).into_owned();
+            out.push((name, v.to_vec()));
+        }
+        Ok(out)
     }
 
     fn create_checkpoint(&self, path: &Path) -> Result<()> {

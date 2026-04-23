@@ -6,6 +6,8 @@ mod apoc_export;
 mod apoc_load;
 #[cfg(feature = "apoc-path")]
 mod apoc_path;
+#[cfg(feature = "apoc-trigger")]
+pub mod apoc_trigger;
 mod error;
 mod eval;
 mod ops;

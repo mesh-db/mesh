@@ -96,6 +96,8 @@ impl Cli {
             bolt_tls: None,
             grpc_tls: None,
             mode: self.mode,
+            #[cfg(feature = "apoc-load")]
+            apoc_import: None,
         })
     }
 

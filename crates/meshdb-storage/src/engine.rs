@@ -20,7 +20,7 @@
 //!
 //! The concrete RocksDB impl lives in [`crate::rocksdb_engine`].
 
-use crate::Result;
+use crate::{Error, Result};
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
 use std::path::Path;
 
@@ -442,6 +442,35 @@ pub trait StorageEngine: Send + Sync {
     /// Snapshot every registered constraint. Order is insertion order
     /// for deterministic `SHOW CONSTRAINTS` output across restarts.
     fn list_property_constraints(&self) -> Vec<PropertyConstraintSpec>;
+
+    // --- apoc.trigger.* registry ---
+
+    /// Persist an `apoc.trigger.*` registration. The value is a
+    /// JSON-encoded blob owned by `meshdb-executor`'s
+    /// `TriggerSpec` — storage stays format-agnostic so the
+    /// schema can evolve without bumping the storage trait.
+    /// Default impl errors loudly so backends that haven't
+    /// wired triggers in yet surface the gap immediately.
+    fn put_trigger(&self, _name: &str, _value: &[u8]) -> Result<()> {
+        Err(Error::Unsupported(
+            "trigger registry is not supported by this backend".into(),
+        ))
+    }
+
+    /// Remove a registered trigger by name. Idempotent — dropping
+    /// a non-existent name is a no-op.
+    fn delete_trigger(&self, _name: &str) -> Result<()> {
+        Err(Error::Unsupported(
+            "trigger registry is not supported by this backend".into(),
+        ))
+    }
+
+    /// Snapshot every registered trigger as `(name, value)` pairs
+    /// in insertion-order by name. The value bytes are passed
+    /// straight back to the caller for format-side decoding.
+    fn list_triggers(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(Vec::new())
+    }
 
     // --- Snapshot / restore hooks ---
 

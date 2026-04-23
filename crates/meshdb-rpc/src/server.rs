@@ -57,6 +57,91 @@ fn default_registry_factory() -> Arc<dyn Fn() -> ProcedureRegistry + Send + Sync
     })
 }
 
+/// Compute the pre-commit trigger diff from a prepared command
+/// batch. `created_*` entries come from `PutNode` / `PutEdge`
+/// commands whose id wasn't yet in the store; `deleted_*`
+/// entries come from `DeleteEdge` / `DetachDeleteNode` commands
+/// resolved against the pre-commit store snapshot. When a tx
+/// issues multiple writes for the same id (e.g. CREATE then
+/// SET), last-write wins — trigger bodies see the final shape.
+#[cfg(feature = "apoc-trigger")]
+fn compute_trigger_diff(
+    store: &dyn StorageEngine,
+    commands: &[GraphCommand],
+) -> meshdb_executor::apoc_trigger::TriggerDiff {
+    use meshdb_executor::apoc_trigger::TriggerDiff;
+    let mut diff = TriggerDiff::default();
+    // Flatten Batch variants and restrict to the four
+    // data-mutation types — DDL / index / constraint commands
+    // aren't part of the trigger surface.
+    let mut flat: Vec<&GraphCommand> = Vec::with_capacity(commands.len());
+    fn collect<'a>(out: &mut Vec<&'a GraphCommand>, cmds: &'a [GraphCommand]) {
+        for c in cmds {
+            match c {
+                GraphCommand::Batch(inner) => collect(out, inner),
+                _ => out.push(c),
+            }
+        }
+    }
+    collect(&mut flat, commands);
+    // Track last-write-wins per node/edge id so CREATE+SET in
+    // the same tx yields one entry with the final shape.
+    let mut created_nodes: std::collections::HashMap<meshdb_core::NodeId, meshdb_core::Node> =
+        std::collections::HashMap::new();
+    let mut created_edges: std::collections::HashMap<meshdb_core::EdgeId, meshdb_core::Edge> =
+        std::collections::HashMap::new();
+    for cmd in flat {
+        match cmd {
+            GraphCommand::PutNode(n) => {
+                // Only classify as "created" if the id wasn't in
+                // the store pre-tx. Updates to existing nodes
+                // land in the (deferred) $assignedNodeProperties
+                // bucket in Neo4j — we skip them for V1.
+                let is_new = store.get_node(n.id).map(|o| o.is_none()).unwrap_or(true);
+                if is_new {
+                    created_nodes.insert(n.id, n.clone());
+                }
+            }
+            GraphCommand::PutEdge(e) => {
+                let is_new = store.get_edge(e.id).map(|o| o.is_none()).unwrap_or(true);
+                if is_new {
+                    created_edges.insert(e.id, e.clone());
+                }
+            }
+            GraphCommand::DeleteEdge(id) => {
+                if let Ok(Some(prev)) = store.get_edge(*id) {
+                    diff.deleted_relationships.push(prev);
+                }
+            }
+            GraphCommand::DetachDeleteNode(id) => {
+                if let Ok(Some(prev)) = store.get_node(*id) {
+                    diff.deleted_nodes.push(prev);
+                }
+                // DetachDelete also removes incident edges; the
+                // pre-commit adjacency tells us which.
+                if let Ok(outs) = store.outgoing(*id) {
+                    for (eid, _) in outs {
+                        if let Ok(Some(e)) = store.get_edge(eid) {
+                            diff.deleted_relationships.push(e);
+                        }
+                    }
+                }
+                if let Ok(ins) = store.incoming(*id) {
+                    for (eid, _) in ins {
+                        if let Ok(Some(e)) = store.get_edge(eid) {
+                            diff.deleted_relationships.push(e);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    diff.created_nodes = created_nodes.into_values().collect();
+    diff.created_relationships = created_edges.into_values().collect();
+    diff
+}
+
 #[derive(Clone)]
 pub struct MeshService {
     store: Arc<dyn StorageEngine>,
@@ -1218,8 +1303,88 @@ impl MeshService {
         }
         // Single-node: apply the batch directly through the store's
         // atomic apply_batch helper (one rocksdb WriteBatch).
+        // Triggers fire AFTER the commit succeeds — see
+        // `fire_triggers_after_single_node_commit` for the
+        // pre-commit diff snapshot + post-commit firing dance.
+        #[cfg(feature = "apoc-trigger")]
+        let trigger_diff = self.snapshot_trigger_diff(&commands);
         apply_prepared_batch(self.store.as_ref(), &commands).map_err(internal)?;
+        #[cfg(feature = "apoc-trigger")]
+        self.fire_triggers_after_single_node_commit(trigger_diff);
         Ok(())
+    }
+
+    /// Compute the trigger diff against the pre-commit store state.
+    /// Returns `None` when no trigger registry is attached or the
+    /// registry is empty, so the commit path skips the diff
+    /// computation cost in the common case. Held as a snapshot
+    /// so the firing path doesn't need to re-examine the commands
+    /// (they've already been applied to the store).
+    #[cfg(feature = "apoc-trigger")]
+    fn snapshot_trigger_diff(
+        &self,
+        commands: &[GraphCommand],
+    ) -> Option<meshdb_executor::apoc_trigger::TriggerDiff> {
+        let factory = &self.procedure_registry_factory;
+        let registry = factory();
+        let trig = registry.trigger_registry()?;
+        if trig.is_empty() {
+            return None;
+        }
+        if meshdb_executor::apoc_trigger::is_suppressed() {
+            return None;
+        }
+        Some(compute_trigger_diff(self.store.as_ref(), commands))
+    }
+
+    /// Fire all registered after-phase triggers against a diff
+    /// captured before the commit. Runs synchronously on the
+    /// calling thread so the thread-local suppression guard
+    /// applies to the trigger's own writes. Failures are logged
+    /// and swallowed — the originating transaction has already
+    /// committed, so an erroring trigger doesn't undo user work.
+    ///
+    /// V1 only fires in single-node mode; Raft and Routing
+    /// callers skip this path. Per-node firing in clustered
+    /// deployments needs a separate design: decide whether every
+    /// peer fires its own copy (double-execution) or only the
+    /// leader / coordinator (consistency-vs-availability
+    /// tradeoffs). Tracked in CLAUDE.md.
+    #[cfg(feature = "apoc-trigger")]
+    fn fire_triggers_after_single_node_commit(
+        &self,
+        diff: Option<meshdb_executor::apoc_trigger::TriggerDiff>,
+    ) {
+        let Some(diff) = diff else { return };
+        let factory = &self.procedure_registry_factory;
+        let procedures = factory();
+        let Some(trig) = procedures.trigger_registry().cloned() else {
+            return;
+        };
+        let storage_reader =
+            meshdb_executor::StorageReaderAdapter(self.store.as_ref() as &dyn StorageEngine);
+        let writer = BufferingGraphWriter::new();
+        meshdb_executor::apoc_trigger::fire_after_triggers(
+            &trig,
+            diff,
+            &storage_reader as &dyn meshdb_executor::GraphReader,
+            &writer as &dyn meshdb_executor::GraphWriter,
+            &procedures,
+        );
+        // Trigger bodies that wrote now have buffered commands
+        // in `writer`. Commit them via the same direct path used
+        // above; the suppression flag inside `fire_after_triggers`
+        // is per-thread so it stays in effect through this commit
+        // — preventing any further trigger firing from these writes.
+        let cmds = writer.into_commands();
+        if !cmds.is_empty() {
+            if let Err(e) = apply_prepared_batch(self.store.as_ref(), &cmds) {
+                tracing::warn!(
+                    error = %e,
+                    "committing trigger-induced writes failed"
+                );
+            }
+        }
     }
 
     /// Routing-mode DDL fan-out with rollback. Apply every entry in

@@ -3487,3 +3487,221 @@ async fn apoc_periodic_iterate_list_mode_with_extra_params() {
         .collect();
     assert_eq!(got, vec![110, 120]);
 }
+
+#[cfg(feature = "apoc-trigger")]
+mod apoc_trigger {
+    use super::*;
+    use meshdb_executor::apoc_trigger::TriggerRegistry;
+    use meshdb_executor::ProcedureRegistry;
+
+    /// Build a single-node MeshService with a fresh trigger
+    /// registry attached to its procedure-registry factory.
+    fn spawn_service_with_triggers() -> (MeshService, Arc<dyn StorageEngine>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+        let registry = TriggerRegistry::from_storage(store.clone()).unwrap();
+        let svc = MeshService::new(store.clone()).with_procedure_registry_factory(move || {
+            let mut p = ProcedureRegistry::new();
+            p.register_defaults();
+            p.set_trigger_registry(registry.clone());
+            p
+        });
+        (svc, store, dir)
+    }
+
+    /// Run a single Cypher statement through the service:
+    /// execute → commit → return result rows.
+    async fn run(svc: &MeshService, query: &str) -> Vec<meshdb_executor::Row> {
+        let (rows, cmds) = svc
+            .execute_cypher_in_tx(query.to_string(), ParamMap::new(), Vec::new(), false)
+            .await
+            .unwrap_or_else(|e| panic!("execute {query}: {e:?}"));
+        svc.commit_buffered_commands(cmds)
+            .await
+            .unwrap_or_else(|e| panic!("commit {query}: {e:?}"));
+        rows
+    }
+
+    #[tokio::test]
+    async fn trigger_install_drop_list_roundtrips_via_cypher() {
+        let (svc, _store, _d) = spawn_service_with_triggers();
+        // install
+        let rows = run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'bump', \
+               'MATCH (n:Widget) RETURN 1', null, null) \
+             YIELD name, installed RETURN name, installed",
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        // list sees it
+        let rows = run(
+            &svc,
+            "CALL apoc.trigger.list() YIELD name, query RETURN name, query",
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        // drop removes it
+        let rows = run(
+            &svc,
+            "CALL apoc.trigger.drop('meshdb', 'bump') \
+             YIELD name, removed RETURN name, removed",
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        match rows[0].get("removed") {
+            Some(Value::Property(Property::Bool(true))) => {}
+            other => panic!("expected removed=true, got {other:?}"),
+        }
+        // list is empty again
+        let rows = run(&svc, "CALL apoc.trigger.list() YIELD name RETURN name").await;
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trigger_fires_after_create_and_sees_created_nodes() {
+        let (svc, store, _d) = spawn_service_with_triggers();
+        // Install a trigger that writes a Marker node
+        // whenever a Widget is created. The trigger inspects
+        // `$createdNodes` and only fires when it sees one.
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'markWidget', \
+               'UNWIND $createdNodes AS n \
+                WITH n WHERE \"Widget\" IN labels(n) \
+                CREATE (:Marker {name: n.name})', \
+               null, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        // Create a Widget — should trigger a Marker creation.
+        run(&svc, "CREATE (:Widget {name: 'one'})").await;
+        // Marker should exist.
+        let markers = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "Marker"))
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 1, "trigger should have created one Marker");
+        assert_eq!(
+            markers[0].properties.get("name"),
+            Some(&Property::String("one".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_recursion_guard_stops_self_triggering() {
+        let (svc, store, _d) = spawn_service_with_triggers();
+        // A trigger that creates another Widget whenever it sees
+        // one in $createdNodes. Without a suppression guard this
+        // would loop until the process dies; with the guard it
+        // fires exactly once per real user write.
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'copyWidget', \
+               'UNWIND $createdNodes AS n \
+                WITH n WHERE \"Widget\" IN labels(n) \
+                CREATE (:Widget {name: n.name + \"_copy\"})', \
+               null, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        run(&svc, "CREATE (:Widget {name: 'seed'})").await;
+        // Expect 2 widgets: the original + the trigger's copy.
+        // Not 4, not infinite.
+        let widgets = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "Widget"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            widgets.len(),
+            2,
+            "recursion guard should stop the trigger from self-triggering"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_sees_deleted_nodes_and_relationships() {
+        let (svc, store, _d) = spawn_service_with_triggers();
+        run(
+            &svc,
+            "CREATE (a:Widget {name: 'a'})-[:LINKS]->(b:Widget {name: 'b'})",
+        )
+        .await;
+        run(
+            &svc,
+            "CALL apoc.trigger.install('meshdb', 'logDeletes', \
+               'UNWIND $deletedNodes AS n \
+                CREATE (:DeletionLog {name: n.name})', \
+               null, null) \
+             YIELD name RETURN name",
+        )
+        .await;
+        run(&svc, "MATCH (w:Widget {name: 'a'}) DETACH DELETE w").await;
+        // Expect one DeletionLog node with name='a'.
+        let logs = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.labels.iter().any(|l| l == "DeletionLog"))
+            .collect::<Vec<_>>();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].properties.get("name"),
+            Some(&Property::String("a".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_rejects_before_phase_for_now() {
+        let (svc, _store, _d) = spawn_service_with_triggers();
+        // Exercising the install-time validation — we error
+        // loudly on unsupported phases rather than silently
+        // accepting one that won't fire.
+        let (_rows, cmds) = svc
+            .execute_cypher_in_tx(
+                "CALL apoc.trigger.install('meshdb', 'x', 'RETURN 1', \
+                   {phase: 'before'}, null) \
+                 YIELD name RETURN name"
+                    .to_string(),
+                ParamMap::new(),
+                Vec::new(),
+                false,
+            )
+            .await
+            .map_err(|e| e.to_string())
+            .map(|ok| ok)
+            .unwrap_or_else(|e| {
+                assert!(
+                    e.contains("only the 'after' phase"),
+                    "expected after-only rejection, got: {e}"
+                );
+                // Short-circuit — we got the error we wanted.
+                (Vec::new(), Vec::new())
+            });
+        // If we got here without error, the install should NOT
+        // have been accepted. Drain commands so the harness
+        // doesn't leak, then fail.
+        if !cmds.is_empty() {
+            panic!("install should have rejected phase=before before producing commands");
+        }
+    }
+
+    #[tokio::test]
+    async fn trigger_drop_is_idempotent_for_unknown_name() {
+        let (svc, _store, _d) = spawn_service_with_triggers();
+        let rows = run(
+            &svc,
+            "CALL apoc.trigger.drop('meshdb', 'nonexistent') \
+             YIELD name, removed RETURN name, removed",
+        )
+        .await;
+        match rows[0].get("removed") {
+            Some(Value::Property(Property::Bool(false))) => {}
+            other => panic!("expected removed=false for unknown trigger, got {other:?}"),
+        }
+    }
+}

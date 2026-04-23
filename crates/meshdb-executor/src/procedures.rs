@@ -277,6 +277,19 @@ pub enum BuiltinProc {
     /// `RETURN {...} AS row;` statement per result row.
     #[cfg(feature = "apoc-export")]
     ApocExportCypherQuery,
+    /// `apoc.trigger.install(databaseName, name, statement,
+    /// selector, config)` — register an after-phase Cypher
+    /// trigger persisted in the trigger CF.
+    #[cfg(feature = "apoc-trigger")]
+    ApocTriggerInstall,
+    /// `apoc.trigger.drop(databaseName, name)` — remove a
+    /// registered trigger.
+    #[cfg(feature = "apoc-trigger")]
+    ApocTriggerDrop,
+    /// `apoc.trigger.list()` — yield one row per registered
+    /// trigger.
+    #[cfg(feature = "apoc-trigger")]
+    ApocTriggerList,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -530,6 +543,36 @@ impl Procedure {
                 let cfg = crate::apoc_load::import_config_from_registry(procedures);
                 crate::apoc_export::export_cypher_query(reader, &cfg, procedures, &query, &file)
                     .map(ProcRows::Eager)
+            }
+            #[cfg(feature = "apoc-trigger")]
+            Some(BuiltinProc::ApocTriggerInstall) => {
+                let registry = procedures.trigger_registry().ok_or_else(|| {
+                    Error::Procedure(
+                        "apoc.trigger.* not available — server did not attach a trigger registry"
+                            .into(),
+                    )
+                })?;
+                crate::apoc_trigger::install_call(registry, args).map(ProcRows::Eager)
+            }
+            #[cfg(feature = "apoc-trigger")]
+            Some(BuiltinProc::ApocTriggerDrop) => {
+                let registry = procedures.trigger_registry().ok_or_else(|| {
+                    Error::Procedure(
+                        "apoc.trigger.* not available — server did not attach a trigger registry"
+                            .into(),
+                    )
+                })?;
+                crate::apoc_trigger::drop_call(registry, args).map(ProcRows::Eager)
+            }
+            #[cfg(feature = "apoc-trigger")]
+            Some(BuiltinProc::ApocTriggerList) => {
+                let registry = procedures.trigger_registry().ok_or_else(|| {
+                    Error::Procedure(
+                        "apoc.trigger.* not available — server did not attach a trigger registry"
+                            .into(),
+                    )
+                })?;
+                crate::apoc_trigger::list_call(registry).map(ProcRows::Eager)
             }
         }
     }
@@ -1318,6 +1361,12 @@ pub struct ProcedureRegistry {
     /// config. Callers opt in via [`Self::set_import_config`].
     #[cfg(feature = "apoc-load")]
     import_config: Option<crate::apoc_load::ImportConfig>,
+    /// Active trigger registry. `None` means triggers are
+    /// effectively disabled — install / drop / list will all
+    /// fail with a clear error pointing at the missing
+    /// attachment. meshdb-server attaches one at startup.
+    #[cfg(feature = "apoc-trigger")]
+    trigger_registry: Option<crate::apoc_trigger::TriggerRegistry>,
 }
 
 impl ProcedureRegistry {
@@ -1347,6 +1396,19 @@ impl ProcedureRegistry {
     #[cfg(feature = "apoc-load")]
     pub fn import_config(&self) -> Option<&crate::apoc_load::ImportConfig> {
         self.import_config.as_ref()
+    }
+
+    /// Attach the runtime trigger registry. Required before
+    /// `apoc.trigger.install` / `drop` / `list` will succeed.
+    #[cfg(feature = "apoc-trigger")]
+    pub fn set_trigger_registry(&mut self, registry: crate::apoc_trigger::TriggerRegistry) {
+        self.trigger_registry = Some(registry);
+    }
+
+    /// The currently-attached trigger registry, if any.
+    #[cfg(feature = "apoc-trigger")]
+    pub fn trigger_registry(&self) -> Option<&crate::apoc_trigger::TriggerRegistry> {
+        self.trigger_registry.as_ref()
     }
 
     /// Register the built-in `db.labels`, `db.relationshipTypes`, and
@@ -1873,6 +1935,103 @@ impl ProcedureRegistry {
                     builtin: Some(variant),
                 });
             }
+        }
+        #[cfg(feature = "apoc-trigger")]
+        {
+            self.register(Procedure {
+                qualified_name: vec!["apoc".into(), "trigger".into(), "install".into()],
+                inputs: vec![
+                    ProcArgSpec {
+                        name: "databaseName".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcArgSpec {
+                        name: "name".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcArgSpec {
+                        name: "statement".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcArgSpec {
+                        name: "selector".into(),
+                        ty: ProcType::Any,
+                    },
+                    ProcArgSpec {
+                        name: "config".into(),
+                        ty: ProcType::Any,
+                    },
+                ],
+                outputs: vec![
+                    ProcOutSpec {
+                        name: "name".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcOutSpec {
+                        name: "query".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcOutSpec {
+                        name: "installed".into(),
+                        ty: ProcType::Boolean,
+                    },
+                    ProcOutSpec {
+                        name: "previous".into(),
+                        ty: ProcType::Any,
+                    },
+                ],
+                rows: Vec::new(),
+                builtin: Some(BuiltinProc::ApocTriggerInstall),
+            });
+            self.register(Procedure {
+                qualified_name: vec!["apoc".into(), "trigger".into(), "drop".into()],
+                inputs: vec![
+                    ProcArgSpec {
+                        name: "databaseName".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcArgSpec {
+                        name: "name".into(),
+                        ty: ProcType::String,
+                    },
+                ],
+                outputs: vec![
+                    ProcOutSpec {
+                        name: "name".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcOutSpec {
+                        name: "removed".into(),
+                        ty: ProcType::Boolean,
+                    },
+                ],
+                rows: Vec::new(),
+                builtin: Some(BuiltinProc::ApocTriggerDrop),
+            });
+            self.register(Procedure {
+                qualified_name: vec!["apoc".into(), "trigger".into(), "list".into()],
+                inputs: Vec::new(),
+                outputs: vec![
+                    ProcOutSpec {
+                        name: "name".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcOutSpec {
+                        name: "query".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcOutSpec {
+                        name: "phase".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcOutSpec {
+                        name: "installed_at".into(),
+                        ty: ProcType::Integer,
+                    },
+                ],
+                rows: Vec::new(),
+                builtin: Some(BuiltinProc::ApocTriggerList),
+            });
         }
     }
 }
