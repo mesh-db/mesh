@@ -251,6 +251,32 @@ pub enum BuiltinProc {
     /// model as [`Self::ApocLoadJson`].
     #[cfg(feature = "apoc-load")]
     ApocLoadCsv,
+    /// `apoc.export.csv.all(file, config)` — serialise every
+    /// node and relationship to a CSV file. Reuses
+    /// ImportConfig's gates for file writes.
+    #[cfg(feature = "apoc-export")]
+    ApocExportCsvAll,
+    /// `apoc.export.csv.query(query, file, config)` — execute
+    /// the inner Cypher and serialise each result row as a CSV
+    /// record. Inner query must be read-only.
+    #[cfg(feature = "apoc-export")]
+    ApocExportCsvQuery,
+    /// `apoc.export.json.all(file, config)` — JSONL export of
+    /// every node + relationship.
+    #[cfg(feature = "apoc-export")]
+    ApocExportJsonAll,
+    /// `apoc.export.json.query(query, file, config)` — one
+    /// JSONL object per result row.
+    #[cfg(feature = "apoc-export")]
+    ApocExportJsonQuery,
+    /// `apoc.export.cypher.all(file, config)` — emit re-runnable
+    /// Cypher reconstructing the graph.
+    #[cfg(feature = "apoc-export")]
+    ApocExportCypherAll,
+    /// `apoc.export.cypher.query(query, file, config)` — one
+    /// `RETURN {...} AS row;` statement per result row.
+    #[cfg(feature = "apoc-export")]
+    ApocExportCypherQuery,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -465,6 +491,45 @@ impl Procedure {
                 Ok(ProcRows::Streaming(Box::new(
                     crate::apoc_load::LoadCsvCursor::new(cfg, input, csv_cfg.as_ref()),
                 )))
+            }
+            #[cfg(feature = "apoc-export")]
+            Some(BuiltinProc::ApocExportCsvAll) => {
+                let file = crate::apoc_export::expect_all_args(args)?;
+                let cfg = crate::apoc_load::import_config_from_registry(procedures);
+                crate::apoc_export::export_csv_all(reader, &cfg, &file).map(ProcRows::Eager)
+            }
+            #[cfg(feature = "apoc-export")]
+            Some(BuiltinProc::ApocExportCsvQuery) => {
+                let (query, file) = crate::apoc_export::expect_query_args(args)?;
+                let cfg = crate::apoc_load::import_config_from_registry(procedures);
+                crate::apoc_export::export_csv_query(reader, &cfg, procedures, &query, &file)
+                    .map(ProcRows::Eager)
+            }
+            #[cfg(feature = "apoc-export")]
+            Some(BuiltinProc::ApocExportJsonAll) => {
+                let file = crate::apoc_export::expect_all_args(args)?;
+                let cfg = crate::apoc_load::import_config_from_registry(procedures);
+                crate::apoc_export::export_json_all(reader, &cfg, &file).map(ProcRows::Eager)
+            }
+            #[cfg(feature = "apoc-export")]
+            Some(BuiltinProc::ApocExportJsonQuery) => {
+                let (query, file) = crate::apoc_export::expect_query_args(args)?;
+                let cfg = crate::apoc_load::import_config_from_registry(procedures);
+                crate::apoc_export::export_json_query(reader, &cfg, procedures, &query, &file)
+                    .map(ProcRows::Eager)
+            }
+            #[cfg(feature = "apoc-export")]
+            Some(BuiltinProc::ApocExportCypherAll) => {
+                let file = crate::apoc_export::expect_all_args(args)?;
+                let cfg = crate::apoc_load::import_config_from_registry(procedures);
+                crate::apoc_export::export_cypher_all(reader, &cfg, &file).map(ProcRows::Eager)
+            }
+            #[cfg(feature = "apoc-export")]
+            Some(BuiltinProc::ApocExportCypherQuery) => {
+                let (query, file) = crate::apoc_export::expect_query_args(args)?;
+                let cfg = crate::apoc_load::import_config_from_registry(procedures);
+                crate::apoc_export::export_cypher_query(reader, &cfg, procedures, &query, &file)
+                    .map(ProcRows::Eager)
             }
         }
     }
@@ -1722,5 +1787,92 @@ impl ProcedureRegistry {
             rows: Vec::new(),
             builtin: Some(BuiltinProc::ApocLoadCsv),
         });
+        #[cfg(feature = "apoc-export")]
+        {
+            let all_inputs = || {
+                vec![
+                    ProcArgSpec {
+                        name: "file".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcArgSpec {
+                        name: "config".into(),
+                        ty: ProcType::Any,
+                    },
+                ]
+            };
+            let query_inputs = || {
+                vec![
+                    ProcArgSpec {
+                        name: "query".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcArgSpec {
+                        name: "file".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcArgSpec {
+                        name: "config".into(),
+                        ty: ProcType::Any,
+                    },
+                ]
+            };
+            let stats_outputs = || {
+                vec![
+                    ProcOutSpec {
+                        name: "file".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcOutSpec {
+                        name: "source".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcOutSpec {
+                        name: "format".into(),
+                        ty: ProcType::String,
+                    },
+                    ProcOutSpec {
+                        name: "nodes".into(),
+                        ty: ProcType::Integer,
+                    },
+                    ProcOutSpec {
+                        name: "relationships".into(),
+                        ty: ProcType::Integer,
+                    },
+                    ProcOutSpec {
+                        name: "properties".into(),
+                        ty: ProcType::Integer,
+                    },
+                    ProcOutSpec {
+                        name: "rows".into(),
+                        ty: ProcType::Integer,
+                    },
+                    ProcOutSpec {
+                        name: "time".into(),
+                        ty: ProcType::Integer,
+                    },
+                ]
+            };
+            for (ns, fn_name, is_query, variant) in [
+                ("csv", "all", false, BuiltinProc::ApocExportCsvAll),
+                ("csv", "query", true, BuiltinProc::ApocExportCsvQuery),
+                ("json", "all", false, BuiltinProc::ApocExportJsonAll),
+                ("json", "query", true, BuiltinProc::ApocExportJsonQuery),
+                ("cypher", "all", false, BuiltinProc::ApocExportCypherAll),
+                ("cypher", "query", true, BuiltinProc::ApocExportCypherQuery),
+            ] {
+                self.register(Procedure {
+                    qualified_name: vec!["apoc".into(), "export".into(), ns.into(), fn_name.into()],
+                    inputs: if is_query {
+                        query_inputs()
+                    } else {
+                        all_inputs()
+                    },
+                    outputs: stats_outputs(),
+                    rows: Vec::new(),
+                    builtin: Some(variant),
+                });
+            }
+        }
     }
 }

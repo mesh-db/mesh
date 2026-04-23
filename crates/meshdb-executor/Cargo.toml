@@ -84,6 +84,13 @@ apoc-cypher = []
 # `serde_json`, `csv`, and `reqwest` (blocking + rustls-tls)
 # deps that slim builds don't need.
 apoc-load = ["dep:serde_json", "dep:csv", "dep:reqwest"]
+# `apoc.export.*` — write the graph (or a query result) to a
+# local file as CSV / JSON / re-runnable Cypher. Reuses
+# `apoc-load`'s ImportConfig + security gates — the same
+# `allow_file` / `file_root` operator settings govern both
+# directions. Compiling in the feature does not itself enable
+# exports; the runtime ImportConfig still has to opt in.
+apoc-export = ["apoc-load"]
 
 # Umbrella: every shipped namespace. Add new sub-features here as
 # they land so `--features apoc` keeps meaning "everything".
@@ -101,4 +108,5 @@ apoc = [
     "apoc-path",
     "apoc-cypher",
     "apoc-load",
+    "apoc-export",
 ]

@@ -12042,3 +12042,294 @@ mod apoc_load {
         );
     }
 }
+
+#[cfg(feature = "apoc-export")]
+mod apoc_export {
+    use super::*;
+    use meshdb_executor::ImportConfig;
+
+    fn registry_with_file_root(root: &std::path::Path) -> ProcedureRegistry {
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        procs.set_import_config(ImportConfig {
+            enabled: true,
+            allow_file: true,
+            allow_http: false,
+            file_root: Some(root.to_path_buf()),
+            url_allowlist: Vec::new(),
+            allow_unrestricted: false,
+        });
+        procs
+    }
+
+    fn registry_disabled() -> ProcedureRegistry {
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        procs
+    }
+
+    fn run_with_procs(
+        store: &Store,
+        q: &str,
+        procs: &ProcedureRegistry,
+    ) -> meshdb_executor::Result<Vec<Row>> {
+        let stmt = parse(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+        let p = plan(&stmt).unwrap_or_else(|e| panic!("plan {q}: {e}"));
+        let params = ParamMap::new();
+        execute_with_reader_and_procs(
+            &p,
+            store as &dyn GraphReader,
+            store as &dyn GraphWriter,
+            &params,
+            procs,
+        )
+    }
+
+    fn seed_chain(store: &Store) {
+        run(
+            store,
+            "CREATE (a:Person {name: 'Ada', age: 30})-[:KNOWS {since: 2020}]->\
+                     (b:Person {name: 'Bob', age: 40})",
+        );
+    }
+
+    #[test]
+    fn export_csv_refused_when_disabled() {
+        let (store, _d) = open_store();
+        let procs = registry_disabled();
+        let err = run_with_procs(
+            &store,
+            "CALL apoc.export.csv.all('/tmp/out.csv', {}) YIELD file RETURN file",
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("apoc.import.enabled"),
+            "expected disabled-feature rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn export_csv_refused_outside_file_root() {
+        let (store, _d) = open_store();
+        seed_chain(&store);
+        let root = tempfile::tempdir().unwrap();
+        let other_root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let target = other_root.path().join("out.csv");
+        let err = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.export.csv.all('{}', {{}}) YIELD file RETURN file",
+                target.display()
+            ),
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the configured import root"),
+            "expected file-root rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn export_rejects_http_destination() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let err = run_with_procs(
+            &store,
+            "CALL apoc.export.csv.all('https://example.com/out.csv', {}) \
+             YIELD file RETURN file",
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("HTTP destinations are not supported"),
+            "expected HTTP rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn export_csv_all_writes_file_and_reports_stats() {
+        let (store, _d) = open_store();
+        seed_chain(&store);
+        let root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let target = root.path().join("chain.csv");
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.export.csv.all('{}', {{}}) \
+                 YIELD file, format, nodes, relationships \
+                 RETURN file, format, nodes, relationships",
+                target.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(str_prop(&rows[0], "format"), "csv");
+        assert_eq!(int_prop(&rows[0], "nodes"), 2);
+        assert_eq!(int_prop(&rows[0], "relationships"), 1);
+        let body = std::fs::read_to_string(&target).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("_id,_labels,_start,_end,_type"));
+        assert!(lines[1..=2].iter().any(|l| l.contains("Person")));
+        assert!(lines[3].contains("KNOWS"));
+    }
+
+    #[test]
+    fn export_csv_query_writes_header_then_rows() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'Ada', age: 30})");
+        run(&store, "CREATE (:Person {name: 'Bob', age: 40})");
+        let root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let target = root.path().join("q.csv");
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.export.csv.query(\
+                   'MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY p.name', \
+                   '{}', {{}}) YIELD file, rows RETURN file, rows",
+                target.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(int_prop(&rows[0], "rows"), 2);
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert!(body.lines().next().unwrap().contains("name"));
+        assert!(body.contains("Ada"));
+        assert!(body.contains("Bob"));
+    }
+
+    #[test]
+    fn export_csv_query_rejects_write_inner_plan() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let target = root.path().join("q.csv");
+        let err = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.export.csv.query('CREATE (:X) RETURN 1 AS a', '{}', {{}}) \
+                 YIELD file RETURN file",
+                target.display()
+            ),
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("inner query contains writes"),
+            "expected write-rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn export_json_all_writes_jsonl() {
+        let (store, _d) = open_store();
+        seed_chain(&store);
+        let root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let target = root.path().join("chain.jsonl");
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.export.json.all('{}', {{}}) \
+                 YIELD format, nodes, relationships \
+                 RETURN format, nodes, relationships",
+                target.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(str_prop(&rows[0], "format"), "json");
+        assert_eq!(int_prop(&rows[0], "nodes"), 2);
+        assert_eq!(int_prop(&rows[0], "relationships"), 1);
+        let body = std::fs::read_to_string(&target).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(v.get("type").is_some());
+            assert!(v.get("id").is_some());
+        }
+    }
+
+    #[test]
+    fn export_json_query_writes_one_object_per_row() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'Ada'})");
+        run(&store, "CREATE (:Person {name: 'Bob'})");
+        let root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let target = root.path().join("q.jsonl");
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.export.json.query('MATCH (p:Person) RETURN p.name AS name', \
+                  '{}', {{}}) YIELD rows RETURN rows",
+                target.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(int_prop(&rows[0], "rows"), 2);
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(body.lines().count(), 2);
+    }
+
+    #[test]
+    fn export_cypher_all_emits_reimportable_script() {
+        let (store, _d) = open_store();
+        seed_chain(&store);
+        let root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let target = root.path().join("chain.cypher");
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.export.cypher.all('{}', {{}}) \
+                 YIELD format, nodes, relationships \
+                 RETURN format, nodes, relationships",
+                target.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(str_prop(&rows[0], "format"), "cypher");
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert!(body.contains("// exported by apoc.export.cypher.all"));
+        let create_count = body.matches("CREATE (n").count();
+        assert_eq!(create_count, 2, "two CREATE statements for two nodes");
+        assert!(body.contains(":KNOWS"));
+        assert!(body.contains("_mesh_id"));
+    }
+
+    #[test]
+    fn export_cypher_query_emits_return_statements() {
+        let (store, _d) = open_store();
+        let root = tempfile::tempdir().unwrap();
+        let procs = registry_with_file_root(root.path());
+        let target = root.path().join("q.cypher");
+        let rows = run_with_procs(
+            &store,
+            &format!(
+                "CALL apoc.export.cypher.query(\
+                  'UNWIND [1, 2, 3] AS x RETURN x', '{}', {{}}) \
+                 YIELD rows RETURN rows",
+                target.display()
+            ),
+            &procs,
+        )
+        .unwrap();
+        assert_eq!(int_prop(&rows[0], "rows"), 3);
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(body.matches("RETURN {").count(), 3);
+    }
+}

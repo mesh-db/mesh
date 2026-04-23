@@ -196,6 +196,96 @@ pub fn resolve_source(cfg: &ImportConfig, input: &str) -> Result<Source> {
     }
 }
 
+/// Resolve a file-destination string for `apoc.export.*` against
+/// the same ImportConfig gates `resolve_source` uses. Differences:
+///
+/// * HTTP URLs are rejected — exports are local-only in this
+///   release.
+/// * The target file may not yet exist; we canonicalise the
+///   parent directory and join the filename onto it, confirming
+///   the parent sits inside `file_root` when configured.
+/// * Existing files are silently truncated on write (the
+///   individual export functions are responsible for opening
+///   with `File::create` — this helper only vets the path).
+#[cfg(feature = "apoc-export")]
+pub fn resolve_export_path(cfg: &ImportConfig, input: &str) -> Result<PathBuf> {
+    if !cfg.enabled {
+        return Err(Error::Procedure(
+            "apoc.export.* is disabled — set apoc.import.enabled = true in the server config"
+                .into(),
+        ));
+    }
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Procedure(
+            "apoc.export.*: destination path must not be empty".into(),
+        ));
+    }
+    // Reject HTTP explicitly — the user is probably expecting
+    // something we don't support, so a clear error beats
+    // accepting the path as a filename.
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Err(Error::Procedure(
+            "apoc.export.*: HTTP destinations are not supported — write to a local file".into(),
+        ));
+    }
+    let raw_path = if let Some(rest) = trimmed.strip_prefix("file://") {
+        rest.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    if cfg.allow_unrestricted {
+        return Ok(PathBuf::from(raw_path));
+    }
+    if !cfg.allow_file {
+        return Err(Error::Procedure(
+            "apoc.export.*: file writes disabled — set apoc.import.allow_file = true".into(),
+        ));
+    }
+    let path = PathBuf::from(raw_path);
+    if let Some(root) = &cfg.file_root {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|e| Error::Procedure(format!("apoc.export.*: file_root {root:?}: {e}")))?;
+        // Split into parent + file_name so we can canonicalise
+        // just the parent (which must exist) while leaving the
+        // target filename unresolved.
+        let target = if path.is_absolute() {
+            path.clone()
+        } else {
+            canonical_root.join(&path)
+        };
+        let parent = target.parent().ok_or_else(|| {
+            Error::Procedure(format!(
+                "apoc.export.*: destination '{}' has no parent directory",
+                target.display()
+            ))
+        })?;
+        let file_name = target.file_name().ok_or_else(|| {
+            Error::Procedure(format!(
+                "apoc.export.*: destination '{}' has no file name component",
+                target.display()
+            ))
+        })?;
+        let canonical_parent = parent.canonicalize().map_err(|e| {
+            Error::Procedure(format!(
+                "apoc.export.*: parent directory '{}' does not exist: {e}",
+                parent.display()
+            ))
+        })?;
+        if !canonical_parent.starts_with(&canonical_root) {
+            return Err(Error::Procedure(format!(
+                "apoc.export.*: path '{}' is outside the configured import root '{}'",
+                canonical_parent.display(),
+                canonical_root.display()
+            )));
+        }
+        Ok(canonical_parent.join(file_name))
+    } else {
+        Ok(path)
+    }
+}
+
 /// Fetch a resolved [`Source`] as a byte buffer. Files go
 /// through `std::fs`; URLs go through `reqwest::blocking`.
 /// Both errors surface with a clear prefix so the call site

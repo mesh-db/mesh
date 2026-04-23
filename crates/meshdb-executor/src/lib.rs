@@ -1,5 +1,7 @@
 #[cfg(feature = "apoc-cypher")]
 mod apoc_cypher;
+#[cfg(feature = "apoc-export")]
+mod apoc_export;
 #[cfg(feature = "apoc-load")]
 mod apoc_load;
 #[cfg(feature = "apoc-path")]
