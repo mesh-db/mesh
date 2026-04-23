@@ -3211,3 +3211,187 @@ async fn apoc_periodic_iterate_rejects_unknown_yield_column() {
         err.message(),
     );
 }
+
+#[tokio::test]
+async fn apoc_periodic_iterate_extended_result_columns_present() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let rows = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [1, 2, 3] AS x RETURN x',\
+                'CREATE (:Ext {n: $x})',\
+                {batchSize: 10}\
+            ) YIELD batches, retries, batch, operations, updateStatistics, failedParams \
+             RETURN batches, retries, batch, operations, updateStatistics, failedParams"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("extended-column YIELD should succeed");
+    assert_eq!(rows.len(), 1);
+    let r = &rows[0];
+    // retries: no failures, no retries.
+    match r.get("retries").unwrap() {
+        Value::Property(Property::Int64(0)) => {}
+        other => panic!("expected retries=0, got {other:?}"),
+    }
+    // batch / operations: structured Maps with the expected keys.
+    let batch_keys = match r.get("batch").unwrap() {
+        Value::Property(Property::Map(m)) => m
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>(),
+        other => panic!("expected Map batch, got {other:?}"),
+    };
+    assert!(batch_keys.contains("total"));
+    assert!(batch_keys.contains("committed"));
+    assert!(batch_keys.contains("failed"));
+    let ops = match r.get("operations").unwrap() {
+        Value::Property(Property::Map(m)) => m.clone(),
+        other => panic!("expected Map operations, got {other:?}"),
+    };
+    assert_eq!(ops.get("total"), Some(&Property::Int64(3)));
+    assert_eq!(ops.get("committed"), Some(&Property::Int64(3)));
+    assert_eq!(ops.get("failed"), Some(&Property::Int64(0)));
+    // updateStatistics: 3 nodes created with 1 prop + 1 label each.
+    let upd = match r.get("updateStatistics").unwrap() {
+        Value::Property(Property::Map(m)) => m.clone(),
+        other => panic!("expected Map updateStatistics, got {other:?}"),
+    };
+    assert_eq!(upd.get("nodesCreated"), Some(&Property::Int64(3)));
+    assert_eq!(upd.get("propertiesSet"), Some(&Property::Int64(3)));
+    assert_eq!(upd.get("labelsAdded"), Some(&Property::Int64(3)));
+    // failedParams: empty Map (no failures).
+    match r.get("failedParams").unwrap() {
+        Value::Property(Property::Map(m)) => assert!(m.is_empty()),
+        other => panic!("expected empty Map failedParams, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn apoc_periodic_iterate_retries_count_increments_on_repeated_failure() {
+    // UNIQUE constraint guarantees the duplicate batch fails
+    // every attempt. With retries=2, that batch should be
+    // attempted 3 times total (1 initial + 2 retries) — bumping
+    // retries by 2 even though the batch ultimately fails.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    service
+        .execute_cypher_local(
+            "CREATE CONSTRAINT k_uniq FOR (n:RetK) REQUIRE n.k IS UNIQUE".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    service
+        .execute_cypher_local("CREATE (:RetK {k: 99})".into(), ParamMap::new())
+        .await
+        .unwrap();
+    let rows = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [99] AS x RETURN x',\
+                'CREATE (:RetK {k: $x})',\
+                {batchSize: 1, retries: 2}\
+            ) YIELD failedBatches, retries RETURN failedBatches, retries"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("retries config should succeed even on persistent failure");
+    let r = &rows[0];
+    let int_col = |name: &str| match r.get(name).unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("got {other:?}"),
+    };
+    assert_eq!(int_col("failedBatches"), 1);
+    assert_eq!(int_col("retries"), 2, "should have retried twice");
+}
+
+#[tokio::test]
+async fn apoc_periodic_iterate_failed_params_capture_samples() {
+    // failedParams: -1 captures all sets that fail (capped only
+    // by the set size). Verify the `failedParams` column has an
+    // entry containing the failing input row's `x` value.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    service
+        .execute_cypher_local(
+            "CREATE CONSTRAINT k_uniq FOR (n:FpK) REQUIRE n.k IS UNIQUE".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    service
+        .execute_cypher_local("CREATE (:FpK {k: 7})".into(), ParamMap::new())
+        .await
+        .unwrap();
+    let rows = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [7] AS x RETURN x',\
+                'CREATE (:FpK {k: $x})',\
+                {batchSize: 1, failedParams: -1}\
+            ) YIELD failedParams RETURN failedParams"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("failedParams capture should succeed");
+    let fp = match rows[0].get("failedParams").unwrap() {
+        Value::Property(Property::Map(m)) => m.clone(),
+        other => panic!("got {other:?}"),
+    };
+    assert!(!fp.is_empty(), "failedParams should be populated");
+    // Each entry's value is a List of param-map snapshots.
+    let any_sample = fp.values().any(|v| match v {
+        Property::List(items) => items.iter().any(|item| match item {
+            Property::Map(sample) => sample.get("x") == Some(&Property::Int64(7)),
+            _ => false,
+        }),
+        _ => false,
+    });
+    assert!(any_sample, "expected an x=7 sample in failedParams: {fp:?}");
+}
+
+#[tokio::test]
+async fn apoc_periodic_iterate_failed_params_zero_disables_capture() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    service
+        .execute_cypher_local(
+            "CREATE CONSTRAINT k_uniq FOR (n:FpZ) REQUIRE n.k IS UNIQUE".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    service
+        .execute_cypher_local("CREATE (:FpZ {k: 1})".into(), ParamMap::new())
+        .await
+        .unwrap();
+    let rows = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [1] AS x RETURN x',\
+                'CREATE (:FpZ {k: $x})',\
+                {batchSize: 1, failedParams: 0}\
+            ) YIELD failedParams RETURN failedParams"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let fp = match rows[0].get("failedParams").unwrap() {
+        Value::Property(Property::Map(m)) => m.clone(),
+        other => panic!("got {other:?}"),
+    };
+    assert!(
+        fp.is_empty(),
+        "failedParams=0 should disable capture entirely, got {fp:?}",
+    );
+}

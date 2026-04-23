@@ -406,6 +406,16 @@ pub enum LogicalPlan {
         /// (the Neo4j `params` config option). The iterate
         /// row's bindings take precedence on key collision.
         extra_params: std::collections::HashMap<String, crate::ast::Expr>,
+        /// Number of retries to attempt for a failed batch
+        /// before recording it as failed. Default 0 (no
+        /// retries). Maps to Neo4j's `retries` config key.
+        retries: i64,
+        /// Maximum number of failed-parameter snapshots
+        /// captured per error message and surfaced in the
+        /// `failedParams` result column. -1 means unlimited
+        /// (default in Neo4j); 0 disables capture; positive
+        /// values cap the per-error sample list length.
+        failed_params_cap: i64,
     },
     /// Per-input-row left-join wrapper used by `apply_optional_match`
     /// when the OPTIONAL MATCH body is a multi-hop pattern. Runs
@@ -2150,6 +2160,11 @@ pub const APOC_PERIODIC_ITERATE_COLUMNS: &[&str] = &[
     "errorMessages",
     "timeTaken",
     "wasTerminated",
+    "retries",
+    "failedParams",
+    "batch",
+    "operations",
+    "updateStatistics",
 ];
 
 /// Plan-time rewrite of a `CALL apoc.periodic.iterate(iterateQ,
@@ -2183,6 +2198,8 @@ fn build_apoc_periodic_iterate(
     let mut batch_size: i64 = 10000;
     let mut extra_params: std::collections::HashMap<String, Expr> =
         std::collections::HashMap::new();
+    let mut retries: i64 = 0;
+    let mut failed_params_cap: i64 = -1;
     for (key, value) in &config_entries {
         match key.as_str() {
             "batchSize" => {
@@ -2208,12 +2225,39 @@ fn build_apoc_periodic_iterate(
                     extra_params.insert(k, v);
                 }
             }
-            // Silently accept Neo4j-only options (parallel,
-            // concurrency, iterateList, retries, failedParams)
-            // for forward-compatibility — this MVP commit only
-            // honors batchSize + params; the other knobs land
-            // in follow-up commits.
-            "parallel" | "concurrency" | "iterateList" | "retries" | "failedParams" => {}
+            "retries" => {
+                retries = match value {
+                    Expr::Literal(Literal::Integer(n)) if *n >= 0 => *n,
+                    _ => {
+                        return Err(Error::Plan(
+                            "apoc.periodic.iterate config.retries must be a non-negative \
+                             integer literal"
+                                .into(),
+                        ));
+                    }
+                };
+            }
+            "failedParams" => {
+                failed_params_cap = match value {
+                    // -1 = unlimited capture (Neo4j default);
+                    // 0 = disabled; positive caps per-error
+                    // sample list length.
+                    Expr::Literal(Literal::Integer(n)) if *n >= -1 => *n,
+                    _ => {
+                        return Err(Error::Plan(
+                            "apoc.periodic.iterate config.failedParams must be -1, 0, or a \
+                             positive integer literal"
+                                .into(),
+                        ));
+                    }
+                };
+            }
+            // Forward-compat accept for options we don't yet
+            // honor (parallel / concurrency / iterateList);
+            // commit 3 of the apoc.periodic.iterate series
+            // implements iterateList, parallel/concurrency
+            // remain out of scope.
+            "parallel" | "concurrency" | "iterateList" => {}
             other => {
                 return Err(Error::Plan(format!(
                     "apoc.periodic.iterate: unknown config key {other:?}"
@@ -2254,6 +2298,8 @@ fn build_apoc_periodic_iterate(
         action: Box::new(action_plan),
         batch_size,
         extra_params,
+        retries,
+        failed_params_cap,
     })
 }
 

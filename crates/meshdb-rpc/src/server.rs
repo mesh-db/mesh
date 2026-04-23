@@ -794,16 +794,22 @@ impl MeshService {
                  — the in-explicit-tx check upstream should have rejected this case",
             ));
         }
-        let (iterate_plan, action_plan, batch_size, extra_params_exprs) =
-            match find_apoc_periodic_iterate_node(&plan) {
-                Some(parts) => parts,
-                None => {
-                    return Err(Status::failed_precondition(
-                        "execute_apoc_periodic_iterate called on a plan without an \
+        let (
+            iterate_plan,
+            action_plan,
+            batch_size,
+            extra_params_exprs,
+            max_retries,
+            failed_params_cap,
+        ) = match find_apoc_periodic_iterate_node(&plan) {
+            Some(parts) => parts,
+            None => {
+                return Err(Status::failed_precondition(
+                    "execute_apoc_periodic_iterate called on a plan without an \
                          ApocPeriodicIterate node — the dispatcher upstream miswired this",
-                    ));
-                }
-            };
+                ));
+            }
+        };
 
         // Evaluate any `params` config entries once at start
         // against the existing `params` ParamMap so per-row
@@ -868,8 +874,14 @@ impl MeshService {
         let mut committed_ops: i64 = 0;
         let mut failed_ops: i64 = 0;
         let mut failed_batches: i64 = 0;
+        let mut retries_count: i64 = 0;
         let mut error_messages: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
+        let mut failed_params: std::collections::HashMap<
+            String,
+            Vec<std::collections::HashMap<String, meshdb_core::Property>>,
+        > = std::collections::HashMap::new();
+        let mut update_stats = UpdateStatsAccumulator::default();
         let bs = batch_size.max(1) as usize;
 
         for chunk in input_rows.chunks(bs) {
@@ -877,78 +889,111 @@ impl MeshService {
             let chunk_size = chunk.len() as i64;
             total += chunk_size;
             let chunk_rows: Vec<meshdb_executor::Row> = chunk.to_vec();
-            let action_plan = action_plan.clone();
-            let store = self.store.clone();
-            let routing = self.routing.clone();
-            let extra_params = extra_params.clone();
 
-            let outcome = tokio::task::spawn_blocking(
-                move || -> std::result::Result<Vec<GraphCommand>, meshdb_executor::Error> {
-                    let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
-                    let writer = BufferingGraphWriter::new();
-                    let mut procs = ProcedureRegistry::new();
-                    procs.register_defaults();
-                    for row in chunk_rows {
-                        // Per-row ParamMap: extra_params first
-                        // (lower precedence), then iterate row
-                        // overrides on key collision.
-                        let mut row_params = extra_params.clone();
-                        for (k, v) in row {
-                            row_params.insert(k, v);
-                        }
-                        if let Some(r) = routing.as_ref() {
-                            let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
-                            meshdb_executor::execute_with_reader_and_procs(
-                                &action_plan,
-                                &partitioned as &dyn GraphReader,
-                                &writer as &dyn GraphWriter,
-                                &row_params,
-                                &procs,
-                            )?;
-                        } else {
-                            meshdb_executor::execute_with_reader_and_procs(
-                                &action_plan,
-                                &storage_reader as &dyn GraphReader,
-                                &writer as &dyn GraphWriter,
-                                &row_params,
-                                &procs,
-                            )?;
-                        }
-                    }
-                    Ok(writer.into_commands())
-                },
-            )
-            .await
-            .map_err(|e| {
-                Status::internal(format!("batch {batches_count} executor panicked: {e}"))
-            })?;
-
-            match outcome {
-                Ok(commands) => match self.commit_buffered_commands(commands).await {
-                    Ok(()) => {
-                        committed_ops += chunk_size;
-                    }
-                    Err(e) => {
-                        failed_ops += chunk_size;
-                        failed_batches += 1;
-                        *error_messages.entry(e.message().to_string()).or_insert(0) += 1;
-                        tracing::warn!(
-                            batch = batches_count,
-                            error = %e.message(),
-                            "apoc.periodic.iterate — commit failed; counting as failed batch"
-                        );
-                    }
-                },
-                Err(e) => {
-                    failed_ops += chunk_size;
-                    failed_batches += 1;
-                    *error_messages.entry(e.to_string()).or_insert(0) += 1;
-                    tracing::warn!(
-                        batch = batches_count,
-                        error = %e,
-                        "apoc.periodic.iterate — action failed; counting as failed batch"
-                    );
+            // Retry loop: try the batch up to max_retries + 1
+            // times before counting it as a definitive failure.
+            // Each attempt rebuilds the action's writes from
+            // scratch — no partial-batch state from a previous
+            // failed attempt leaks in.
+            let max_attempts = max_retries.max(0) + 1;
+            let mut last_err: Option<String> = None;
+            let mut succeeded = false;
+            let mut succeeded_commands: Option<Vec<GraphCommand>> = None;
+            for attempt in 0..max_attempts {
+                if attempt > 0 {
+                    retries_count += 1;
                 }
+                let chunk_rows = chunk_rows.clone();
+                let action_plan = action_plan.clone();
+                let store = self.store.clone();
+                let routing = self.routing.clone();
+                let extra_params = extra_params.clone();
+                let outcome_result = tokio::task::spawn_blocking(
+                    move || -> std::result::Result<Vec<GraphCommand>, meshdb_executor::Error> {
+                        let storage_reader =
+                            StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
+                        let writer = BufferingGraphWriter::new();
+                        let mut procs = ProcedureRegistry::new();
+                        procs.register_defaults();
+                        for row in chunk_rows {
+                            let mut row_params = extra_params.clone();
+                            for (k, v) in row {
+                                row_params.insert(k, v);
+                            }
+                            if let Some(r) = routing.as_ref() {
+                                let partitioned =
+                                    PartitionedGraphReader::new(store.clone(), r.clone());
+                                meshdb_executor::execute_with_reader_and_procs(
+                                    &action_plan,
+                                    &partitioned as &dyn GraphReader,
+                                    &writer as &dyn GraphWriter,
+                                    &row_params,
+                                    &procs,
+                                )?;
+                            } else {
+                                meshdb_executor::execute_with_reader_and_procs(
+                                    &action_plan,
+                                    &storage_reader as &dyn GraphReader,
+                                    &writer as &dyn GraphWriter,
+                                    &row_params,
+                                    &procs,
+                                )?;
+                            }
+                        }
+                        Ok(writer.into_commands())
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("batch {batches_count} executor panicked: {e}"))
+                })?;
+                match outcome_result {
+                    Ok(commands) => match self.commit_buffered_commands(commands.clone()).await {
+                        Ok(()) => {
+                            update_stats.absorb(&commands);
+                            succeeded = true;
+                            succeeded_commands = Some(commands);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e.message().to_string());
+                        }
+                    },
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                    }
+                }
+            }
+            if succeeded {
+                let _ = succeeded_commands;
+                committed_ops += chunk_size;
+            } else {
+                failed_ops += chunk_size;
+                failed_batches += 1;
+                let err_str = last_err.unwrap_or_else(|| "<no error captured>".into());
+                *error_messages.entry(err_str.clone()).or_insert(0) += 1;
+                if failed_params_cap != 0 {
+                    let bucket = failed_params.entry(err_str.clone()).or_default();
+                    let cap = if failed_params_cap < 0 {
+                        usize::MAX
+                    } else {
+                        failed_params_cap as usize
+                    };
+                    if bucket.len() < cap {
+                        for row in &chunk_rows {
+                            if bucket.len() >= cap {
+                                break;
+                            }
+                            bucket.push(row_to_property_map(row));
+                        }
+                    }
+                }
+                tracing::warn!(
+                    batch = batches_count,
+                    error = %err_str,
+                    attempts = max_attempts,
+                    "apoc.periodic.iterate — batch failed after retries"
+                );
             }
         }
         let time_taken = started_at.elapsed().as_millis() as i64;
@@ -960,6 +1005,9 @@ impl MeshService {
             committed_ops,
             failed_ops,
             failed_batches,
+            retries_count,
+            &failed_params,
+            &update_stats,
             time_taken,
             &error_messages,
         );
@@ -1708,6 +1756,8 @@ fn find_apoc_periodic_iterate_node(
     meshdb_cypher::LogicalPlan,
     i64,
     std::collections::HashMap<String, meshdb_cypher::Expr>,
+    i64,
+    i64,
 )> {
     use meshdb_cypher::LogicalPlan as P;
     match plan {
@@ -1716,11 +1766,15 @@ fn find_apoc_periodic_iterate_node(
             action,
             batch_size,
             extra_params,
+            retries,
+            failed_params_cap,
         } => Some((
             (**iterate).clone(),
             (**action).clone(),
             *batch_size,
             extra_params.clone(),
+            *retries,
+            *failed_params_cap,
         )),
         P::Filter { input, .. }
         | P::Project { input, .. }
@@ -1800,14 +1854,21 @@ fn eval_extra_params(
     Ok(out)
 }
 
-/// Build the standard 8-column apoc.periodic.iterate result
-/// row from accumulated batch counters.
+/// Build the standard 13-column apoc.periodic.iterate result
+/// row from accumulated batch counters and update statistics.
+#[allow(clippy::too_many_arguments)]
 fn build_apoc_periodic_iterate_row(
     batches: i64,
     total: i64,
     committed_ops: i64,
     failed_ops: i64,
     failed_batches: i64,
+    retries_count: i64,
+    failed_params: &std::collections::HashMap<
+        String,
+        Vec<std::collections::HashMap<String, meshdb_core::Property>>,
+    >,
+    update_stats: &UpdateStatsAccumulator,
     time_taken_ms: i64,
     error_messages: &std::collections::HashMap<String, i64>,
 ) -> meshdb_executor::Row {
@@ -1824,12 +1885,143 @@ fn build_apoc_periodic_iterate_row(
     row.insert("failedBatches".into(), v(Property::Int64(failed_batches)));
     row.insert("timeTaken".into(), v(Property::Int64(time_taken_ms)));
     row.insert("wasTerminated".into(), v(Property::Bool(false)));
+    row.insert("retries".into(), v(Property::Int64(retries_count)));
     let err_map: std::collections::HashMap<String, Property> = error_messages
         .iter()
         .map(|(k, n)| (k.clone(), Property::Int64(*n)))
         .collect();
     row.insert("errorMessages".into(), v(Property::Map(err_map)));
+    // failedParams: { errorMessage: [paramMap, paramMap, ...] }
+    let mut fp_map: std::collections::HashMap<String, Property> =
+        std::collections::HashMap::with_capacity(failed_params.len());
+    for (err, samples) in failed_params {
+        let list: Vec<Property> = samples.iter().map(|m| Property::Map(m.clone())).collect();
+        fp_map.insert(err.clone(), Property::List(list));
+    }
+    row.insert("failedParams".into(), v(Property::Map(fp_map)));
+    // batch + operations: per-batch and per-operation counters.
+    // For row-by-row execution they mirror the top-level
+    // counts (each row is one operation, each chunk is one
+    // batch); the structured maps match the Neo4j shape so
+    // dashboards parsing them keep working.
+    let mut batch_map: std::collections::HashMap<String, Property> =
+        std::collections::HashMap::with_capacity(4);
+    batch_map.insert("total".into(), Property::Int64(batches));
+    batch_map.insert(
+        "committed".into(),
+        Property::Int64(batches - failed_batches),
+    );
+    batch_map.insert("failed".into(), Property::Int64(failed_batches));
+    batch_map.insert("errors".into(), Property::Int64(failed_batches));
+    row.insert("batch".into(), v(Property::Map(batch_map)));
+    let mut ops_map: std::collections::HashMap<String, Property> =
+        std::collections::HashMap::with_capacity(4);
+    ops_map.insert("total".into(), Property::Int64(total));
+    ops_map.insert("committed".into(), Property::Int64(committed_ops));
+    ops_map.insert("failed".into(), Property::Int64(failed_ops));
+    ops_map.insert("errors".into(), Property::Int64(failed_ops));
+    row.insert("operations".into(), v(Property::Map(ops_map)));
+    row.insert(
+        "updateStatistics".into(),
+        v(Property::Map(update_stats.to_map())),
+    );
     row
+}
+
+/// Convert a Row's bindings into a flat property map suitable
+/// for storing as a `failedParams` sample. Skips Node / Edge /
+/// Path bindings (they don't round-trip as properties) — keeps
+/// only the scalar/list/map property bindings the action would
+/// have referenced via `$param` substitution.
+fn row_to_property_map(
+    row: &meshdb_executor::Row,
+) -> std::collections::HashMap<String, meshdb_core::Property> {
+    use meshdb_core::Property;
+    let mut out = std::collections::HashMap::with_capacity(row.len());
+    for (k, val) in row {
+        if let meshdb_executor::Value::Property(p) = val {
+            out.insert(k.clone(), p.clone());
+        } else {
+            // Coarse fallback: stringify graph elements so the
+            // sample is at least diagnostic for the user.
+            out.insert(k.clone(), Property::String(format!("{val:?}")));
+        }
+    }
+    out
+}
+
+/// Accumulator for the update-statistics counters that the
+/// apoc.periodic.iterate `updateStatistics` column reports —
+/// nodesCreated, nodesDeleted, relationshipsCreated,
+/// relationshipsDeleted, propertiesSet, labelsAdded. Walks the
+/// post-batch GraphCommand list and counts the structural
+/// changes; only invoked on successful batches so failed
+/// attempts don't leak into the stats.
+#[derive(Debug, Default)]
+struct UpdateStatsAccumulator {
+    nodes_created: i64,
+    nodes_deleted: i64,
+    relationships_created: i64,
+    relationships_deleted: i64,
+    properties_set: i64,
+    labels_added: i64,
+}
+
+impl UpdateStatsAccumulator {
+    fn absorb(&mut self, cmds: &[GraphCommand]) {
+        for cmd in cmds {
+            self.absorb_one(cmd);
+        }
+    }
+
+    fn absorb_one(&mut self, cmd: &GraphCommand) {
+        match cmd {
+            GraphCommand::PutNode(n) => {
+                // PutNode is upsert — without store-side diff
+                // info we can't tell create vs update. Count
+                // every PutNode as one creation (matching the
+                // common-case shape for IN TRANSACTIONS-style
+                // bulk loads where nodes are new). Properties
+                // and labels add their own counters.
+                self.nodes_created += 1;
+                self.properties_set += n.properties.len() as i64;
+                self.labels_added += n.labels.len() as i64;
+            }
+            GraphCommand::PutEdge(e) => {
+                self.relationships_created += 1;
+                self.properties_set += e.properties.len() as i64;
+            }
+            GraphCommand::DeleteEdge(_) => {
+                self.relationships_deleted += 1;
+            }
+            GraphCommand::DetachDeleteNode(_) => {
+                self.nodes_deleted += 1;
+            }
+            GraphCommand::Batch(inner) => self.absorb(inner),
+            // DDL and other variants don't contribute to
+            // `updateStatistics` — they're schema operations,
+            // not data mutations.
+            _ => {}
+        }
+    }
+
+    fn to_map(&self) -> std::collections::HashMap<String, meshdb_core::Property> {
+        use meshdb_core::Property;
+        let mut m = std::collections::HashMap::with_capacity(6);
+        m.insert("nodesCreated".into(), Property::Int64(self.nodes_created));
+        m.insert("nodesDeleted".into(), Property::Int64(self.nodes_deleted));
+        m.insert(
+            "relationshipsCreated".into(),
+            Property::Int64(self.relationships_created),
+        );
+        m.insert(
+            "relationshipsDeleted".into(),
+            Property::Int64(self.relationships_deleted),
+        );
+        m.insert("propertiesSet".into(), Property::Int64(self.properties_set));
+        m.insert("labelsAdded".into(), Property::Int64(self.labels_added));
+        m
+    }
 }
 
 /// Build the `REPORT STATUS AS <var>` row for a single batch:
