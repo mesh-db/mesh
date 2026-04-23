@@ -1540,287 +1540,340 @@ impl Operator for DeleteOp {
 struct SetPropertyOp {
     input: Box<dyn Operator>,
     assignments: Vec<SetAssignment>,
+    /// Eager-evaluated output: drained input with all SET
+    /// assignments already applied to the store. Populated on
+    /// the first `next()` call so the writes happen before any
+    /// downstream operator (e.g. a fresh MATCH inside a
+    /// CartesianProduct after a `WITH *` boundary) starts
+    /// scanning. Without this, lazy per-row apply interleaved
+    /// the writes with downstream scan caching and
+    /// undercounted side effects in patterns like
+    /// `MATCH (n) SET n.x = 1 WITH * MATCH (m) ...`.
+    buffered: Option<Vec<Row>>,
+    cursor: usize,
 }
 
 impl SetPropertyOp {
     fn new(input: Box<dyn Operator>, assignments: Vec<SetAssignment>) -> Self {
-        Self { input, assignments }
+        Self {
+            input,
+            assignments,
+            buffered: None,
+            cursor: 0,
+        }
+    }
+
+    fn apply_one(&self, ctx: &ExecCtx, mut row: Row) -> Result<Row> {
+        // Phase 1: evaluate any RHSes against the original row bindings.
+        enum Action {
+            SetKey {
+                var: String,
+                key: String,
+                prop: Property,
+            },
+            AddLabels {
+                var: String,
+                labels: Vec<String>,
+            },
+            Replace {
+                var: String,
+                props: Vec<(String, Property)>,
+            },
+            Merge {
+                var: String,
+                props: Vec<(String, Property)>,
+            },
+        }
+        let mut actions: Vec<Action> = Vec::with_capacity(self.assignments.len());
+        for a in &self.assignments {
+            match a {
+                SetAssignment::Property { var, key, value } => {
+                    let evaluated = eval_expr(value, &ctx.eval_ctx(&row))?;
+                    let prop = value_to_property(evaluated)?;
+                    actions.push(Action::SetKey {
+                        var: var.clone(),
+                        key: key.clone(),
+                        prop,
+                    });
+                }
+                SetAssignment::Labels { var, labels } => {
+                    actions.push(Action::AddLabels {
+                        var: var.clone(),
+                        labels: labels.clone(),
+                    });
+                }
+                SetAssignment::Replace { var, properties } => {
+                    // Property values are now `Expr`. Evaluate
+                    // each against the current row + params and
+                    // convert via the shared helper, which
+                    // surfaces InvalidSetValue for Node/Edge.
+                    let props = properties
+                        .iter()
+                        .map(|(k, expr)| {
+                            let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
+                            Ok((k.clone(), value_to_property(v)?))
+                        })
+                        .collect::<Result<Vec<(String, Property)>>>()?;
+                    actions.push(Action::Replace {
+                        var: var.clone(),
+                        props,
+                    });
+                }
+                SetAssignment::Merge { var, properties } => {
+                    let props = properties
+                        .iter()
+                        .map(|(k, expr)| {
+                            let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
+                            Ok((k.clone(), value_to_property(v)?))
+                        })
+                        .collect::<Result<Vec<(String, Property)>>>()?;
+                    actions.push(Action::Merge {
+                        var: var.clone(),
+                        props,
+                    });
+                }
+                SetAssignment::ReplaceFromExpr {
+                    var,
+                    source,
+                    replace,
+                } => {
+                    let v = eval_expr(source, &ctx.eval_ctx(&row))?;
+                    let props = extract_property_map(&v)?;
+                    if *replace {
+                        actions.push(Action::Replace {
+                            var: var.clone(),
+                            props,
+                        });
+                    } else {
+                        actions.push(Action::Merge {
+                            var: var.clone(),
+                            props,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase 2: apply updates in-place to the row bindings.
+        let mut updated_nodes: HashSet<String> = HashSet::new();
+        let mut updated_edges: HashSet<String> = HashSet::new();
+        for action in actions {
+            match action {
+                Action::SetKey { var, key, prop } => match row.get_mut(&var) {
+                    // openCypher: SET on a null target (from
+                    // OPTIONAL MATCH that didn't bind) is a
+                    // silent no-op rather than an error.
+                    Some(Value::Null) | Some(Value::Property(Property::Null)) | None => continue,
+                    // openCypher: SET a.key = null removes the
+                    // property rather than storing a null value.
+                    Some(Value::Node(n)) => {
+                        if matches!(prop, Property::Null) {
+                            n.properties.remove(&key);
+                        } else {
+                            n.properties.insert(key, prop);
+                        }
+                        updated_nodes.insert(var);
+                    }
+                    Some(Value::Edge(e)) => {
+                        if matches!(prop, Property::Null) {
+                            e.properties.remove(&key);
+                        } else {
+                            e.properties.insert(key, prop);
+                        }
+                        updated_edges.insert(var);
+                    }
+                    _ => return Err(Error::UnboundVariable(var)),
+                },
+                Action::AddLabels { var, labels } => match row.get_mut(&var) {
+                    Some(Value::Null) | Some(Value::Property(Property::Null)) | None => continue,
+                    Some(Value::Node(n)) => {
+                        for label in labels {
+                            if !n.labels.contains(&label) {
+                                n.labels.push(label);
+                            }
+                        }
+                        updated_nodes.insert(var);
+                    }
+                    _ => return Err(Error::UnboundVariable(var)),
+                },
+                Action::Replace { var, props } => match row.get_mut(&var) {
+                    Some(Value::Null) | Some(Value::Property(Property::Null)) | None => continue,
+                    Some(Value::Node(n)) => {
+                        n.properties.clear();
+                        for (k, v) in props {
+                            if !matches!(v, Property::Null) {
+                                n.properties.insert(k, v);
+                            }
+                        }
+                        updated_nodes.insert(var);
+                    }
+                    Some(Value::Edge(e)) => {
+                        e.properties.clear();
+                        for (k, v) in props {
+                            if !matches!(v, Property::Null) {
+                                e.properties.insert(k, v);
+                            }
+                        }
+                        updated_edges.insert(var);
+                    }
+                    _ => return Err(Error::UnboundVariable(var)),
+                },
+                Action::Merge { var, props } => match row.get_mut(&var) {
+                    Some(Value::Null) | Some(Value::Property(Property::Null)) | None => continue,
+                    Some(Value::Node(n)) => {
+                        for (k, v) in props {
+                            if matches!(v, Property::Null) {
+                                n.properties.remove(&k);
+                            } else {
+                                n.properties.insert(k, v);
+                            }
+                        }
+                        updated_nodes.insert(var);
+                    }
+                    Some(Value::Edge(e)) => {
+                        for (k, v) in props {
+                            if matches!(v, Property::Null) {
+                                e.properties.remove(&k);
+                            } else {
+                                e.properties.insert(k, v);
+                            }
+                        }
+                        updated_edges.insert(var);
+                    }
+                    _ => return Err(Error::UnboundVariable(var)),
+                },
+            }
+        }
+
+        // Phase 3: flush each mutated entity once to the writer.
+        for var in &updated_nodes {
+            if let Some(Value::Node(n)) = row.get(var) {
+                ctx.writer.put_node(n)?;
+            }
+        }
+        for var in &updated_edges {
+            if let Some(Value::Edge(e)) = row.get(var) {
+                ctx.writer.put_edge(e)?;
+            }
+        }
+
+        Ok(row)
     }
 }
 
 impl Operator for SetPropertyOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        match self.input.next(ctx)? {
-            None => Ok(None),
-            Some(mut row) => {
-                // Phase 1: evaluate any RHSes against the original row bindings.
-                enum Action {
-                    SetKey {
-                        var: String,
-                        key: String,
-                        prop: Property,
-                    },
-                    AddLabels {
-                        var: String,
-                        labels: Vec<String>,
-                    },
-                    Replace {
-                        var: String,
-                        props: Vec<(String, Property)>,
-                    },
-                    Merge {
-                        var: String,
-                        props: Vec<(String, Property)>,
-                    },
-                }
-                let mut actions: Vec<Action> = Vec::with_capacity(self.assignments.len());
-                for a in &self.assignments {
-                    match a {
-                        SetAssignment::Property { var, key, value } => {
-                            let evaluated = eval_expr(value, &ctx.eval_ctx(&row))?;
-                            let prop = value_to_property(evaluated)?;
-                            actions.push(Action::SetKey {
-                                var: var.clone(),
-                                key: key.clone(),
-                                prop,
-                            });
-                        }
-                        SetAssignment::Labels { var, labels } => {
-                            actions.push(Action::AddLabels {
-                                var: var.clone(),
-                                labels: labels.clone(),
-                            });
-                        }
-                        SetAssignment::Replace { var, properties } => {
-                            // Property values are now `Expr`. Evaluate
-                            // each against the current row + params and
-                            // convert via the shared helper, which
-                            // surfaces InvalidSetValue for Node/Edge.
-                            let props = properties
-                                .iter()
-                                .map(|(k, expr)| {
-                                    let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
-                                    Ok((k.clone(), value_to_property(v)?))
-                                })
-                                .collect::<Result<Vec<(String, Property)>>>()?;
-                            actions.push(Action::Replace {
-                                var: var.clone(),
-                                props,
-                            });
-                        }
-                        SetAssignment::Merge { var, properties } => {
-                            let props = properties
-                                .iter()
-                                .map(|(k, expr)| {
-                                    let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
-                                    Ok((k.clone(), value_to_property(v)?))
-                                })
-                                .collect::<Result<Vec<(String, Property)>>>()?;
-                            actions.push(Action::Merge {
-                                var: var.clone(),
-                                props,
-                            });
-                        }
-                        SetAssignment::ReplaceFromExpr {
-                            var,
-                            source,
-                            replace,
-                        } => {
-                            let v = eval_expr(source, &ctx.eval_ctx(&row))?;
-                            let props = extract_property_map(&v)?;
-                            if *replace {
-                                actions.push(Action::Replace {
-                                    var: var.clone(),
-                                    props,
-                                });
-                            } else {
-                                actions.push(Action::Merge {
-                                    var: var.clone(),
-                                    props,
-                                });
-                            }
-                        }
-                    }
-                }
-
-                // Phase 2: apply updates in-place to the row bindings.
-                let mut updated_nodes: HashSet<String> = HashSet::new();
-                let mut updated_edges: HashSet<String> = HashSet::new();
-                for action in actions {
-                    match action {
-                        Action::SetKey { var, key, prop } => match row.get_mut(&var) {
-                            // openCypher: SET on a null target (from
-                            // OPTIONAL MATCH that didn't bind) is a
-                            // silent no-op rather than an error.
-                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
-                                continue
-                            }
-                            // openCypher: SET a.key = null removes the
-                            // property rather than storing a null value.
-                            Some(Value::Node(n)) => {
-                                if matches!(prop, Property::Null) {
-                                    n.properties.remove(&key);
-                                } else {
-                                    n.properties.insert(key, prop);
-                                }
-                                updated_nodes.insert(var);
-                            }
-                            Some(Value::Edge(e)) => {
-                                if matches!(prop, Property::Null) {
-                                    e.properties.remove(&key);
-                                } else {
-                                    e.properties.insert(key, prop);
-                                }
-                                updated_edges.insert(var);
-                            }
-                            _ => return Err(Error::UnboundVariable(var)),
-                        },
-                        Action::AddLabels { var, labels } => match row.get_mut(&var) {
-                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
-                                continue
-                            }
-                            Some(Value::Node(n)) => {
-                                for label in labels {
-                                    if !n.labels.contains(&label) {
-                                        n.labels.push(label);
-                                    }
-                                }
-                                updated_nodes.insert(var);
-                            }
-                            _ => return Err(Error::UnboundVariable(var)),
-                        },
-                        Action::Replace { var, props } => match row.get_mut(&var) {
-                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
-                                continue
-                            }
-                            Some(Value::Node(n)) => {
-                                n.properties.clear();
-                                for (k, v) in props {
-                                    if !matches!(v, Property::Null) {
-                                        n.properties.insert(k, v);
-                                    }
-                                }
-                                updated_nodes.insert(var);
-                            }
-                            Some(Value::Edge(e)) => {
-                                e.properties.clear();
-                                for (k, v) in props {
-                                    if !matches!(v, Property::Null) {
-                                        e.properties.insert(k, v);
-                                    }
-                                }
-                                updated_edges.insert(var);
-                            }
-                            _ => return Err(Error::UnboundVariable(var)),
-                        },
-                        Action::Merge { var, props } => match row.get_mut(&var) {
-                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
-                                continue
-                            }
-                            Some(Value::Node(n)) => {
-                                for (k, v) in props {
-                                    if matches!(v, Property::Null) {
-                                        n.properties.remove(&k);
-                                    } else {
-                                        n.properties.insert(k, v);
-                                    }
-                                }
-                                updated_nodes.insert(var);
-                            }
-                            Some(Value::Edge(e)) => {
-                                for (k, v) in props {
-                                    if matches!(v, Property::Null) {
-                                        e.properties.remove(&k);
-                                    } else {
-                                        e.properties.insert(k, v);
-                                    }
-                                }
-                                updated_edges.insert(var);
-                            }
-                            _ => return Err(Error::UnboundVariable(var)),
-                        },
-                    }
-                }
-
-                // Phase 3: flush each mutated entity once to the writer.
-                for var in &updated_nodes {
-                    if let Some(Value::Node(n)) = row.get(var) {
-                        ctx.writer.put_node(n)?;
-                    }
-                }
-                for var in &updated_edges {
-                    if let Some(Value::Edge(e)) = row.get(var) {
-                        ctx.writer.put_edge(e)?;
-                    }
-                }
-
-                Ok(Some(row))
+        // Eager: drain input + apply all SETs upfront, then
+        // stream the mutated rows. See `buffered` doc comment
+        // for why lazy per-row apply broke `WITH *`-then-MATCH.
+        if self.buffered.is_none() {
+            let mut input_rows: Vec<Row> = Vec::new();
+            while let Some(row) = self.input.next(ctx)? {
+                input_rows.push(row);
             }
+            let mut applied: Vec<Row> = Vec::with_capacity(input_rows.len());
+            for row in input_rows {
+                applied.push(self.apply_one(ctx, row)?);
+            }
+            self.buffered = Some(applied);
+            self.cursor = 0;
         }
+        let rows = self.buffered.as_ref().unwrap();
+        if self.cursor < rows.len() {
+            let row = rows[self.cursor].clone();
+            self.cursor += 1;
+            return Ok(Some(row));
+        }
+        Ok(None)
     }
 }
 
 struct RemoveOp {
     input: Box<dyn Operator>,
     items: Vec<RemoveSpec>,
+    /// Eager-evaluated output, same rationale as
+    /// [`SetPropertyOp::buffered`]: drain input and apply all
+    /// removes to the store before any downstream operator
+    /// starts. Lazy per-row apply would interleave writes with
+    /// downstream scan caching.
+    buffered: Option<Vec<Row>>,
+    cursor: usize,
 }
 
 impl RemoveOp {
     fn new(input: Box<dyn Operator>, items: Vec<RemoveSpec>) -> Self {
-        Self { input, items }
+        Self {
+            input,
+            items,
+            buffered: None,
+            cursor: 0,
+        }
+    }
+
+    fn apply_one(&self, ctx: &ExecCtx, mut row: Row) -> Result<Row> {
+        let mut updated_nodes: HashSet<String> = HashSet::new();
+        let mut updated_edges: HashSet<String> = HashSet::new();
+        for item in &self.items {
+            match item {
+                RemoveSpec::Property { var, key } => match row.get_mut(var) {
+                    // Null target (from OPTIONAL MATCH) is a
+                    // no-op, matching Neo4j's REMOVE semantics.
+                    Some(Value::Null) | Some(Value::Property(Property::Null)) | None => continue,
+                    Some(Value::Node(n)) => {
+                        n.properties.remove(key);
+                        updated_nodes.insert(var.clone());
+                    }
+                    Some(Value::Edge(e)) => {
+                        e.properties.remove(key);
+                        updated_edges.insert(var.clone());
+                    }
+                    _ => return Err(Error::UnboundVariable(var.clone())),
+                },
+                RemoveSpec::Labels { var, labels } => match row.get_mut(var) {
+                    Some(Value::Null) | Some(Value::Property(Property::Null)) | None => continue,
+                    Some(Value::Node(n)) => {
+                        n.labels.retain(|l| !labels.contains(l));
+                        updated_nodes.insert(var.clone());
+                    }
+                    _ => return Err(Error::UnboundVariable(var.clone())),
+                },
+            }
+        }
+        for var in &updated_nodes {
+            if let Some(Value::Node(n)) = row.get(var) {
+                ctx.writer.put_node(n)?;
+            }
+        }
+        for var in &updated_edges {
+            if let Some(Value::Edge(e)) = row.get(var) {
+                ctx.writer.put_edge(e)?;
+            }
+        }
+        Ok(row)
     }
 }
 
 impl Operator for RemoveOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        match self.input.next(ctx)? {
-            None => Ok(None),
-            Some(mut row) => {
-                let mut updated_nodes: HashSet<String> = HashSet::new();
-                let mut updated_edges: HashSet<String> = HashSet::new();
-                for item in &self.items {
-                    match item {
-                        RemoveSpec::Property { var, key } => match row.get_mut(var) {
-                            // Null target (from OPTIONAL MATCH) is a
-                            // no-op, matching Neo4j's REMOVE semantics.
-                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
-                                continue
-                            }
-                            Some(Value::Node(n)) => {
-                                n.properties.remove(key);
-                                updated_nodes.insert(var.clone());
-                            }
-                            Some(Value::Edge(e)) => {
-                                e.properties.remove(key);
-                                updated_edges.insert(var.clone());
-                            }
-                            _ => return Err(Error::UnboundVariable(var.clone())),
-                        },
-                        RemoveSpec::Labels { var, labels } => match row.get_mut(var) {
-                            Some(Value::Null) | Some(Value::Property(Property::Null)) | None => {
-                                continue
-                            }
-                            Some(Value::Node(n)) => {
-                                n.labels.retain(|l| !labels.contains(l));
-                                updated_nodes.insert(var.clone());
-                            }
-                            _ => return Err(Error::UnboundVariable(var.clone())),
-                        },
-                    }
-                }
-                for var in &updated_nodes {
-                    if let Some(Value::Node(n)) = row.get(var) {
-                        ctx.writer.put_node(n)?;
-                    }
-                }
-                for var in &updated_edges {
-                    if let Some(Value::Edge(e)) = row.get(var) {
-                        ctx.writer.put_edge(e)?;
-                    }
-                }
-                Ok(Some(row))
+        if self.buffered.is_none() {
+            let mut input_rows: Vec<Row> = Vec::new();
+            while let Some(row) = self.input.next(ctx)? {
+                input_rows.push(row);
             }
+            let mut applied: Vec<Row> = Vec::with_capacity(input_rows.len());
+            for row in input_rows {
+                applied.push(self.apply_one(ctx, row)?);
+            }
+            self.buffered = Some(applied);
+            self.cursor = 0;
         }
+        let rows = self.buffered.as_ref().unwrap();
+        if self.cursor < rows.len() {
+            let row = rows[self.cursor].clone();
+            self.cursor += 1;
+            return Ok(Some(row));
+        }
+        Ok(None)
     }
 }
 
@@ -3150,11 +3203,17 @@ struct MergeNodeOp {
     /// logic runs lazily on the first `next()` so
     /// `ExecCtx::params` is available.
     merge_done: bool,
-    /// Current upstream row — held between calls while we drain
-    /// `merged_nodes` against it. `None` for the top-level
-    /// case (no input).
-    current_input_row: Option<Row>,
     cursor: usize,
+    /// Eager-evaluated output for the input-driven case: drain
+    /// the entire input on first call, run merge for each row
+    /// (writing to the store as we go), and accumulate the
+    /// (input_row, merged_node) cross-products. Lazy per-row
+    /// merging interleaved writes with downstream scan caching
+    /// for `WITH *`-then-MATCH patterns. Only populated when
+    /// `input.is_some()`; the standalone case (`input.is_none()`)
+    /// is already eager via `merge_done`.
+    input_buffered: Option<Vec<Row>>,
+    input_cursor: usize,
 }
 
 impl MergeNodeOp {
@@ -3175,8 +3234,9 @@ impl MergeNodeOp {
             input,
             merged_nodes: Vec::new(),
             merge_done: false,
-            current_input_row: None,
             cursor: 0,
+            input_buffered: None,
+            input_cursor: 0,
         }
     }
 
@@ -3264,29 +3324,34 @@ impl Operator for MergeNodeOp {
         // Input-driven case: evaluate pattern properties *per
         // input row* so references like `MERGE (:City {name:
         // person.bornIn})` resolve against the bound `person`.
-        // Each incoming row produces its own merged-node set,
-        // which is then cross-joined with that row before
-        // emission.
-        loop {
-            if let Some(base) = self.current_input_row.as_ref() {
-                if self.cursor < self.merged_nodes.len() {
-                    let node = self.merged_nodes[self.cursor].clone();
-                    self.cursor += 1;
-                    let mut row = base.clone();
-                    row.insert(self.var.clone(), Value::Node(node));
-                    return Ok(Some(row));
+        // Eager evaluation — drain all input + run all merges +
+        // cross-join with input rows before yielding any. Lazy
+        // per-row merging interleaved writes with downstream
+        // scan caching, which broke `WITH *`-then-MATCH chains.
+        if self.input_buffered.is_none() {
+            let mut input_rows: Vec<Row> = Vec::new();
+            while let Some(row) = self.input.as_mut().unwrap().next(ctx)? {
+                input_rows.push(row);
+            }
+            let mut output: Vec<Row> = Vec::new();
+            for input_row in input_rows {
+                let nodes = self.run_merge_for(ctx, &input_row)?;
+                for node in nodes {
+                    let mut out = input_row.clone();
+                    out.insert(self.var.clone(), Value::Node(node));
+                    output.push(out);
                 }
             }
-            match self.input.as_mut().unwrap().next(ctx)? {
-                None => return Ok(None),
-                Some(row) => {
-                    let nodes = self.run_merge_for(ctx, &row)?;
-                    self.merged_nodes = nodes;
-                    self.cursor = 0;
-                    self.current_input_row = Some(row);
-                }
-            }
+            self.input_buffered = Some(output);
+            self.input_cursor = 0;
         }
+        let rows = self.input_buffered.as_ref().unwrap();
+        if self.input_cursor < rows.len() {
+            let row = rows[self.input_cursor].clone();
+            self.input_cursor += 1;
+            return Ok(Some(row));
+        }
+        Ok(None)
     }
 }
 
@@ -3321,13 +3386,17 @@ struct MergeEdgeOp {
     properties: Vec<(String, Expr)>,
     on_create: Vec<SetAssignment>,
     on_match: Vec<SetAssignment>,
-    /// Rows buffered from the current input row's MERGE result —
-    /// one per existing matched edge (or a single synthesized edge
-    /// if the create branch fired). Drained before the next
-    /// `input.next()` call so multi-match semantics stay correct:
-    /// `MATCH (a:A),(b:B) MERGE (a)-[r:T]->(b)` against two pre-
-    /// existing edges has to yield two rows, not one.
+    /// All output rows from the eager merge pass, queued for
+    /// streaming. Populated on the first `next()` call: drain
+    /// input, run merge for each row (writing to the store as
+    /// we go), accumulate every (input_row × matched_edge)
+    /// cross-product. Eager evaluation is required for
+    /// `WITH *`-then-MATCH chains — see `next` impl for why.
     pending: std::collections::VecDeque<Row>,
+    /// Set after the eager merge pass populates `pending` so
+    /// subsequent `next()` calls don't re-drain the (already
+    /// exhausted) input.
+    drained: bool,
 }
 
 impl MergeEdgeOp {
@@ -3354,60 +3423,66 @@ impl MergeEdgeOp {
             on_create,
             on_match,
             pending: std::collections::VecDeque::new(),
+            drained: false,
         }
     }
 }
 
-impl Operator for MergeEdgeOp {
-    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
-        loop {
-            if let Some(row) = self.pending.pop_front() {
-                return Ok(Some(row));
+impl MergeEdgeOp {
+    /// Per-input-row merge step: scan for matching edges, take
+    /// either the match or create branch, push resulting output
+    /// rows onto `out`. Factored out so the eager `next()` can
+    /// run this for every drained input row before yielding.
+    fn merge_for(&self, ctx: &ExecCtx, row: Row, out: &mut Vec<Row>) -> Result<()> {
+        // Resolve src/dst. Both must be Value::Node — the
+        // planner enforces that the variables came from an
+        // earlier producer, so anything else is a bug or a
+        // later-added feature that didn't update the check.
+        let src_node = match row.get(&self.src_var) {
+            Some(Value::Node(n)) => n.clone(),
+            _ => return Err(Error::UnboundVariable(self.src_var.clone())),
+        };
+        let dst_node = match row.get(&self.dst_var) {
+            Some(Value::Node(n)) => n.clone(),
+            _ => return Err(Error::UnboundVariable(self.dst_var.clone())),
+        };
+
+        // Evaluate the inline edge property filter once per
+        // input row. These are AST expressions so they can
+        // reference outer bindings (`MERGE (a)-[r:T {k: a.v}]->(b)`).
+        let required_props: Vec<(String, Property)> = self
+            .properties
+            .iter()
+            .map(|(k, expr)| {
+                let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
+                Ok((k.clone(), value_to_property(v)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let edge_matches = |edge: &Edge| -> bool {
+            required_props.iter().all(|(k, want)| {
+                edge.properties
+                    .get(k)
+                    .map(|have| have == want)
+                    .unwrap_or(false)
+            })
+        };
+
+        // Collect every edge of type `edge_type` from src to
+        // dst (and, for undirected patterns, dst to src) that
+        // also satisfies the inline property filter.
+        let mut matched: Vec<Edge> = Vec::new();
+        for (edge_id, neighbor_id) in ctx.store.outgoing(src_node.id)? {
+            if neighbor_id != dst_node.id {
+                continue;
             }
-            let Some(row) = self.input.next(ctx)? else {
-                return Ok(None);
-            };
-            // Resolve src/dst. Both must be Value::Node — the
-            // planner enforces that the variables came from an
-            // earlier producer, so anything else is a bug or a
-            // later-added feature that didn't update the check.
-            let src_node = match row.get(&self.src_var) {
-                Some(Value::Node(n)) => n.clone(),
-                _ => return Err(Error::UnboundVariable(self.src_var.clone())),
-            };
-            let dst_node = match row.get(&self.dst_var) {
-                Some(Value::Node(n)) => n.clone(),
-                _ => return Err(Error::UnboundVariable(self.dst_var.clone())),
-            };
-
-            // Evaluate the inline edge property filter once per
-            // input row. These are AST expressions so they can
-            // reference outer bindings (`MERGE (a)-[r:T {k: a.v}]->(b)`).
-            let required_props: Vec<(String, Property)> = self
-                .properties
-                .iter()
-                .map(|(k, expr)| {
-                    let v = eval_expr(expr, &ctx.eval_ctx(&row))?;
-                    Ok((k.clone(), value_to_property(v)?))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let edge_matches = |edge: &Edge| -> bool {
-                required_props.iter().all(|(k, want)| {
-                    edge.properties
-                        .get(k)
-                        .map(|have| have == want)
-                        .unwrap_or(false)
-                })
-            };
-
-            // Collect every edge of type `edge_type` from src to
-            // dst (and, for undirected patterns, dst to src) that
-            // also satisfies the inline property filter. If any
-            // exist we take the match branch and yield one row per
-            // match. If none exist we synthesize one and yield a
-            // single row from the create branch.
-            let mut matched: Vec<Edge> = Vec::new();
-            for (edge_id, neighbor_id) in ctx.store.outgoing(src_node.id)? {
+            if let Some(edge) = ctx.store.get_edge(edge_id)? {
+                if edge.edge_type == self.edge_type && edge_matches(&edge) {
+                    matched.push(edge);
+                }
+            }
+        }
+        if self.undirected {
+            for (edge_id, neighbor_id) in ctx.store.incoming(src_node.id)? {
                 if neighbor_id != dst_node.id {
                     continue;
                 }
@@ -3417,53 +3492,64 @@ impl Operator for MergeEdgeOp {
                     }
                 }
             }
-            if self.undirected {
-                for (edge_id, neighbor_id) in ctx.store.incoming(src_node.id)? {
-                    if neighbor_id != dst_node.id {
-                        continue;
-                    }
-                    if let Some(edge) = ctx.store.get_edge(edge_id)? {
-                        if edge.edge_type == self.edge_type && edge_matches(&edge) {
-                            matched.push(edge);
-                        }
-                    }
-                }
-            }
+        }
 
-            if matched.is_empty() {
-                let mut new_edge = Edge::new(&self.edge_type, src_node.id, dst_node.id);
-                for (k, p) in &required_props {
-                    new_edge.properties.insert(k.clone(), p.clone());
-                }
+        if matched.is_empty() {
+            let mut new_edge = Edge::new(&self.edge_type, src_node.id, dst_node.id);
+            for (k, p) in &required_props {
+                new_edge.properties.insert(k.clone(), p.clone());
+            }
+            let mut row_out = row.clone();
+            apply_merge_edge_actions(
+                &mut new_edge,
+                &self.on_create,
+                &self.edge_var,
+                ctx,
+                &mut row_out,
+            )?;
+            ctx.writer.put_edge(&new_edge)?;
+            row_out.insert(self.edge_var.clone(), Value::Edge(new_edge));
+            out.push(row_out);
+        } else {
+            for mut existing in matched {
                 let mut row_out = row.clone();
-                apply_merge_edge_actions(
-                    &mut new_edge,
-                    &self.on_create,
-                    &self.edge_var,
-                    ctx,
-                    &mut row_out,
-                )?;
-                ctx.writer.put_edge(&new_edge)?;
-                row_out.insert(self.edge_var.clone(), Value::Edge(new_edge));
-                self.pending.push_back(row_out);
-            } else {
-                for mut existing in matched {
-                    let mut row_out = row.clone();
-                    if !self.on_match.is_empty() {
-                        apply_merge_edge_actions(
-                            &mut existing,
-                            &self.on_match,
-                            &self.edge_var,
-                            ctx,
-                            &mut row_out,
-                        )?;
-                        ctx.writer.put_edge(&existing)?;
-                    }
-                    row_out.insert(self.edge_var.clone(), Value::Edge(existing));
-                    self.pending.push_back(row_out);
+                if !self.on_match.is_empty() {
+                    apply_merge_edge_actions(
+                        &mut existing,
+                        &self.on_match,
+                        &self.edge_var,
+                        ctx,
+                        &mut row_out,
+                    )?;
+                    ctx.writer.put_edge(&existing)?;
                 }
+                row_out.insert(self.edge_var.clone(), Value::Edge(existing));
+                out.push(row_out);
             }
         }
+        Ok(())
+    }
+}
+
+impl Operator for MergeEdgeOp {
+    fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
+        // Eager evaluation — drain all input + run all merges
+        // (writing to the store) before yielding any row. Lazy
+        // per-input-row merging interleaved writes with
+        // downstream scan caching for `WITH *`-then-MATCH chains.
+        if self.pending.is_empty() && !self.drained {
+            let mut input_rows: Vec<Row> = Vec::new();
+            while let Some(row) = self.input.next(ctx)? {
+                input_rows.push(row);
+            }
+            let mut out: Vec<Row> = Vec::new();
+            for row in input_rows {
+                self.merge_for(ctx, row, &mut out)?;
+            }
+            self.pending.extend(out);
+            self.drained = true;
+        }
+        Ok(self.pending.pop_front())
     }
 }
 

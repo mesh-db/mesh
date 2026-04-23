@@ -8963,6 +8963,124 @@ fn property_type_constraint_rejects_existing_bad_data() {
     assert!(err.to_string().contains("INTEGER"));
 }
 
+// ---------------------------------------------------------------
+// Eager-write regression tests. Each pattern below has the
+// shape `MATCH ... <write> WITH * MATCH ... RETURN ...` — the
+// second MATCH rebuilds its scan per input row, and a lazy
+// per-row apply on the write operator would interleave writes
+// with that scan caching, causing stale-data reads. The fix
+// (eager drain + apply on the first `next()` of each write op)
+// ensures every write is committed before any downstream scan
+// rebuild runs.
+// ---------------------------------------------------------------
+
+#[test]
+fn eager_set_property_visible_after_with_then_match() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:T {n: 1})");
+    run(&store, "CREATE (:T {n: 2})");
+    run(&store, "CREATE (:T {n: 3})");
+    // SET on every T node, then re-MATCH and read the property.
+    // With lazy SET, the second-MATCH scan rebuilt per input
+    // row would observe a different snapshot each time and
+    // some of the read x values would be null.
+    let rows = run(
+        &store,
+        "MATCH (n:T) SET n.x = n.n * 10 \
+         WITH * \
+         MATCH (m:T) \
+         RETURN m.n AS n, m.x AS x ORDER BY n",
+    );
+    // 3 input rows from first MATCH × 3 m matches per row = 9 output rows.
+    assert_eq!(rows.len(), 9);
+    // Every emitted m.x must be non-null because every T has
+    // had its x set before any second-MATCH scan begins.
+    for row in &rows {
+        match row.get("x") {
+            Some(Value::Property(Property::Int64(_))) => {}
+            other => panic!("expected x=Int64, got {other:?} for row {row:?}"),
+        }
+    }
+}
+
+#[test]
+fn eager_remove_property_visible_after_with_then_match() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:T {n: 1, x: 100})");
+    run(&store, "CREATE (:T {n: 2, x: 200})");
+    run(&store, "CREATE (:T {n: 3, x: 300})");
+    // REMOVE x on every T, then re-MATCH and read x.
+    let rows = run(
+        &store,
+        "MATCH (n:T) REMOVE n.x \
+         WITH * \
+         MATCH (m:T) \
+         RETURN m.x AS x",
+    );
+    assert_eq!(rows.len(), 9);
+    // After eager REMOVE, every m.x must be null.
+    for row in &rows {
+        match row.get("x") {
+            Some(Value::Null) | Some(Value::Property(Property::Null)) => {}
+            other => panic!("expected x=null, got {other:?} for row {row:?}"),
+        }
+    }
+}
+
+#[test]
+fn eager_merge_node_visible_after_with_then_match() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Source {tag: 'a'})");
+    run(&store, "CREATE (:Source {tag: 'b'})");
+    run(&store, "CREATE (:Source {tag: 'c'})");
+    // For each Source, MERGE a Mirror node tagged the same way.
+    // Then count the Mirrors visible after WITH. The expected
+    // count is 3 — one Mirror per Source. Lazy per-row merging
+    // would let earlier-input-row Mirrors not yet exist when
+    // later-input-row second-MATCH scans rebuild.
+    let rows = run(
+        &store,
+        "MATCH (s:Source) MERGE (m:Mirror {tag: s.tag}) \
+         WITH * \
+         MATCH (n:Mirror) \
+         RETURN s.tag AS s, count(n) AS c",
+    );
+    // 3 input rows; each second-MATCH should see all 3 Mirrors.
+    for row in &rows {
+        assert_eq!(
+            int_prop(row, "c"),
+            3,
+            "expected 3 Mirrors visible, row: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn eager_merge_edge_visible_after_with_then_match() {
+    let (store, _d) = open_store();
+    run(&store, "CREATE (:Hub {n: 0})");
+    run(&store, "CREATE (:Spoke {n: 1})");
+    run(&store, "CREATE (:Spoke {n: 2})");
+    run(&store, "CREATE (:Spoke {n: 3})");
+    // For each Spoke, MERGE an edge from the Hub. Then count
+    // edges visible after WITH.
+    let rows = run(
+        &store,
+        "MATCH (h:Hub), (s:Spoke) MERGE (h)-[r:LINKS]->(s) \
+         WITH * \
+         MATCH ()-[e:LINKS]->() \
+         RETURN s.n AS s, count(e) AS c",
+    );
+    // Each input row should see all 3 LINKS edges.
+    for row in &rows {
+        assert_eq!(
+            int_prop(row, "c"),
+            3,
+            "expected 3 LINKS edges, row: {row:?}"
+        );
+    }
+}
+
 #[test]
 fn constraint_persists_across_reopen() {
     let dir = TempDir::new().unwrap();
