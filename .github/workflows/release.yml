@@ -92,6 +92,7 @@ jobs:
             meshdb-cluster
             meshdb-cypher
             meshdb-client
+            meshdb-apoc
             meshdb-executor
             meshdb-rpc
             meshdb-server
