@@ -1,3 +1,5 @@
+#[cfg(feature = "apoc-cypher")]
+mod apoc_cypher;
 #[cfg(feature = "apoc-path")]
 mod apoc_path;
 mod error;

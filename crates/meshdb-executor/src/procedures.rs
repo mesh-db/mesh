@@ -1,9 +1,17 @@
-#[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+#[cfg(any(
+    feature = "apoc-create",
+    feature = "apoc-refactor",
+    feature = "apoc-cypher"
+))]
 use crate::error::Error;
 use crate::error::Result;
 use crate::reader::GraphReader;
 use crate::value::Value;
-#[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+#[cfg(any(
+    feature = "apoc-create",
+    feature = "apoc-refactor",
+    feature = "apoc-cypher"
+))]
 use crate::writer::GraphWriter;
 #[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
 use meshdb_core::Edge;
@@ -213,6 +221,24 @@ pub enum BuiltinProc {
     /// path that reached that node) under the `path` column.
     #[cfg(feature = "apoc-path")]
     ApocPathSpanningTree,
+    /// `apoc.cypher.run(cypher, params)` — parse / plan / execute
+    /// the supplied Cypher statement against the current reader
+    /// and yield each result row as a single `value` column
+    /// carrying a `Map<String, Value>`. Rejects plans containing
+    /// write operators — callers who need writes route through
+    /// [`Self::ApocCypherDoIt`]. Registered as a write builtin
+    /// so the dispatch path has access to both reader and
+    /// procedure registry; the read-only check fires after
+    /// planning.
+    #[cfg(feature = "apoc-cypher")]
+    ApocCypherRun,
+    /// `apoc.cypher.doIt(cypher, params)` — same shape as
+    /// `apoc.cypher.run` but allows writes. The inner execution
+    /// uses the outer query's writer, so mutations accumulate in
+    /// the same buffer and commit atomically with the enclosing
+    /// transaction.
+    #[cfg(feature = "apoc-cypher")]
+    ApocCypherDoIt,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -291,6 +317,12 @@ impl Procedure {
             ) => true,
             #[cfg(feature = "apoc-refactor")]
             Some(BuiltinProc::ApocRefactorSetType) => true,
+            // Both cypher.run and cypher.doIt go through the
+            // write path — run uses it only for the plan-level
+            // read-only check it performs *after* planning, doIt
+            // uses it because it actually writes.
+            #[cfg(feature = "apoc-cypher")]
+            Some(BuiltinProc::ApocCypherRun | BuiltinProc::ApocCypherDoIt) => true,
             _ => false,
         }
     }
@@ -379,20 +411,36 @@ impl Procedure {
             Some(BuiltinProc::ApocRefactorSetType) => Err(Error::Procedure(
                 "apoc.refactor.setType is a write procedure — call via resolve_write_rows".into(),
             )),
+            #[cfg(feature = "apoc-cypher")]
+            Some(BuiltinProc::ApocCypherRun | BuiltinProc::ApocCypherDoIt) => {
+                Err(Error::Procedure(
+                    "apoc.cypher.* is dispatched through resolve_write_rows — caller bug".into(),
+                ))
+            }
         }
     }
 
     /// Write-procedure dispatch path. The args are already
     /// evaluated and type-checked; the row is produced as a side
     /// effect of the mutation (e.g. the newly-created node) so
-    /// `row_matches` is skipped for these procedures.
-    #[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+    /// `row_matches` is skipped for these procedures. The
+    /// procedure registry is threaded through for procedures
+    /// (like `apoc.cypher.doIt`) that recurse into the executor
+    /// and need to resolve nested `CALL` sites against the same
+    /// set; most write built-ins ignore it.
+    #[cfg(any(
+        feature = "apoc-create",
+        feature = "apoc-refactor",
+        feature = "apoc-cypher"
+    ))]
     pub fn resolve_write_rows(
         &self,
         reader: &dyn GraphReader,
         writer: &dyn GraphWriter,
         args: &[Value],
+        procedures: &ProcedureRegistry,
     ) -> Result<Vec<ProcRow>> {
+        let _ = procedures;
         match self.builtin {
             #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateNode) => apoc_create_node(writer, args),
@@ -420,6 +468,14 @@ impl Procedure {
             }
             #[cfg(feature = "apoc-refactor")]
             Some(BuiltinProc::ApocRefactorSetType) => apoc_refactor_set_type(reader, writer, args),
+            #[cfg(feature = "apoc-cypher")]
+            Some(BuiltinProc::ApocCypherRun) => {
+                crate::apoc_cypher::run_cypher(reader, writer, args, procedures, false)
+            }
+            #[cfg(feature = "apoc-cypher")]
+            Some(BuiltinProc::ApocCypherDoIt) => {
+                crate::apoc_cypher::run_cypher(reader, writer, args, procedures, true)
+            }
             _ => Err(Error::Procedure("procedure is not a write builtin".into())),
         }
     }
@@ -1505,6 +1561,46 @@ impl ProcedureRegistry {
             }],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::ApocPathSpanningTree),
+        });
+        #[cfg(feature = "apoc-cypher")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "cypher".into(), "run".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "cypher".into(),
+                    ty: ProcType::String,
+                },
+                ProcArgSpec {
+                    name: "params".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "value".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocCypherRun),
+        });
+        #[cfg(feature = "apoc-cypher")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "cypher".into(), "doIt".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "cypher".into(),
+                    ty: ProcType::String,
+                },
+                ProcArgSpec {
+                    name: "params".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "value".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocCypherDoIt),
         });
     }
 }

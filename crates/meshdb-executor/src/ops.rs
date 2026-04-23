@@ -343,7 +343,7 @@ fn is_write_only_plan(plan: &LogicalPlan) -> bool {
 /// even when the limit suppresses all output rows — Cypher
 /// specifies write operators are eager regardless of how many
 /// rows downstream `LIMIT 0` / `LIMIT N` consumes.
-fn plan_contains_writes(plan: &LogicalPlan) -> bool {
+pub(crate) fn plan_contains_writes(plan: &LogicalPlan) -> bool {
     use LogicalPlan::*;
     match plan {
         // Write-bearing variants — terminate true.
@@ -2640,9 +2640,13 @@ impl ProcedureCallOp {
             // write builtin — `is_write_builtin` returns true only
             // when one of those features is on, so widen the gate
             // when a new write namespace lands.
-            #[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
+            #[cfg(any(
+                feature = "apoc-create",
+                feature = "apoc-refactor",
+                feature = "apoc-cypher"
+            ))]
             {
-                let rows = proc.resolve_write_rows(ctx.store, ctx.writer, &args)?;
+                let rows = proc.resolve_write_rows(ctx.store, ctx.writer, &args, ctx.procedures)?;
                 let merged: Vec<Row> = rows
                     .iter()
                     .map(|pr| self.merge_proc_row(pr, &input_row, &projection))
@@ -2653,7 +2657,11 @@ impl ProcedureCallOp {
                 };
                 return Ok(());
             }
-            #[cfg(not(any(feature = "apoc-create", feature = "apoc-refactor")))]
+            #[cfg(not(any(
+                feature = "apoc-create",
+                feature = "apoc-refactor",
+                feature = "apoc-cypher"
+            )))]
             {
                 let _ = (ctx, &args);
                 return Err(Error::Procedure(

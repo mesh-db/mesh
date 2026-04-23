@@ -11516,3 +11516,200 @@ mod apoc_path {
         }
     }
 }
+
+#[cfg(feature = "apoc-cypher")]
+mod apoc_cypher {
+    use super::*;
+
+    fn unwrap_value_map(row: &Row) -> std::collections::HashMap<String, Value> {
+        match row.get("value") {
+            Some(Value::Map(m)) => m.clone(),
+            other => panic!("expected Value::Map under 'value', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_executes_simple_read_and_yields_each_row_as_value_map() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'Ada', age: 30})");
+        run(&store, "CREATE (:Person {name: 'Bob', age: 40})");
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.cypher.run('MATCH (p:Person) RETURN p.name AS name, p.age AS age', {}) YIELD value \
+             RETURN value",
+        );
+        assert_eq!(rows.len(), 2);
+        let mut pairs: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| {
+                let m = unwrap_value_map(r);
+                let name = match m.get("name") {
+                    Some(Value::Property(Property::String(s))) => s.clone(),
+                    other => panic!("expected string name, got {other:?}"),
+                };
+                let age = match m.get("age") {
+                    Some(Value::Property(Property::Int64(n))) => *n,
+                    other => panic!("expected int age, got {other:?}"),
+                };
+                (name, age)
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs, vec![("Ada".to_string(), 30), ("Bob".into(), 40)]);
+    }
+
+    #[test]
+    fn run_threads_inner_parameters() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'Ada'})");
+        run(&store, "CREATE (:Person {name: 'Bob'})");
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.cypher.run('MATCH (p:Person {name: $target}) RETURN p.name AS name', {target: 'Ada'}) YIELD value \
+             RETURN value",
+        );
+        assert_eq!(rows.len(), 1);
+        let m = unwrap_value_map(&rows[0]);
+        match m.get("name") {
+            Some(Value::Property(Property::String(s))) => assert_eq!(s, "Ada"),
+            other => panic!("expected Ada, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_passes_through_node_values_unchanged() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'Ada', age: 30})");
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.cypher.run('MATCH (p:Person) RETURN p', {}) YIELD value \
+             RETURN value",
+        );
+        assert_eq!(rows.len(), 1);
+        let m = unwrap_value_map(&rows[0]);
+        match m.get("p") {
+            Some(Value::Node(n)) => {
+                assert_eq!(
+                    n.properties.get("name"),
+                    Some(&Property::String("Ada".into()))
+                );
+                assert_eq!(n.properties.get("age"), Some(&Property::Int64(30)));
+            }
+            other => panic!("expected Node under p, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_rejects_plans_containing_writes() {
+        let (store, _d) = open_store();
+        let stmt =
+            parse("CALL apoc.cypher.run('CREATE (:X) RETURN 1', {}) YIELD value RETURN value")
+                .unwrap();
+        let p = plan(&stmt).unwrap();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let params = ParamMap::new();
+        let err = execute_with_reader_and_procs(
+            &p,
+            &store as &dyn GraphReader,
+            &store as &dyn GraphWriter,
+            &params,
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("apoc.cypher.run cannot execute"),
+            "expected read-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn doit_persists_inner_writes() {
+        let (store, _d) = open_store();
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.cypher.doIt('CREATE (n:Widget {id: 7}) RETURN n.id AS id', {}) YIELD value \
+             RETURN value",
+        );
+        assert_eq!(rows.len(), 1);
+        let m = unwrap_value_map(&rows[0]);
+        match m.get("id") {
+            Some(Value::Property(Property::Int64(n))) => assert_eq!(*n, 7),
+            other => panic!("expected id=7, got {other:?}"),
+        }
+        let found = run(&store, "MATCH (w:Widget) RETURN w.id AS id");
+        assert_eq!(found.len(), 1);
+        assert_eq!(int_prop(&found[0], "id"), 7);
+    }
+
+    #[test]
+    fn doit_write_and_read_are_visible_together() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Counter {n: 0})");
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.cypher.doIt('MATCH (c:Counter) SET c.n = c.n + 1 RETURN c.n AS n', {}) YIELD value \
+             RETURN value",
+        );
+        assert_eq!(rows.len(), 1);
+        let m = unwrap_value_map(&rows[0]);
+        assert!(matches!(
+            m.get("n"),
+            Some(Value::Property(Property::Int64(1)))
+        ));
+    }
+
+    #[test]
+    fn run_propagates_parse_errors_with_clear_prefix() {
+        let (store, _d) = open_store();
+        let stmt = parse("CALL apoc.cypher.run('THIS IS NOT CYPHER', {}) YIELD value RETURN value")
+            .unwrap();
+        let p = plan(&stmt).unwrap();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let params = ParamMap::new();
+        let err = execute_with_reader_and_procs(
+            &p,
+            &store as &dyn GraphReader,
+            &store as &dyn GraphWriter,
+            &params,
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("parse error in inner query"),
+            "expected parse-error prefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_empty_result_yields_zero_rows() {
+        let (store, _d) = open_store();
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.cypher.run('MATCH (:Nonexistent) RETURN 1 AS x', {}) YIELD value \
+             RETURN value",
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn run_multi_row_result() {
+        let (store, _d) = open_store();
+        let rows = run_with_default_procs(
+            &store,
+            "CALL apoc.cypher.run('UNWIND [1, 2, 3, 4] AS x RETURN x', {}) YIELD value \
+             RETURN value",
+        );
+        assert_eq!(rows.len(), 4);
+        let mut xs: Vec<i64> = rows
+            .iter()
+            .map(|r| match unwrap_value_map(r).get("x") {
+                Some(Value::Property(Property::Int64(n))) => *n,
+                other => panic!("expected int, got {other:?}"),
+            })
+            .collect();
+        xs.sort();
+        assert_eq!(xs, vec![1, 2, 3, 4]);
+    }
+}

@@ -52,13 +52,22 @@ apoc-meta = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/meta"]
 # that flag is the scalar dispatcher's marker.
 apoc-refactor = []
 # `apoc.path.*` — traversal procedures (expand / expandConfig /
-# subgraphAll / subgraphNodes / spanningTree). These are
-# procedure-only for now (the scalar side — create / slice /
-# combine / elements — ships in a separate crate feature once
-# the apoc-scalar dispatcher grows pass-through for Value::Path).
-# No `__apoc` because these don't go through the scalar
-# dispatcher.
+# subgraphAll / subgraphNodes / spanningTree) plus the
+# Path-aware scalars (create / slice / combine / elements).
+# These scalars live in `eval.rs` directly rather than routing
+# through `meshdb-apoc`, because they take / return graph
+# element values (Node / Edge / Path) the APOC scalar
+# dispatcher can't carry. No `__apoc` marker because the scalar
+# wiring is native-executor-side.
 apoc-path = []
+# `apoc.cypher.*` — run an arbitrary Cypher statement from
+# inside another query. Ships `apoc.cypher.run` (read-only) and
+# `apoc.cypher.doIt` (write-capable); both recurse into
+# `execute_with_reader_and_procs` with the current reader /
+# writer / procedure registry so inner writes accumulate in the
+# outer buffer for atomic commit, and nested procedure calls
+# resolve against the same registry.
+apoc-cypher = []
 
 # Umbrella: every shipped namespace. Add new sub-features here as
 # they land so `--features apoc` keeps meaning "everything".
@@ -74,4 +83,5 @@ apoc = [
     "apoc-meta",
     "apoc-refactor",
     "apoc-path",
+    "apoc-cypher",
 ]
