@@ -192,6 +192,27 @@ pub enum BuiltinProc {
     /// others as not-set.
     #[cfg(feature = "apoc-path")]
     ApocPathExpandConfig,
+    /// `apoc.path.subgraphNodes(startNode, config)` — walks the
+    /// reachable subgraph under NODE_GLOBAL uniqueness and
+    /// yields one row per distinct node reached, under the
+    /// `node` column. Same config surface as expandConfig, but
+    /// `minLevel` is forced to 0 (start node is included) and
+    /// `uniqueness` is forced to NODE_GLOBAL.
+    #[cfg(feature = "apoc-path")]
+    ApocPathSubgraphNodes,
+    /// `apoc.path.subgraphAll(startNode, config)` — walks the
+    /// reachable subgraph and yields a single row with two
+    /// columns: `nodes` (list of distinct nodes) and
+    /// `relationships` (list of distinct edges). Enumeration is
+    /// eager internally since the output is a single aggregate.
+    #[cfg(feature = "apoc-path")]
+    ApocPathSubgraphAll,
+    /// `apoc.path.spanningTree(startNode, config)` — walks under
+    /// NODE_GLOBAL uniqueness and yields one row per reached
+    /// node carrying its discovery path (the first BFS-order
+    /// path that reached that node) under the `path` column.
+    #[cfg(feature = "apoc-path")]
+    ApocPathSpanningTree,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -312,6 +333,27 @@ impl Procedure {
                 let cfg = crate::apoc_path::config_from_expand_config_args(args)?;
                 Ok(ProcRows::Streaming(Box::new(
                     crate::apoc_path::ExpandCursor::new(cfg),
+                )))
+            }
+            #[cfg(feature = "apoc-path")]
+            Some(BuiltinProc::ApocPathSubgraphNodes) => {
+                let cfg = crate::apoc_path::config_from_expand_config_args(args)?;
+                Ok(ProcRows::Streaming(Box::new(
+                    crate::apoc_path::SubgraphNodesCursor::new(cfg),
+                )))
+            }
+            #[cfg(feature = "apoc-path")]
+            Some(BuiltinProc::ApocPathSubgraphAll) => {
+                let cfg = crate::apoc_path::config_from_expand_config_args(args)?;
+                Ok(ProcRows::Streaming(Box::new(
+                    crate::apoc_path::SubgraphAllCursor::new(cfg),
+                )))
+            }
+            #[cfg(feature = "apoc-path")]
+            Some(BuiltinProc::ApocPathSpanningTree) => {
+                let cfg = crate::apoc_path::config_from_expand_config_args(args)?;
+                Ok(ProcRows::Streaming(Box::new(
+                    crate::apoc_path::SpanningTreeCursor::new(cfg),
                 )))
             }
             #[cfg(feature = "apoc-create")]
@@ -1397,6 +1439,72 @@ impl ProcedureRegistry {
             }],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::ApocPathExpandConfig),
+        });
+        #[cfg(feature = "apoc-path")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "path".into(), "subgraphNodes".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "startNode".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "config".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "node".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocPathSubgraphNodes),
+        });
+        #[cfg(feature = "apoc-path")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "path".into(), "subgraphAll".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "startNode".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "config".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![
+                ProcOutSpec {
+                    name: "nodes".into(),
+                    ty: ProcType::Any,
+                },
+                ProcOutSpec {
+                    name: "relationships".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocPathSubgraphAll),
+        });
+        #[cfg(feature = "apoc-path")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "path".into(), "spanningTree".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "startNode".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "config".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "path".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocPathSpanningTree),
         });
     }
 }

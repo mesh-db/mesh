@@ -788,6 +788,168 @@ impl ProcCursor for ExpandCursor {
     }
 }
 
+/// Cursor that walks like [`ExpandCursor`] but emits one row
+/// per distinct reached node instead of per path. Used by
+/// `apoc.path.subgraphNodes`. Because `apoc.path.subgraphNodes`
+/// always runs with NODE_GLOBAL uniqueness (each node reached
+/// at most once), the underlying expansion naturally produces
+/// one path per node — this adapter just extracts the path's
+/// last node under the `node` column.
+pub struct SubgraphNodesCursor {
+    inner: ExpandCursor,
+}
+
+impl SubgraphNodesCursor {
+    pub const OUTPUT_COLUMN: &'static str = "node";
+
+    pub fn new(mut config: ExpandConfig) -> Self {
+        // Neo4j's subgraph walkers always include the start node
+        // and enforce NODE_GLOBAL uniqueness. Override before
+        // constructing the inner cursor so user-supplied config
+        // doesn't accidentally exclude the start or loop.
+        config.min_level = 0;
+        config.uniqueness = Uniqueness::NodeGlobal;
+        Self {
+            inner: ExpandCursor::new(config),
+        }
+    }
+}
+
+impl ProcCursor for SubgraphNodesCursor {
+    fn advance(&mut self, reader: &dyn GraphReader) -> Result<Option<ProcRow>> {
+        // With NODE_GLOBAL + minLevel=0, every emitted path has
+        // a unique last-node. Extract it and remap the column.
+        loop {
+            match self.inner.advance(reader)? {
+                Some(mut row) => match row.remove(ExpandCursor::OUTPUT_COLUMN) {
+                    Some(Value::Path { nodes, .. }) => {
+                        let last = match nodes.last() {
+                            Some(n) => n.clone(),
+                            // A zero-node path is structurally
+                            // impossible (the walker seeds with
+                            // the start node), but skip
+                            // defensively rather than panicking
+                            // if the invariant ever slips.
+                            None => continue,
+                        };
+                        let mut out: ProcRow = HashMap::new();
+                        out.insert(Self::OUTPUT_COLUMN.to_string(), Value::Node(last));
+                        return Ok(Some(out));
+                    }
+                    _ => continue,
+                },
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Cursor for `apoc.path.spanningTree` — forces minLevel=0 and
+/// NODE_GLOBAL uniqueness so each reachable node is yielded
+/// exactly once with its discovery path. Otherwise identical to
+/// [`ExpandCursor`]. Kept as a thin newtype (rather than just
+/// flipping config fields at the call site) so the procedure's
+/// documented semantics are visible in the type.
+pub struct SpanningTreeCursor(ExpandCursor);
+
+impl SpanningTreeCursor {
+    pub fn new(mut config: ExpandConfig) -> Self {
+        config.min_level = 0;
+        config.uniqueness = Uniqueness::NodeGlobal;
+        Self(ExpandCursor::new(config))
+    }
+}
+
+impl ProcCursor for SpanningTreeCursor {
+    fn advance(&mut self, reader: &dyn GraphReader) -> Result<Option<ProcRow>> {
+        self.0.advance(reader)
+    }
+}
+
+/// Cursor for `apoc.path.subgraphAll` — walks the entire
+/// reachable subgraph under the config, then emits a single row
+/// `{nodes: [...], relationships: [...]}`. Enumeration is
+/// eager internally (the output is a single aggregate, so there's
+/// nothing to stream), but the cursor still returns `None`
+/// after the one emission so the executor can advance past it.
+pub struct SubgraphAllCursor {
+    inner: ExpandCursor,
+    /// `true` once we've walked the whole subgraph and buffered
+    /// the aggregate row into `pending`.
+    drained: bool,
+    /// `true` once the aggregate row has been handed to the
+    /// caller — a second call returns `None`.
+    emitted: bool,
+    /// Accumulated distinct nodes in first-reached order.
+    nodes: Vec<Node>,
+    /// Accumulated distinct edges in first-reached order.
+    edges: Vec<Edge>,
+    seen_nodes: HashSet<NodeId>,
+    seen_edges: HashSet<EdgeId>,
+}
+
+impl SubgraphAllCursor {
+    pub const NODES_COLUMN: &'static str = "nodes";
+    pub const RELATIONSHIPS_COLUMN: &'static str = "relationships";
+
+    pub fn new(mut config: ExpandConfig) -> Self {
+        config.min_level = 0;
+        config.uniqueness = Uniqueness::NodeGlobal;
+        Self {
+            inner: ExpandCursor::new(config),
+            drained: false,
+            emitted: false,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            seen_nodes: HashSet::new(),
+            seen_edges: HashSet::new(),
+        }
+    }
+
+    fn drain(&mut self, reader: &dyn GraphReader) -> Result<()> {
+        while let Some(mut row) = self.inner.advance(reader)? {
+            let path = row.remove(ExpandCursor::OUTPUT_COLUMN);
+            if let Some(Value::Path { nodes, edges }) = path {
+                for n in nodes {
+                    if self.seen_nodes.insert(n.id) {
+                        self.nodes.push(n);
+                    }
+                }
+                for e in edges {
+                    if self.seen_edges.insert(e.id) {
+                        self.edges.push(e);
+                    }
+                }
+            }
+        }
+        self.drained = true;
+        Ok(())
+    }
+}
+
+impl ProcCursor for SubgraphAllCursor {
+    fn advance(&mut self, reader: &dyn GraphReader) -> Result<Option<ProcRow>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        if !self.drained {
+            self.drain(reader)?;
+        }
+        // Hand over the accumulator contents via mem::take so
+        // the cursor doesn't clone the full vectors — once
+        // emitted the cursor returns None anyway.
+        let nodes = std::mem::take(&mut self.nodes);
+        let edges = std::mem::take(&mut self.edges);
+        let nodes_value = Value::List(nodes.into_iter().map(Value::Node).collect());
+        let edges_value = Value::List(edges.into_iter().map(Value::Edge).collect());
+        let mut out: ProcRow = HashMap::new();
+        out.insert(Self::NODES_COLUMN.to_string(), nodes_value);
+        out.insert(Self::RELATIONSHIPS_COLUMN.to_string(), edges_value);
+        self.emitted = true;
+        Ok(Some(out))
+    }
+}
+
 /// Coerce a procedure arg to a NodeId. Accepts `Value::Node` (a
 /// materialised node from a `MATCH`) directly; reject anything
 /// else with a clear error — APOC's path traversal can't start

@@ -11111,4 +11111,221 @@ mod apoc_path {
             Some(&Property::Int64(2020))
         );
     }
+
+    // --- subgraphNodes ---
+
+    #[test]
+    fn subgraph_nodes_yields_each_reached_node_once() {
+        let (store, _d) = chain_of_four();
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.subgraphNodes(ada, {relationshipFilter: '>KNOWS', maxLevel: 10}) YIELD node \
+             RETURN node",
+        );
+        let mut names: Vec<String> = rows
+            .iter()
+            .map(|r| match r.get("node") {
+                Some(Value::Node(n)) => match n.properties.get("name") {
+                    Some(Property::String(s)) => s.clone(),
+                    _ => "?".into(),
+                },
+                other => panic!("expected Node, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Ada", "Bob", "Cara", "Dan"]);
+    }
+
+    #[test]
+    fn subgraph_nodes_includes_start_node() {
+        let (store, _d) = open_store();
+        run(&store, "CREATE (:Person {name: 'Solo'})");
+        // Single isolated node — subgraphNodes still yields the
+        // start since minLevel is forced to 0.
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (p:Person {name: 'Solo'}) \
+             CALL apoc.path.subgraphNodes(p, {}) YIELD node \
+             RETURN node",
+        );
+        assert_eq!(rows.len(), 1);
+        if let Some(Value::Node(n)) = rows[0].get("node") {
+            assert_eq!(
+                n.properties.get("name"),
+                Some(&Property::String("Solo".into()))
+            );
+        } else {
+            panic!("expected Node");
+        }
+    }
+
+    #[test]
+    fn subgraph_nodes_respects_blacklist() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (:Person {name: 'Ada'})-[:KNOWS]->(:Person:Spam {name: 'Bot'})-[:KNOWS]->\
+                     (:Person {name: 'Cara'})",
+        );
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.subgraphNodes(ada, {relationshipFilter: '>KNOWS', labelFilter: '-Spam', maxLevel: 10}) YIELD node \
+             RETURN node",
+        );
+        let names: Vec<String> = rows
+            .iter()
+            .map(|r| match r.get("node") {
+                Some(Value::Node(n)) => match n.properties.get("name") {
+                    Some(Property::String(s)) => s.clone(),
+                    _ => "?".into(),
+                },
+                _ => panic!("expected node"),
+            })
+            .collect();
+        assert_eq!(names, vec!["Ada"]);
+    }
+
+    // --- subgraphAll ---
+
+    #[test]
+    fn subgraph_all_yields_single_row_with_nodes_and_relationships() {
+        let (store, _d) = chain_of_four();
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.subgraphAll(ada, {relationshipFilter: '>KNOWS', maxLevel: 10}) YIELD nodes, relationships \
+             RETURN nodes, relationships",
+        );
+        assert_eq!(rows.len(), 1, "subgraphAll emits exactly one row");
+        match rows[0].get("nodes") {
+            Some(Value::List(items)) => {
+                assert_eq!(items.len(), 4);
+                for item in items {
+                    assert!(matches!(item, Value::Node(_)));
+                }
+            }
+            other => panic!("expected list of nodes, got {other:?}"),
+        }
+        match rows[0].get("relationships") {
+            Some(Value::List(items)) => {
+                assert_eq!(items.len(), 3);
+                for item in items {
+                    assert!(matches!(item, Value::Edge(_)));
+                }
+            }
+            other => panic!("expected list of edges, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subgraph_all_dedupes_across_multiple_paths() {
+        let (store, _d) = open_store();
+        // Diamond: A→B, A→C, B→D, C→D. NODE_GLOBAL visits D
+        // once, so only one of the two edges to D is walked.
+        run(
+            &store,
+            "CREATE (a:Person {name: 'A'}), (b:Person {name: 'B'}), \
+                     (c:Person {name: 'C'}), (d:Person {name: 'D'}), \
+                     (a)-[:R]->(b), (a)-[:R]->(c), (b)-[:R]->(d), (c)-[:R]->(d)",
+        );
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (a:Person {name: 'A'}) \
+             CALL apoc.path.subgraphAll(a, {relationshipFilter: '>R', maxLevel: 10}) YIELD nodes, relationships \
+             RETURN nodes, relationships",
+        );
+        assert_eq!(rows.len(), 1);
+        match rows[0].get("nodes") {
+            Some(Value::List(items)) => assert_eq!(items.len(), 4),
+            other => panic!("expected list of nodes, got {other:?}"),
+        }
+        match rows[0].get("relationships") {
+            Some(Value::List(items)) => assert_eq!(
+                items.len(),
+                3,
+                "NODE_GLOBAL visits D once, so only one of the two edges to D is walked"
+            ),
+            other => panic!("expected list of edges, got {other:?}"),
+        }
+    }
+
+    // --- spanningTree ---
+
+    #[test]
+    fn spanning_tree_yields_path_per_reached_node() {
+        let (store, _d) = chain_of_four();
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.spanningTree(ada, {relationshipFilter: '>KNOWS', maxLevel: 10}) YIELD path \
+             RETURN path",
+        );
+        let mut lens: Vec<usize> = rows
+            .iter()
+            .map(|r| unwrap_path(r, "path").0.len())
+            .collect();
+        lens.sort();
+        assert_eq!(lens, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn spanning_tree_ignores_secondary_paths_to_already_visited_nodes() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (a:Person {name: 'A'}), (b:Person {name: 'B'}), \
+                     (c:Person {name: 'C'}), (d:Person {name: 'D'}), \
+                     (a)-[:R]->(b), (a)-[:R]->(c), (b)-[:R]->(d), (c)-[:R]->(d)",
+        );
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (a:Person {name: 'A'}) \
+             CALL apoc.path.spanningTree(a, {relationshipFilter: '>R', maxLevel: 10}) YIELD path \
+             RETURN path",
+        );
+        assert_eq!(rows.len(), 4, "one path per node under NODE_GLOBAL");
+    }
+
+    #[test]
+    fn spanning_tree_end_node_filter_restricts_emission() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (a:Person {name: 'A'})-[:R]->(b:Person {name: 'B'})-[:R]->\
+                     (c:Person:Target {name: 'C'})-[:R]->(d:Person {name: 'D'})",
+        );
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (a:Person {name: 'A'}) \
+             CALL apoc.path.spanningTree(a, {relationshipFilter: '>R', labelFilter: '>Target', maxLevel: 10}) YIELD path \
+             RETURN path",
+        );
+        assert_eq!(rows.len(), 1);
+        let (nodes, _) = unwrap_path(&rows[0], "path");
+        assert_eq!(path_names(&nodes), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn subgraph_nodes_and_spanning_tree_agree_on_reach_set() {
+        let (store, _d) = chain_of_four();
+        let ns = run_with_default_procs(
+            &store,
+            "MATCH (a:Person {name: 'Ada'}) \
+             CALL apoc.path.subgraphNodes(a, {relationshipFilter: '>KNOWS', maxLevel: 10}) YIELD node \
+             RETURN node",
+        );
+        let st = run_with_default_procs(
+            &store,
+            "MATCH (a:Person {name: 'Ada'}) \
+             CALL apoc.path.spanningTree(a, {relationshipFilter: '>KNOWS', maxLevel: 10}) YIELD path \
+             RETURN path",
+        );
+        assert_eq!(
+            ns.len(),
+            st.len(),
+            "subgraphNodes and spanningTree should report the same reach-set size"
+        );
+    }
 }
