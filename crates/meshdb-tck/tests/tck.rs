@@ -2,11 +2,11 @@ use cucumber::{given, then, when, World};
 use meshdb_core::Property;
 use meshdb_cypher::{parse, plan};
 use meshdb_executor::{
-    execute_with_reader_and_procs, ParamMap, ProcArgSpec, ProcOutSpec, ProcRow, ProcType,
-    Procedure, ProcedureRegistry, Row, Value,
+    execute_with_reader_and_procs, GraphReader, ParamMap, ProcArgSpec, ProcOutSpec, ProcRow,
+    ProcType, Procedure, ProcedureRegistry, Row, Value,
 };
 use meshdb_storage::RocksDbStorageEngine;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tempfile::TempDir;
 
 #[derive(World)]
@@ -19,6 +19,11 @@ struct MeshWorld {
     procedures: ProcedureRegistry,
     results: Vec<Row>,
     error: Option<String>,
+    /// Snapshot of the graph captured immediately before the
+    /// most recent `When executing query:` step. Read by the
+    /// side-effects assertions to compute deltas. None until the
+    /// first query has been run.
+    pre_snapshot: Option<Snapshot>,
 }
 
 impl std::fmt::Debug for MeshWorld {
@@ -41,6 +46,7 @@ impl MeshWorld {
             procedures: ProcedureRegistry::new(),
             results: Vec::new(),
             error: None,
+            pre_snapshot: None,
         }
     }
 
@@ -365,6 +371,12 @@ fn when_executing_query(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
     let query = step.docstring.as_ref().expect("docstring").trim();
     world.error = None;
     world.results.clear();
+    // Snapshot state right before the query so the side-effects
+    // assertions can diff post vs pre. Setup steps (`Given having
+    // executed:`, `Given the binary-tree-2 graph`) are completed
+    // by this point, so their writes don't count toward the
+    // query's side effects.
+    world.pre_snapshot = Some(snapshot(&world.store));
     world.run_cypher(query);
 }
 
@@ -1012,13 +1024,219 @@ fn then_result_empty(world: &mut MeshWorld) {
 }
 
 #[then("no side effects")]
-fn then_no_side_effects(_world: &mut MeshWorld) {
-    // Side-effect checking is optional for now
+fn then_no_side_effects(world: &mut MeshWorld) {
+    let pre = world.pre_snapshot.as_ref().expect(
+        "no pre-query snapshot — `no side effects` must follow a `When executing query:` step",
+    );
+    let post = snapshot(&world.store);
+    let effects = effects_between(pre, &post);
+    assert_eq!(
+        effects,
+        Effects::default(),
+        "Expected no side effects, but observed:\n{effects:#?}",
+    );
 }
 
 #[then(regex = r"^the side effects should be:$")]
-fn then_side_effects(_world: &mut MeshWorld) {
-    // Side-effect checking deferred
+fn then_side_effects(world: &mut MeshWorld, step: &cucumber::gherkin::Step) {
+    let pre = world.pre_snapshot.as_ref().expect(
+        "no pre-query snapshot — `the side effects should be:` must follow a `When executing query:` step",
+    );
+    let post = snapshot(&world.store);
+    let observed = effects_between(pre, &post);
+    let expected = parse_expected_effects(step);
+    assert_eq!(
+        observed, expected,
+        "Side-effects mismatch.\nExpected: {expected:#?}\nObserved: {observed:#?}",
+    );
+}
+
+// --- Side-effect tracking ---
+
+/// Snapshot of the parts of the graph state that contribute to
+/// the openCypher side-effects model. Captured before each
+/// `When executing query:` step and diffed against a fresh
+/// snapshot taken when the assertion fires. Designed to be
+/// cheap-but-not-clever: `BTreeMap`/`BTreeSet` everywhere so
+/// diffs are deterministic regardless of HashMap iteration order.
+#[derive(Default, Debug, Clone)]
+struct Snapshot {
+    /// Live node IDs, stored as their `Debug`-string form so the
+    /// snapshot doesn't depend on `NodeId`'s internals.
+    node_ids: BTreeSet<String>,
+    /// Live edge IDs, same string-form convention.
+    edge_ids: BTreeSet<String>,
+    /// Per-node label set, keyed by node-id-string.
+    node_labels: HashMap<String, BTreeSet<String>>,
+    /// Per-node property map, keyed by node-id-string. The inner
+    /// map's values are the `Debug`-formatted property so a value
+    /// change between snapshots is detected as a (key, oldval) →
+    /// (key, newval) pair.
+    node_props: HashMap<String, HashMap<String, String>>,
+    /// Per-edge property map, same shape as `node_props`.
+    edge_props: HashMap<String, HashMap<String, String>>,
+}
+
+/// Walk the live graph once and produce a [`Snapshot`]. O(N+E)
+/// — fine for TCK-sized scenarios (typical graphs are < 100
+/// elements).
+fn snapshot(store: &impl GraphReader) -> Snapshot {
+    let mut snap = Snapshot::default();
+    let node_ids = store.all_node_ids().expect("snapshot: all_node_ids");
+    for nid in node_ids {
+        let nid_s = format!("{nid:?}");
+        snap.node_ids.insert(nid_s.clone());
+        let node = match store.get_node(nid).expect("snapshot: get_node") {
+            Some(n) => n,
+            None => continue,
+        };
+        let labels: BTreeSet<String> = node.labels.iter().cloned().collect();
+        snap.node_labels.insert(nid_s.clone(), labels);
+        let props: HashMap<String, String> = node
+            .properties
+            .iter()
+            .map(|(k, v)| (k.clone(), format!("{v:?}")))
+            .collect();
+        snap.node_props.insert(nid_s, props);
+        for (eid, _target) in store.outgoing(nid).expect("snapshot: outgoing") {
+            let eid_s = format!("{eid:?}");
+            if snap.edge_ids.insert(eid_s.clone()) {
+                if let Some(edge) = store.get_edge(eid).expect("snapshot: get_edge") {
+                    let props: HashMap<String, String> = edge
+                        .properties
+                        .iter()
+                        .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                        .collect();
+                    snap.edge_props.insert(eid_s, props);
+                }
+            }
+        }
+    }
+    snap
+}
+
+/// The openCypher side-effects vocabulary: `+nodes` /
+/// `-nodes` / `+relationships` / `-relationships` / `+labels` /
+/// `-labels` / `+properties` / `-properties`. All counts default
+/// to 0 — an empty `Effects` is the "no side effects" baseline.
+///
+/// Semantics (matches Neo4j / TCK convention):
+///
+/// - **nodes / relationships**: count of distinct entity IDs
+///   present in only one of the two snapshots.
+/// - **labels**: count of distinct label *names* added or removed
+///   from the graph as a whole. Adding two `:Label` nodes counts
+///   as `+labels: 1`, not `+labels: 2`.
+/// - **properties**: count of distinct (entity, key, value)
+///   triples that appear in only one snapshot. Setting an
+///   existing property to a new value counts as `-properties: 1,
+///   +properties: 1`.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+struct Effects {
+    plus_nodes: i64,
+    minus_nodes: i64,
+    plus_relationships: i64,
+    minus_relationships: i64,
+    plus_labels: i64,
+    minus_labels: i64,
+    plus_properties: i64,
+    minus_properties: i64,
+}
+
+fn effects_between(pre: &Snapshot, post: &Snapshot) -> Effects {
+    let mut out = Effects::default();
+    out.plus_nodes = post.node_ids.difference(&pre.node_ids).count() as i64;
+    out.minus_nodes = pre.node_ids.difference(&post.node_ids).count() as i64;
+    out.plus_relationships = post.edge_ids.difference(&pre.edge_ids).count() as i64;
+    out.minus_relationships = pre.edge_ids.difference(&post.edge_ids).count() as i64;
+
+    let pre_labels: BTreeSet<&String> = pre.node_labels.values().flatten().collect();
+    let post_labels: BTreeSet<&String> = post.node_labels.values().flatten().collect();
+    out.plus_labels = post_labels.difference(&pre_labels).count() as i64;
+    out.minus_labels = pre_labels.difference(&post_labels).count() as i64;
+
+    // Properties: walk the union of (entity, key) pairs across
+    // both snapshots. A pair appearing in only one snapshot is
+    // an add/remove; a pair appearing in both with different
+    // values is a remove + an add. Done separately for nodes and
+    // edges, then summed — TCK doesn't distinguish entity scope
+    // for the property counts.
+    let (np_minus, np_plus) = property_diff(&pre.node_props, &post.node_props);
+    let (ep_minus, ep_plus) = property_diff(&pre.edge_props, &post.edge_props);
+    out.minus_properties = np_minus + ep_minus;
+    out.plus_properties = np_plus + ep_plus;
+
+    out
+}
+
+/// Helper for [`effects_between`]: count `(entity, key, value)`
+/// triples that differ between two per-entity property maps.
+/// Returns `(removed_count, added_count)`.
+fn property_diff(
+    pre: &HashMap<String, HashMap<String, String>>,
+    post: &HashMap<String, HashMap<String, String>>,
+) -> (i64, i64) {
+    let mut removed: i64 = 0;
+    let mut added: i64 = 0;
+    let all_entities: BTreeSet<&String> = pre.keys().chain(post.keys()).collect();
+    for ent in all_entities {
+        let pre_props = pre.get(ent);
+        let post_props = post.get(ent);
+        match (pre_props, post_props) {
+            (Some(p), Some(q)) => {
+                for (k, v) in p {
+                    if q.get(k) != Some(v) {
+                        removed += 1;
+                    }
+                }
+                for (k, v) in q {
+                    if p.get(k) != Some(v) {
+                        added += 1;
+                    }
+                }
+            }
+            (Some(p), None) => removed += p.len() as i64,
+            (None, Some(q)) => added += q.len() as i64,
+            (None, None) => {}
+        }
+    }
+    (removed, added)
+}
+
+/// Parse the `the side effects should be:` data table into an
+/// [`Effects`] struct. Each row is `| <key> | <count> |` where
+/// `<key>` is one of `+nodes` / `-nodes` / `+relationships` /
+/// `-relationships` / `+labels` / `-labels` / `+properties` /
+/// `-properties`. Unknown keys panic — better than silently
+/// passing on a typo'd assertion.
+fn parse_expected_effects(step: &cucumber::gherkin::Step) -> Effects {
+    let table = step
+        .table
+        .as_ref()
+        .expect("`the side effects should be:` requires a data table");
+    let mut effects = Effects::default();
+    for row in &table.rows {
+        if row.len() != 2 {
+            panic!("side-effects row must have 2 cells, got {row:?}");
+        }
+        let key = row[0].trim();
+        let value: i64 = row[1]
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("side-effects count for {key} must parse as i64: {e}"));
+        match key {
+            "+nodes" => effects.plus_nodes = value,
+            "-nodes" => effects.minus_nodes = value,
+            "+relationships" => effects.plus_relationships = value,
+            "-relationships" => effects.minus_relationships = value,
+            "+labels" => effects.plus_labels = value,
+            "-labels" => effects.minus_labels = value,
+            "+properties" => effects.plus_properties = value,
+            "-properties" => effects.minus_properties = value,
+            other => panic!("unknown side-effect key: {other:?}"),
+        }
+    }
+    effects
 }
 
 #[then(regex = r"^an? \w+ should be raised at (?:compile time|runtime|any time): .+$")]
