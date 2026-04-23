@@ -34,7 +34,7 @@ It runs in three modes:
 Install from crates.io (pre-1.0, so the version must be explicit):
 
 ```sh
-cargo install meshdb-server --version 0.1.0-alpha.3
+cargo install meshdb-server --version 0.1.0-alpha.6
 ```
 
 Or build from source:
@@ -205,7 +205,25 @@ expressions.
 **Procedures / subqueries:** `CALL { ... }` (unit and returning form),
 `CALL proc YIELD ...` against a runtime-extensible registry. Built-in
 procedures: `db.labels()`, `db.relationshipTypes()`, `db.propertyKeys()`,
-`db.constraints()`. No APOC library ships by default.
+`db.constraints()`. APOC-compatible procedures and scalars ship behind
+opt-in Cargo features — see the *APOC compatibility* section below.
+
+**Batched-write procedures:** `CALL { ... } IN TRANSACTIONS [OF n ROWS]
+[ON ERROR { FAIL | CONTINUE | BREAK }] [REPORT STATUS AS s]` — the
+Neo4j 5 form for splitting large bulk-write streams across independently-
+committed transactions. `apoc.periodic.iterate(iterateQuery, actionQuery,
+config)` ships as a planner-level rewrite over the same machinery and
+honors `batchSize`, `params`, `retries`, `failedParams`, and
+`iterateList`. Both forms reject use inside an explicit
+`BEGIN`/`COMMIT` since per-batch commits would conflict with the
+enclosing transaction.
+
+**Explicit Bolt transactions:** `BEGIN` / `COMMIT` / `ROLLBACK` Bolt
+messages are fully wired — multi-statement transactions accumulate
+their writes and commit atomically through the same single-node /
+Raft / routing-2PC machinery as auto-commit RUNs. Read-your-writes
+overlay between RUNs in the same transaction; DDL (CREATE INDEX /
+CONSTRAINT) participates in transaction commit and rollback.
 
 **Schema:** `CREATE INDEX` / `DROP INDEX` / `SHOW INDEXES` on single-property
 or composite tuples, for both node (`FOR (n:Label) ON (n.a, n.b, ...)`) and
@@ -294,6 +312,60 @@ and spatial `Point` (Cartesian 2D/3D, WGS-84 2D/3D, EPSG-tagged).
   transactions with atomic batch commit
 - **gRPC** via tonic: `MeshQuery`, `MeshWrite`, `MeshRaft` services. See
   `crates/meshdb-rpc/proto/mesh.proto`.
+
+### APOC compatibility
+
+Mesh ships an APOC-compatible surface in the standalone `meshdb-apoc`
+crate. Each namespace is gated behind a Cargo feature so default builds
+pay nothing; turn on the umbrella `apoc` feature to get everything, or
+opt in per-namespace:
+
+```sh
+cargo install meshdb-server --version 0.1.0-alpha.6 --features apoc
+# or just the namespaces you need:
+cargo install meshdb-server --version 0.1.0-alpha.6 \
+  --features apoc-coll,apoc-text,apoc-create
+```
+
+Shipped today:
+
+- **Scalars** — `apoc.coll.*` (sum / avg / max / min / toSet / sort[Desc] /
+  reverse / contains / union / intersection / subtract / flatten / zip /
+  indexOf / occurrences / toMap), `apoc.text.*` (join / split / replace /
+  indexOf / lpad / rpad / capitalize[All] / decapitalize / swapCase /
+  camelCase / snakeCase / upperCamelCase / repeat / reverse / urlencode /
+  urldecode / regexGroups / hexValue / base64Encode / base64Decode /
+  byteCount / clean / levenshteinDistance), `apoc.map.*` (merge /
+  fromPairs / fromLists / fromValues / setKey / removeKey / removeKeys /
+  values / submap / mergeList), `apoc.util.*` (md5 / sha1 / sha256 /
+  sha384 / sha512), `apoc.convert.*` (toJson / fromJsonMap / fromJsonList),
+  `apoc.date.*` (currentTimestamp / toISO8601 / fromISO8601 / convert /
+  add), `apoc.number.*` (parseInt / parseFloat / arabicToRoman /
+  romanToArabic / format), `apoc.create.*` scalars (uuid / uuidBase64 /
+  uuidBase64ToHex / uuidHexToBase64), `apoc.meta.*` scalars (type /
+  isType / types).
+- **Aggregates** (always-on, wired into the native aggregate operator):
+  `apoc.agg.first` / `last` / `nth` / `median` / `product`.
+- **Write procedures** (`apoc-create`): `apoc.create.node(labels, props)`,
+  `apoc.create.relationship(from, type, props, to)`,
+  `apoc.create.addLabels` / `removeLabels` / `setLabels` / `setProperty` /
+  `setRelProperty`. (`apoc-refactor`): `apoc.refactor.setType(rel,
+  newType)`. All route through the procedure registry's write-dispatch
+  path so writes ride the same single-node / Raft / routing-2PC
+  machinery as `CREATE` / `MERGE`.
+- **Read procedures** (`apoc-meta`): `apoc.meta.schema()`.
+- **Batched-write procedures** (always-on, no Cargo feature):
+  `apoc.periodic.iterate(iterateQuery, actionQuery, config)` —
+  planner-level rewrite into a dedicated batched-commit dispatcher.
+  Honors `batchSize`, `params`, `retries`, `failedParams`,
+  `iterateList`; emits the standard 13-column Neo4j result row.
+  `parallel` / `concurrency` are accepted as forward-compat no-ops —
+  Mesh's parallel-action runtime is sketched but deferred.
+
+Not yet implemented: `apoc.path.*` expansion, `apoc.cypher.run*`
+(needs runtime Cypher evaluation), `apoc.load.*` / `apoc.export.*`
+(file I/O and format parsers), `apoc.trigger.*` (DB-level event
+system).
 
 ---
 
@@ -433,9 +505,18 @@ pair, `ca_path` to the shared CA bundle.
 
 ## Known limitations
 
-- **No built-in APOC procedure library.** The `CALL` procedure framework
-  and an extensible `ProcedureRegistry` are in place, but no APOC-compatible
-  procedures ship with Mesh.
+- **APOC coverage is partial** — see the *APOC compatibility* section
+  above. The big remaining namespaces are `apoc.path.*` (configurable
+  graph-traversal expansions), `apoc.cypher.run*` (runtime evaluation
+  of Cypher strings), `apoc.load.*` / `apoc.export.*` (file I/O), and
+  `apoc.trigger.*` (DB-level event hooks). Each blocks on
+  infrastructure that isn't there yet rather than more of the same
+  registration plumbing.
+- **No parallel batch execution for `apoc.periodic.iterate`** — batches
+  run strictly in sequence today. The `parallel: true` /
+  `concurrency: N` config keys are accepted as no-ops; a real
+  worker-pool implementation is sketched but deferred until a real
+  workload needs the throughput.
 - **GQL quantified path patterns** — parenthesized-subpath form like
   `((a)-[:T]-(b))+` — aren't parsed. The Neo4j 5 relationship-level
   shorthand (`->+`, `->*`, `->{n,m}`) is fully supported.
@@ -454,6 +535,7 @@ mesh/
 │   ├── meshdb-cluster/     # Raft via openraft, partitioner, cluster state
 │   ├── meshdb-rpc/         # tonic gRPC services, partitioned reader/writer, 2PC, TLS helpers
 │   ├── meshdb-bolt/        # Pure-protocol Bolt library: PackStream, framing, handshake, messages
+│   ├── meshdb-apoc/        # APOC-compatible scalars (per-namespace Cargo features)
 │   ├── meshdb-client/      # Binary: TUI client for Bolt-compatible graph DBs (Mesh, Neo4j)
 │   ├── meshdb-tck/         # openCypher TCK (Technology Compatibility Kit) runner
 │   └── meshdb-server/      # Binary: config, startup, gRPC listener, Bolt listener
