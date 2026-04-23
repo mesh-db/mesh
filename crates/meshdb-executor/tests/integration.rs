@@ -10632,3 +10632,483 @@ mod apoc_agg {
         );
     }
 }
+
+#[cfg(feature = "apoc-path")]
+mod apoc_path {
+    use super::*;
+
+    /// Extract the `(nodes, edges)` of a `Value::Path`. Panics on
+    /// any other shape so test failures point at the exact column
+    /// that didn't yield a path.
+    fn unwrap_path(row: &Row, key: &str) -> (Vec<Node>, Vec<Edge>) {
+        match row.get(key) {
+            Some(Value::Path { nodes, edges }) => (nodes.clone(), edges.clone()),
+            other => panic!("expected Value::Path at {key}, got {other:?}"),
+        }
+    }
+
+    /// The name property off each node in the path, in order.
+    /// Makes assertions on traversal order readable at a glance.
+    fn path_names(nodes: &[Node]) -> Vec<String> {
+        nodes
+            .iter()
+            .map(|n| match n.properties.get("name") {
+                Some(Property::String(s)) => s.clone(),
+                _ => "?".into(),
+            })
+            .collect()
+    }
+
+    /// Build the canonical chain graph used by most path tests:
+    /// Ada -[KNOWS]-> Bob -[KNOWS]-> Cara -[KNOWS]-> Dan.
+    /// Returns the store + the tempdir (kept alive for the test).
+    fn chain_of_four() -> (Store, TempDir) {
+        let (store, d) = open_store();
+        run(
+            &store,
+            "CREATE (:Person {name: 'Ada'})-[:KNOWS]->(:Person {name: 'Bob'})-[:KNOWS]->\
+                     (:Person {name: 'Cara'})-[:KNOWS]->(:Person {name: 'Dan'})",
+        );
+        (store, d)
+    }
+
+    #[test]
+    fn expand_yields_paths_within_level_bounds() {
+        let (store, _d) = chain_of_four();
+        // Start from Ada, follow KNOWS outgoing, 1..3 hops. We
+        // expect three paths: Ada→Bob, Ada→Bob→Cara,
+        // Ada→Bob→Cara→Dan.
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '>KNOWS', '', 1, 3) YIELD path \
+             RETURN path",
+        );
+        let mut names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        names.sort_by_key(|p| p.len());
+        assert_eq!(
+            names,
+            vec![
+                vec!["Ada".to_string(), "Bob".into()],
+                vec!["Ada".into(), "Bob".into(), "Cara".into()],
+                vec!["Ada".into(), "Bob".into(), "Cara".into(), "Dan".into()],
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_min_level_zero_includes_start_node() {
+        let (store, _d) = chain_of_four();
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '>KNOWS', '', 0, 1) YIELD path \
+             RETURN path",
+        );
+        // Expect two paths: the length-0 path (just Ada) and
+        // Ada→Bob.
+        let mut names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        names.sort_by_key(|p| p.len());
+        assert_eq!(
+            names,
+            vec![vec!["Ada".to_string()], vec!["Ada".into(), "Bob".into()],]
+        );
+    }
+
+    #[test]
+    fn expand_rel_filter_restricts_traversal_direction() {
+        let (store, _d) = chain_of_four();
+        // From Bob going outgoing only — should reach Cara and
+        // Dan but never Ada (reverse).
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (bob:Person {name: 'Bob'}) \
+             CALL apoc.path.expand(bob, '>KNOWS', '', 1, 10) YIELD path \
+             RETURN path",
+        );
+        let names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        for path in &names {
+            assert!(
+                !path.contains(&"Ada".to_string()),
+                "outgoing-only should not reach Ada, got {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_rel_filter_accepts_incoming() {
+        let (store, _d) = chain_of_four();
+        // From Dan going incoming only — reverses the chain.
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (dan:Person {name: 'Dan'}) \
+             CALL apoc.path.expand(dan, '<KNOWS', '', 1, 10) YIELD path \
+             RETURN path",
+        );
+        let mut names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        names.sort_by_key(|p| p.len());
+        assert_eq!(
+            names,
+            vec![
+                vec!["Dan".to_string(), "Cara".into()],
+                vec!["Dan".into(), "Cara".into(), "Bob".into()],
+                vec!["Dan".into(), "Cara".into(), "Bob".into(), "Ada".into()],
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_rel_filter_rejects_wrong_type() {
+        let (store, _d) = chain_of_four();
+        // LOVES doesn't exist in the chain.
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '>LOVES', '', 1, 10) YIELD path \
+             RETURN path",
+        );
+        assert!(rows.is_empty(), "LOVES filter should match no paths");
+    }
+
+    #[test]
+    fn expand_label_blacklist_prunes_traversal() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person:Spam {name: 'Bot'})-[:KNOWS]->\
+                     (c:Person {name: 'Cara'})",
+        );
+        // Blacklisting Spam blocks expansion past Bot, so Cara
+        // is unreachable.
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '>KNOWS', '-Spam', 1, 10) YIELD path \
+             RETURN path",
+        );
+        let names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        assert!(names.is_empty(), "blacklisting Spam should yield no paths");
+    }
+
+    #[test]
+    fn expand_label_end_node_marker_restricts_emission() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (:Person {name: 'Ada'})-[:KNOWS]->(:Person {name: 'Bob'})-[:KNOWS]->\
+                     (:Person:Admin {name: 'Cara'})-[:KNOWS]->(:Person {name: 'Dan'})",
+        );
+        // `>Admin` says "only emit paths ending at Admin-labelled
+        // nodes". Traversal continues past Cara but only the
+        // Ada→Bob→Cara path is emitted.
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '>KNOWS', '>Admin', 1, 10) YIELD path \
+             RETURN path",
+        );
+        let names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        assert_eq!(
+            names,
+            vec![vec!["Ada".to_string(), "Bob".into(), "Cara".into()]]
+        );
+    }
+
+    #[test]
+    fn expand_label_terminator_stops_traversal() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (:Person {name: 'Ada'})-[:KNOWS]->(:Person:Leaf {name: 'Bob'})-[:KNOWS]->\
+                     (:Person {name: 'Cara'})",
+        );
+        // `/Leaf` emits the Bob path and STOPS expansion, so
+        // Ada→Bob→Cara is never seen.
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '>KNOWS', '/Leaf', 1, 10) YIELD path \
+             RETURN path",
+        );
+        let names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        assert_eq!(names, vec![vec!["Ada".to_string(), "Bob".into()]]);
+    }
+
+    #[test]
+    fn expand_default_uniqueness_avoids_cycles() {
+        // Triangle: Ada → Bob → Cara → Ada. Default
+        // NODE_GLOBAL uniqueness should prevent revisiting.
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Cara'}), \
+                     (a)-[:KNOWS]->(b), (b)-[:KNOWS]->(c), (c)-[:KNOWS]->(a)",
+        );
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '>KNOWS', '', 1, 10) YIELD path \
+             RETURN path",
+        );
+        // With NODE_GLOBAL: Ada → Bob and Ada → Bob → Cara.
+        // Ada is already visited so the cycle-back is skipped.
+        let mut names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        names.sort_by_key(|p| p.len());
+        assert_eq!(
+            names,
+            vec![
+                vec!["Ada".to_string(), "Bob".into()],
+                vec!["Ada".into(), "Bob".into(), "Cara".into()],
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_config_honors_uniqueness_none() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}), \
+                     (a)-[:KNOWS]->(b), (b)-[:KNOWS]->(a)",
+        );
+        // NONE lets the walker revisit nodes freely, so with
+        // maxLevel=3 and one forward + one backward KNOWS edge
+        // between the two nodes, expansion cycles back and forth
+        // unchecked. Compare against the NODE_GLOBAL run on the
+        // same graph — NONE should produce strictly more paths.
+        let rows_none = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expandConfig(ada, {relationshipFilter: 'KNOWS', uniqueness: 'NONE', minLevel: 1, maxLevel: 3}) YIELD path \
+             RETURN path",
+        );
+        let rows_global = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expandConfig(ada, {relationshipFilter: 'KNOWS', uniqueness: 'NODE_GLOBAL', minLevel: 1, maxLevel: 3}) YIELD path \
+             RETURN path",
+        );
+        assert!(
+            rows_none.len() > rows_global.len(),
+            "NONE ({}) should yield more paths than NODE_GLOBAL ({}) on a cyclic graph",
+            rows_none.len(),
+            rows_global.len(),
+        );
+    }
+
+    #[test]
+    fn expand_config_relationship_path_uniqueness() {
+        let (store, _d) = open_store();
+        // Diamond: Ada → Bob → Cara, Ada → Bob → Cara via
+        // parallel edges. RELATIONSHIP_PATH lets us visit Cara
+        // twice via different edges; NODE_GLOBAL would not.
+        run(
+            &store,
+            "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Cara'}), \
+                     (a)-[:KNOWS]->(b), (b)-[:KNOWS {id: 1}]->(c), (b)-[:KNOWS {id: 2}]->(c)",
+        );
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expandConfig(ada, {relationshipFilter: '>KNOWS', uniqueness: 'RELATIONSHIP_PATH', minLevel: 2, maxLevel: 2}) YIELD path \
+             RETURN path",
+        );
+        // Both Ada→Bob→Cara paths via different parallel edges.
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn expand_config_limit_stops_early() {
+        let (store, _d) = open_store();
+        // Wide fan-out from Hub.
+        run(
+            &store,
+            "CREATE (h:Hub {name: 'Hub'}), \
+                     (h)-[:OUT]->(:Leaf {name: 'L1'}), \
+                     (h)-[:OUT]->(:Leaf {name: 'L2'}), \
+                     (h)-[:OUT]->(:Leaf {name: 'L3'}), \
+                     (h)-[:OUT]->(:Leaf {name: 'L4'}), \
+                     (h)-[:OUT]->(:Leaf {name: 'L5'})",
+        );
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (h:Hub) \
+             CALL apoc.path.expandConfig(h, {relationshipFilter: '>OUT', minLevel: 1, maxLevel: 1, limit: 2}) YIELD path \
+             RETURN path",
+        );
+        assert_eq!(rows.len(), 2, "limit: 2 should truncate after 2 paths");
+    }
+
+    #[test]
+    fn expand_config_downstream_limit_short_circuits_stream() {
+        // Same wide fan-out — but instead of config limit, use a
+        // Cypher-level `LIMIT 1`. The streaming cursor should
+        // stop the expansion after emitting once, not enumerate
+        // all five leaves. We verify correctness (one row
+        // returned, the streaming path didn't crash) — true
+        // short-circuiting is confirmed by inspection of the
+        // cursor implementation.
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (h:Hub {name: 'Hub'}), \
+                     (h)-[:OUT]->(:Leaf {name: 'L1'}), \
+                     (h)-[:OUT]->(:Leaf {name: 'L2'}), \
+                     (h)-[:OUT]->(:Leaf {name: 'L3'})",
+        );
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (h:Hub) \
+             CALL apoc.path.expand(h, '>OUT', '', 1, 1) YIELD path \
+             RETURN path LIMIT 1",
+        );
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn expand_config_end_nodes_list() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (:Person {name: 'Ada'})-[:KNOWS]->(:Person {name: 'Bob'})-[:KNOWS]->\
+                     (:Person {name: 'Cara'})-[:KNOWS]->(:Person {name: 'Dan'})",
+        );
+        // Only emit paths ending at Cara.
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}), (cara:Person {name: 'Cara'}) \
+             CALL apoc.path.expandConfig(ada, {relationshipFilter: '>KNOWS', endNodes: [cara], minLevel: 1, maxLevel: 10}) YIELD path \
+             RETURN path",
+        );
+        let names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        assert_eq!(
+            names,
+            vec![vec!["Ada".to_string(), "Bob".into(), "Cara".into()]]
+        );
+    }
+
+    #[test]
+    fn expand_config_rejects_unknown_uniqueness() {
+        let (store, _d) = chain_of_four();
+        let stmt = parse(
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expandConfig(ada, {relationshipFilter: '>KNOWS', uniqueness: 'NODE_BOGUS'}) YIELD path \
+             RETURN path",
+        )
+        .unwrap();
+        let p = plan(&stmt).unwrap();
+        let mut procs = ProcedureRegistry::new();
+        procs.register_defaults();
+        let params = ParamMap::new();
+        let err = execute_with_reader_and_procs(
+            &p,
+            &store as &dyn GraphReader,
+            &store as &dyn GraphWriter,
+            &params,
+            &procs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown uniqueness"),
+            "expected unknown-uniqueness error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn expand_empty_filter_is_permissive() {
+        let (store, _d) = chain_of_four();
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '', '', 1, 1) YIELD path \
+             RETURN path",
+        );
+        let names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        assert_eq!(names, vec![vec!["Ada".to_string(), "Bob".into()]]);
+    }
+
+    #[test]
+    fn expand_over_multi_type_graph_filters_by_rel_type() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Cara'}), \
+                     (a)-[:KNOWS]->(b), (a)-[:LIKES]->(c), (b)-[:KNOWS]->(c)",
+        );
+        // Only follow KNOWS, so Cara is reachable via Bob but
+        // not directly from Ada-LIKES-Cara.
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '>KNOWS', '', 1, 10) YIELD path \
+             RETURN path",
+        );
+        let mut names: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| path_names(&unwrap_path(r, "path").0))
+            .collect();
+        names.sort_by_key(|p| p.len());
+        assert_eq!(
+            names,
+            vec![
+                vec!["Ada".to_string(), "Bob".into()],
+                vec!["Ada".into(), "Bob".into(), "Cara".into()],
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_preserves_edge_and_node_contents() {
+        let (store, _d) = open_store();
+        run(
+            &store,
+            "CREATE (:Person {name: 'Ada', age: 30})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob', age: 40})",
+        );
+        let rows = run_with_default_procs(
+            &store,
+            "MATCH (ada:Person {name: 'Ada'}) \
+             CALL apoc.path.expand(ada, '>KNOWS', '', 1, 1) YIELD path \
+             RETURN path",
+        );
+        let (nodes, edges) = unwrap_path(&rows[0], "path");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(nodes[0].properties.get("age"), Some(&Property::Int64(30)));
+        assert_eq!(nodes[1].properties.get("age"), Some(&Property::Int64(40)));
+        assert_eq!(edges[0].edge_type, "KNOWS");
+        assert_eq!(
+            edges[0].properties.get("since"),
+            Some(&Property::Int64(2020))
+        );
+    }
+}

@@ -26,8 +26,11 @@
 //!   traversal branches.
 
 use crate::error::{Error, Result};
-use meshdb_core::{EdgeId, NodeId};
-use std::collections::HashSet;
+use crate::procedures::{ProcCursor, ProcRow};
+use crate::reader::GraphReader;
+use crate::value::Value;
+use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Per-edge traversal direction used when deciding whether an
 /// adjacency edge matches a [`RelFilter`] clause. The walker
@@ -219,6 +222,7 @@ impl LabelFilter {
 
     /// `true` when the filter has no entries at all — every node
     /// is visitable, every reached node is a valid endpoint.
+    #[cfg(test)]
     pub fn is_permissive(&self) -> bool {
         self.whitelist.is_empty()
             && self.blacklist.is_empty()
@@ -228,18 +232,22 @@ impl LabelFilter {
 
     /// `true` if the walker is allowed to visit (and therefore
     /// potentially emit / expand from) a node with these labels.
-    /// Blacklist always rejects; whitelist gate fires only when at
-    /// least one positive marker exists.
+    /// Blacklist always rejects. Whitelist (`+`) is the only gate
+    /// on *which nodes can be traversed*. End-node (`>`) and
+    /// terminator (`/`) markers do NOT restrict visitability —
+    /// they only affect whether a path is *emitted* and whether
+    /// expansion *stops*. This lets `">Admin"` mean "find paths
+    /// ending at Admin nodes, walking through whatever intermediate
+    /// labels exist" without forcing the caller to whitelist every
+    /// transit label.
     pub fn is_visitable(&self, labels: &[String]) -> bool {
         if labels.iter().any(|l| self.blacklist.contains(l)) {
             return false;
         }
-        if self.whitelist.is_empty() && self.end_nodes.is_empty() && self.terminators.is_empty() {
+        if self.whitelist.is_empty() {
             return true;
         }
-        labels.iter().any(|l| {
-            self.whitelist.contains(l) || self.end_nodes.contains(l) || self.terminators.contains(l)
-        })
+        labels.iter().any(|l| self.whitelist.contains(l))
     }
 
     /// `true` if traversal may continue past a node with these
@@ -310,18 +318,6 @@ impl Uniqueness {
             Self::RelationshipGlobal | Self::RelationshipLevel | Self::RelationshipPath
         )
     }
-
-    pub fn is_global(self) -> bool {
-        matches!(self, Self::NodeGlobal | Self::RelationshipGlobal)
-    }
-
-    pub fn is_level(self) -> bool {
-        matches!(self, Self::NodeLevel | Self::RelationshipLevel)
-    }
-
-    pub fn is_path(self) -> bool {
-        matches!(self, Self::NodePath | Self::RelationshipPath)
-    }
 }
 
 /// Traversal-scope uniqueness state. The tracker owns the global
@@ -383,6 +379,635 @@ impl UniquenessTracker {
             Some(Uniqueness::RelationshipPath) => path_visited.insert(edge),
             _ => true,
         }
+    }
+}
+
+/// Resolved configuration for an [`ExpandCursor`]. Both
+/// `apoc.path.expand` (positional args) and
+/// `apoc.path.expandConfig` (map-keyed config) lower to this
+/// shape so the cursor has a single input surface. The builder
+/// methods on the cursor enforce invariants (min ≤ max, etc.).
+#[derive(Debug, Clone)]
+pub struct ExpandConfig {
+    pub start_node: NodeId,
+    pub min_level: i64,
+    pub max_level: i64,
+    pub rel_filter: RelFilter,
+    pub label_filter: LabelFilter,
+    pub uniqueness: Uniqueness,
+    /// When `false` (the Neo4j APOC default for `apoc.path.expand`)
+    /// the start node is exempt from `label_filter.is_visitable`
+    /// and the node-list whitelist / blacklist. It's still subject
+    /// to emission filtering (endpoint / min-level).
+    pub filter_start_node: bool,
+    /// Per-call emission cap. `None` means unbounded (bounded in
+    /// practice by the graph size and uniqueness).
+    pub limit: Option<usize>,
+    /// If non-empty, only paths ending at one of these nodes are
+    /// emitted. Orthogonal to labelFilter's `>` markers — both
+    /// restrictions apply.
+    pub end_nodes: Option<HashSet<NodeId>>,
+    /// If non-empty, a node with an ID in this set is never
+    /// visited (identical semantics to labelFilter's `-`, but
+    /// node-identity-keyed instead of label-keyed).
+    pub blacklist_nodes: Option<HashSet<NodeId>>,
+    /// If non-empty, a node must be in this set to be visited
+    /// (identical semantics to labelFilter's `+`, but
+    /// node-identity-keyed). Start node is exempt when
+    /// `filter_start_node` is false.
+    pub whitelist_nodes: Option<HashSet<NodeId>>,
+}
+
+impl ExpandConfig {
+    /// Normalise level bounds per Neo4j APOC conventions: any
+    /// negative minLevel resolves to 1 (paths must have at least
+    /// one hop); any negative maxLevel is "unbounded" — we report
+    /// it as `i64::MAX` so the walker's `level > max` checks
+    /// never trip except on a conflicting bound.
+    pub fn resolve_levels(&self) -> (usize, usize) {
+        let min = if self.min_level < 0 {
+            1
+        } else {
+            self.min_level as usize
+        };
+        let max = if self.max_level < 0 {
+            usize::MAX
+        } else {
+            self.max_level as usize
+        };
+        (min, max.max(min))
+    }
+}
+
+/// BFS path expansion cursor. Enumerates every valid path from
+/// `config.start_node` that satisfies the relationship/label
+/// filters, level bounds, and uniqueness rules. Yields one
+/// `ProcRow` per path, under the column name `path`. Runs lazily
+/// — state is preserved between `advance` calls so a downstream
+/// `LIMIT` can stop the cursor without materialising the full
+/// path set. BFS is used unconditionally in this first cut;
+/// `bfs: false` (DFS) callers get the same result set in a
+/// different order, which is still spec-compliant for callers
+/// that don't assume an order.
+pub struct ExpandCursor {
+    config: ExpandConfig,
+    tracker: UniquenessTracker,
+    queue: VecDeque<Frontier>,
+    /// Count of entries remaining in the current BFS level;
+    /// hitting zero triggers `tracker.advance_level()` so
+    /// level-scoped uniqueness resets as we cross boundaries.
+    current_level_remaining: usize,
+    /// Count of entries added at the next BFS level. When the
+    /// current level fully drains, this becomes the new
+    /// remaining count.
+    next_level_count: usize,
+    emitted: usize,
+    output_column: String,
+}
+
+struct Frontier {
+    node_id: NodeId,
+    /// Node ordering in the path being built, in traversal order.
+    /// `nodes[0] == start_node`, `nodes.last() == node_id`.
+    path_nodes: Vec<NodeId>,
+    /// Edges in traversal order. `edges.len() == nodes.len() - 1`.
+    path_edges: Vec<EdgeId>,
+    /// Per-path visited sets for `*_PATH` uniqueness modes.
+    /// Always present but only populated when the mode uses them;
+    /// keeps the frontier shape uniform at the cost of two extra
+    /// empty HashSets per entry for non-path modes.
+    path_visited_nodes: HashSet<NodeId>,
+    path_visited_edges: HashSet<EdgeId>,
+    /// Buffered pending emission — set when a newly pushed path
+    /// satisfies `min_level` and `is_endpoint`. Drained before
+    /// the entry is popped for expansion. Storing it here instead
+    /// of a side queue keeps emission order aligned with BFS
+    /// discovery order.
+    pending_emit: bool,
+}
+
+impl ExpandCursor {
+    /// Column name the procedure yields under. Must match the
+    /// procedure's declared output column in the registry.
+    pub const OUTPUT_COLUMN: &'static str = "path";
+
+    pub fn new(config: ExpandConfig) -> Self {
+        let tracker = UniquenessTracker::new(config.uniqueness);
+        let queue = VecDeque::new();
+        Self {
+            config,
+            tracker,
+            queue,
+            current_level_remaining: 0,
+            next_level_count: 0,
+            emitted: 0,
+            output_column: Self::OUTPUT_COLUMN.to_string(),
+        }
+    }
+
+    /// Eagerly seed the queue with the start node. Done on first
+    /// `advance` rather than in `new` so a cursor can be
+    /// constructed cheaply and only pay the reader round-trip
+    /// when iteration actually begins.
+    fn seed_if_empty(&mut self, reader: &dyn GraphReader) -> Result<()> {
+        if self.emitted == 0 && self.queue.is_empty() {
+            let start = self.config.start_node;
+            // Consume the start-node uniqueness slot so
+            // NODE_GLOBAL doesn't let a cycle come back through
+            // the start node.
+            let mut path_visited_nodes: HashSet<NodeId> = HashSet::new();
+            let _admitted = self.tracker.try_visit_node(start, &mut path_visited_nodes);
+            self.queue.push_back(Frontier {
+                node_id: start,
+                path_nodes: vec![start],
+                path_edges: Vec::new(),
+                path_visited_nodes,
+                path_visited_edges: HashSet::new(),
+                pending_emit: self.should_emit_start(reader)?,
+            });
+            self.current_level_remaining = 1;
+            self.next_level_count = 0;
+        }
+        Ok(())
+    }
+
+    /// True when the start node is itself a valid emission
+    /// (length-0 path) under the resolved config. Honors both
+    /// `filter_start_node` (for visitability) and the endpoint /
+    /// min-level gates (which always apply).
+    fn should_emit_start(&self, reader: &dyn GraphReader) -> Result<bool> {
+        let (min_level, _) = self.config.resolve_levels();
+        if min_level > 0 {
+            return Ok(false);
+        }
+        let node = match reader.get_node(self.config.start_node)? {
+            Some(n) => n,
+            None => return Ok(false),
+        };
+        if self.config.filter_start_node {
+            if !self.config.label_filter.is_visitable(&node.labels) {
+                return Ok(false);
+            }
+            if let Some(wl) = &self.config.whitelist_nodes {
+                if !wl.contains(&self.config.start_node) {
+                    return Ok(false);
+                }
+            }
+            if let Some(bl) = &self.config.blacklist_nodes {
+                if bl.contains(&self.config.start_node) {
+                    return Ok(false);
+                }
+            }
+        }
+        if !self.config.label_filter.is_endpoint(&node.labels) {
+            return Ok(false);
+        }
+        if let Some(endset) = &self.config.end_nodes {
+            if !endset.contains(&self.config.start_node) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Expand `entry` — enumerate its outgoing / incoming
+    /// adjacencies, filter them, push new frontier entries, and
+    /// set `pending_emit` on each qualifying new entry. Called
+    /// when the caller has decided to advance past the current
+    /// frontier head. Returns the number of entries pushed onto
+    /// the queue.
+    fn expand(&mut self, entry_snapshot: Frontier, reader: &dyn GraphReader) -> Result<usize> {
+        let node = match reader.get_node(entry_snapshot.node_id)? {
+            Some(n) => n,
+            None => return Ok(0),
+        };
+        // Terminator labels stop expansion.
+        if !self.config.label_filter.can_continue(&node.labels) {
+            return Ok(0);
+        }
+        let new_level = entry_snapshot.path_nodes.len(); // path_nodes includes start, so this is the next-hop level
+        let (_, max_level) = self.config.resolve_levels();
+        if new_level > max_level {
+            return Ok(0);
+        }
+        let mut pushed = 0usize;
+        if self.config.rel_filter.allows_any_outgoing() {
+            for (edge_id, neighbor_id) in reader.outgoing(entry_snapshot.node_id)? {
+                if self.try_push(
+                    &entry_snapshot,
+                    edge_id,
+                    neighbor_id,
+                    Direction::Outgoing,
+                    reader,
+                )? {
+                    pushed += 1;
+                }
+            }
+        }
+        if self.config.rel_filter.allows_any_incoming() {
+            for (edge_id, neighbor_id) in reader.incoming(entry_snapshot.node_id)? {
+                if self.try_push(
+                    &entry_snapshot,
+                    edge_id,
+                    neighbor_id,
+                    Direction::Incoming,
+                    reader,
+                )? {
+                    pushed += 1;
+                }
+            }
+        }
+        Ok(pushed)
+    }
+
+    /// Try to create a new frontier entry for `(edge_id,
+    /// neighbor_id)` extending `entry`. Returns `Ok(true)` if a
+    /// new entry was pushed, `Ok(false)` if filters rejected it.
+    fn try_push(
+        &mut self,
+        entry: &Frontier,
+        edge_id: EdgeId,
+        neighbor_id: NodeId,
+        direction: Direction,
+        reader: &dyn GraphReader,
+    ) -> Result<bool> {
+        // Relationship filter — cheapest check, do first.
+        let edge = match reader.get_edge(edge_id)? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        if !self.config.rel_filter.accepts(&edge.edge_type, direction) {
+            return Ok(false);
+        }
+        // Node-identity blacklist.
+        if let Some(bl) = &self.config.blacklist_nodes {
+            if bl.contains(&neighbor_id) {
+                return Ok(false);
+            }
+        }
+        // Node-identity whitelist.
+        if let Some(wl) = &self.config.whitelist_nodes {
+            if !wl.contains(&neighbor_id) {
+                return Ok(false);
+            }
+        }
+        let neighbor = match reader.get_node(neighbor_id)? {
+            Some(n) => n,
+            None => return Ok(false),
+        };
+        if !self.config.label_filter.is_visitable(&neighbor.labels) {
+            return Ok(false);
+        }
+        // Uniqueness. Fork per-path sets from the parent so
+        // siblings branch independently.
+        let mut new_path_nodes_set = entry.path_visited_nodes.clone();
+        let mut new_path_edges_set = entry.path_visited_edges.clone();
+        if self.config.uniqueness.is_node_scoped()
+            && !self
+                .tracker
+                .try_visit_node(neighbor_id, &mut new_path_nodes_set)
+        {
+            return Ok(false);
+        }
+        if self.config.uniqueness.is_relationship_scoped()
+            && !self
+                .tracker
+                .try_visit_edge(edge_id, &mut new_path_edges_set)
+        {
+            return Ok(false);
+        }
+        // Build the new path vectors.
+        let mut new_nodes = entry.path_nodes.clone();
+        new_nodes.push(neighbor_id);
+        let mut new_edges = entry.path_edges.clone();
+        new_edges.push(edge_id);
+        let new_level = new_nodes.len() - 1; // hops == edges.len
+        let (min_level, max_level) = self.config.resolve_levels();
+        let within_bounds = new_level >= min_level && new_level <= max_level;
+        let is_endpoint = self.config.label_filter.is_endpoint(&neighbor.labels);
+        let passes_end_nodes = self
+            .config
+            .end_nodes
+            .as_ref()
+            .map(|s| s.contains(&neighbor_id))
+            .unwrap_or(true);
+        let should_emit = within_bounds && is_endpoint && passes_end_nodes;
+        self.queue.push_back(Frontier {
+            node_id: neighbor_id,
+            path_nodes: new_nodes,
+            path_edges: new_edges,
+            path_visited_nodes: new_path_nodes_set,
+            path_visited_edges: new_path_edges_set,
+            pending_emit: should_emit,
+        });
+        self.next_level_count += 1;
+        Ok(true)
+    }
+
+    /// Fetch every node and edge in `entry.path_*` and assemble
+    /// a `Value::Path`. Done on demand (emission time) rather
+    /// than during expansion to keep frontier entries small when
+    /// paths are long or branching is wide.
+    fn materialize(&self, entry: &Frontier, reader: &dyn GraphReader) -> Result<Value> {
+        let mut nodes: Vec<Node> = Vec::with_capacity(entry.path_nodes.len());
+        for nid in &entry.path_nodes {
+            match reader.get_node(*nid)? {
+                Some(n) => nodes.push(n),
+                None => {
+                    return Err(Error::Procedure(format!(
+                        "apoc.path.expand: node {nid:?} vanished during traversal"
+                    )))
+                }
+            }
+        }
+        let mut edges: Vec<Edge> = Vec::with_capacity(entry.path_edges.len());
+        for eid in &entry.path_edges {
+            match reader.get_edge(*eid)? {
+                Some(e) => edges.push(e),
+                None => {
+                    return Err(Error::Procedure(format!(
+                        "apoc.path.expand: edge {eid:?} vanished during traversal"
+                    )))
+                }
+            }
+        }
+        Ok(Value::Path { nodes, edges })
+    }
+}
+
+impl ProcCursor for ExpandCursor {
+    fn advance(&mut self, reader: &dyn GraphReader) -> Result<Option<ProcRow>> {
+        self.seed_if_empty(reader)?;
+        if let Some(limit) = self.config.limit {
+            if self.emitted >= limit {
+                return Ok(None);
+            }
+        }
+        loop {
+            // Process queue head: first consume its pending
+            // emission (if any), then expand it next iteration.
+            if let Some(head) = self.queue.front_mut() {
+                if head.pending_emit {
+                    head.pending_emit = false;
+                    // Clone ids out before materialising so we
+                    // can release the borrow.
+                    let nodes = head.path_nodes.clone();
+                    let edges = head.path_edges.clone();
+                    let frontier_snap = Frontier {
+                        node_id: head.node_id,
+                        path_nodes: nodes,
+                        path_edges: edges,
+                        path_visited_nodes: HashSet::new(),
+                        path_visited_edges: HashSet::new(),
+                        pending_emit: false,
+                    };
+                    let path = self.materialize(&frontier_snap, reader)?;
+                    let mut row: ProcRow = HashMap::new();
+                    row.insert(self.output_column.clone(), path);
+                    self.emitted += 1;
+                    return Ok(Some(row));
+                }
+            } else {
+                return Ok(None);
+            }
+            // Pop the head and expand it.
+            let entry = self.queue.pop_front().expect("queue non-empty above");
+            self.current_level_remaining = self.current_level_remaining.saturating_sub(1);
+            let _ = self.expand(entry, reader)?;
+            if self.current_level_remaining == 0 {
+                // Cross level boundary.
+                self.current_level_remaining = std::mem::replace(&mut self.next_level_count, 0);
+                self.tracker.advance_level();
+            }
+            if let Some(limit) = self.config.limit {
+                if self.emitted >= limit {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// Coerce a procedure arg to a NodeId. Accepts `Value::Node` (a
+/// materialised node from a `MATCH`) directly; reject anything
+/// else with a clear error — APOC's path traversal can't start
+/// from a type it can't identify.
+pub fn expect_start_node(v: &Value, position: &str) -> Result<NodeId> {
+    match v {
+        Value::Node(n) => Ok(n.id),
+        Value::Null | Value::Property(Property::Null) => Err(Error::Procedure(format!(
+            "apoc.path.*: {position} must be a node, got null"
+        ))),
+        other => Err(Error::Procedure(format!(
+            "apoc.path.*: {position} must be a node, got {other:?}"
+        ))),
+    }
+}
+
+/// Pull an `Int64` out of a procedure arg, returning the default
+/// when the arg is null. Raises `TypeMismatch` on non-integer
+/// values — `apoc.path.expand`'s min/max levels are strictly
+/// integer.
+pub fn expect_int_or_default(v: &Value, default: i64, position: &str) -> Result<i64> {
+    match v {
+        Value::Null | Value::Property(Property::Null) => Ok(default),
+        Value::Property(Property::Int64(n)) => Ok(*n),
+        other => Err(Error::Procedure(format!(
+            "apoc.path.*: {position} must be an integer, got {other:?}"
+        ))),
+    }
+}
+
+/// Pull a `String` out of a procedure arg, returning the default
+/// when the arg is null. Used for the filter DSL inputs.
+pub fn expect_string_or_default(v: &Value, default: &str, position: &str) -> Result<String> {
+    match v {
+        Value::Null | Value::Property(Property::Null) => Ok(default.to_string()),
+        Value::Property(Property::String(s)) => Ok(s.clone()),
+        other => Err(Error::Procedure(format!(
+            "apoc.path.*: {position} must be a string, got {other:?}"
+        ))),
+    }
+}
+
+/// Build an `ExpandConfig` from the positional arguments to
+/// `apoc.path.expand(startNode, relFilter, labelFilter,
+/// minLevel, maxLevel)`. Defaults for the filters are empty
+/// strings (permissive); min/max default to the Neo4j
+/// convention (`-1` sentinels for "unspecified").
+pub fn config_from_expand_args(args: &[Value]) -> Result<ExpandConfig> {
+    if args.len() != 5 {
+        return Err(Error::Procedure(format!(
+            "apoc.path.expand expects 5 arguments, got {}",
+            args.len()
+        )));
+    }
+    let start_node = expect_start_node(&args[0], "first argument (startNode)")?;
+    let rel_filter_str =
+        expect_string_or_default(&args[1], "", "second argument (relationshipFilter)")?;
+    let label_filter_str = expect_string_or_default(&args[2], "", "third argument (labelFilter)")?;
+    let min_level = expect_int_or_default(&args[3], -1, "fourth argument (minLevel)")?;
+    let max_level = expect_int_or_default(&args[4], -1, "fifth argument (maxLevel)")?;
+    Ok(ExpandConfig {
+        start_node,
+        min_level,
+        max_level,
+        rel_filter: RelFilter::parse(&rel_filter_str)?,
+        label_filter: LabelFilter::parse(&label_filter_str)?,
+        uniqueness: Uniqueness::NodeGlobal,
+        // `apoc.path.expand`'s positional form does NOT filter the
+        // start node — Neo4j docs are explicit about this. The
+        // expandConfig form exposes `filterStartNode` so callers
+        // can opt in.
+        filter_start_node: false,
+        limit: None,
+        end_nodes: None,
+        blacklist_nodes: None,
+        whitelist_nodes: None,
+    })
+}
+
+/// Build an `ExpandConfig` from the map argument to
+/// `apoc.path.expandConfig(startNode, config)`. Unknown keys
+/// are accepted silently (forward-compat: Neo4j APOC occasionally
+/// adds keys) but logged via tracing for visibility.
+pub fn config_from_expand_config_args(args: &[Value]) -> Result<ExpandConfig> {
+    if args.len() != 2 {
+        return Err(Error::Procedure(format!(
+            "apoc.path.expandConfig expects 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let start_node = expect_start_node(&args[0], "first argument (startNode)")?;
+    let config_map = match &args[1] {
+        Value::Map(m) => map_from_value_map(m)?,
+        Value::Property(Property::Map(m)) => m.clone(),
+        Value::Null | Value::Property(Property::Null) => HashMap::new(),
+        other => {
+            return Err(Error::Procedure(format!(
+                "apoc.path.expandConfig: second argument must be a map, got {other:?}"
+            )));
+        }
+    };
+    let get_str = |key: &str, default: &str| -> Result<String> {
+        match config_map.get(key) {
+            Some(Property::String(s)) => Ok(s.clone()),
+            Some(Property::Null) | None => Ok(default.to_string()),
+            Some(other) => Err(Error::Procedure(format!(
+                "apoc.path.expandConfig: config['{key}'] must be a string, got {other:?}"
+            ))),
+        }
+    };
+    let get_int = |key: &str, default: i64| -> Result<i64> {
+        match config_map.get(key) {
+            Some(Property::Int64(n)) => Ok(*n),
+            Some(Property::Null) | None => Ok(default),
+            Some(other) => Err(Error::Procedure(format!(
+                "apoc.path.expandConfig: config['{key}'] must be an integer, got {other:?}"
+            ))),
+        }
+    };
+    let get_bool = |key: &str, default: bool| -> Result<bool> {
+        match config_map.get(key) {
+            Some(Property::Bool(b)) => Ok(*b),
+            Some(Property::Null) | None => Ok(default),
+            Some(other) => Err(Error::Procedure(format!(
+                "apoc.path.expandConfig: config['{key}'] must be a boolean, got {other:?}"
+            ))),
+        }
+    };
+    let min_level = get_int("minLevel", -1)?;
+    let max_level = get_int("maxLevel", -1)?;
+    let rel_str = get_str("relationshipFilter", "")?;
+    let label_str = get_str("labelFilter", "")?;
+    let uniq_str = get_str("uniqueness", "NODE_GLOBAL")?;
+    let filter_start_node = get_bool("filterStartNode", false)?;
+    let limit_raw = get_int("limit", -1)?;
+    let limit = if limit_raw < 0 {
+        None
+    } else {
+        Some(limit_raw as usize)
+    };
+    // Node-list filters live in the outer Value::Map (which carries
+    // Node values), not the Property::Map lowering. When the
+    // caller passes `{endNodes: [node1, node2]}` those nodes stay
+    // as Value::Node — which means they won't make it through the
+    // `match &args[1] { Value::Property(Property::Map(m)) => ... }`
+    // branch above. Use the Value::Map branch path to extract them.
+    let (end_nodes, blacklist_nodes, whitelist_nodes) = match &args[1] {
+        Value::Map(m) => (
+            extract_node_id_set(m.get("endNodes"), "endNodes")?,
+            extract_node_id_set(m.get("blacklistNodes"), "blacklistNodes")?,
+            extract_node_id_set(m.get("whitelistNodes"), "whitelistNodes")?,
+        ),
+        _ => (None, None, None),
+    };
+    Ok(ExpandConfig {
+        start_node,
+        min_level,
+        max_level,
+        rel_filter: RelFilter::parse(&rel_str)?,
+        label_filter: LabelFilter::parse(&label_str)?,
+        uniqueness: Uniqueness::parse(&uniq_str)?,
+        filter_start_node,
+        limit,
+        end_nodes,
+        blacklist_nodes,
+        whitelist_nodes,
+    })
+}
+
+/// Lower a `HashMap<String, Value>` (from a `Value::Map`
+/// literal) to a `HashMap<String, Property>`, failing on entries
+/// that carry graph elements. Used to extract scalar config keys
+/// while deferring node-list keys for separate handling.
+fn map_from_value_map(m: &HashMap<String, Value>) -> Result<HashMap<String, Property>> {
+    let mut out = HashMap::with_capacity(m.len());
+    for (k, v) in m {
+        match v {
+            Value::Property(p) => {
+                out.insert(k.clone(), p.clone());
+            }
+            // Skip Node / Edge / Path / nested Value::Map entries
+            // — those are node-list filters handled by the caller.
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Pull a set of NodeIds out of a `Value::List` whose items are
+/// `Value::Node`. Returns `Ok(None)` if the key is absent or
+/// explicit null — signals "no filter". An empty list is taken
+/// as "match nothing" (consistent with APOC — an empty
+/// whitelist excludes every node).
+fn extract_node_id_set(v: Option<&Value>, key: &str) -> Result<Option<HashSet<NodeId>>> {
+    match v {
+        None | Some(Value::Null | Value::Property(Property::Null)) => Ok(None),
+        Some(Value::Node(n)) => {
+            let mut s = HashSet::new();
+            s.insert(n.id);
+            Ok(Some(s))
+        }
+        Some(Value::List(items)) => {
+            let mut s = HashSet::new();
+            for item in items {
+                match item {
+                    Value::Node(n) => {
+                        s.insert(n.id);
+                    }
+                    other => {
+                        return Err(Error::Procedure(format!(
+                            "apoc.path.expandConfig: config['{key}'] must contain nodes, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(Some(s))
+        }
+        Some(other) => Err(Error::Procedure(format!(
+            "apoc.path.expandConfig: config['{key}'] must be a list of nodes, got {other:?}"
+        ))),
     }
 }
 
@@ -473,12 +1098,13 @@ mod tests {
     #[test]
     fn label_filter_end_node_marker() {
         let f = LabelFilter::parse(">Admin").unwrap();
-        // `>Admin` implicitly whitelists Admin (visitable).
+        // `>Admin` restricts emission, not visitability — every
+        // intermediate label is still allowed to transit.
         assert!(f.is_visitable(&["Admin".into()]));
-        // Non-Admin nodes are not visitable when only `>` is set.
-        assert!(!f.is_visitable(&["User".into()]));
-        // Admin is a valid endpoint.
+        assert!(f.is_visitable(&["User".into()]));
+        // Admin is a valid endpoint; non-Admin is not.
         assert!(f.is_endpoint(&["Admin".into()]));
+        assert!(!f.is_endpoint(&["User".into()]));
         // Traversal continues past an end-node marker.
         assert!(f.can_continue(&["Admin".into()]));
     }
@@ -486,10 +1112,16 @@ mod tests {
     #[test]
     fn label_filter_terminator_stops_expansion() {
         let f = LabelFilter::parse("/Leaf").unwrap();
+        // Like end-node markers, terminators don't gate
+        // visitability — they only stop expansion and constrain
+        // emission.
         assert!(f.is_visitable(&["Leaf".into()]));
+        assert!(f.is_visitable(&["Other".into()]));
         assert!(f.is_endpoint(&["Leaf".into()]));
+        assert!(!f.is_endpoint(&["Other".into()]));
         // Terminator stops expansion past this node.
         assert!(!f.can_continue(&["Leaf".into()]));
+        assert!(f.can_continue(&["Other".into()]));
     }
 
     #[test]
@@ -497,16 +1129,21 @@ mod tests {
         // Whitelist: Person. Blacklist: Spam. End-node: Admin.
         // Terminator: Sink.
         let f = LabelFilter::parse("+Person|-Spam|>Admin|/Sink").unwrap();
+        // Whitelist is set, so a node must carry Person to transit.
         assert!(f.is_visitable(&["Person".into()]));
-        assert!(f.is_visitable(&["Admin".into()]));
-        assert!(f.is_visitable(&["Sink".into()]));
-        assert!(!f.is_visitable(&["Spam".into()]));
+        // Admin / Sink alone aren't whitelisted — APOC callers
+        // who want those as transit labels add `+Admin` etc.
+        assert!(!f.is_visitable(&["Admin".into()]));
+        assert!(!f.is_visitable(&["Sink".into()]));
+        // Spam is blacklisted — even if it also carries Person
+        // it's rejected. Test that blacklist wins.
+        assert!(!f.is_visitable(&["Person".into(), "Spam".into()]));
         assert!(!f.is_visitable(&["Other".into()]));
+        // `/Sink` stops expansion regardless of other labels.
         assert!(f.can_continue(&["Person".into()]));
-        assert!(f.can_continue(&["Admin".into()]));
-        assert!(!f.can_continue(&["Sink".into()]));
-        // When any > or / marker is present, only those labels
-        // are valid endpoints — Person alone doesn't qualify.
+        assert!(!f.can_continue(&["Person".into(), "Sink".into()]));
+        // When > or / markers exist, only those labels are valid
+        // endpoints — Person alone doesn't qualify.
         assert!(!f.is_endpoint(&["Person".into()]));
         assert!(f.is_endpoint(&["Admin".into()]));
         assert!(f.is_endpoint(&["Sink".into()]));

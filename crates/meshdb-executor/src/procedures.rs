@@ -173,6 +173,25 @@ pub enum BuiltinProc {
     /// same complexity class as Neo4j APOC's equivalent.
     #[cfg(feature = "apoc-meta")]
     ApocMetaSchema,
+    /// `apoc.path.expand(startNode, relationshipFilter,
+    /// labelFilter, minLevel, maxLevel)` — BFS path traversal
+    /// from `startNode`, yielding one `path` column per
+    /// discovered path that satisfies the filter + level
+    /// constraints. Streams rows via [`ProcRows::Streaming`] so
+    /// a downstream `LIMIT` short-circuits enumeration.
+    #[cfg(feature = "apoc-path")]
+    ApocPathExpand,
+    /// `apoc.path.expandConfig(startNode, config)` — config-map
+    /// variant of [`Self::ApocPathExpand`]. Accepts `minLevel`,
+    /// `maxLevel`, `relationshipFilter`, `labelFilter`,
+    /// `uniqueness`, `filterStartNode`, `limit`, `endNodes`,
+    /// `blacklistNodes`, `whitelistNodes`. Other Neo4j APOC
+    /// config keys (`sequence`, `bfs`, `optional`,
+    /// `terminatorNodes`) parse without error but aren't yet
+    /// load-bearing — `bfs` is treated as always-true, the
+    /// others as not-set.
+    #[cfg(feature = "apoc-path")]
+    ApocPathExpandConfig,
 }
 
 /// One data-table row. Columns are keyed by declared column name
@@ -280,6 +299,20 @@ impl Procedure {
             #[cfg(feature = "apoc-meta")]
             Some(BuiltinProc::ApocMetaSchema) => {
                 builtin_apoc_meta_schema(reader).map(ProcRows::Eager)
+            }
+            #[cfg(feature = "apoc-path")]
+            Some(BuiltinProc::ApocPathExpand) => {
+                let cfg = crate::apoc_path::config_from_expand_args(args)?;
+                Ok(ProcRows::Streaming(Box::new(
+                    crate::apoc_path::ExpandCursor::new(cfg),
+                )))
+            }
+            #[cfg(feature = "apoc-path")]
+            Some(BuiltinProc::ApocPathExpandConfig) => {
+                let cfg = crate::apoc_path::config_from_expand_config_args(args)?;
+                Ok(ProcRows::Streaming(Box::new(
+                    crate::apoc_path::ExpandCursor::new(cfg),
+                )))
             }
             #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateNode) => Err(Error::Procedure(
@@ -1312,6 +1345,58 @@ impl ProcedureRegistry {
             }],
             rows: Vec::new(),
             builtin: Some(BuiltinProc::ApocRefactorSetType),
+        });
+        #[cfg(feature = "apoc-path")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "path".into(), "expand".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "startNode".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "relationshipFilter".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "labelFilter".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "minLevel".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "maxLevel".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "path".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocPathExpand),
+        });
+        #[cfg(feature = "apoc-path")]
+        self.register(Procedure {
+            qualified_name: vec!["apoc".into(), "path".into(), "expandConfig".into()],
+            inputs: vec![
+                ProcArgSpec {
+                    name: "startNode".into(),
+                    ty: ProcType::Any,
+                },
+                ProcArgSpec {
+                    name: "config".into(),
+                    ty: ProcType::Any,
+                },
+            ],
+            outputs: vec![ProcOutSpec {
+                name: "path".into(),
+                ty: ProcType::Any,
+            }],
+            rows: Vec::new(),
+            builtin: Some(BuiltinProc::ApocPathExpandConfig),
         });
     }
 }
