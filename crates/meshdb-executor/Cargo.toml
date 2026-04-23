@@ -51,6 +51,14 @@ apoc-meta = ["__apoc", "dep:meshdb-apoc", "meshdb-apoc/meta"]
 # side procedure registration directly. No `__apoc` either, since
 # that flag is the scalar dispatcher's marker.
 apoc-refactor = []
+# `apoc.path.*` — traversal procedures (expand / expandConfig /
+# subgraphAll / subgraphNodes / spanningTree). These are
+# procedure-only for now (the scalar side — create / slice /
+# combine / elements — ships in a separate crate feature once
+# the apoc-scalar dispatcher grows pass-through for Value::Path).
+# No `__apoc` because these don't go through the scalar
+# dispatcher.
+apoc-path = []
 
 # Umbrella: every shipped namespace. Add new sub-features here as
 # they land so `--features apoc` keeps meaning "everything".
@@ -65,4 +73,5 @@ apoc = [
     "apoc-create",
     "apoc-meta",
     "apoc-refactor",
+    "apoc-path",
 ]

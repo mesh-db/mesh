@@ -1,3 +1,5 @@
+#[cfg(feature = "apoc-path")]
+mod apoc_path;
 mod error;
 mod eval;
 mod ops;
