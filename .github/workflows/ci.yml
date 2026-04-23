@@ -56,6 +56,14 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets
 
+      - name: Run tests (all features)
+        # `meshdb-server`'s default feature set doesn't flip on its
+        # own `apoc-load` / `apoc-export` / `apoc-trigger` sub-features
+        # (only the executor's, transitively). An `--all-features`
+        # pass guards against feature-gated code rotting in the
+        # server crate, which the default build can't see.
+        run: cargo test --workspace --all-targets --all-features
+
       - name: Run full openCypher TCK
         # The default meshdb-tck invocation above only runs Match1.feature
         # (the smoke-test fixture). This step points TCK_FEATURES at the
