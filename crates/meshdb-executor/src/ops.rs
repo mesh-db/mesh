@@ -243,6 +243,66 @@ fn is_write_only_plan(plan: &LogicalPlan) -> bool {
     }
 }
 
+/// True when `plan` contains any write-bearing operator anywhere
+/// in its subtree. Used by [`build_op`] to flag `Limit` operators
+/// that need to drain their input to ensure side effects happen
+/// even when the limit suppresses all output rows — Cypher
+/// specifies write operators are eager regardless of how many
+/// rows downstream `LIMIT 0` / `LIMIT N` consumes.
+fn plan_contains_writes(plan: &LogicalPlan) -> bool {
+    use LogicalPlan::*;
+    match plan {
+        // Write-bearing variants — terminate true.
+        CreatePath { .. }
+        | Delete { .. }
+        | SetProperty { .. }
+        | Remove { .. }
+        | MergeNode { .. }
+        | MergeEdge { .. }
+        | Foreach { .. } => true,
+
+        // Container variants with a single required `input`.
+        Filter { input, .. }
+        | Project { input, .. }
+        | Aggregate { input, .. }
+        | Distinct { input, .. }
+        | OrderBy { input, .. }
+        | Skip { input, .. }
+        | Limit { input, .. }
+        | EdgeExpand { input, .. }
+        | OptionalEdgeExpand { input, .. }
+        | VarLengthExpand { input, .. }
+        | Identity { input, .. }
+        | CoalesceNullRow { input, .. }
+        | UnwindChain { input, .. }
+        | BindPath { input, .. }
+        | ShortestPath { input, .. } => plan_contains_writes(input),
+
+        // Two-input variant.
+        CartesianProduct { left, right } => {
+            plan_contains_writes(left) || plan_contains_writes(right)
+        }
+
+        // UNION carries N branches; any can be write-bearing.
+        Union { branches, .. } => branches.iter().any(plan_contains_writes),
+
+        // Subquery wrappers carry both an `input` row source and a
+        // `body` plan; either can be write-bearing.
+        CallSubquery { input, body } | OptionalApply { input, body, .. } => {
+            plan_contains_writes(input) || plan_contains_writes(body)
+        }
+
+        // Variants whose `input` is optional (top-level producer
+        // when `None`).
+        ProcedureCall { input, .. } | LoadCsv { input, .. } => {
+            input.as_ref().map_or(false, |i| plan_contains_writes(i))
+        }
+
+        // Leaves and DDL — no writes flow through here.
+        _ => false,
+    }
+}
+
 /// DDL dispatch. Returns `Ok(Some(rows))` when `plan` is a schema
 /// statement and was handled; `Ok(None)` when it's a regular graph
 /// operation that the operator pipeline should execute normally.
@@ -847,7 +907,19 @@ pub(crate) fn build_op_inner(plan: &LogicalPlan, seed: Option<&Row>) -> Box<dyn 
             Box::new(OrderByOp::new(child!(input), sort_items.clone()))
         }
         LogicalPlan::Skip { input, count } => Box::new(SkipOp::new(child!(input), count.clone())),
-        LogicalPlan::Limit { input, count } => Box::new(LimitOp::new(child!(input), count.clone())),
+        LogicalPlan::Limit { input, count } => {
+            // When the input subtree contains a write, we must
+            // drain it after the limit is exhausted (or before
+            // returning None on `LIMIT 0`) — Cypher specifies
+            // write side effects are eager regardless of how
+            // many output rows downstream consumes.
+            let drain_on_complete = plan_contains_writes(input);
+            Box::new(LimitOp::new(
+                child!(input),
+                count.clone(),
+                drain_on_complete,
+            ))
+        }
         LogicalPlan::MergeNode {
             input,
             var,
@@ -6103,15 +6175,39 @@ struct LimitOp {
     input: Box<dyn Operator>,
     count_expr: Expr,
     remaining: Option<i64>,
+    /// True when the input subtree carries a write operator
+    /// (CREATE / SET / DELETE / etc.). After the limit is hit
+    /// (including the `LIMIT 0` case where it's hit before the
+    /// first pull), drain the input fully so eager side effects
+    /// land — Cypher specifies writes happen regardless of how
+    /// many rows downstream consumes.
+    drain_on_complete: bool,
+    /// Set after the post-limit drain runs so we don't re-drain
+    /// on every subsequent `next()` call.
+    drained: bool,
 }
 
 impl LimitOp {
-    fn new(input: Box<dyn Operator>, count_expr: Expr) -> Self {
+    fn new(input: Box<dyn Operator>, count_expr: Expr, drain_on_complete: bool) -> Self {
         Self {
             input,
             count_expr,
             remaining: None,
+            drain_on_complete,
+            drained: false,
         }
+    }
+
+    /// Pull from input until exhausted, discarding rows. Used
+    /// after the limit is satisfied to ensure write operators
+    /// in the subtree run their full set of writes.
+    fn drain_input(&mut self, ctx: &ExecCtx) -> Result<()> {
+        if self.drained {
+            return Ok(());
+        }
+        while self.input.next(ctx)?.is_some() {}
+        self.drained = true;
+        Ok(())
     }
 }
 
@@ -6125,6 +6221,9 @@ impl Operator for LimitOp {
         }
         let rem = self.remaining.as_mut().unwrap();
         if *rem <= 0 {
+            if self.drain_on_complete {
+                self.drain_input(ctx)?;
+            }
             return Ok(None);
         }
         match self.input.next(ctx)? {
