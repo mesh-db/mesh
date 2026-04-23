@@ -1289,27 +1289,42 @@ impl CreatePathOp {
 impl Operator for CreatePathOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         if self.input.is_some() {
-            // Drain the whole input first, then replay sequentially. Draining up
-            // front avoids aliasing the source scan's cursor while we're writing
-            // to the store (node-label scans cache ids lazily on first call).
+            // Eager evaluation: drain the entire input *and* apply
+            // all writes on the first call, then stream the
+            // already-applied rows. This is required by Cypher's
+            // "writes are eager" semantics — subsequent operators
+            // (especially fresh scans inside a CartesianProduct
+            // for `WITH * MATCH ...`) must see the post-write
+            // graph state. The previous lazy per-`next()` apply
+            // interleaved writes with downstream scan caching,
+            // so a `MATCH () CREATE () WITH * MATCH () CREATE ()`
+            // pattern undercounted: the right-side scan rebuilt
+            // for each left row only saw writes done before that
+            // particular iteration.
             if let Some(buffered) = self.buffered.as_mut() {
                 if self.cursor < buffered.len() {
                     let row = buffered[self.cursor].clone();
                     self.cursor += 1;
-                    return Ok(Some(self.apply(ctx, &row)?));
+                    return Ok(Some(row));
                 }
                 return Ok(None);
             }
-            let mut rows: Vec<Row> = Vec::new();
-            {
+            let input_rows: Vec<Row> = {
                 let input = self.input.as_mut().unwrap();
+                let mut acc = Vec::new();
                 while let Some(row) = input.next(ctx)? {
-                    rows.push(row);
+                    acc.push(row);
                 }
+                acc
+            };
+            let mut applied: Vec<Row> = Vec::with_capacity(input_rows.len());
+            for row in input_rows {
+                applied.push(self.apply(ctx, &row)?);
             }
-            self.buffered = Some(rows);
+            self.buffered = Some(applied);
             self.cursor = 0;
-            // Fall through to next call via recursion.
+            // Fall through to next call via recursion to yield
+            // the first buffered row.
             self.next(ctx)
         } else {
             if self.done {
