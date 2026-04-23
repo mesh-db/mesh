@@ -181,6 +181,40 @@ pub enum BuiltinProc {
 /// recomputing offsets.
 pub type ProcRow = HashMap<String, Value>;
 
+/// A read-procedure row source. Most built-ins materialize a small
+/// finite result up front (`Eager`). Path-traversal procedures with
+/// potentially-unbounded output return a `Streaming` cursor so the
+/// executor pulls one row at a time — a downstream `LIMIT` stops
+/// enumeration without materializing the full path set.
+pub enum ProcRows {
+    Eager(Vec<ProcRow>),
+    Streaming(Box<dyn ProcCursor>),
+}
+
+impl std::fmt::Debug for ProcRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcRows::Eager(rows) => f
+                .debug_tuple("Eager")
+                .field(&format_args!("{} rows", rows.len()))
+                .finish(),
+            ProcRows::Streaming(_) => f.debug_struct("Streaming").finish(),
+        }
+    }
+}
+
+/// Lazy row producer used by streaming procedures. Each `advance`
+/// call receives a fresh `GraphReader` reference and pulls the next
+/// output row, returning `None` when exhausted. State that needs to
+/// live across calls (visited sets, frontier queues, the currently-
+/// expanding path) is owned by the cursor itself; the reader is
+/// borrowed afresh on each call so the executor retains the freedom
+/// to switch reader implementations mid-query (e.g. for the
+/// in-transaction overlay reader).
+pub trait ProcCursor {
+    fn advance(&mut self, reader: &dyn GraphReader) -> Result<Option<ProcRow>>;
+}
+
 impl Procedure {
     /// True when the call arguments match this row's input columns.
     /// Applied per row during execution — rows whose input cells
@@ -221,18 +255,32 @@ impl Procedure {
         }
     }
 
-    /// Produce the row set the executor should iterate. Static
-    /// procedures simply hand back their pre-populated `rows`;
-    /// built-ins derive their rows from the live graph via `reader`.
-    pub fn resolve_rows(&self, reader: &dyn GraphReader) -> Result<Vec<ProcRow>> {
+    /// Produce the row source the executor should iterate. Static
+    /// procedures simply hand back their pre-populated `rows` as
+    /// `Eager`; built-ins with bounded output derive their rows
+    /// from the live graph (still eager, but live). Streaming
+    /// built-ins — path traversals, subgraph walks — hand back a
+    /// cursor so the executor can pull lazily and short-circuit
+    /// on downstream `LIMIT`. `args` carries the call arguments
+    /// after type coercion; today's eager builtins ignore them
+    /// (their inputs are empty), but streaming cursors use them
+    /// to seed traversal state.
+    pub fn resolve_rows(&self, reader: &dyn GraphReader, args: &[Value]) -> Result<ProcRows> {
+        let _ = args;
         match self.builtin {
-            None => Ok(self.rows.clone()),
-            Some(BuiltinProc::DbLabels) => builtin_db_labels(reader),
-            Some(BuiltinProc::DbRelationshipTypes) => builtin_db_relationship_types(reader),
-            Some(BuiltinProc::DbPropertyKeys) => builtin_db_property_keys(reader),
-            Some(BuiltinProc::DbConstraints) => builtin_db_constraints(reader),
+            None => Ok(ProcRows::Eager(self.rows.clone())),
+            Some(BuiltinProc::DbLabels) => builtin_db_labels(reader).map(ProcRows::Eager),
+            Some(BuiltinProc::DbRelationshipTypes) => {
+                builtin_db_relationship_types(reader).map(ProcRows::Eager)
+            }
+            Some(BuiltinProc::DbPropertyKeys) => {
+                builtin_db_property_keys(reader).map(ProcRows::Eager)
+            }
+            Some(BuiltinProc::DbConstraints) => builtin_db_constraints(reader).map(ProcRows::Eager),
             #[cfg(feature = "apoc-meta")]
-            Some(BuiltinProc::ApocMetaSchema) => builtin_apoc_meta_schema(reader),
+            Some(BuiltinProc::ApocMetaSchema) => {
+                builtin_apoc_meta_schema(reader).map(ProcRows::Eager)
+            }
             #[cfg(feature = "apoc-create")]
             Some(BuiltinProc::ApocCreateNode) => Err(Error::Procedure(
                 "apoc.create.node is a write procedure — call via resolve_write_rows".into(),

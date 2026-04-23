@@ -2397,11 +2397,28 @@ struct ProcedureCallOp {
     args: Option<Vec<Expr>>,
     yield_spec: Option<YieldSpec>,
     standalone: bool,
-    buffered: Vec<Row>,
-    buffered_idx: usize,
+    /// Row source for the currently-active input row. Transitions
+    /// `None → (Buffered|Streaming) → None` per input row. Streaming
+    /// cursors can be pulled from lazily — successive `next()` calls
+    /// resume the cursor without rebuilding per-input state.
+    active: ProcActiveSource,
     // Only set for the standalone form, which drives itself off a
     // synthetic seed row exactly once.
     done: bool,
+}
+
+/// Per-input-row row source. See [`ProcedureCallOp::active`].
+enum ProcActiveSource {
+    None,
+    Buffered {
+        rows: Vec<Row>,
+        idx: usize,
+    },
+    Streaming {
+        cursor: Box<dyn crate::procedures::ProcCursor>,
+        input_row: Row,
+        projection: Vec<(String, String)>,
+    },
 }
 
 impl ProcedureCallOp {
@@ -2418,8 +2435,7 @@ impl ProcedureCallOp {
             args,
             yield_spec,
             standalone,
-            buffered: Vec::new(),
-            buffered_idx: 0,
+            active: ProcActiveSource::None,
             done: false,
         }
     }
@@ -2561,41 +2577,81 @@ impl ProcedureCallOp {
         }
     }
 
-    /// Invoke the procedure once for `input_row` and emit zero or
-    /// more output rows into `out`. Handles the "zero-output-column
-    /// pass-through" case that keeps `MATCH (n) CALL test.doNothing()
-    /// RETURN n.name` from filtering the match rows.
-    fn invoke_once(
+    /// Merge one procedure-produced row with the input row (or an
+    /// empty row for standalone calls) and apply the YIELD-driven
+    /// projection. Shared by the eager and streaming paths.
+    fn merge_proc_row(
         &self,
-        ctx: &ExecCtx,
+        proc_row: &crate::procedures::ProcRow,
         input_row: &Row,
-        proc: &crate::procedures::Procedure,
         projection: &[(String, String)],
-        out: &mut Vec<Row>,
+    ) -> Row {
+        let mut merged = if self.standalone {
+            Row::new()
+        } else {
+            input_row.clone()
+        };
+        for (src, alias) in projection {
+            let v = proc_row.get(src).cloned().unwrap_or(Value::Null);
+            merged.insert(alias.clone(), v);
+        }
+        merged
+    }
+
+    /// Invoke the procedure once for `input_row` and install the
+    /// resulting row source into `self.active`. Handles the
+    /// "zero-output-column pass-through" case that keeps
+    /// `MATCH (n) CALL test.doNothing() RETURN n.name` from
+    /// filtering the match rows. The produced source may be
+    /// `Buffered` (eager: TCK data tables, read built-ins with
+    /// bounded output, all write procedures) or `Streaming`
+    /// (path-style built-ins with potentially-unbounded output).
+    fn invoke_once(
+        &mut self,
+        ctx: &ExecCtx,
+        input_row: Row,
+        proc: &crate::procedures::Procedure,
+        projection: Vec<(String, String)>,
     ) -> Result<()> {
         // Zero-output-column procedures are side-effect-only in
         // the TCK; they either suppress rows entirely (standalone)
         // or pass the input row through unchanged (in-query).
         if proc.outputs.is_empty() {
-            if !self.standalone {
-                out.push(input_row.clone());
+            if self.standalone {
+                self.active = ProcActiveSource::None;
+            } else {
+                self.active = ProcActiveSource::Buffered {
+                    rows: vec![input_row],
+                    idx: 0,
+                };
             }
             return Ok(());
         }
-        let args = self.evaluate_args(ctx, input_row, proc)?;
-        // Write builtins (apoc.create.node, …) take the writer +
-        // args directly and produce already-final rows, so we skip
-        // the row_matches filter that read builtins use to look up
-        // matching candidate rows from a static / read-derived set.
+        let args = self.evaluate_args(ctx, &input_row, proc)?;
         let is_write = proc.is_write_builtin();
-        let rows = if is_write {
+        // Write builtins (apoc.create.node, …) take the writer +
+        // args directly and produce already-final rows, so they
+        // skip the row_matches filter. Read built-ins similarly
+        // generate their rows from args, not from a candidate set
+        // — row_matches only applies to static TCK data tables
+        // (where `builtin` is None).
+        if is_write {
             // The cfg gate must include every feature that owns a
             // write builtin — `is_write_builtin` returns true only
             // when one of those features is on, so widen the gate
             // when a new write namespace lands.
             #[cfg(any(feature = "apoc-create", feature = "apoc-refactor"))]
             {
-                proc.resolve_write_rows(ctx.store, ctx.writer, &args)?
+                let rows = proc.resolve_write_rows(ctx.store, ctx.writer, &args)?;
+                let merged: Vec<Row> = rows
+                    .iter()
+                    .map(|pr| self.merge_proc_row(pr, &input_row, &projection))
+                    .collect();
+                self.active = ProcActiveSource::Buffered {
+                    rows: merged,
+                    idx: 0,
+                };
+                return Ok(());
             }
             #[cfg(not(any(feature = "apoc-create", feature = "apoc-refactor")))]
             {
@@ -2604,23 +2660,31 @@ impl ProcedureCallOp {
                     "write procedure dispatched in a non-write-apoc build".into(),
                 ));
             }
-        } else {
-            proc.resolve_rows(ctx.store)?
-        };
-        for proc_row in &rows {
-            if !is_write && !proc.row_matches(proc_row, &args) {
-                continue;
+        }
+        match proc.resolve_rows(ctx.store, &args)? {
+            crate::procedures::ProcRows::Eager(rows) => {
+                // Static TCK data tables (`builtin.is_none()`)
+                // filter by input-column matching. Built-ins
+                // always skip — their rows are produced directly
+                // from args, not looked up from a candidate set.
+                let is_static = proc.builtin.is_none();
+                let merged: Vec<Row> = rows
+                    .iter()
+                    .filter(|pr| !is_static || proc.row_matches(pr, &args))
+                    .map(|pr| self.merge_proc_row(pr, &input_row, &projection))
+                    .collect();
+                self.active = ProcActiveSource::Buffered {
+                    rows: merged,
+                    idx: 0,
+                };
             }
-            let mut merged = if self.standalone {
-                Row::new()
-            } else {
-                input_row.clone()
-            };
-            for (src, alias) in projection {
-                let v = proc_row.get(src).cloned().unwrap_or(Value::Null);
-                merged.insert(alias.clone(), v);
+            crate::procedures::ProcRows::Streaming(cursor) => {
+                self.active = ProcActiveSource::Streaming {
+                    cursor,
+                    input_row,
+                    projection,
+                };
             }
-            out.push(merged);
         }
         Ok(())
     }
@@ -2643,14 +2707,50 @@ fn coerce_arg(v: Value, ty: crate::procedures::ProcType) -> Value {
 impl Operator for ProcedureCallOp {
     fn next(&mut self, ctx: &ExecCtx) -> Result<Option<Row>> {
         loop {
-            if self.buffered_idx < self.buffered.len() {
-                let row = self.buffered[self.buffered_idx].clone();
-                self.buffered_idx += 1;
-                return Ok(Some(row));
+            // 1. Drain an active row source first. Streaming cursors
+            //    get a fresh reader reference on each pull so an
+            //    overlay reader swap mid-query is picked up.
+            match &mut self.active {
+                ProcActiveSource::Buffered { rows, idx } => {
+                    if *idx < rows.len() {
+                        let row = rows[*idx].clone();
+                        *idx += 1;
+                        return Ok(Some(row));
+                    }
+                    self.active = ProcActiveSource::None;
+                }
+                ProcActiveSource::Streaming {
+                    cursor,
+                    input_row,
+                    projection,
+                } => match cursor.advance(ctx.store)? {
+                    Some(proc_row) => {
+                        // Inline the merge here — we're holding a
+                        // `&mut self.active` borrow through this arm
+                        // so we can't call `&self` helper methods.
+                        let mut merged = if self.standalone {
+                            Row::new()
+                        } else {
+                            input_row.clone()
+                        };
+                        for (src, alias) in projection.iter() {
+                            let v = proc_row.get(src).cloned().unwrap_or(Value::Null);
+                            merged.insert(alias.clone(), v);
+                        }
+                        return Ok(Some(merged));
+                    }
+                    None => {
+                        self.active = ProcActiveSource::None;
+                    }
+                },
+                ProcActiveSource::None => {}
             }
-            self.buffered.clear();
-            self.buffered_idx = 0;
 
+            // 2. Active source exhausted — pull the next input row
+            //    and build a fresh source. The procedure reference
+            //    lives in `ctx.procedures` (immutable for the query)
+            //    so we can borrow across the input pull + invoke
+            //    without cloning.
             let proc = match ctx.procedures.get(&self.qualified_name) {
                 Some(p) => p,
                 None => {
@@ -2661,7 +2761,6 @@ impl Operator for ProcedureCallOp {
                 }
             };
             let projection = self.resolve_projection(proc)?;
-
             let input_row = match &mut self.input {
                 Some(inp) => match inp.next(ctx)? {
                     Some(r) => r,
@@ -2675,16 +2774,11 @@ impl Operator for ProcedureCallOp {
                     Row::new()
                 }
             };
-
-            let mut produced = Vec::new();
-            self.invoke_once(ctx, &input_row, proc, &projection, &mut produced)?;
-            if produced.is_empty() {
-                if self.input.is_some() {
-                    continue;
-                }
-                return Ok(None);
-            }
-            self.buffered = produced;
+            self.invoke_once(ctx, input_row, proc, projection)?;
+            // Loop re-enters step 1 to drain the freshly-installed
+            // source. If invoke_once installed an empty Buffered
+            // source, we'll loop around and pull the next input row
+            // (for input-driven calls) or return None (standalone).
         }
     }
 }
