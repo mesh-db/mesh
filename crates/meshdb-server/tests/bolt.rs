@@ -861,6 +861,144 @@ async fn bolt_tx_delete_edge_hides_edge_from_traversal() {
 }
 
 // ---------------------------------------------------------------
+// Bolt explicit-transaction audit tests. Each one targets an
+// edge case the original tx test set didn't cover: empty txs,
+// read-only txs, MERGE / CALL / DDL inside txs, and DDL rollback.
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn bolt_tx_empty_begin_commit_succeeds() {
+    // BEGIN immediately followed by COMMIT must succeed cleanly
+    // and leave the store untouched. The implementation comment
+    // says "Empty batch is fine" — verify it actually is.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+    begin_tx(&mut sock).await;
+    let reply = commit_tx(&mut sock).await;
+    assert!(
+        matches!(reply, BoltMessage::Success { .. }),
+        "empty COMMIT should succeed, got {reply:?}",
+    );
+    // Store is empty.
+    let (records, _) = run_and_pull(&mut sock, "MATCH (n) RETURN n").await;
+    assert!(records.is_empty());
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_read_only_commit_succeeds() {
+    // BEGIN; MATCH (read only); COMMIT — no buffered writes.
+    // Should succeed and the MATCH should return rows.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+    let _ = run_and_pull(&mut sock, "CREATE (:T {n: 1}), (:T {n: 2})").await;
+    begin_tx(&mut sock).await;
+    let (records, _) = run_and_pull(&mut sock, "MATCH (t:T) RETURN t.n AS n").await;
+    assert_eq!(records.len(), 2);
+    let reply = commit_tx(&mut sock).await;
+    assert!(
+        matches!(reply, BoltMessage::Success { .. }),
+        "read-only COMMIT should succeed, got {reply:?}",
+    );
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_merge_sees_buffered_create_in_same_tx() {
+    // MERGE inside a tx must see prior CREATEs in the same tx
+    // via the read-your-writes overlay — otherwise it would
+    // create a duplicate node instead of matching.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE (:Person {name: 'alice'})").await;
+    let _ = run_and_pull(&mut sock, "MERGE (p:Person {name: 'alice'})").await;
+    let _ = commit_tx(&mut sock).await;
+
+    // Should be exactly one Person — MERGE matched the buffered CREATE.
+    let (records, _) = run_and_pull(&mut sock, "MATCH (p:Person {name: 'alice'}) RETURN p").await;
+    assert_eq!(
+        records.len(),
+        1,
+        "MERGE should match the buffered CREATE — {} rows is too many",
+        records.len(),
+    );
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_create_index_commits_atomically_with_writes() {
+    // BEGIN; CREATE INDEX; CREATE node; COMMIT — both should
+    // land. Verifies DDL flows through the buffer and lands in
+    // the same commit batch as the graph write.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE INDEX FOR (n:Tagged) ON (n.tag)").await;
+    let _ = run_and_pull(&mut sock, "CREATE (:Tagged {tag: 'x'})").await;
+    let _ = commit_tx(&mut sock).await;
+
+    // Index visible after commit.
+    let (idx_records, _) = run_and_pull(&mut sock, "SHOW INDEXES").await;
+    assert!(
+        !idx_records.is_empty(),
+        "CREATE INDEX in tx should land on COMMIT",
+    );
+    // Node visible after commit.
+    let (node_records, _) = run_and_pull(&mut sock, "MATCH (n:Tagged) RETURN n.tag AS tag").await;
+    assert_eq!(node_records.len(), 1);
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_create_index_rollback_drops_the_index() {
+    // BEGIN; CREATE INDEX; ROLLBACK — the index must NOT exist
+    // afterwards. Verifies DDL participates in transactional
+    // rollback semantics, not just graph mutations.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE INDEX FOR (n:Ghost) ON (n.gone)").await;
+    let _ = rollback_tx(&mut sock).await;
+
+    let (idx_records, _) = run_and_pull(&mut sock, "SHOW INDEXES").await;
+    assert!(
+        idx_records.is_empty(),
+        "ROLLBACK should drop the buffered CREATE INDEX, but index list is: {idx_records:?}",
+    );
+    goodbye(sock).await;
+}
+
+#[tokio::test]
+async fn bolt_tx_multiple_runs_with_pulls_between_each() {
+    // BEGIN; RUN; PULL; RUN; PULL; RUN; PULL; COMMIT — the
+    // buffered write set must survive each PULL. Existing
+    // multi-RUN test bundles RUNs without explicit PULL
+    // sequencing; this one walks through one PULL per RUN.
+    let (addr, _dir) = spawn_bolt_server().await;
+    let mut sock = connect_and_hello(&addr).await;
+
+    begin_tx(&mut sock).await;
+    let _ = run_and_pull(&mut sock, "CREATE (:Step {n: 1})").await;
+    let _ = run_and_pull(&mut sock, "CREATE (:Step {n: 2})").await;
+    let _ = run_and_pull(&mut sock, "CREATE (:Step {n: 3})").await;
+    let _ = commit_tx(&mut sock).await;
+
+    let (records, _) = run_and_pull(&mut sock, "MATCH (s:Step) RETURN count(s) AS c").await;
+    assert_eq!(records.len(), 1);
+    let count_cell = &records[0][0];
+    let count = match count_cell {
+        BoltValue::Int(n) => *n,
+        other => panic!("expected Int, got {other:?}"),
+    };
+    assert_eq!(count, 3, "all three Step nodes should land on COMMIT");
+    goodbye(sock).await;
+}
+
+// ---------------------------------------------------------------
 // Bolt auth validation
 // ---------------------------------------------------------------
 
