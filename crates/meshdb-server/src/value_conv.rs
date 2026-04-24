@@ -21,8 +21,9 @@
 //! the full UUID string.
 
 use meshdb_bolt::{
-    is_bolt_4_4, BoltValue, TAG_DATE, TAG_DATE_TIME, TAG_DATE_TIME_LEGACY, TAG_DURATION,
-    TAG_LOCAL_DATE_TIME, TAG_NODE, TAG_PATH, TAG_RELATIONSHIP, TAG_UNBOUND_RELATIONSHIP,
+    is_bolt_4_4, BoltValue, TAG_DATE, TAG_DATE_TIME, TAG_DATE_TIME_LEGACY, TAG_DATE_TIME_ZONE_ID,
+    TAG_DATE_TIME_ZONE_ID_LEGACY, TAG_DURATION, TAG_LOCAL_DATE_TIME, TAG_NODE, TAG_PATH,
+    TAG_RELATIONSHIP, TAG_UNBOUND_RELATIONSHIP,
 };
 use meshdb_core::{Duration, Edge, Node, NodeId, Property};
 use meshdb_executor::{ParamMap, Row, Value};
@@ -206,37 +207,69 @@ fn property_to_bolt(p: &Property, bolt_version: [u8; 4]) -> BoltValue {
         Property::DateTime {
             nanos,
             tz_offset_secs,
-            ..
+            tz_name,
         } => {
-            // Timezone-aware DateTime. The wire struct has the same
-            // three fields in both versions — `[seconds, nanos,
-            // tz_offset_secs]` — but the tag and the semantics of
-            // `seconds` diverge:
-            //   * Bolt 5.0+: tag 0x49 (TAG_DATE_TIME), `seconds` is
-            //     the UTC instant. The driver reconstructs local
-            //     wall-clock from `seconds + tz_offset_secs`.
-            //   * Bolt 4.4:  tag 0x46 (TAG_DATE_TIME_LEGACY),
-            //     `seconds` is the *local wall-clock* instant (the
-            //     UTC instant with the offset already added). The
-            //     driver reads the offset for display only.
-            // Our storage is always UTC (`Property::DateTime.nanos`
-            // is UTC epoch-nanos), so under 4.4 we shift by the
-            // offset to produce local seconds.
+            // Two distinct wire representations depending on whether
+            // the zone is named:
+            //
+            //   * Named zone (tz_name is Some, e.g. "Europe/Stockholm"):
+            //     DateTimeZoneId struct — tag 0x69 (5.0+) or 0x66
+            //     (4.4 legacy). Fields `[seconds, nanos, tz_id: String]`.
+            //   * Offset-only (tz_name is None): DateTime struct —
+            //     tag 0x49 (5.0+) or 0x46 (4.4 legacy). Fields
+            //     `[seconds, nanos, tz_offset_seconds: Int]`.
+            //
+            // Seconds semantics follow the same split we documented
+            // on the offset-only branch: 5.0+ carries UTC, 4.4
+            // carries local wall-clock with the offset already
+            // applied. For named zones under 4.4 we resolve the
+            // offset from `chrono_tz` at the stored UTC instant so
+            // a round-trip through an old driver still rebuilds the
+            // same wall-clock time.
             let utc_seconds = nanos.div_euclid(1_000_000_000) as i64;
             let subsec = nanos.rem_euclid(1_000_000_000) as i64;
-            let offset = tz_offset_secs.unwrap_or(0) as i64;
-            let (tag, seconds) = if is_bolt_4_4(bolt_version) {
-                (TAG_DATE_TIME_LEGACY, utc_seconds + offset)
+
+            // Only emit DateTimeZoneId for *valid IANA* zone names.
+            // A driver-supplied non-IANA label like Go's
+            // `FixedZone("UTC+2", 7200).Location().String()` can land
+            // in `tz_name` but isn't parseable back out of the zone
+            // database — emitting it as a tz_id struct would make
+            // the peer driver hydrate the result as InvalidValue.
+            // Fall through to the offset-only DateTime branch when
+            // that's the case.
+            if let Some(zone) = tz_name.as_deref().filter(|z| is_known_iana_zone(z)) {
+                let effective_offset = tz_offset_secs
+                    .map(|s| s as i64)
+                    .or_else(|| resolve_zone_offset(zone, *nanos))
+                    .unwrap_or(0);
+                let (tag, seconds) = if is_bolt_4_4(bolt_version) {
+                    (TAG_DATE_TIME_ZONE_ID_LEGACY, utc_seconds + effective_offset)
+                } else {
+                    (TAG_DATE_TIME_ZONE_ID, utc_seconds)
+                };
+                BoltValue::Struct {
+                    tag,
+                    fields: vec![
+                        BoltValue::Int(seconds),
+                        BoltValue::Int(subsec),
+                        BoltValue::String(zone.to_string()),
+                    ],
+                }
             } else {
-                (TAG_DATE_TIME, utc_seconds)
-            };
-            BoltValue::Struct {
-                tag,
-                fields: vec![
-                    BoltValue::Int(seconds),
-                    BoltValue::Int(subsec),
-                    BoltValue::Int(offset),
-                ],
+                let offset = tz_offset_secs.unwrap_or(0) as i64;
+                let (tag, seconds) = if is_bolt_4_4(bolt_version) {
+                    (TAG_DATE_TIME_LEGACY, utc_seconds + offset)
+                } else {
+                    (TAG_DATE_TIME, utc_seconds)
+                };
+                BoltValue::Struct {
+                    tag,
+                    fields: vec![
+                        BoltValue::Int(seconds),
+                        BoltValue::Int(subsec),
+                        BoltValue::Int(offset),
+                    ],
+                }
             }
         }
         Property::LocalDateTime(nanos) => datetime_to_bolt(*nanos),
@@ -277,6 +310,42 @@ fn property_to_bolt(p: &Property, bolt_version: [u8; 4]) -> BoltValue {
             },
         },
     }
+}
+
+/// Resolve the UTC offset (in seconds east of UTC) for a named IANA
+/// zone at a specific UTC instant. Returns None when the zone name
+/// isn't recognised by chrono-tz — the caller falls back to 0 (i.e.
+/// "Z") so an unknown zone doesn't produce nonsensical wire values.
+///
+/// Why this lookup exists: Bolt 4.4 legacy `DateTimeZoneId` carries
+/// local-wall-clock seconds, which requires knowing the zone's
+/// offset at the source instant. Storage only remembers the zone
+/// *name* once decoded from a previous driver round-trip (and may
+/// or may not have a stashed `tz_offset_secs` depending on how the
+/// Property landed). This function bridges back to an offset for
+/// encoding.
+/// True iff `tz_name` parses as a known IANA region in the chrono-tz
+/// zone database. Non-IANA labels (fixed-offset aliases like Go's
+/// `FixedZone("UTC+2", 7200)`, abbreviations like `"CEST"`, user
+/// typos) return false so the encoder falls back to the offset-only
+/// DateTime struct rather than handing the driver a tz_id it can't
+/// resolve.
+fn is_known_iana_zone(tz_name: &str) -> bool {
+    tz_name.parse::<chrono_tz::Tz>().is_ok()
+}
+
+fn resolve_zone_offset(tz_name: &str, utc_nanos: i128) -> Option<i64> {
+    use chrono::{DateTime, Offset, Utc};
+    use chrono_tz::Tz;
+    let tz: Tz = tz_name.parse().ok()?;
+    let utc_secs = utc_nanos.div_euclid(1_000_000_000);
+    let utc_nsec = utc_nanos.rem_euclid(1_000_000_000);
+    // i128 → i64 can fail for extremes well outside the year
+    // 1..9999 range the TCK exercises; out-of-range falls back to
+    // zero offset rather than panicking.
+    let utc_secs_i64 = i64::try_from(utc_secs).ok()?;
+    let dt = DateTime::<Utc>::from_timestamp(utc_secs_i64, utc_nsec as u32)?;
+    Some(dt.with_timezone(&tz).offset().fix().local_minus_utc() as i64)
 }
 
 /// Encode a UTC epoch-nanos `DateTime` as a Bolt 4.4
@@ -508,8 +577,14 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             })
         }
         meshdb_bolt::TAG_DATE_TIME_ZONE_ID | meshdb_bolt::TAG_DATE_TIME_ZONE_ID_LEGACY => {
-            // Zoned DateTime with named timezone (e.g. "Europe/Stockholm").
-            // Approximate by ignoring the tz name and storing as UTC.
+            // [seconds, nanos, tz_id: String].
+            //   * Bolt 5 tag 0x69: `seconds` is the UTC instant.
+            //   * Bolt 4.4 tag 0x66 (legacy): `seconds` is the local
+            //     wall-clock instant in the named zone. Rebuild UTC
+            //     by resolving the zone's offset via chrono-tz.
+            //     Unknown zone names fall back to treating seconds
+            //     as UTC directly (a best-effort compromise — loses
+            //     precision but doesn't drop the datetime).
             if fields.len() != 3 {
                 return Err(ParamConversionError::MalformedTemporal {
                     tag,
@@ -518,11 +593,53 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             }
             let seconds = temporal_int(fields, 0, tag, "DateTimeZoneId seconds")?;
             let nanos = temporal_int(fields, 1, tag, "DateTimeZoneId nanos")?;
-            let epoch_nanos: i128 = (seconds as i128) * 1_000_000_000 + (nanos as i128);
+            let tz_id = match &fields[2] {
+                BoltValue::String(s) => s.clone(),
+                other => {
+                    return Err(ParamConversionError::MalformedTemporal {
+                        tag,
+                        reason: match other {
+                            BoltValue::Int(_) => "tz_id field was Int, expected String",
+                            _ => "tz_id field was not a String",
+                        },
+                    });
+                }
+            };
+            let utc_nanos_initial: i128 = (seconds as i128) * 1_000_000_000 + (nanos as i128);
+            // Drivers occasionally park non-IANA labels in this slot
+            // (Go's `FixedZone("UTC+2", 7200).String()` is one real
+            // example). Only keep the name if chrono-tz recognises
+            // it; otherwise store as offset-only so a round-trip
+            // doesn't re-emit an unrecognised tz_id the peer hydrates
+            // as InvalidValue.
+            if !is_known_iana_zone(&tz_id) {
+                return Ok(Property::DateTime {
+                    nanos: utc_nanos_initial,
+                    tz_offset_secs: None,
+                    tz_name: None,
+                });
+            }
+            let utc_nanos = if tag == meshdb_bolt::TAG_DATE_TIME_ZONE_ID_LEGACY {
+                // Shift local-wall-clock → UTC using the zone's
+                // offset at that instant. Note: we resolve the
+                // offset against the local-time value itself; the
+                // lookup is correct for unambiguous instants and
+                // deterministic (first occurrence) at DST fall-back.
+                match resolve_zone_offset(&tz_id, utc_nanos_initial) {
+                    Some(offset_secs) => utc_nanos_initial - (offset_secs as i128) * 1_000_000_000,
+                    None => utc_nanos_initial,
+                }
+            } else {
+                utc_nanos_initial
+            };
+            // Stash the offset too — `tz_offset_secs` is useful for
+            // downstream Cypher expressions that don't want to
+            // re-resolve the zone database.
+            let tz_offset_secs = resolve_zone_offset(&tz_id, utc_nanos).map(|o| o as i32);
             Ok(Property::DateTime {
-                nanos: epoch_nanos,
-                tz_offset_secs: None,
-                tz_name: None,
+                nanos: utc_nanos,
+                tz_offset_secs,
+                tz_name: Some(tz_id),
             })
         }
         meshdb_bolt::TAG_LOCAL_TIME => {

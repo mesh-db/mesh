@@ -44,10 +44,6 @@ See `drivers/python/README.md` for the per-language venv bootstrap.
 
 ## Known gaps
 
-- **Zoned DateTime with `tz_name`** — `Property::DateTime` carries an
-  optional IANA region name (`Europe/Stockholm`, etc.) but the
-  encoder currently ignores it and emits offset-only DateTime
-  (`0x49` / `0x46`) rather than DateTimeZoneId (`0x69` / `0x66`).
-  Offset-aware tz-aware values round-trip correctly; zone names are
-  silently dropped. Fix: teach `property_to_bolt`'s DateTime arm to
-  switch on `tz_name.is_some()`.
+_(None right now. Please open an issue when one surfaces — the
+harness is green across all four language drivers and every
+matrix cell on both this box and CI.)_

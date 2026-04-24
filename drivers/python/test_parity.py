@@ -96,6 +96,30 @@ def test_temporal_datetime_nonzero_offset_roundtrip(session: Session) -> None:
     )
 
 
+def test_temporal_datetime_iana_zone_server_emits_zone_name(session: Session) -> None:
+    # Zoned DateTime server→client path: Cypher's
+    # `datetime({timezone: 'Europe/Stockholm', ...})` constructs a
+    # zoned instant on the server, Mesh encodes as DateTimeZoneId
+    # (tag 0x69 / 0x66), and the driver hydrates with the IANA name
+    # attached. Tests Mesh's encoder, not the driver's encoder —
+    # neo4j-python-driver 5.28 + Python 3.14 has a packstream issue
+    # encoding ZoneInfo-tagged datetimes on the outbound side, so
+    # this direction is what matters for driver-compat signal.
+    result = session.run(
+        "RETURN datetime({year: 2024, month: 6, day: 15, "
+        "hour: 14, minute: 30, second: 45, timezone: 'Europe/Stockholm'}) AS v"
+    ).single()
+    assert result is not None
+    back = result["v"].to_native()
+    # The Python driver hydrates zone-id DateTimes with a pytz
+    # `DstTzInfo` whose IANA name lives on `.zone`; newer Pythons
+    # (where the driver picks ZoneInfo) expose it on `.key`. Accept
+    # either — the point is the zone name survived the wire hop.
+    tz = back.tzinfo
+    iana = getattr(tz, "key", None) or getattr(tz, "zone", None)
+    assert iana == "Europe/Stockholm"
+
+
 def test_temporal_date_roundtrip(session: Session) -> None:
     sent = date(2024, 6, 15)
     record = session.run("RETURN $v AS v", v=sent).single()

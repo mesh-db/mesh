@@ -123,6 +123,114 @@ fn datetime_encoder_uses_legacy_tag_under_bolt_4_4() {
 }
 
 #[test]
+fn datetime_with_tz_name_emits_zone_id_struct() {
+    // `Property::DateTime { tz_name: Some(...) }` should produce
+    // the DateTimeZoneId struct (tag 0x69 under 5.0+, 0x66 under
+    // 4.4) with fields `[seconds, nanos, tz_id: String]`, not the
+    // offset-only DateTime struct. Previously the encoder dropped
+    // tz_name entirely and emitted tag 0x49 / 0x46.
+    //
+    // UTC instant: 2024-06-15T12:30:45Z. Offset in Europe/Stockholm
+    // that moment is +02:00 (CEST, summer time), so 4.4 legacy
+    // seconds should be UTC + 7200.
+    let input = Property::DateTime {
+        nanos: 1_718_454_645_000_000_000, // 2024-06-15T12:30:45Z
+        tz_offset_secs: Some(7200),
+        tz_name: Some("Europe/Stockholm".to_string()),
+    };
+    let mut row = Row::new();
+    row.insert("v".to_string(), Value::Property(input));
+    let fields = vec!["v".to_string()];
+
+    let bolt_54 = &row_to_bolt_fields(&row, &fields, meshdb_bolt::BOLT_5_4)[0];
+    match bolt_54 {
+        BoltValue::Struct { tag, fields } => {
+            assert_eq!(
+                *tag,
+                meshdb_bolt::TAG_DATE_TIME_ZONE_ID,
+                "5.x zoned should emit 0x69"
+            );
+            assert_eq!(fields.len(), 3);
+            match &fields[0] {
+                BoltValue::Int(s) => assert_eq!(*s, 1_718_454_645),
+                _ => panic!("seconds wrong type"),
+            }
+            match &fields[2] {
+                BoltValue::String(z) => assert_eq!(z, "Europe/Stockholm"),
+                _ => panic!("tz_id wrong type"),
+            }
+        }
+        other => panic!("expected Struct, got {other:?}"),
+    }
+
+    let bolt_44 = &row_to_bolt_fields(&row, &fields, meshdb_bolt::BOLT_4_4)[0];
+    match bolt_44 {
+        BoltValue::Struct { tag, fields } => {
+            assert_eq!(
+                *tag,
+                meshdb_bolt::TAG_DATE_TIME_ZONE_ID_LEGACY,
+                "4.4 zoned should emit 0x66"
+            );
+            // 4.4 legacy: seconds = UTC + zone_offset = 1_718_454_645 + 7200.
+            match &fields[0] {
+                BoltValue::Int(s) => assert_eq!(*s, 1_718_454_645 + 7200),
+                _ => panic!("seconds wrong type"),
+            }
+        }
+        other => panic!("expected Struct, got {other:?}"),
+    }
+}
+
+#[test]
+fn datetime_zone_id_decode_preserves_name_and_shifts_legacy_to_utc() {
+    // Bolt 5 zoned (tag 0x69): seconds already UTC, tz_id preserved.
+    let zone5 = BoltValue::Struct {
+        tag: meshdb_bolt::TAG_DATE_TIME_ZONE_ID,
+        fields: vec![
+            BoltValue::Int(1_718_454_645), // UTC
+            BoltValue::Int(0),
+            BoltValue::String("Europe/Stockholm".to_string()),
+        ],
+    };
+    match bolt_value_to_property(&zone5).expect("zone5 decode") {
+        Property::DateTime {
+            nanos,
+            tz_offset_secs,
+            tz_name,
+        } => {
+            assert_eq!(nanos, 1_718_454_645_000_000_000);
+            assert_eq!(tz_name.as_deref(), Some("Europe/Stockholm"));
+            // June in Stockholm = CEST = UTC+2.
+            assert_eq!(tz_offset_secs, Some(7200));
+        }
+        other => panic!("expected DateTime, got {other:?}"),
+    }
+
+    // Bolt 4.4 zoned (tag 0x66): seconds are local wall-clock;
+    // decoder must subtract the zone's offset to recover UTC.
+    let zone44 = BoltValue::Struct {
+        tag: meshdb_bolt::TAG_DATE_TIME_ZONE_ID_LEGACY,
+        fields: vec![
+            BoltValue::Int(1_718_454_645 + 7200), // local wall-clock (CEST)
+            BoltValue::Int(0),
+            BoltValue::String("Europe/Stockholm".to_string()),
+        ],
+    };
+    match bolt_value_to_property(&zone44).expect("zone44 decode") {
+        Property::DateTime {
+            nanos,
+            tz_offset_secs,
+            tz_name,
+        } => {
+            assert_eq!(nanos, 1_718_454_645_000_000_000, "must normalize to UTC");
+            assert_eq!(tz_name.as_deref(), Some("Europe/Stockholm"));
+            assert_eq!(tz_offset_secs, Some(7200));
+        }
+        other => panic!("expected DateTime, got {other:?}"),
+    }
+}
+
+#[test]
 fn datetime_legacy_tag_roundtrips_through_decoder_back_to_utc() {
     // Symmetric decode: a driver sending a Bolt 4.4 legacy DateTime
     // should land in storage as UTC. Build the legacy struct by hand
