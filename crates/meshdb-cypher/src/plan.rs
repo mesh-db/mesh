@@ -428,6 +428,19 @@ pub enum LogicalPlan {
         /// mental model — but users following Neo4j-flavour
         /// migration scripts can flip it on.
         iterate_list: bool,
+        /// `parallel` config: when true, the dispatcher fans
+        /// batches out through a bounded worker pool instead
+        /// of running them back-to-back. Throughput wins
+        /// materialize in single-node mode — Raft and routing
+        /// serialize commits internally so the gains there are
+        /// limited to hiding per-batch planning / read latency
+        /// rather than true write concurrency. Default false.
+        parallel: bool,
+        /// `concurrency` config: upper bound on batches in
+        /// flight when `parallel` is true. Ignored otherwise.
+        /// Defaults to 50 (matching Neo4j) when `parallel` is
+        /// enabled and `concurrency` isn't explicitly set.
+        concurrency: usize,
     },
     /// Per-input-row left-join wrapper used by `apply_optional_match`
     /// when the OPTIONAL MATCH body is a multi-hop pattern. Runs
@@ -2256,6 +2269,13 @@ fn build_apoc_periodic_iterate(
     let mut retries: i64 = 0;
     let mut failed_params_cap: i64 = -1;
     let mut iterate_list: bool = false;
+    let mut parallel: bool = false;
+    // Sentinel `None` means "user didn't set concurrency".
+    // Resolved below: 50 (Neo4j default) when parallel is on,
+    // 1 otherwise (it's ignored but still stored as a valid
+    // `usize`). Keeping the two extract steps separate lets
+    // the error messages point at the user-visible key.
+    let mut concurrency: Option<usize> = None;
     for (key, value) in &config_entries {
         match key.as_str() {
             "batchSize" => {
@@ -2320,10 +2340,30 @@ fn build_apoc_periodic_iterate(
                     }
                 };
             }
-            // Forward-compat accept for options Mesh doesn't
-            // execute against — Mesh has no parallel-action
-            // dispatch path.
-            "parallel" | "concurrency" => {}
+            "parallel" => {
+                parallel = match value {
+                    Expr::Literal(Literal::Boolean(b)) => *b,
+                    _ => {
+                        return Err(Error::Plan(
+                            "apoc.periodic.iterate config.parallel must be a boolean \
+                             literal"
+                                .into(),
+                        ));
+                    }
+                };
+            }
+            "concurrency" => {
+                concurrency = Some(match value {
+                    Expr::Literal(Literal::Integer(n)) if *n > 0 => *n as usize,
+                    _ => {
+                        return Err(Error::Plan(
+                            "apoc.periodic.iterate config.concurrency must be a positive \
+                             integer literal"
+                                .into(),
+                        ));
+                    }
+                });
+            }
             other => {
                 return Err(Error::Plan(format!(
                     "apoc.periodic.iterate: unknown config key {other:?}"
@@ -2359,6 +2399,16 @@ fn build_apoc_periodic_iterate(
         }
     }
 
+    // Resolve the final concurrency value. When `parallel` is
+    // off, the field is never consulted by the dispatcher — we
+    // store 1 just to keep the type non-zero and any future
+    // accidental use harmless.
+    let concurrency = match (parallel, concurrency) {
+        (true, Some(n)) => n,
+        (true, None) => 50,
+        (false, _) => 1,
+    };
+
     Ok(LogicalPlan::ApocPeriodicIterate {
         iterate: Box::new(iterate_plan),
         action: Box::new(action_plan),
@@ -2367,6 +2417,8 @@ fn build_apoc_periodic_iterate(
         retries,
         failed_params_cap,
         iterate_list,
+        parallel,
+        concurrency,
     })
 }
 

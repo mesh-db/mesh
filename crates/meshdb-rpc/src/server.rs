@@ -1050,6 +1050,8 @@ impl MeshService {
             max_retries,
             failed_params_cap,
             iterate_list,
+            parallel,
+            concurrency,
         ) = match find_apoc_periodic_iterate_node(&plan) {
             Some(parts) => parts,
             None => {
@@ -1118,173 +1120,88 @@ impl MeshService {
         };
 
         let started_at = std::time::Instant::now();
-        let mut batches_count: i64 = 0;
-        let mut total: i64 = 0;
-        let mut committed_ops: i64 = 0;
-        let mut failed_ops: i64 = 0;
-        let mut failed_batches: i64 = 0;
-        let mut retries_count: i64 = 0;
-        let mut error_messages: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        let mut failed_params: std::collections::HashMap<
-            String,
-            Vec<std::collections::HashMap<String, meshdb_core::Property>>,
-        > = std::collections::HashMap::new();
-        let mut update_stats = UpdateStatsAccumulator::default();
+        let shared = Arc::new(SharedApocStats::new());
         let bs = batch_size.max(1) as usize;
 
-        for chunk in input_rows.chunks(bs) {
-            batches_count += 1;
-            let chunk_size = chunk.len() as i64;
-            total += chunk_size;
-            let chunk_rows: Vec<meshdb_executor::Row> = chunk.to_vec();
+        // Materialize the batches up front so the spawned
+        // parallel tasks own their chunks without borrowing
+        // across the task boundary.
+        let chunks: Vec<Vec<meshdb_executor::Row>> =
+            input_rows.chunks(bs).map(|c| c.to_vec()).collect();
 
-            // Retry loop: try the batch up to max_retries + 1
-            // times before counting it as a definitive failure.
-            // Each attempt rebuilds the action's writes from
-            // scratch — no partial-batch state from a previous
-            // failed attempt leaks in.
-            let max_attempts = max_retries.max(0) + 1;
-            let mut last_err: Option<String> = None;
-            let mut succeeded = false;
-            let mut succeeded_commands: Option<Vec<GraphCommand>> = None;
-            for attempt in 0..max_attempts {
-                if attempt > 0 {
-                    retries_count += 1;
-                }
-                let chunk_rows = chunk_rows.clone();
-                let action_plan = action_plan.clone();
-                let store = self.store.clone();
-                let routing = self.routing.clone();
-                let extra_params = extra_params.clone();
-                let registry_factory = self.procedure_registry_factory.clone();
-                let outcome_result = tokio::task::spawn_blocking(
-                    move || -> std::result::Result<Vec<GraphCommand>, meshdb_executor::Error> {
-                        let storage_reader =
-                            StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
-                        let writer = BufferingGraphWriter::new();
-                        let procs = registry_factory();
-                        if iterate_list {
-                            // Batch-as-list mode: bind the whole
-                            // chunk to `$_batch` (a list of
-                            // row-Maps) and run the action ONCE.
-                            // The action is responsible for
-                            // `UNWIND $_batch AS row` to process
-                            // its elements.
-                            let mut params = extra_params.clone();
-                            let batch_list: Vec<meshdb_core::Property> = chunk_rows
-                                .iter()
-                                .map(|row| meshdb_core::Property::Map(row_to_property_map(row)))
-                                .collect();
-                            params.insert(
-                                "_batch".into(),
-                                meshdb_executor::Value::Property(meshdb_core::Property::List(
-                                    batch_list,
-                                )),
-                            );
-                            if let Some(r) = routing.as_ref() {
-                                let partitioned =
-                                    PartitionedGraphReader::new(store.clone(), r.clone());
-                                meshdb_executor::execute_with_reader_and_procs(
-                                    &action_plan,
-                                    &partitioned as &dyn GraphReader,
-                                    &writer as &dyn GraphWriter,
-                                    &params,
-                                    &procs,
-                                )?;
-                            } else {
-                                meshdb_executor::execute_with_reader_and_procs(
-                                    &action_plan,
-                                    &storage_reader as &dyn GraphReader,
-                                    &writer as &dyn GraphWriter,
-                                    &params,
-                                    &procs,
-                                )?;
-                            }
-                        } else {
-                            for row in chunk_rows {
-                                let mut row_params = extra_params.clone();
-                                for (k, v) in row {
-                                    row_params.insert(k, v);
-                                }
-                                if let Some(r) = routing.as_ref() {
-                                    let partitioned =
-                                        PartitionedGraphReader::new(store.clone(), r.clone());
-                                    meshdb_executor::execute_with_reader_and_procs(
-                                        &action_plan,
-                                        &partitioned as &dyn GraphReader,
-                                        &writer as &dyn GraphWriter,
-                                        &row_params,
-                                        &procs,
-                                    )?;
-                                } else {
-                                    meshdb_executor::execute_with_reader_and_procs(
-                                        &action_plan,
-                                        &storage_reader as &dyn GraphReader,
-                                        &writer as &dyn GraphWriter,
-                                        &row_params,
-                                        &procs,
-                                    )?;
-                                }
-                            }
-                        }
-                        Ok(writer.into_commands())
-                    },
-                )
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("batch {batches_count} executor panicked: {e}"))
+        if parallel {
+            let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+            let mut handles = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                // Acquire OUTSIDE the spawn so the outer loop
+                // provides back-pressure — we never queue more
+                // tasks than the permit count allows at any one
+                // moment. Dropping the permit at task end
+                // releases it for the next chunk.
+                let permit = sem.clone().acquire_owned().await.map_err(|e| {
+                    Status::internal(format!("parallel-batch semaphore closed: {e}"))
                 })?;
-                match outcome_result {
-                    Ok(commands) => match self.commit_buffered_commands(commands.clone()).await {
-                        Ok(()) => {
-                            update_stats.absorb(&commands);
-                            succeeded = true;
-                            succeeded_commands = Some(commands);
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = Some(e.message().to_string());
-                        }
-                    },
-                    Err(e) => {
-                        last_err = Some(e.to_string());
-                    }
-                }
+                let this = self.clone();
+                let action_plan = action_plan.clone();
+                let extra_params = extra_params.clone();
+                let shared = shared.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = permit;
+                    this.run_apoc_periodic_batch(
+                        chunk,
+                        action_plan,
+                        extra_params,
+                        max_retries,
+                        iterate_list,
+                        failed_params_cap,
+                        shared,
+                    )
+                    .await
+                }));
             }
-            if succeeded {
-                let _ = succeeded_commands;
-                committed_ops += chunk_size;
-            } else {
-                failed_ops += chunk_size;
-                failed_batches += 1;
-                let err_str = last_err.unwrap_or_else(|| "<no error captured>".into());
-                *error_messages.entry(err_str.clone()).or_insert(0) += 1;
-                if failed_params_cap != 0 {
-                    let bucket = failed_params.entry(err_str.clone()).or_default();
-                    let cap = if failed_params_cap < 0 {
-                        usize::MAX
-                    } else {
-                        failed_params_cap as usize
-                    };
-                    if bucket.len() < cap {
-                        for row in &chunk_rows {
-                            if bucket.len() >= cap {
-                                break;
-                            }
-                            bucket.push(row_to_property_map(row));
-                        }
-                    }
-                }
-                tracing::warn!(
-                    batch = batches_count,
-                    error = %err_str,
-                    attempts = max_attempts,
-                    "apoc.periodic.iterate — batch failed after retries"
-                );
+            // Drive every task to completion. Individual batch
+            // failures already landed in `shared`; only a task-
+            // level panic (JoinError) or an unrecoverable
+            // executor panic surfaces here as an internal error.
+            for handle in handles {
+                handle.await.map_err(|e| {
+                    Status::internal(format!("parallel batch task panicked: {e}"))
+                })??;
+            }
+        } else {
+            for chunk in chunks {
+                self.run_apoc_periodic_batch(
+                    chunk,
+                    action_plan.clone(),
+                    extra_params.clone(),
+                    max_retries,
+                    iterate_list,
+                    failed_params_cap,
+                    shared.clone(),
+                )
+                .await?;
             }
         }
+
         let time_taken = started_at.elapsed().as_millis() as i64;
+
+        // Snapshot the shared state into owned values so the
+        // result-row builder doesn't hold any mutexes — after
+        // this point the outer mutexes are effectively dropped.
+        let (batches_count, total, committed_ops, failed_ops, failed_batches, retries_count) = {
+            let c = shared.counters.lock().unwrap();
+            (
+                c.batches,
+                c.total,
+                c.committed_ops,
+                c.failed_ops,
+                c.failed_batches,
+                c.retries,
+            )
+        };
+        let error_messages = shared.errors.lock().unwrap().clone();
+        let failed_params = shared.failed_params.lock().unwrap().clone();
+        let update_stats = shared.update_stats.lock().unwrap().clone();
 
         // Build the standard APOC result row.
         let result_row = build_apoc_periodic_iterate_row(
@@ -1339,6 +1256,185 @@ impl MeshService {
         .map_err(|e| Status::internal(format!("apoc.periodic.iterate projection panicked: {e}")))?
         .map_err(|e| Status::internal(format!("apoc.periodic.iterate projection failed: {e}")))?;
         Ok((final_rows, Vec::new()))
+    }
+
+    /// Execute one batch of `apoc.periodic.iterate`: run the
+    /// action query up to `max_retries + 1` times, commit any
+    /// resulting writes, and fold the outcome into `shared`.
+    /// Called once per batch from the dispatcher — back-to-back
+    /// in the default sequential path, concurrently through a
+    /// `tokio::spawn` pool when `parallel: true`. Returns `Ok`
+    /// even when the batch ultimately fails (the failure is
+    /// recorded in `shared.errors` / `shared.failed_params`);
+    /// only an executor-task panic surfaces as `Err`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_apoc_periodic_batch(
+        &self,
+        chunk_rows: Vec<meshdb_executor::Row>,
+        action_plan: meshdb_cypher::LogicalPlan,
+        extra_params: meshdb_executor::ParamMap,
+        max_retries: i64,
+        iterate_list: bool,
+        failed_params_cap: i64,
+        shared: Arc<SharedApocStats>,
+    ) -> std::result::Result<(), Status> {
+        let chunk_size = chunk_rows.len() as i64;
+        let max_attempts = max_retries.max(0) + 1;
+
+        // Increment the batches / total counters up front so
+        // the batch index we log on failure stays coherent with
+        // the final report, even under parallel dispatch.
+        let batch_index = {
+            let mut c = shared.counters.lock().unwrap();
+            c.batches += 1;
+            c.total += chunk_size;
+            c.batches
+        };
+
+        let mut last_err: Option<String> = None;
+        let mut succeeded_commands: Option<Vec<GraphCommand>> = None;
+        let mut retries_incurred: i64 = 0;
+
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                retries_incurred += 1;
+            }
+            let chunk_rows_attempt = chunk_rows.clone();
+            let action_plan_attempt = action_plan.clone();
+            let store = self.store.clone();
+            let routing = self.routing.clone();
+            let extra_params_attempt = extra_params.clone();
+            let registry_factory = self.procedure_registry_factory.clone();
+            let outcome_result = tokio::task::spawn_blocking(
+                move || -> std::result::Result<Vec<GraphCommand>, meshdb_executor::Error> {
+                    let storage_reader = StorageReaderAdapter(store.as_ref() as &dyn StorageEngine);
+                    let writer = BufferingGraphWriter::new();
+                    let procs = registry_factory();
+                    if iterate_list {
+                        // Batch-as-list mode: bind the whole
+                        // chunk to `$_batch` (a list of
+                        // row-Maps) and run the action ONCE.
+                        let mut params = extra_params_attempt.clone();
+                        let batch_list: Vec<meshdb_core::Property> = chunk_rows_attempt
+                            .iter()
+                            .map(|row| meshdb_core::Property::Map(row_to_property_map(row)))
+                            .collect();
+                        params.insert(
+                            "_batch".into(),
+                            meshdb_executor::Value::Property(meshdb_core::Property::List(
+                                batch_list,
+                            )),
+                        );
+                        if let Some(r) = routing.as_ref() {
+                            let partitioned = PartitionedGraphReader::new(store.clone(), r.clone());
+                            meshdb_executor::execute_with_reader_and_procs(
+                                &action_plan_attempt,
+                                &partitioned as &dyn GraphReader,
+                                &writer as &dyn GraphWriter,
+                                &params,
+                                &procs,
+                            )?;
+                        } else {
+                            meshdb_executor::execute_with_reader_and_procs(
+                                &action_plan_attempt,
+                                &storage_reader as &dyn GraphReader,
+                                &writer as &dyn GraphWriter,
+                                &params,
+                                &procs,
+                            )?;
+                        }
+                    } else {
+                        for row in chunk_rows_attempt {
+                            let mut row_params = extra_params_attempt.clone();
+                            for (k, v) in row {
+                                row_params.insert(k, v);
+                            }
+                            if let Some(r) = routing.as_ref() {
+                                let partitioned =
+                                    PartitionedGraphReader::new(store.clone(), r.clone());
+                                meshdb_executor::execute_with_reader_and_procs(
+                                    &action_plan_attempt,
+                                    &partitioned as &dyn GraphReader,
+                                    &writer as &dyn GraphWriter,
+                                    &row_params,
+                                    &procs,
+                                )?;
+                            } else {
+                                meshdb_executor::execute_with_reader_and_procs(
+                                    &action_plan_attempt,
+                                    &storage_reader as &dyn GraphReader,
+                                    &writer as &dyn GraphWriter,
+                                    &row_params,
+                                    &procs,
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(writer.into_commands())
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("batch {batch_index} executor panicked: {e}")))?;
+
+            match outcome_result {
+                Ok(commands) => match self.commit_buffered_commands(commands.clone()).await {
+                    Ok(()) => {
+                        succeeded_commands = Some(commands);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e.message().to_string());
+                    }
+                },
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if let Some(commands) = succeeded_commands {
+            {
+                let mut s = shared.update_stats.lock().unwrap();
+                s.absorb(&commands);
+            }
+            let mut c = shared.counters.lock().unwrap();
+            c.committed_ops += chunk_size;
+            c.retries += retries_incurred;
+        } else {
+            {
+                let mut c = shared.counters.lock().unwrap();
+                c.failed_ops += chunk_size;
+                c.failed_batches += 1;
+                c.retries += retries_incurred;
+            }
+            let err_str = last_err.unwrap_or_else(|| "<no error captured>".into());
+            {
+                let mut errs = shared.errors.lock().unwrap();
+                *errs.entry(err_str.clone()).or_insert(0) += 1;
+            }
+            if failed_params_cap != 0 {
+                let mut fp = shared.failed_params.lock().unwrap();
+                let bucket = fp.entry(err_str.clone()).or_default();
+                let cap = if failed_params_cap < 0 {
+                    usize::MAX
+                } else {
+                    failed_params_cap as usize
+                };
+                for row in &chunk_rows {
+                    if bucket.len() >= cap {
+                        break;
+                    }
+                    bucket.push(row_to_property_map(row));
+                }
+            }
+            tracing::warn!(
+                batch = batch_index,
+                error = %err_str,
+                attempts = max_attempts,
+                "apoc.periodic.iterate — batch failed after retries"
+            );
+        }
+        Ok(())
     }
 
     /// Commit a batch of `GraphCommand`s through the active backend.
@@ -2415,6 +2511,8 @@ fn find_apoc_periodic_iterate_node(
     i64,
     i64,
     bool,
+    bool,
+    usize,
 )> {
     use meshdb_cypher::LogicalPlan as P;
     match plan {
@@ -2426,6 +2524,8 @@ fn find_apoc_periodic_iterate_node(
             retries,
             failed_params_cap,
             iterate_list,
+            parallel,
+            concurrency,
         } => Some((
             (**iterate).clone(),
             (**action).clone(),
@@ -2434,6 +2534,8 @@ fn find_apoc_periodic_iterate_node(
             *retries,
             *failed_params_cap,
             *iterate_list,
+            *parallel,
+            *concurrency,
         )),
         P::Filter { input, .. }
         | P::Project { input, .. }
@@ -2616,7 +2718,7 @@ fn row_to_property_map(
 /// post-batch GraphCommand list and counts the structural
 /// changes; only invoked on successful batches so failed
 /// attempts don't leak into the stats.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct UpdateStatsAccumulator {
     nodes_created: i64,
     nodes_deleted: i64,
@@ -2680,6 +2782,56 @@ impl UpdateStatsAccumulator {
         m.insert("propertiesSet".into(), Property::Int64(self.properties_set));
         m.insert("labelsAdded".into(), Property::Int64(self.labels_added));
         m
+    }
+}
+
+/// Cross-batch counters that add up to the top-level
+/// `batches`, `total`, `committedOperations`, `failedOperations`,
+/// `failedBatches`, and `retries` columns in the final apoc
+/// result row. Lives inside [`SharedApocStats`] behind a mutex
+/// so parallel batch tasks can fold their outcomes in safely.
+#[derive(Debug, Default, Clone)]
+struct ApocBatchCounters {
+    batches: i64,
+    total: i64,
+    committed_ops: i64,
+    failed_ops: i64,
+    failed_batches: i64,
+    retries: i64,
+}
+
+/// Shared per-run state for one `apoc.periodic.iterate`
+/// dispatch. Each batch — whether the default sequential loop
+/// or a tokio-spawned parallel task — folds its outcome into
+/// these mutex-guarded fields, and the final result row reads
+/// them once after every batch has completed.
+///
+/// `std::sync::Mutex` is the right choice here: every locked
+/// section is short and non-async, so we never hold a guard
+/// across an `.await`. `parking_lot::Mutex` would save a few
+/// nanoseconds per lock but `apoc.periodic.iterate` is
+/// bottlenecked on per-batch commit latency, not lock
+/// overhead.
+struct SharedApocStats {
+    counters: std::sync::Mutex<ApocBatchCounters>,
+    errors: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+    failed_params: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            Vec<std::collections::HashMap<String, meshdb_core::Property>>,
+        >,
+    >,
+    update_stats: std::sync::Mutex<UpdateStatsAccumulator>,
+}
+
+impl SharedApocStats {
+    fn new() -> Self {
+        Self {
+            counters: std::sync::Mutex::new(ApocBatchCounters::default()),
+            errors: std::sync::Mutex::new(std::collections::HashMap::new()),
+            failed_params: std::sync::Mutex::new(std::collections::HashMap::new()),
+            update_stats: std::sync::Mutex::new(UpdateStatsAccumulator::default()),
+        }
     }
 }
 

@@ -3512,6 +3512,123 @@ async fn apoc_periodic_iterate_list_mode_with_extra_params() {
     assert_eq!(got, vec![110, 120]);
 }
 
+#[tokio::test]
+async fn apoc_periodic_iterate_parallel_creates_all_target_nodes() {
+    // Parallel happy-path analogue of
+    // `apoc_periodic_iterate_basic_creates_all_target_nodes`: 20
+    // rows × batchSize 2 → 10 batches, dispatched through a pool
+    // of 4. Aggregates must match the sequential semantics
+    // exactly — `batches`, `total`, `committedOperations`,
+    // `failedBatches`, and the underlying write count are all
+    // order-independent.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    let rows = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND range(1, 20) AS x RETURN x',\
+                'CREATE (:ApocPar {n: $x})',\
+                {batchSize: 2, parallel: true, concurrency: 4}\
+            ) YIELD batches, total, committedOperations, failedOperations, failedBatches \
+             RETURN batches, total, committedOperations, failedOperations, failedBatches"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("parallel apoc.periodic.iterate should succeed");
+    assert_eq!(rows.len(), 1);
+    let r = &rows[0];
+    let int_col = |name: &str| match r.get(name).unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("expected Int64 for {name}, got {other:?}"),
+    };
+    assert_eq!(int_col("batches"), 10);
+    assert_eq!(int_col("total"), 20);
+    assert_eq!(int_col("committedOperations"), 20);
+    assert_eq!(int_col("failedOperations"), 0);
+    assert_eq!(int_col("failedBatches"), 0);
+
+    // All 20 writes must have landed, regardless of which task
+    // committed each batch.
+    let count_rows = service
+        .execute_cypher_local(
+            "MATCH (n:ApocPar) RETURN count(n) AS c".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let c = match count_rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("got {other:?}"),
+    };
+    assert_eq!(c, 20);
+}
+
+#[tokio::test]
+async fn apoc_periodic_iterate_parallel_failed_batch_doesnt_block_others() {
+    // Parallel variant of
+    // `apoc_periodic_iterate_continues_past_failed_batch`.
+    // UNIQUE collision makes one batch fail, the others must
+    // still commit — verifies per-batch failure isolation under
+    // concurrent dispatch.
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = MeshService::new(store.clone());
+    service
+        .execute_cypher_local(
+            "CREATE CONSTRAINT kpar_uniq FOR (n:ApocParK) REQUIRE n.k IS UNIQUE".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    // Pre-seed key 99 so the batch carrying $x=99 collides.
+    service
+        .execute_cypher_local("CREATE (:ApocParK {k: 99})".into(), ParamMap::new())
+        .await
+        .unwrap();
+    let rows = service
+        .execute_cypher_local(
+            "CALL apoc.periodic.iterate(\
+                'UNWIND [1, 2, 3, 4, 99, 6, 7, 8] AS x RETURN x',\
+                'CREATE (:ApocParK {k: $x})',\
+                {batchSize: 1, parallel: true, concurrency: 4}\
+            ) YIELD batches, total, committedOperations, failedOperations, failedBatches \
+             RETURN batches, total, committedOperations, failedOperations, failedBatches"
+                .into(),
+            ParamMap::new(),
+        )
+        .await
+        .expect("parallel iterate should survive a failing batch");
+    let r = &rows[0];
+    let int_col = |name: &str| match r.get(name).unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("got {other:?}"),
+    };
+    // 8 batches total, 7 commit, 1 fails (the 99 duplicate).
+    assert_eq!(int_col("batches"), 8);
+    assert_eq!(int_col("total"), 8);
+    assert_eq!(int_col("committedOperations"), 7);
+    assert_eq!(int_col("failedOperations"), 1);
+    assert_eq!(int_col("failedBatches"), 1);
+
+    // The 7 successful inserts plus the pre-seeded 99 should all
+    // be in the store; the 99 from the iterate stream was
+    // rejected by the UNIQUE constraint.
+    let count_rows = service
+        .execute_cypher_local(
+            "MATCH (n:ApocParK) RETURN count(n) AS c".into(),
+            ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let c = match count_rows[0].get("c").unwrap() {
+        Value::Property(Property::Int64(n)) => *n,
+        other => panic!("got {other:?}"),
+    };
+    assert_eq!(c, 8);
+}
+
 #[cfg(feature = "apoc-trigger")]
 mod apoc_trigger {
     use super::*;
