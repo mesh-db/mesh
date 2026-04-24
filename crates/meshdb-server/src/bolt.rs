@@ -424,13 +424,33 @@ where
                 // tracing events emitted by the executor inherit the
                 // bolt_run span.
                 use tracing::Instrument;
+                // Pre-compute RETURN column order from a parse pass
+                // so we can emit it in the SUCCESS header the driver
+                // reads *before* receiving any RECORD. The double
+                // parse (here + inside execute_cypher_local) is
+                // cheap; Row is a HashMap that doesn't preserve
+                // insertion order, so we can't derive declared order
+                // from the rows themselves.
+                let declared_fields = meshdb_cypher::parse(&query)
+                    .ok()
+                    .map(|stmt| meshdb_cypher::output_columns(&stmt))
+                    .unwrap_or_default();
                 match service
                     .execute_cypher_local(query, param_map)
                     .instrument(run_span)
                     .await
                 {
                     Ok(rows) => {
-                        let fields = field_names_from_rows(&rows);
+                        // Use declared order when the query had a
+                        // RETURN; otherwise fall back to the
+                        // row-key derivation for queries where the
+                        // rows themselves name the columns
+                        // (SHOW INDEXES, procedure YIELDs, etc.).
+                        let fields = if declared_fields.is_empty() {
+                            field_names_from_rows(&rows)
+                        } else {
+                            declared_fields
+                        };
                         send(&mut writer, &fields_success(&fields)).await?;
                         phase = Phase::Streaming { rows, fields };
                     }
@@ -512,6 +532,10 @@ where
                     _ => unreachable!(),
                 };
                 use tracing::Instrument;
+                let declared_fields = meshdb_cypher::parse(&query)
+                    .ok()
+                    .map(|stmt| meshdb_cypher::output_columns(&stmt))
+                    .unwrap_or_default();
                 match service
                     .execute_cypher_in_tx(query, param_map, buffered.clone(), true)
                     .instrument(run_span)
@@ -519,7 +543,11 @@ where
                 {
                     Ok((rows, mut commands)) => {
                         buffered.append(&mut commands);
-                        let fields = field_names_from_rows(&rows);
+                        let fields = if declared_fields.is_empty() {
+                            field_names_from_rows(&rows)
+                        } else {
+                            declared_fields
+                        };
                         send(&mut writer, &fields_success(&fields)).await?;
                         phase = Phase::InTxStreaming {
                             buffered,

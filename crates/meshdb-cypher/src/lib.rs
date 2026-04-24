@@ -12,7 +12,7 @@ pub use ast::PropertyType;
 pub use error::{Error, Result};
 pub use parser::parse;
 pub use plan::{
-    format_plan, plan, plan_with_context, AggregateArg, AggregateFn, AggregateSpec, CreateEdgeSpec,
-    CreateNodeSpec, LogicalPlan, OuterBindingKind, PlannerContext, PointSeekBounds, RemoveSpec,
-    SetAssignment,
+    format_plan, output_columns, plan, plan_with_context, AggregateArg, AggregateFn, AggregateSpec,
+    CreateEdgeSpec, CreateNodeSpec, LogicalPlan, OuterBindingKind, PlannerContext, PointSeekBounds,
+    RemoveSpec, SetAssignment,
 };

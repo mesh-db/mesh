@@ -3756,10 +3756,20 @@ impl MeshQuery for MeshService {
             serde_json::from_slice(&req.params_json)
                 .map_err(|e| Status::invalid_argument(format!("decoding params: {e}")))?
         };
-        let rows = self.execute_cypher_local(query, params).await?;
+        let rows = self.execute_cypher_local(query.clone(), params).await?;
         let rows_json = serde_json::to_vec(&rows)
             .map_err(|e| Status::internal(format!("encoding rows: {e}")))?;
-        Ok(Response::new(ExecuteCypherResponse { rows_json }))
+        // Field order derives from re-parsing the query string. The
+        // double parse (once here, once in execute_cypher_local) is
+        // cheap compared to the actual execute cost and keeps the
+        // rows-only return shape backwards-compat for every caller.
+        // Empty fields means "no RETURN clause" — Bolt falls back to
+        // alphabetical row-key ordering for that case.
+        let fields = match meshdb_cypher::parse(&query) {
+            Ok(stmt) => meshdb_cypher::output_columns(&stmt),
+            Err(_) => Vec::new(),
+        };
+        Ok(Response::new(ExecuteCypherResponse { rows_json, fields }))
     }
 }
 

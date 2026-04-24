@@ -2096,6 +2096,49 @@ fn plan_union(u: &UnionStmt, ctx: &PlannerContext) -> Result<LogicalPlan> {
     })
 }
 
+/// Return the ordered list of output column names for a top-level
+/// statement, in the order the user wrote them in `RETURN` (or the
+/// terminal RETURN of a MATCH / UNWIND chain). Empty vec for
+/// queries that produce no rows (DDL, CREATE without RETURN,
+/// standalone procedure calls). Used by the Bolt listener to emit
+/// the `fields` metadata in declaration order — HashMap-derived
+/// ordering sorts alphabetically, which breaks drivers that access
+/// columns positionally (neo4j-go-driver, Java's reactive API).
+///
+/// UNION returns its first branch's columns, matching the wire
+/// semantics Neo4j documents (all branches must project the same
+/// columns; order follows the first).
+pub fn output_columns(stmt: &Statement) -> Vec<String> {
+    match stmt {
+        Statement::Match(m) => {
+            if m.terminal.star || m.terminal.return_items.is_empty() {
+                Vec::new()
+            } else {
+                m.terminal
+                    .return_items
+                    .iter()
+                    .map(return_item_column_name)
+                    .collect()
+            }
+        }
+        Statement::Unwind(u) => u.return_items.iter().map(return_item_column_name).collect(),
+        Statement::Return(r) => r.return_items.iter().map(return_item_column_name).collect(),
+        Statement::Union(u) => u.branches.first().map(output_columns).unwrap_or_default(),
+        Statement::Explain(inner) | Statement::Profile(inner) => output_columns(inner),
+        Statement::Create(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)
+        | Statement::ShowIndexes
+        | Statement::CreatePointIndex(_)
+        | Statement::DropPointIndex(_)
+        | Statement::ShowPointIndexes
+        | Statement::CreateConstraint(_)
+        | Statement::DropConstraint(_)
+        | Statement::ShowConstraints
+        | Statement::CallProcedure(_) => Vec::new(),
+    }
+}
+
 /// Return the ordered list of output column names for a UNION
 /// branch. Only accepts read-producing statements — any branch
 /// that doesn't carry a `RETURN` (e.g. pure SET/DELETE) fails,

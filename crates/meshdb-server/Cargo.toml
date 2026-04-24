@@ -18,6 +18,7 @@ path = "src/lib.rs"
 meshdb-core = { workspace = true }
 meshdb-storage = { workspace = true }
 meshdb-cluster = { workspace = true }
+meshdb-cypher = { workspace = true }
 meshdb-rpc = { workspace = true }
 meshdb-bolt = { workspace = true }
 meshdb-executor = { workspace = true }

@@ -44,16 +44,6 @@ See `drivers/python/README.md` for the per-language venv bootstrap.
 
 ## Known gaps
 
-- **RETURN field order is alphabetical, not declaration-order** —
-  `meshdb_server::value_conv::field_names_from_rows` collects
-  column names into a `BTreeSet`, so `RETURN a, r, b` comes back
-  on the wire as `[a, b, r]`. Drivers that access by name (Python
-  / JS) are unaffected; drivers that access positionally (Go
-  `record.Values[i]`) see columns in the wrong slot. Neo4j's spec
-  preserves RETURN declaration order. Fix: have the executor's
-  Project operator emit a field-name list in declaration order,
-  thread it through to `fields_success` instead of deriving from
-  BTreeSet-sorted row keys.
 - **Zoned DateTime with `tz_name`** — `Property::DateTime` carries an
   optional IANA region name (`Europe/Stockholm`, etc.) but the
   encoder currently ignores it and emits offset-only DateTime

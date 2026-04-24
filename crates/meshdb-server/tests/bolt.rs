@@ -690,10 +690,9 @@ async fn bolt_tx_match_sees_buffered_edge_via_traversal() {
     )
     .await;
     assert_eq!(records.len(), 1, "traversal should see the buffered edge");
-    // `field_names_from_rows` sorts column names alphabetically, so
-    // the RECORD arrives as [dst, src] regardless of RETURN order.
-    assert_eq!(records[0][0].as_str(), Some("bob"));
-    assert_eq!(records[0][1].as_str(), Some("alice"));
+    // Column order matches the RETURN declaration: [src, dst].
+    assert_eq!(records[0][0].as_str(), Some("alice"));
+    assert_eq!(records[0][1].as_str(), Some("bob"));
 
     let _ = commit_tx(&mut sock).await;
     goodbye(sock).await;

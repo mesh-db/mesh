@@ -254,12 +254,13 @@ func TestCreateRelationshipAndMatchPattern(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Single: %v", err)
 		}
-		av, _ := record.Get("a")
-		rv, _ := record.Get("r")
-		bv, _ := record.Get("b")
-		a := av.(dbtype.Node)
-		r := rv.(dbtype.Relationship)
-		b := bv.(dbtype.Node)
+		// Positional access works now — Mesh preserves RETURN
+		// declaration order on the wire. Values[0..2] match the
+		// RETURN a, r, b order regardless of the alphabetical
+		// sort that used to happen on the server side.
+		a := record.Values[0].(dbtype.Node)
+		r := record.Values[1].(dbtype.Relationship)
+		b := record.Values[2].(dbtype.Node)
 		if a.Props["role"] != "alice-go" {
 			t.Errorf("a.role: got %v, want alice-go", a.Props["role"])
 		}

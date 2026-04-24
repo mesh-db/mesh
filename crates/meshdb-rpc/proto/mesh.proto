@@ -228,8 +228,18 @@ message ExecuteCypherRequest {
 
 // Rows carried as a single JSON blob (serde-serialized Vec<mesh_executor::Row>).
 // A typed proto Value is deferred until the row shape stabilizes.
+//
+// `fields` carries the RETURN column order as written by the user
+// (empty for queries with no RETURN). The Bolt listener emits these
+// as the `fields` metadata on the SUCCESS preceding RECORDs, so
+// drivers that access columns positionally (neo4j-go-driver, Java
+// reactive API) see the correct slot mapping. Row keys alone can't
+// carry this — Rust's HashMap yields non-deterministic iteration
+// order and the prior BTreeSet-based derivation sorted
+// alphabetically.
 message ExecuteCypherResponse {
   bytes rows_json = 1;
+  repeated string fields = 2;
 }
 
 // Mutations. Writes for a node are routed to the partition owner; writes for
