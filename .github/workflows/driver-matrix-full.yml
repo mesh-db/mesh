@@ -89,8 +89,9 @@ jobs:
           python -m venv drivers/python/.venv
           drivers/python/.venv/bin/pip install -q -r drivers/python/requirements.txt
       - name: Run matrix cell
-        env:
-          PATH: ${{ github.workspace }}/drivers/python/.venv/bin:${{ env.PATH }}
+        # run-matrix.sh discovers drivers/python/.venv/bin/python
+        # directly; no PATH override needed (see ci.yml for why an
+        # env-PATH swap would break the shell shebang).
         run: >
           drivers/run-matrix.sh
           --lang=py

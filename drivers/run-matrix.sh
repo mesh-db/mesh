@@ -245,7 +245,16 @@ export MESH_BOLT_MODE="$MODE"
 case "$LANG" in
   py)
     echo "[run-matrix] running drivers/python suite" >&2
-    if ! (cd drivers/python && python -m pytest -q); then
+    # Prefer the pinned venv python when present — lets CI steps
+    # skip the `$GITHUB_PATH` dance. Falls back to PATH `python` so a
+    # developer who has pytest + neo4j in a parent env can still run
+    # the harness without creating a venv.
+    if [[ -x "$REPO_ROOT/drivers/python/.venv/bin/python" ]]; then
+      PY_BIN="$REPO_ROOT/drivers/python/.venv/bin/python"
+    else
+      PY_BIN="python"
+    fi
+    if ! (cd drivers/python && "$PY_BIN" -m pytest -q); then
       echo "[run-matrix] python suite failed" >&2
       echo "[run-matrix] server log: $LOG_A" >&2
       [[ -n "$SERVER_PID_B" ]] && echo "[run-matrix] peer B log: $LOG_B" >&2

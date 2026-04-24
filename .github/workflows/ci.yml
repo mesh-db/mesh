@@ -121,13 +121,17 @@ jobs:
         # with basic auth + self-signed TLS. The nightly full-axis
         # workflow (driver-matrix-full.yml) covers the Bolt version
         # axis and every combination beyond this pair.
-        env:
-          PATH: ${{ github.workspace }}/drivers/python/.venv/bin:${{ env.PATH }}
+        #
+        # The orchestrator discovers the venv python at
+        # drivers/python/.venv/bin/python, so no PATH dance needed
+        # here. (An `env: PATH: ...` override would clobber the
+        # runner's shell PATH — `${{ env.PATH }}` refers to
+        # workflow env, not the shell env, so it evaluates to empty
+        # and drops `/usr/bin` on the floor; the next shebang
+        # resolution fails with "bash: No such file or directory".)
         run: drivers/run-matrix.sh --lang=py --auth=none --tls=off --bolt=5.4
 
       - name: Matrix cell — production shape (bolt=5.4, auth=basic, tls=on)
-        env:
-          PATH: ${{ github.workspace }}/drivers/python/.venv/bin:${{ env.PATH }}
         run: drivers/run-matrix.sh --lang=py --auth=basic --tls=on --bolt=5.4
 
       - name: Upload server logs on failure
