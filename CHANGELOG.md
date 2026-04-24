@@ -7,14 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### 0.1.0 release notes (draft)
-
 First stable minor cut from the alpha line. No breaking changes to
 on-disk format, network protocols, or config shape from
 `0.1.0-alpha.9`; upgrade is a process restart on the same data
 directory.
 
-#### Highlights
+### Highlights
 
 - **Distributed 2PC is now test-verified**, not just documented.
   Four new failure-injection integration tests cover coordinator
@@ -44,7 +42,7 @@ directory.
   `meshdb-rpc::ConvertError`, and `meshdb-apoc::ApocError` can be
   added without a breaking-change bump.
 
-#### Known limitations deferred past 0.1.0
+### Known limitations deferred past 0.1.0
 
 - `allShortestPaths` parses but the planner rejects it. Single
   `shortestPath(...)` works.
@@ -61,7 +59,7 @@ directory.
 - Criterion benches run locally only. A CI perf-regression gate
   (baseline + variance budget) is a follow-up.
 
-#### Stability commitments for 0.x
+### Stability commitments for 0.x
 
 - **Bolt wire protocol (v4.4–5.4):** stable within a minor;
   breaking additions cut a new minor.
@@ -81,7 +79,7 @@ directory.
   embedding Mesh as a library should pin to exact minor
   versions.
 
-#### Upgrade from `0.1.0-alpha.9`
+### Upgrade from `0.1.0-alpha.9`
 
 No action required beyond a binary restart. No data migration,
 no config changes, no protocol changes. Alpha releases have been

@@ -74,10 +74,31 @@ jobs:
           sed -i -E '/^\[workspace\.dependencies\]/,/^\[/{
             s|^(meshdb-[a-zA-Z0-9_-]+ = \{ path = "crates/meshdb-[a-zA-Z0-9_-]+", version = )"[^"]*"|\1"'"$VERSION"'"|
           }' Cargo.toml
+          # Promote the `[Unreleased]` CHANGELOG section to a dated
+          # `[$VERSION]` header and drop a fresh empty `[Unreleased]`
+          # above it. Matches the Keep-a-Changelog + release-please
+          # pattern: curators write notes under `[Unreleased]` during
+          # the development cycle and the release workflow carves
+          # them off at cut time. Idempotent because this step short-
+          # circuits (via the `current == VERSION` check above) when
+          # re-running after a failed publish.
+          if [[ -f CHANGELOG.md ]] && grep -q '^## \[Unreleased\]$' CHANGELOG.md; then
+            release_date=$(date -u '+%Y-%m-%d')
+            awk -v ver="$VERSION" -v date="$release_date" '
+              /^## \[Unreleased\]$/ && !done {
+                print "## [Unreleased]"
+                print ""
+                print "## [" ver "] - " date
+                done=1
+                next
+              }
+              { print }
+            ' CHANGELOG.md > CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
+          fi
           # Sync Cargo.lock. `--workspace` updates only workspace members;
           # transitive deps are left pinned.
           cargo update --workspace --quiet
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit -m "chore: release v$VERSION"
           git push origin HEAD:main
 
@@ -132,11 +153,27 @@ jobs:
             echo "GitHub release v$VERSION already exists — skipping."
             exit 0
           fi
-          prev_tag=$(git describe --tags --abbrev=0 "v$VERSION^" 2>/dev/null || true)
-          if [[ -n "$prev_tag" ]]; then
-            body=$(git log --pretty=format:'- %s' "$prev_tag..v$VERSION")
-          else
-            body=$(git log --pretty=format:'- %s' "v$VERSION")
+          # Prefer the curated CHANGELOG section the bump step just
+          # promoted (everything between `## [$VERSION]` and the next
+          # `## [...]` header, header line itself stripped). Falls
+          # back to a git-log bullet list when the section is empty —
+          # e.g. for alpha cuts where no one maintained
+          # `[Unreleased]` notes.
+          body=""
+          if [[ -f CHANGELOG.md ]]; then
+            body=$(awk -v header="## [$VERSION]" '
+              index($0, header) == 1 { found=1; next }
+              /^## \[/ && found { exit }
+              found { print }
+            ' CHANGELOG.md)
+          fi
+          if [[ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]]; then
+            prev_tag=$(git describe --tags --abbrev=0 "v$VERSION^" 2>/dev/null || true)
+            if [[ -n "$prev_tag" ]]; then
+              body=$(git log --pretty=format:'- %s' "$prev_tag..v$VERSION")
+            else
+              body=$(git log --pretty=format:'- %s' "v$VERSION")
+            fi
           fi
           prerelease=()
           [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
