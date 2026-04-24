@@ -9,15 +9,6 @@ import neo4j from 'neo4j-driver';
 
 import { openDriver } from './helpers.js';
 
-// Bolt 4.4 Node struct has 3 fields (id / labels / properties); 5.0+
-// added a 4th `element_id` — same divergence for Relationship
-// (5 fields vs 8) and UnboundRelationship (3 vs 4). Mesh's encoder
-// currently emits the 5.x shape regardless of negotiated version,
-// which fails 4.4 drivers with a "wrong struct size" protocol error.
-// Tests that return Node or Relationship are gated here until the
-// encoder is taught to switch on version.
-const SKIP_NODE_REL_ON_44 = { skip: process.env.MESH_BOLT_VERSION === '4.4' };
-
 let driver;
 
 before(() => {
@@ -161,7 +152,7 @@ test('Point WGS-84 round-trip', async () => {
 
 // --- CREATE with parameter + MATCH ------------------------------------
 
-test('CREATE node with param, MATCH round-trip', SKIP_NODE_REL_ON_44, async () => {
+test('CREATE node with param, MATCH round-trip', async () => {
   await withSession(async (session) => {
     await session.run(
       'CREATE (n:DriverParityJS {marker: $m, idx: $i})',
@@ -178,7 +169,7 @@ test('CREATE node with param, MATCH round-trip', SKIP_NODE_REL_ON_44, async () =
   });
 });
 
-test('CREATE relationship, MATCH pattern with Node + Relationship', SKIP_NODE_REL_ON_44, async () => {
+test('CREATE relationship, MATCH pattern with Node + Relationship', async () => {
   await withSession(async (session) => {
     await session.run(
       `CREATE (a:DriverParityJS {role: $a_role}),

@@ -190,15 +190,16 @@ async fn bolt_returns_full_node_struct_with_labels_and_props() {
     let (records, _) = run_and_pull(&mut sock, "MATCH (n:Widget) RETURN n").await;
     assert_eq!(records.len(), 1);
 
-    // The single field is the node itself, encoded as PackStream
-    // Struct(tag=0x4E, [id, labels, props, element_id]).
+    // Under Bolt 4.4 the Node struct is 3 fields: [id, labels, props].
+    // Bolt 5.0+ adds `element_id` as a 4th field — covered by the
+    // version-conditional tests in `tests/value_conv_roundtrip.rs`.
     let node = &records[0][0];
     let (tag, fields) = match node {
         BoltValue::Struct { tag, fields } => (*tag, fields),
         other => panic!("expected Node struct, got {:?}", other),
     };
     assert_eq!(tag, meshdb_bolt::TAG_NODE);
-    assert_eq!(fields.len(), 4);
+    assert_eq!(fields.len(), 3);
 
     // Field 0: id (Int — folded from the UUID).
     assert!(matches!(fields[0], BoltValue::Int(_)));
@@ -217,11 +218,6 @@ async fn bolt_returns_full_node_struct_with_labels_and_props() {
         BoltValue::Float(f) => assert!((f - 4.2).abs() < 1e-9),
         ref other => panic!("expected Float for weight, got {:?}", other),
     }
-
-    // Field 3: element_id — UUID string form, 36 chars with 4 dashes.
-    let elem = fields[3].as_str().unwrap();
-    assert_eq!(elem.len(), 36);
-    assert_eq!(elem.chars().filter(|c| *c == '-').count(), 4);
 
     goodbye(sock).await;
 }

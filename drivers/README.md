@@ -44,17 +44,6 @@ See `drivers/python/README.md` for the per-language venv bootstrap.
 
 ## Known gaps
 
-- **Bolt 4.4 Node / Relationship struct sizes** — the encoder
-  always emits the Bolt 5.x shape: 4-field Node, 8-field
-  Relationship, 4-field UnboundRelationship (with `element_id`
-  / `start_element_id` / `end_element_id`). Bolt 4.4 expects
-  3 / 5 / 3. The JS driver rejects the mismatch with
-  `ProtocolError: Wrong struct size for Node, expected 3 but was 4`;
-  the Python driver is more lenient and ignores trailing fields.
-  Tests that return Node / Relationship are skipped on
-  `--bolt=4.4` until `property_to_bolt`, `node_to_bolt`,
-  `edge_to_bolt`, and `unbound_relationship_to_bolt` learn to
-  switch on the negotiated version.
 - **Zoned DateTime with `tz_name`** — `Property::DateTime` carries an
   optional IANA region name (`Europe/Stockholm`, etc.) but the
   encoder currently ignores it and emits offset-only DateTime

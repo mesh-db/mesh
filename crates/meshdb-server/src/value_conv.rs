@@ -1,17 +1,24 @@
 //! Conversion from meshdb-executor row/value types onto `BoltValue` for
 //! transmission over the Bolt protocol.
 //!
-//! Reference for the graph struct layouts (Bolt 4.4):
-//! - Node (tag 0x4E): `{id: Int, labels: List<String>, properties: Map,
-//!   element_id: String}`
-//! - Relationship (tag 0x52): `{id, start_id, end_id, type: String,
-//!   properties: Map, element_id, start_element_id, end_element_id}`
+//! Graph struct layouts vary by negotiated Bolt version:
+//!
+//!   | Struct              | Bolt 4.4                           | Bolt 5.0+                                                             |
+//!   | Node (0x4E)         | {id, labels, properties}           | {id, labels, properties, element_id}                                  |
+//!   | Relationship (0x52) | {id, start, end, type, properties} | {id, start, end, type, properties, element_id, start_el, end_el}      |
+//!   | UnboundRel (0x72)   | {id, type, properties}             | {id, type, properties, element_id}                                    |
+//!
+//! Bolt 5.0 added the `element_id` / `start_element_id` /
+//! `end_element_id` trailer; a 4.4-speaking driver strict-checks
+//! field count and rejects 5.x-shaped structs as protocol errors
+//! (only the stricter drivers — Python's is lenient about trailing
+//! fields — but JS, Go, and .NET all reject the shape).
 //!
 //! Our `NodeId` / `EdgeId` are UUID v7 (128 bits). Bolt's numeric `id`
 //! fields are i64, so we fold the low 8 bytes of the UUID into an
 //! i64 — stable and deterministic per id. Drivers that care about
-//! long-term stability (Bolt 5+) should use `element_id`, which we
-//! set to the full UUID string.
+//! long-term stability (Bolt 5+) use `element_id`, which we set to
+//! the full UUID string.
 
 use meshdb_bolt::{
     is_bolt_4_4, BoltValue, TAG_DATE, TAG_DATE_TIME, TAG_DATE_TIME_LEGACY, TAG_DURATION,
@@ -159,14 +166,17 @@ fn unbound_relationship_to_bolt(edge: &Edge, bolt_version: [u8; 4]) -> BoltValue
         .map(|(k, v)| (k.clone(), property_to_bolt(v, bolt_version)))
         .collect();
     props.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut fields = vec![
+        BoltValue::Int(edge_uuid_to_bolt_id(edge.id)),
+        BoltValue::String(edge.edge_type.clone()),
+        BoltValue::Map(props),
+    ];
+    if !is_bolt_4_4(bolt_version) {
+        fields.push(BoltValue::String(edge.id.as_uuid().to_string()));
+    }
     BoltValue::Struct {
         tag: TAG_UNBOUND_RELATIONSHIP,
-        fields: vec![
-            BoltValue::Int(edge_uuid_to_bolt_id(edge.id)),
-            BoltValue::String(edge.edge_type.clone()),
-            BoltValue::Map(props),
-            BoltValue::String(edge.id.as_uuid().to_string()),
-        ],
+        fields,
     }
 }
 
@@ -304,19 +314,22 @@ fn node_to_bolt(node: &Node, bolt_version: [u8; 4]) -> BoltValue {
     // Node.properties is a HashMap; iteration order is non-deterministic.
     // Sort by key so the Bolt representation is stable across runs.
     props.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut fields = vec![
+        BoltValue::Int(uuid_to_bolt_id(node.id)),
+        BoltValue::List(
+            node.labels
+                .iter()
+                .map(|l| BoltValue::String(l.clone()))
+                .collect(),
+        ),
+        BoltValue::Map(props),
+    ];
+    if !is_bolt_4_4(bolt_version) {
+        fields.push(BoltValue::String(node.id.as_uuid().to_string()));
+    }
     BoltValue::Struct {
         tag: TAG_NODE,
-        fields: vec![
-            BoltValue::Int(uuid_to_bolt_id(node.id)),
-            BoltValue::List(
-                node.labels
-                    .iter()
-                    .map(|l| BoltValue::String(l.clone()))
-                    .collect(),
-            ),
-            BoltValue::Map(props),
-            BoltValue::String(node.id.as_uuid().to_string()),
-        ],
+        fields,
     }
 }
 
@@ -327,18 +340,21 @@ fn edge_to_bolt(edge: &Edge, bolt_version: [u8; 4]) -> BoltValue {
         .map(|(k, v)| (k.clone(), property_to_bolt(v, bolt_version)))
         .collect();
     props.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut fields = vec![
+        BoltValue::Int(edge_uuid_to_bolt_id(edge.id)),
+        BoltValue::Int(uuid_to_bolt_id(edge.source)),
+        BoltValue::Int(uuid_to_bolt_id(edge.target)),
+        BoltValue::String(edge.edge_type.clone()),
+        BoltValue::Map(props),
+    ];
+    if !is_bolt_4_4(bolt_version) {
+        fields.push(BoltValue::String(edge.id.as_uuid().to_string()));
+        fields.push(BoltValue::String(edge.source.as_uuid().to_string()));
+        fields.push(BoltValue::String(edge.target.as_uuid().to_string()));
+    }
     BoltValue::Struct {
         tag: TAG_RELATIONSHIP,
-        fields: vec![
-            BoltValue::Int(edge_uuid_to_bolt_id(edge.id)),
-            BoltValue::Int(uuid_to_bolt_id(edge.source)),
-            BoltValue::Int(uuid_to_bolt_id(edge.target)),
-            BoltValue::String(edge.edge_type.clone()),
-            BoltValue::Map(props),
-            BoltValue::String(edge.id.as_uuid().to_string()),
-            BoltValue::String(edge.source.as_uuid().to_string()),
-            BoltValue::String(edge.target.as_uuid().to_string()),
-        ],
+        fields,
     }
 }
 

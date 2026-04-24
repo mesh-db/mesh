@@ -269,6 +269,68 @@ fn point_3d_wgs84_roundtrip() {
     assert_eq!(out, input);
 }
 
+// ---- Graph struct version-conditional field counts ----
+
+#[test]
+fn node_struct_drops_element_id_under_bolt_4_4() {
+    // Bolt 4.4 Node is 3 fields; 5.0+ added element_id as the 4th.
+    let node = sample_node("Alice");
+    let mut row = Row::new();
+    row.insert("n".to_string(), Value::Node(node.clone()));
+
+    let bolt_44 = &row_to_bolt_fields(&row, &["n".to_string()], meshdb_bolt::BOLT_4_4)[0];
+    match bolt_44 {
+        BoltValue::Struct { tag, fields } => {
+            assert_eq!(*tag, TAG_NODE);
+            assert_eq!(fields.len(), 3, "4.4 Node must be 3 fields");
+        }
+        other => panic!("expected Struct, got {other:?}"),
+    }
+
+    let bolt_54 = &row_to_bolt_fields(&row, &["n".to_string()], meshdb_bolt::BOLT_5_4)[0];
+    match bolt_54 {
+        BoltValue::Struct { tag, fields } => {
+            assert_eq!(*tag, TAG_NODE);
+            assert_eq!(fields.len(), 4, "5.x Node must be 4 fields");
+            // 4th field is element_id as the UUID string.
+            match &fields[3] {
+                BoltValue::String(s) => assert_eq!(s, &node.id.as_uuid().to_string()),
+                _ => panic!("element_id field wrong type"),
+            }
+        }
+        other => panic!("expected Struct, got {other:?}"),
+    }
+}
+
+#[test]
+fn relationship_struct_drops_element_ids_under_bolt_4_4() {
+    // Bolt 4.4 Relationship is 5 fields; 5.0+ adds element_id,
+    // start_element_id, end_element_id for a total of 8.
+    let a = sample_node("A");
+    let b = sample_node("B");
+    let edge = sample_edge(a.id, b.id);
+    let mut row = Row::new();
+    row.insert("r".to_string(), Value::Edge(edge.clone()));
+
+    let bolt_44 = &row_to_bolt_fields(&row, &["r".to_string()], meshdb_bolt::BOLT_4_4)[0];
+    match bolt_44 {
+        BoltValue::Struct { tag, fields } => {
+            assert_eq!(*tag, TAG_RELATIONSHIP);
+            assert_eq!(fields.len(), 5, "4.4 Relationship must be 5 fields");
+        }
+        other => panic!("expected Struct, got {other:?}"),
+    }
+
+    let bolt_54 = &row_to_bolt_fields(&row, &["r".to_string()], meshdb_bolt::BOLT_5_4)[0];
+    match bolt_54 {
+        BoltValue::Struct { tag, fields } => {
+            assert_eq!(*tag, TAG_RELATIONSHIP);
+            assert_eq!(fields.len(), 8, "5.x Relationship must be 8 fields");
+        }
+        other => panic!("expected Struct, got {other:?}"),
+    }
+}
+
 // ---- Path (server → client only) ----
 //
 // We don't have a `BoltValue → Value::Path` decoder because
