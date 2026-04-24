@@ -1,9 +1,15 @@
 //! Failure-injection integration tests for the routing-mode 2PC path.
 //!
-//! Each test exercises one branch of the crash-recovery machinery:
-//! `recover_pending_transactions` on the coordinator side (Tests A and B)
-//! and `recover_participant_staging` + `recover_participant_decisions` on
-//! the participant side (Test C).
+//! Each test exercises a distinct failure branch:
+//! - coordinator restart after a crash pre-decision
+//!   (`recover_pending_transactions`, abort branch)
+//! - coordinator restart after a crash post-`CommitDecision`
+//!   (`recover_pending_transactions`, resume-commit branch)
+//! - participant restart after a rejected COMMIT
+//!   (`recover_participant_staging` +
+//!   `recover_participant_decisions` via the `ResolveTransaction` RPC)
+//! - synchronous rollback when a peer rejects PREPARE outright
+//!   (the in-`run` rollback path — no restart involved)
 //!
 //! Deterministic injection is done via the cfg-gated
 //! [`meshdb_rpc::FaultPoints`] struct — a handle the test harness hangs
@@ -521,5 +527,85 @@ async fn two_pc_participant_crash_after_prepare_ack_recovers_via_resolve_transac
     assert!(
         post_resolve_count > pre_resolve_count,
         "ResolveTransaction was never called on peer A during B's recovery (before: {pre_resolve_count}, after: {post_resolve_count})",
+    );
+}
+
+#[tokio::test]
+async fn two_pc_prepare_reject_rolls_back_prepared_peers_cleanly() {
+    // Scenario: peer B refuses PREPARE outright. The coordinator
+    // (A) must:
+    //   1. Stop the PREPARE loop on the first failure.
+    //   2. Log `AbortDecision` before attempting rollback.
+    //   3. Send ABORT to every peer already in the `prepared` set
+    //      (i.e. whichever peers' PREPARE the coordinator had
+    //      already collected — at most one in a two-peer cluster).
+    //   4. Log `Completed` and surface B's PREPARE error to the
+    //      client.
+    //
+    // Verifies the in-`run` rollback path — distinct from the
+    // restart-driven recovery paths exercised by Tests A / B / C.
+    // No restart is needed here: the rollback is synchronous and
+    // must leave the cluster clean.
+
+    let (peer_a, peer_b) = spawn_two_peer_cluster().await;
+
+    peer_b
+        .fault_points
+        .reject_prepare
+        .store(true, Ordering::SeqCst);
+
+    let mut q_a = MeshQueryClient::connect(peer_a.grpc_url()).await.unwrap();
+    let err = q_a
+        .execute_cypher(ExecuteCypherRequest {
+            query: twenty_probe_nodes_cypher(),
+            params_json: vec![],
+        })
+        .await
+        .expect_err("B's PREPARE rejection must surface as a client error");
+    assert!(
+        err.message().contains("reject_prepare") || err.message().contains("injected fault"),
+        "unexpected error: {}",
+        err.message()
+    );
+
+    // Rollback drained any per-peer staging — nothing should have
+    // been applied on either peer.
+    assert_eq!(count_probes_local(peer_a.grpc_url()).await, 0);
+    assert_eq!(count_probes_local(peer_b.grpc_url()).await, 0);
+
+    // B refused PREPARE before staging or logging, so its
+    // participant log must not contain a `Prepared` entry for the
+    // rolled-back txid. (It may pick up an `Aborted` entry if the
+    // coordinator fanned ABORT to B too, which is fine — the
+    // invariant is "never Prepared without a matching Committed
+    // or Aborted later.")
+    let b_entries = read_participant_log(peer_b.config.data_dir.as_path());
+    assert!(
+        !b_entries
+            .iter()
+            .any(|e| matches!(e, ParticipantLogEntry::Prepared { .. })),
+        "peer B logged Prepared despite rejecting PREPARE: {:?}",
+        b_entries,
+    );
+
+    // After the rollback, a fresh write must succeed — the service
+    // didn't get wedged by the abort path. Clear the fault, issue
+    // a second CREATE, and confirm it lands on both peers.
+    peer_b
+        .fault_points
+        .reject_prepare
+        .store(false, Ordering::SeqCst);
+    q_a.execute_cypher(ExecuteCypherRequest {
+        query: twenty_probe_nodes_cypher(),
+        params_json: vec![],
+    })
+    .await
+    .expect("post-rollback write should succeed");
+    let post_a = count_probes_local(peer_a.grpc_url()).await;
+    let post_b = count_probes_local(peer_b.grpc_url()).await;
+    assert_eq!(
+        post_a + post_b,
+        20,
+        "post-rollback write didn't fully land (a={post_a}, b={post_b})",
     );
 }

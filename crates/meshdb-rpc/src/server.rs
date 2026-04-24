@@ -4074,6 +4074,12 @@ impl MeshWrite for MeshService {
                 Err(Status::invalid_argument("phase UNSPECIFIED is not valid"))
             }
             BatchPhase::Prepare => {
+                #[cfg(any(test, feature = "fault-inject"))]
+                if let Some(fp) = &self.fault_points {
+                    if fp.reject_prepare.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(Status::internal("injected fault: reject_prepare"));
+                    }
+                }
                 let commands: Vec<GraphCommand> =
                     serde_json::from_slice(&req.commands_json).map_err(bad_request)?;
                 // Terminal outcome takes precedence over staging

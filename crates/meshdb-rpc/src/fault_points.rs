@@ -36,6 +36,13 @@ pub struct FaultPoints {
     /// after some participants have already applied.
     pub crash_after_kth_commit_rpc: AtomicI32,
 
+    /// Participant: in the `BatchPhase::Prepare` handler, refuse
+    /// before staging or logging anything. The coordinator treats
+    /// this as a normal PREPARE failure and drives its rollback
+    /// path — log `AbortDecision`, send ABORT to every peer that
+    /// did ack PREPARE, log `Completed`, return the original error.
+    pub reject_prepare: AtomicBool,
+
     /// Participant: in the `BatchPhase::Commit` handler, return
     /// `Status::internal("injected fault")` before applying the
     /// staged batch. Leaves the participant's `Prepared` log entry
@@ -55,6 +62,7 @@ impl FaultPoints {
             crash_after_prepare_log: AtomicBool::new(false),
             crash_after_commit_decision_log: AtomicBool::new(false),
             crash_after_kth_commit_rpc: AtomicI32::new(-1),
+            reject_prepare: AtomicBool::new(false),
             reject_commit_before_apply: AtomicBool::new(false),
             resolve_transaction_call_count: AtomicU32::new(0),
         }
