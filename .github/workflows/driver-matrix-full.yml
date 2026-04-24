@@ -1,0 +1,300 @@
+name: Driver matrix (full axis)
+
+# Walks the complete Bolt version × auth × TLS grid across every
+# language driver. Per-PR CI (ci.yml) runs the two representative
+# cells per language; this workflow covers the other 10 per language
+# = 40 cells total, parallelized via a matrix strategy.
+#
+# Schedule: Monday 06:00 UTC. Weekly cadence is enough signal for a
+# compat surface that otherwise moves on driver-release cadence
+# (neo4j-{python,js,go,java}-driver roll on months, not hours), and
+# keeps the weekly runner-minute spend reasonable.
+#
+# Failure behavior: on any cell failing, open (or refresh) a GitHub
+# issue so the flake doesn't silently vanish into the Actions log. An
+# `autoclose` step in the issue-opening job closes the issue on the
+# next green run.
+
+on:
+  schedule:
+    # "At 06:00 UTC every Monday."
+    - cron: '0 6 * * 1'
+  # Manual dispatch is handy for reproducing failures or validating
+  # the workflow itself without waiting for Monday.
+  workflow_dispatch:
+
+concurrency:
+  group: driver-matrix-full
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Shared pre-step: build the release binary once and cache it. The
+  # per-language matrix jobs download it from the artifact rather
+  # than each rebuilding from scratch — saves ~4 minutes per cell
+  # on a cold cargo cache.
+  build-server:
+    name: Build meshdb-server (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev openssl
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p meshdb-server
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshdb-server-release
+          path: target/release/meshdb-server
+          retention-days: 7
+
+  python:
+    name: "python / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }}"
+    needs: build-server
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        bolt: ['5.4', '5.0', '4.4']
+        auth: ['none', 'basic']
+        tls: ['off', 'on']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: meshdb-server-release
+          path: target/release
+      - run: chmod +x target/release/meshdb-server
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python driver
+        run: |
+          python -m venv drivers/python/.venv
+          drivers/python/.venv/bin/pip install -q -r drivers/python/requirements.txt
+      - name: Run matrix cell
+        env:
+          PATH: ${{ github.workspace }}/drivers/python/.venv/bin:${{ env.PATH }}
+        run: >
+          drivers/run-matrix.sh
+          --lang=py
+          --bolt=${{ matrix.bolt }}
+          --auth=${{ matrix.auth }}
+          --tls=${{ matrix.tls }}
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-python-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}
+          path: drivers/.run/logs/
+          if-no-files-found: ignore
+
+  js:
+    name: "js / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }}"
+    needs: build-server
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        bolt: ['5.4', '5.0', '4.4']
+        auth: ['none', 'basic']
+        tls: ['off', 'on']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: meshdb-server-release
+          path: target/release
+      - run: chmod +x target/release/meshdb-server
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --prefix drivers/js
+      - name: Run matrix cell
+        run: >
+          drivers/run-matrix.sh
+          --lang=js
+          --bolt=${{ matrix.bolt }}
+          --auth=${{ matrix.auth }}
+          --tls=${{ matrix.tls }}
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-js-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}
+          path: drivers/.run/logs/
+          if-no-files-found: ignore
+
+  go:
+    name: "go / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }}"
+    needs: build-server
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        bolt: ['5.4', '5.0', '4.4']
+        auth: ['none', 'basic']
+        tls: ['off', 'on']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: meshdb-server-release
+          path: target/release
+      - run: chmod +x target/release/meshdb-server
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: drivers/go/go.sum
+      - run: (cd drivers/go && go mod download)
+      - name: Run matrix cell
+        run: >
+          drivers/run-matrix.sh
+          --lang=go
+          --bolt=${{ matrix.bolt }}
+          --auth=${{ matrix.auth }}
+          --tls=${{ matrix.tls }}
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-go-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}
+          path: drivers/.run/logs/
+          if-no-files-found: ignore
+
+  java:
+    name: "java / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }}"
+    needs: build-server
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        bolt: ['5.4', '5.0', '4.4']
+        auth: ['none', 'basic']
+        tls: ['off', 'on']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: meshdb-server-release
+          path: target/release
+      - run: chmod +x target/release/meshdb-server
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Run matrix cell
+        run: >
+          drivers/run-matrix.sh
+          --lang=java
+          --bolt=${{ matrix.bolt }}
+          --auth=${{ matrix.auth }}
+          --tls=${{ matrix.tls }}
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-java-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}
+          path: drivers/.run/logs/
+          if-no-files-found: ignore
+
+  # Issue management: open one issue per full-axis failure so the
+  # flake doesn't silently vanish into the Actions log, and close it
+  # when the next scheduled run passes clean. `if: failure()` alone
+  # isn't enough because we want this step to run even when upstream
+  # matrix cells failed but not when the workflow was cancelled.
+  report:
+    name: Report results
+    needs: [python, js, go, java]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open or close tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATUS: ${{ needs.python.result == 'success' && needs.js.result == 'success' && needs.go.result == 'success' && needs.java.result == 'success' && 'success' || 'failure' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Search for any open issue with the standard title prefix.
+          # Using title-match rather than a label because labels
+          # require one-time setup that'd add friction to turning
+          # this workflow on in a fresh repo.
+          TITLE_PREFIX="Driver matrix (full axis) failure"
+          EXISTING_URL=$(
+            gh issue list \
+              --state open \
+              --search "\"$TITLE_PREFIX\" in:title" \
+              --json url \
+              --jq '.[0].url // empty'
+          )
+
+          if [ "$STATUS" = "success" ]; then
+            if [ -n "$EXISTING_URL" ]; then
+              echo "Full-axis run green; closing $EXISTING_URL"
+              gh issue close "$EXISTING_URL" \
+                --comment "All cells passed on ${RUN_URL}. Closing."
+            else
+              echo "Full-axis run green; no issue to close."
+            fi
+            exit 0
+          fi
+
+          # Failure path — file or refresh the issue with links to
+          # the run and per-cell logs (downloadable as artifacts).
+          BODY="Full-axis driver matrix failed: ${RUN_URL}
+
+          Per-cell results:
+          - python: ${{ needs.python.result }}
+          - js: ${{ needs.js.result }}
+          - go: ${{ needs.go.result }}
+          - java: ${{ needs.java.result }}
+
+          Server logs for failing cells are attached as artifacts
+          named \`logs-<lang>-<bolt>-<auth>-<tls>\`."
+
+          if [ -n "$EXISTING_URL" ]; then
+            echo "Refreshing $EXISTING_URL"
+            gh issue comment "$EXISTING_URL" --body "$BODY"
+          else
+            gh issue create \
+              --title "$TITLE_PREFIX ($(date -u +%Y-%m-%d))" \
+              --body "$BODY"
+          fi

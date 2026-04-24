@@ -10,17 +10,19 @@ authentication / TLS plumbing.
 
 ```
 drivers/
-  common/                Server TOML configs + cert generator.
-                         server.toml         — default (auth=off, tls=off, all bolt versions)
-                         server-auth.toml    — basic auth (neo4j/password)
-                         server-tls.toml     — self-signed TLS
-                         server-bolt44.toml  — clamped to Bolt 4.4
-                         server-bolt50.toml  — clamped to Bolt 5.0
-                         server-bolt54.toml  — clamped to Bolt 5.4
-                         gen-cert.sh         — writes cert.pem / key.pem
-  python/                Phase 1: official neo4j-python-driver tests.
+  common/
+    gen-cert.sh          Writes cert.pem / key.pem for the TLS cell.
+  python/                neo4j-python-driver tests.
+  js/                    neo4j-driver (npm) tests.
+  go/                    neo4j-go-driver/v5 tests.
+  java/                  neo4j-java-driver (Maven) tests.
   run-matrix.sh          Orchestrator. One invocation = one matrix cell.
 ```
+
+The orchestrator generates `drivers/.run/config.toml` on each run
+from the axis flags — no hand-written per-cell configs to
+maintain. The canonical, developer-facing Mesh config examples
+are `mesh.toml` and `cluster.toml` at the repo root.
 
 ## Run a single cell
 
@@ -30,17 +32,27 @@ PATH="$(pwd)/drivers/python/.venv/bin:$PATH" \
   drivers/run-matrix.sh --lang=py --bolt=5.4
 ```
 
-See `drivers/python/README.md` for the per-language venv bootstrap.
+Flags are orthogonal — any combination works (e.g. the "real
+deployment" cell):
 
-## Phase status
+```sh
+drivers/run-matrix.sh --lang=java --auth=basic --tls=on --bolt=5.4
+```
 
-- **Phase 1 (current)**: Python driver + smoke + parity tests +
-  baseline CI cell. Lands the harness, the configurable Bolt
-  version axis (`bolt_advertised_versions`), and the Neo4j-prefixed
-  server agent string needed to connect with official drivers at all.
-- **Phase 2**: JS, Java, Go drivers.
-- **Phase 3**: PR matrix (per-driver × auth × TLS) + nightly full-axis.
-- **Phase 4**: Routing mode + ROUTE message compat.
+See the per-language READMEs for venv / npm / go mod / Maven
+bootstrap.
+
+## CI
+
+- **Per PR** (`.github/workflows/ci.yml`): each of the four
+  `driver-matrix-*` jobs runs two cells — the `bolt=5.4` plaintext
+  baseline and the `auth=basic, tls=on` production shape. 8
+  cells total, parallelized across four jobs.
+- **Nightly full axis** (`.github/workflows/driver-matrix-full.yml`):
+  Monday 06:00 UTC. Walks the full Bolt version × auth × TLS grid
+  per language — 12 cells × 4 drivers = 48 cells, parallelized
+  via matrix strategy. Failures open (or refresh) a GitHub issue;
+  the next green run closes it. Also manually dispatchable.
 
 ## Known gaps
 

@@ -115,13 +115,20 @@ jobs:
           python -m venv drivers/python/.venv
           drivers/python/.venv/bin/pip install -q -r drivers/python/requirements.txt
 
-      - name: Run baseline matrix cell (bolt=5.4, auth=none, tls=off)
-        # Phase 1 wires a single representative cell. Phase 3 will
-        # expand to the per-PR matrix; the nightly full-axis run
-        # lives in a separate workflow file added at that point.
+      - name: Matrix cell — baseline (bolt=5.4, auth=none, tls=off)
+        # Per-PR matrix runs two cells per driver: the default
+        # bolt=5.4 plaintext path and the "real deployment" shape
+        # with basic auth + self-signed TLS. The nightly full-axis
+        # workflow (driver-matrix-full.yml) covers the Bolt version
+        # axis and every combination beyond this pair.
         env:
           PATH: ${{ github.workspace }}/drivers/python/.venv/bin:${{ env.PATH }}
         run: drivers/run-matrix.sh --lang=py --auth=none --tls=off --bolt=5.4
+
+      - name: Matrix cell — production shape (bolt=5.4, auth=basic, tls=on)
+        env:
+          PATH: ${{ github.workspace }}/drivers/python/.venv/bin:${{ env.PATH }}
+        run: drivers/run-matrix.sh --lang=py --auth=basic --tls=on --bolt=5.4
 
       - name: Upload server logs on failure
         if: failure()
@@ -164,8 +171,11 @@ jobs:
         # an explicit commit.
         run: npm install --prefix drivers/js
 
-      - name: Run baseline matrix cell (bolt=5.4, auth=none, tls=off)
+      - name: Matrix cell — baseline (bolt=5.4, auth=none, tls=off)
         run: drivers/run-matrix.sh --lang=js --auth=none --tls=off --bolt=5.4
+
+      - name: Matrix cell — production shape (bolt=5.4, auth=basic, tls=on)
+        run: drivers/run-matrix.sh --lang=js --auth=basic --tls=on --bolt=5.4
 
       - name: Upload server logs on failure
         if: failure()
@@ -207,8 +217,11 @@ jobs:
       - name: Fetch Go driver
         run: (cd drivers/go && go mod download)
 
-      - name: Run baseline matrix cell (bolt=5.4, auth=none, tls=off)
+      - name: Matrix cell — baseline (bolt=5.4, auth=none, tls=off)
         run: drivers/run-matrix.sh --lang=go --auth=none --tls=off --bolt=5.4
+
+      - name: Matrix cell — production shape (bolt=5.4, auth=basic, tls=on)
+        run: drivers/run-matrix.sh --lang=go --auth=basic --tls=on --bolt=5.4
 
       - name: Upload server logs on failure
         if: failure()
@@ -248,8 +261,11 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - name: Run baseline matrix cell (bolt=5.4, auth=none, tls=off)
+      - name: Matrix cell — baseline (bolt=5.4, auth=none, tls=off)
         run: drivers/run-matrix.sh --lang=java --auth=none --tls=off --bolt=5.4
+
+      - name: Matrix cell — production shape (bolt=5.4, auth=basic, tls=on)
+        run: drivers/run-matrix.sh --lang=java --auth=basic --tls=on --bolt=5.4
 
       - name: Upload server logs on failure
         if: failure()

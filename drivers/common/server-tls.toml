@@ -1,8 +1,0 @@
-self_id = 1
-listen_address = "127.0.0.1:7401"
-data_dir = "drivers/.run/data-tls"
-bolt_address = "127.0.0.1:7687"
-
-[bolt_tls]
-cert_path = "drivers/.run/certs/cert.pem"
-key_path = "drivers/.run/certs/key.pem"
