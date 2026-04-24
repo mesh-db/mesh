@@ -122,4 +122,4 @@ The foundational phases are all shipping — single-node graph store, Cypher par
 - Prefer strong typing over stringly-typed interfaces.
 - Each crate should have its own `Error` type.
 - Integration tests in each crate's `tests/` directory.
-- Benchmarks with `criterion` for storage and query hot paths.
+- Benchmarks with `criterion` for storage and query hot paths. The two suites live at `crates/meshdb-storage/benches/storage_bench.rs` (point lookup, single + batched inserts, adjacency scan, label / indexed-property seeks) and `crates/meshdb-rpc/benches/query_bench.rs` (end-to-end Cypher through `MeshService::execute_cypher_local`: `CREATE`, `MATCH` by label, indexed-property match, one-hop expansion, label-count aggregate). Run with `cargo bench -p meshdb-storage --bench storage_bench` or add `-- --quick` for a 30-second smoke run. Criterion writes HTML reports to `target/criterion/<bench_name>/report/index.html`. Benches are local-only — CI does not gate on them because noise would produce false alarms without a baseline + variance budget in place.

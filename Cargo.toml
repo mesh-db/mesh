@@ -53,6 +53,11 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # supplied wall-clock and round-trips the region name through the
 # `[Region/City]` suffix on output.
 chrono-tz = { version = "0.10", default-features = false }
+# criterion: micro-benchmark harness used by the per-crate
+# `benches/` suites (storage + query hot paths). Each bench crate
+# pulls it into `[dev-dependencies]` and marks its targets with
+# `harness = false` so criterion owns the binary entry point.
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [profile.release]
 lto = "thin"

@@ -44,6 +44,11 @@ fault-inject = []
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "query_bench"
+harness = false
 
 [build-dependencies]
 tonic-build = "0.12"
