@@ -31,10 +31,10 @@ It runs in three modes:
 
 ### 1. Get the binary
 
-Install from crates.io (pre-1.0, so the version must be explicit):
+Install from crates.io:
 
 ```sh
-cargo install meshdb-server --version 0.1.0-alpha.6
+cargo install meshdb-server
 ```
 
 Or build from source:
@@ -321,11 +321,11 @@ crate, enabled by default. The default-features build of
 wanting a slimmer binary can opt out:
 
 ```sh
-cargo install meshdb-server --version 0.1.0-alpha.6
+cargo install meshdb-server
 # trim it back: no APOC at all
-cargo install meshdb-server --version 0.1.0-alpha.6 --no-default-features
+cargo install meshdb-server --no-default-features
 # or just specific namespaces
-cargo install meshdb-server --version 0.1.0-alpha.6 \
+cargo install meshdb-server \
   --no-default-features --features apoc-coll,apoc-text,apoc-create
 ```
 
@@ -360,14 +360,38 @@ Shipped today:
   `apoc.periodic.iterate(iterateQuery, actionQuery, config)` —
   planner-level rewrite into a dedicated batched-commit dispatcher.
   Honors `batchSize`, `params`, `retries`, `failedParams`,
-  `iterateList`; emits the standard 13-column Neo4j result row.
-  `parallel` / `concurrency` are accepted as forward-compat no-ops —
-  Mesh's parallel-action runtime is sketched but deferred.
-
-Not yet implemented: `apoc.path.*` expansion, `apoc.cypher.run*`
-(needs runtime Cypher evaluation), `apoc.load.*` / `apoc.export.*`
-(file I/O and format parsers), `apoc.trigger.*` (DB-level event
-system).
+  `iterateList`, `parallel`, and `concurrency` (default 50 when
+  `parallel: true`). Parallel dispatch uses a `tokio::sync::Semaphore`-
+  bounded worker pool with `Arc<Mutex<...>>`-guarded stats
+  accumulators; throughput gains materialize fully in single-node
+  mode, while Raft and routing-2PC modes still serialize commits
+  internally. Emits the standard 13-column Neo4j result row.
+- **Path procedures** (`apoc-path`): `apoc.path.expand`,
+  `apoc.path.expandConfig`, `apoc.path.subgraphAll`,
+  `apoc.path.subgraphNodes`, `apoc.path.spanningTree`. Share a
+  streaming BFS walker with the full APOC filter DSL
+  (`relationshipFilter` `>TYPE|<TYPE`, `labelFilter`
+  `+include|-exclude|>end|/terminator`) and all seven uniqueness
+  modes. The feature also enables `apoc.path.*` scalar shaping
+  (`create` / `slice` / `combine` / `elements`).
+- **Cypher-runner procedures** (`apoc-cypher`): `apoc.cypher.run`
+  (read-only) and `apoc.cypher.doIt` (write-capable; writes
+  accumulate in the outer query's buffered writer for atomic
+  commit).
+- **File I/O procedures** (`apoc-load` / `apoc-export`):
+  `apoc.load.json` / `apoc.load.csv` and
+  `apoc.export.{csv,json,cypher}.{all,query}`. Both sides share a
+  strict-default-off `ImportConfig` security surface (`enabled` /
+  `allow_file` / `allow_http` / `file_root` / `url_allowlist` /
+  `allow_unrestricted`) set via the `[apoc_import]` section of
+  the server config.
+- **Trigger procedures** (`apoc-trigger`): `apoc.trigger.install`
+  / `drop` / `list` / `start` / `stop` with all four phases
+  (`before`, `after`, `afterAsync`, `rollback`). The trigger
+  registry persists in a dedicated RocksDB CF, replicates across
+  Raft / routing via `GraphCommand::InstallTrigger`, and trigger-
+  induced writes recurse through the cluster commit path under a
+  from-trigger suppression guard.
 
 ---
 
@@ -514,14 +538,16 @@ pair, `ca_path` to the shared CA bundle.
   `apoc.trigger.*` (DB-level event hooks). Each blocks on
   infrastructure that isn't there yet rather than more of the same
   registration plumbing.
-- **No parallel batch execution for `apoc.periodic.iterate`** — batches
-  run strictly in sequence today. The `parallel: true` /
-  `concurrency: N` config keys are accepted as no-ops; a real
-  worker-pool implementation is sketched but deferred until a real
-  workload needs the throughput.
 - **GQL quantified path patterns** — parenthesized-subpath form like
   `((a)-[:T]-(b))+` — aren't parsed. The Neo4j 5 relationship-level
   shorthand (`->+`, `->*`, `->{n,m}`) is fully supported.
+- **`allShortestPaths`** parses but the planner rejects it; single
+  `shortestPath(...)` works. Multi-shortest-path support is a
+  post-0.1 item.
+- **Vectorized / columnar execution** — Mesh uses a Volcano/iterator
+  model throughout. Analytical workloads at 100M+ rows would
+  eventually want vectorization; OLTP and bounded-traversal workloads
+  don't benefit.
 
 ---
 
@@ -543,7 +569,8 @@ mesh/
 │   └── meshdb-server/      # Binary: config, startup, gRPC listener, Bolt listener
 └── .github/workflows/
     ├── ci.yml             # Build + test + fmt check on push and PR
-    └── release-plz.yml    # Release PR + crates.io publish automation
+    ├── driver-matrix-full.yml  # Nightly full-axis driver matrix
+    └── release.yml        # Manual workflow_dispatch release + crates.io publish
 ```
 
 Each crate has its own `Error` type via `thiserror` and its own `tests/`
@@ -708,14 +735,16 @@ The `.github/workflows/ci.yml` workflow runs all three on every push and
 pull request, against Ubuntu + stable Rust, with `Swatinem/rust-cache` for
 fast incremental rebuilds.
 
-Releases are managed by `release-plz` (`.github/workflows/release-plz.yml`).
-On each push to `main` it opens (or updates) a single Release PR that bumps
-the shared workspace version in `Cargo.toml` and updates `CHANGELOG.md`.
-Merging that PR tags `v{version}`, cuts a GitHub Release, and publishes
-every crate to crates.io in dependency order. Use **"Create a merge commit"**
-(not "Squash and merge") when merging Release PRs — release-plz's tag
-creation has a [known bug](https://github.com/release-plz/release-plz/issues/2759)
-with squash merges.
+Releases are cut manually via `.github/workflows/release.yml`
+(`workflow_dispatch` with a `version` input). The workflow bumps
+the shared workspace version in `Cargo.toml`, keeps the internal
+`[workspace.dependencies]` pins in lockstep, promotes
+`CHANGELOG.md`'s `[Unreleased]` section to `[{version}] - {date}`,
+commits and pushes, tags `v{version}`, publishes every crate to
+crates.io in dependency order, and creates a GitHub Release using
+the promoted CHANGELOG section as the body. Every destructive step
+is idempotent — a re-run after a partial failure picks up where
+it left off without republishing or double-promoting.
 
 ---
 
