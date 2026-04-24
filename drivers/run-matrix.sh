@@ -45,10 +45,10 @@ for arg in "$@"; do
 done
 
 if [[ -z "$LANG" ]]; then
-  echo "--lang is required (one of: py)" >&2
+  echo "--lang is required (one of: py, js)" >&2
   exit 2
 fi
-case "$LANG" in py) ;; *) echo "unsupported --lang=$LANG (Phase 1 ships py only)" >&2; exit 2 ;; esac
+case "$LANG" in py|js) ;; *) echo "unsupported --lang=$LANG" >&2; exit 2 ;; esac
 case "$AUTH" in none|basic) ;; *) echo "--auth must be none|basic" >&2; exit 2 ;; esac
 case "$TLS"  in off|on)     ;; *) echo "--tls must be off|on" >&2; exit 2 ;; esac
 case "$MODE" in single)     ;; *) echo "Phase 1 only supports --mode=single" >&2; exit 2 ;; esac
@@ -142,6 +142,18 @@ case "$LANG" in
     echo "[run-matrix] running drivers/python suite" >&2
     if ! (cd drivers/python && python -m pytest -q); then
       echo "[run-matrix] python suite failed" >&2
+      echo "[run-matrix] server log: $LOG_FILE" >&2
+      exit 1
+    fi
+    ;;
+  js)
+    echo "[run-matrix] running drivers/js suite" >&2
+    if [[ ! -d drivers/js/node_modules ]]; then
+      echo "[run-matrix] drivers/js/node_modules missing — run 'cd drivers/js && npm install' first" >&2
+      exit 2
+    fi
+    if ! (cd drivers/js && npm test --silent); then
+      echo "[run-matrix] js suite failed" >&2
       echo "[run-matrix] server log: $LOG_FILE" >&2
       exit 1
     fi

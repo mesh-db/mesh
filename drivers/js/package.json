@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "type": "module",
+  "name": "meshdb-driver-matrix-js",
+  "description": "Driver-matrix tests for Mesh's Bolt listener via the official neo4j-driver.",
+  "scripts": {
+    "test": "node --test --test-reporter=spec 'test/*.test.js'"
+  },
+  "dependencies": {
+    "neo4j-driver": "5.28.1"
+  }
+}

@@ -130,3 +130,47 @@ jobs:
           name: driver-matrix-python-logs
           path: drivers/.run/logs/
           if-no-files-found: ignore
+
+  driver-matrix-js:
+    name: Driver matrix (JS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev openssl
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build meshdb-server (release)
+        run: cargo build --release -p meshdb-server
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install JS driver
+        # Pinned to drivers/js/package.json so a driver upgrade is
+        # an explicit commit.
+        run: npm install --prefix drivers/js
+
+      - name: Run baseline matrix cell (bolt=5.4, auth=none, tls=off)
+        run: drivers/run-matrix.sh --lang=js --auth=none --tls=off --bolt=5.4
+
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-matrix-js-logs
+          path: drivers/.run/logs/
+          if-no-files-found: ignore
