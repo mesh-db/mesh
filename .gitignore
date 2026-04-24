@@ -3,3 +3,7 @@
 /data
 **/data/
 .claude/worktrees/
+
+# macOS Finder metadata — harmless but clutters diffs.
+.DS_Store
+**/.DS_Store
