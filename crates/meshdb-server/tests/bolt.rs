@@ -9,7 +9,7 @@ use meshdb_bolt::{
     BOLT_4_4,
 };
 use meshdb_rpc::MeshService;
-use meshdb_server::bolt::run_listener;
+use meshdb_server::bolt::{run_listener, RouteContext};
 use meshdb_storage::{RocksDbStorageEngine as Store, StorageEngine};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +34,11 @@ async fn spawn_bolt_server() -> (String, TempDir) {
             None,
             None,
             None,
-            Arc::new(addr.to_string()),
+            Arc::new(RouteContext {
+                local_advertised: addr.to_string(),
+                peers: Arc::new(meshdb_cluster::Membership::new(std::iter::empty())),
+                raft: None,
+            }),
         )
         .await;
     });
@@ -1063,7 +1067,11 @@ async fn spawn_bolt_server_with_auth(username: &str, password: &str) -> (String,
             Some(auth),
             None,
             None,
-            Arc::new(addr.to_string()),
+            Arc::new(RouteContext {
+                local_advertised: addr.to_string(),
+                peers: Arc::new(meshdb_cluster::Membership::new(std::iter::empty())),
+                raft: None,
+            }),
         )
         .await;
     });
@@ -1188,7 +1196,11 @@ async fn spawn_bolt_server_with_bcrypt_auth(
             Some(auth),
             None,
             None,
-            Arc::new(addr.to_string()),
+            Arc::new(RouteContext {
+                local_advertised: addr.to_string(),
+                peers: Arc::new(meshdb_cluster::Membership::new(std::iter::empty())),
+                raft: None,
+            }),
         )
         .await;
     });

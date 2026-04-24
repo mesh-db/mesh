@@ -8,7 +8,9 @@ use meshdb_bolt::{
     perform_client_handshake, read_message, write_message, BoltMessage, BoltValue, BOLT_4_4,
 };
 use meshdb_rpc::MeshService;
-use meshdb_server::bolt::{build_tls_acceptor, install_default_crypto_provider, run_listener};
+use meshdb_server::bolt::{
+    build_tls_acceptor, install_default_crypto_provider, run_listener, RouteContext,
+};
 use meshdb_storage::{RocksDbStorageEngine as Store, StorageEngine};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -57,7 +59,11 @@ async fn spawn_tls_bolt_server() -> (String, TempDir) {
             None,
             Some(acceptor),
             None,
-            Arc::new(addr.to_string()),
+            Arc::new(RouteContext {
+                local_advertised: addr.to_string(),
+                peers: Arc::new(meshdb_cluster::Membership::new(std::iter::empty())),
+                raft: None,
+            }),
         )
         .await;
     });

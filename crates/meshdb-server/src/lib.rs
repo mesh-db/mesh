@@ -126,7 +126,13 @@ fn build_routing_service(
     let peers: Vec<Peer> = config
         .peers
         .iter()
-        .map(|p| Peer::new(PeerId(p.id), p.address.clone()))
+        .map(|p| {
+            let base = Peer::new(PeerId(p.id), p.address.clone());
+            match &p.bolt_address {
+                Some(ba) => base.with_bolt_address(ba),
+                None => base,
+            }
+        })
         .collect();
     let cluster = Arc::new(
         Cluster::new(PeerId(config.self_id), config.num_partitions, peers)
@@ -230,7 +236,13 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
     let peers: Vec<Peer> = config
         .peers
         .iter()
-        .map(|p| Peer::new(PeerId(p.id), p.address.clone()))
+        .map(|p| {
+            let base = Peer::new(PeerId(p.id), p.address.clone());
+            match &p.bolt_address {
+                Some(ba) => base.with_bolt_address(ba),
+                None => base,
+            }
+        })
         .collect();
     let membership = Membership::new(peers);
     let peer_ids: Vec<PeerId> = membership.peer_ids().collect();
@@ -412,12 +424,33 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         tracing::info!(addr = %bolt_local, auth = auth_state, tls = tls_state, advertised = %advertised_state, "meshdb-server bolt listening");
         let bolt_service = service_arc.clone();
         let bolt_auth_clone = bolt_auth.clone();
-        // The advertised address is what we echo back in ROUTE
-        // responses so cluster-aware drivers (`neo4j://...`) know
-        // where to reach us. Fall back to the listener's actual
-        // bound address when the config leaves it blank (tests
-        // commonly bind `127.0.0.1:0`).
-        let advertised_bolt_addr = Arc::new(bolt_addr.to_string());
+        // Assemble the ROUTE context. `local_advertised` is echoed
+        // back in single-node mode; `peers` carries every configured
+        // peer + its optional Bolt address so routing-mode tables
+        // list siblings; `raft` lets the handler resolve the current
+        // leader at ROUTE time for a spec-correct WRITE role.
+        //
+        // Peers are snapshotted from `config.peers` — static for the
+        // server's lifetime — rather than pulled from the live
+        // Raft/Routing state because driver-facing Bolt endpoints
+        // don't change on membership churn and the static list
+        // already has what we need.
+        let peers_for_route: Vec<Peer> = config
+            .peers
+            .iter()
+            .map(|p| {
+                let base = Peer::new(PeerId(p.id), p.address.clone());
+                match &p.bolt_address {
+                    Some(ba) => base.with_bolt_address(ba),
+                    None => base,
+                }
+            })
+            .collect();
+        let route_ctx = Arc::new(bolt::RouteContext {
+            local_advertised: bolt_addr.to_string(),
+            peers: Arc::new(Membership::new(peers_for_route)),
+            raft: raft_handle.clone(),
+        });
         Some(tokio::spawn(async move {
             if let Err(e) = bolt::run_listener(
                 bolt_listener,
@@ -425,7 +458,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 bolt_auth_clone,
                 tls_acceptor,
                 advertised,
-                advertised_bolt_addr,
+                route_ctx,
             )
             .await
             {

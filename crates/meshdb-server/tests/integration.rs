@@ -143,10 +143,12 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
 
@@ -578,10 +580,12 @@ async fn build_components_multi_peer_builds_raft() {
             PeerConfig {
                 id: 1,
                 address: "127.0.0.1:7001".into(),
+                bolt_address: None,
             },
             PeerConfig {
                 id: 2,
                 address: "127.0.0.1:7002".into(),
+                bolt_address: None,
             },
         ],
         bootstrap: false,
@@ -615,10 +619,12 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
             PeerConfig {
                 id: 1,
                 address: "127.0.0.1:7001".into(),
+                bolt_address: None,
             },
             PeerConfig {
                 id: 2,
                 address: "127.0.0.1:7002".into(),
+                bolt_address: None,
             },
         ],
         bootstrap: false,
@@ -666,10 +672,12 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -837,10 +845,12 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1055,10 +1065,12 @@ async fn peer_restart_recovers_persistent_raft_state() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1210,10 +1222,12 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1368,10 +1382,12 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1621,10 +1637,12 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1895,10 +1913,12 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2078,10 +2098,12 @@ async fn cypher_merge_replicates_through_raft() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2240,10 +2262,12 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2405,10 +2429,12 @@ async fn two_peer_raft_replicates_via_server_components() {
         PeerConfig {
             id: 1,
             address: addr_a.to_string(),
+            bolt_address: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
+            bolt_address: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2535,6 +2561,279 @@ async fn two_peer_raft_replicates_via_server_components() {
         replicated,
         "peer B did not receive the replicated command via the binary path"
     );
+}
+
+#[tokio::test]
+async fn route_success_lists_peers_and_leader_under_the_right_roles() {
+    // 2-peer Raft cluster with Bolt listeners on both peers. Driver
+    // ROUTE arrives at the follower; the response must carry:
+    //   - ROUTE and READ: both peers' Bolt addresses.
+    //   - WRITE: only the current Raft leader's Bolt address.
+    //
+    // Skipping the usual `serve()` flow here because `serve()` binds
+    // the Bolt listener internally from `config.bolt_address` —
+    // which would require knowing the Bolt port before the config
+    // exists. Instead we pre-bind both the gRPC and Bolt listeners,
+    // construct configs with the already-bound addresses in
+    // `peers[].bolt_address`, and spawn the Bolt listener ourselves
+    // with a hand-crafted `RouteContext`. Exercises the same
+    // `route_success` path the binary hits.
+    use meshdb_bolt::{
+        perform_client_handshake, read_message, write_message, BoltMessage, BoltValue, BOLT_5_4,
+    };
+    use meshdb_cluster::{Membership, Peer};
+    use meshdb_server::bolt::{run_listener, RouteContext};
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, Duration};
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let grpc_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bolt_a_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bolt_b_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_addr_a = grpc_a.local_addr().unwrap().to_string();
+    let grpc_addr_b = grpc_b.local_addr().unwrap().to_string();
+    let bolt_addr_a = bolt_a_listener.local_addr().unwrap().to_string();
+    let bolt_addr_b = bolt_b_listener.local_addr().unwrap().to_string();
+
+    let peers = vec![
+        PeerConfig {
+            id: 1,
+            address: grpc_addr_a.clone(),
+            bolt_address: Some(bolt_addr_a.clone()),
+        },
+        PeerConfig {
+            id: 2,
+            address: grpc_addr_b.clone(),
+            bolt_address: Some(bolt_addr_b.clone()),
+        },
+    ];
+    let mk_config = |self_id: u64, data_dir: PathBuf, grpc: &str, bootstrap: bool| ServerConfig {
+        self_id,
+        listen_address: grpc.to_string(),
+        data_dir,
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap,
+        bolt_address: None, // we spawn the Bolt listener manually
+        metrics_address: None,
+        bolt_auth: None,
+        bolt_tls: None,
+        bolt_advertised_versions: None,
+        grpc_tls: None,
+        mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
+    };
+    let config_a = mk_config(1, dir_a.path().to_path_buf(), &grpc_addr_a, true);
+    let config_b = mk_config(2, dir_b.path().to_path_buf(), &grpc_addr_b, false);
+
+    let components_a = meshdb_server::build_components(&config_a).await.unwrap();
+    let components_b = meshdb_server::build_components(&config_b).await.unwrap();
+    let raft_a = components_a.raft.clone().unwrap();
+    let raft_b = components_b.raft.clone().unwrap();
+
+    let ServerComponents {
+        service: service_a,
+        raft: _,
+        raft_service: raft_service_a,
+    } = components_a;
+    let ServerComponents {
+        service: service_b,
+        raft: _,
+        raft_service: raft_service_b,
+    } = components_b;
+    let raft_service_a = raft_service_a.unwrap();
+    let raft_service_b = raft_service_b.unwrap();
+
+    let service_a = Arc::new(service_a);
+    let service_b = Arc::new(service_b);
+
+    // gRPC servers for Raft replication + Query/Write.
+    tokio::spawn({
+        let svc = service_a.clone();
+        async move {
+            Server::builder()
+                .add_service((*svc).clone().into_query_server())
+                .add_service((*svc).clone().into_write_server())
+                .add_service(raft_service_a.into_server())
+                .serve_with_incoming(TcpListenerStream::new(grpc_a))
+                .await
+                .unwrap();
+        }
+    });
+    tokio::spawn({
+        let svc = service_b.clone();
+        async move {
+            Server::builder()
+                .add_service((*svc).clone().into_query_server())
+                .add_service((*svc).clone().into_write_server())
+                .add_service(raft_service_b.into_server())
+                .serve_with_incoming(TcpListenerStream::new(grpc_b))
+                .await
+                .unwrap();
+        }
+    });
+
+    // Build Membership snapshots (both peers see both addresses).
+    let membership_for_route = Arc::new(Membership::new(vec![
+        Peer::new(PeerId(1), grpc_addr_a.clone()).with_bolt_address(bolt_addr_a.clone()),
+        Peer::new(PeerId(2), grpc_addr_b.clone()).with_bolt_address(bolt_addr_b.clone()),
+    ]));
+
+    // Manually spawn each peer's Bolt listener with a RouteContext
+    // that can see the full peer set + its own Raft handle.
+    tokio::spawn({
+        let service = service_a.clone();
+        let ctx = Arc::new(RouteContext {
+            local_advertised: bolt_addr_a.clone(),
+            peers: membership_for_route.clone(),
+            raft: Some(raft_a.clone()),
+        });
+        async move {
+            let _ = run_listener(bolt_a_listener, service, None, None, None, ctx).await;
+        }
+    });
+    tokio::spawn({
+        let service = service_b.clone();
+        let ctx = Arc::new(RouteContext {
+            local_advertised: bolt_addr_b.clone(),
+            peers: membership_for_route.clone(),
+            raft: Some(raft_b.clone()),
+        });
+        async move {
+            let _ = run_listener(bolt_b_listener, service, None, None, None, ctx).await;
+        }
+    });
+
+    sleep(Duration::from_millis(80)).await;
+
+    meshdb_server::initialize_if_seed(&config_a, &raft_a)
+        .await
+        .unwrap();
+
+    // Wait for leadership — peer A bootstraps, should become leader.
+    let mut leader_id: Option<u64> = None;
+    for _ in 0..60 {
+        sleep(Duration::from_millis(100)).await;
+        if let Some(id) = raft_a.raft.metrics().borrow().current_leader {
+            leader_id = Some(id);
+            break;
+        }
+    }
+    let leader = leader_id.expect("raft should elect a leader within 6s");
+    assert_eq!(leader, 1, "peer A bootstrapped so it should be leader");
+
+    // Connect to the follower (peer B) via Bolt and send ROUTE.
+    let mut sock = TcpStream::connect(&bolt_addr_b).await.unwrap();
+    let preferences = [BOLT_5_4, [0; 4], [0; 4], [0; 4]];
+    let agreed = perform_client_handshake(&mut sock, &preferences)
+        .await
+        .unwrap();
+    assert_eq!(agreed, BOLT_5_4);
+
+    write_message(
+        &mut sock,
+        &BoltMessage::Hello {
+            extra: BoltValue::map([
+                ("user_agent", BoltValue::String("mesh-test/0.1".into())),
+                ("scheme", BoltValue::String("none".into())),
+            ]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let _hello_ack = read_message(&mut sock).await.unwrap();
+    // Bolt 5.1+ needs LOGON before ROUTE; 5.4 hits that gate.
+    write_message(
+        &mut sock,
+        &BoltMessage::Logon {
+            auth: BoltValue::map([("scheme", BoltValue::String("none".into()))]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let _logon_ack = read_message(&mut sock).await.unwrap();
+
+    write_message(
+        &mut sock,
+        &BoltMessage::Route {
+            routing: BoltValue::Map(vec![]),
+            bookmarks: BoltValue::List(vec![]),
+            extra: BoltValue::Map(vec![]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let raw = read_message(&mut sock).await.unwrap();
+    let reply = BoltMessage::decode(&raw).unwrap();
+
+    let metadata = match reply {
+        BoltMessage::Success { metadata } => metadata,
+        other => panic!("expected SUCCESS, got {other:?}"),
+    };
+    let rt = metadata.get("rt").expect("rt metadata").clone();
+    let servers = rt
+        .get("servers")
+        .and_then(|v| match v {
+            BoltValue::List(xs) => Some(xs.clone()),
+            _ => None,
+        })
+        .expect("servers list");
+    assert_eq!(servers.len(), 3, "ROUTE + READ + WRITE");
+
+    // Collect per-role address sets for assertion.
+    let addrs_for = |role: &str| -> Vec<String> {
+        servers
+            .iter()
+            .find_map(|s| {
+                let role_match = s.get("role").and_then(|v| v.as_str()) == Some(role);
+                if !role_match {
+                    return None;
+                }
+                s.get("addresses").map(|a| match a {
+                    BoltValue::List(xs) => xs
+                        .iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect(),
+                    _ => Vec::new(),
+                })
+            })
+            .unwrap_or_default()
+    };
+    let route_addrs = addrs_for("ROUTE");
+    let read_addrs = addrs_for("READ");
+    let write_addrs = addrs_for("WRITE");
+
+    // ROUTE and READ both contain both peer addresses (order may vary,
+    // self goes first). We check set membership, not order.
+    for role_addrs in [&route_addrs, &read_addrs] {
+        assert!(
+            role_addrs.iter().any(|a| a == &bolt_addr_a),
+            "role list should include leader {bolt_addr_a}: {role_addrs:?}"
+        );
+        assert!(
+            role_addrs.iter().any(|a| a == &bolt_addr_b),
+            "role list should include follower {bolt_addr_b}: {role_addrs:?}"
+        );
+    }
+    // WRITE lists only the leader (peer A).
+    assert_eq!(
+        write_addrs,
+        vec![bolt_addr_a.clone()],
+        "WRITE should name the leader only: {write_addrs:?}"
+    );
+
+    // TTL and db fields present.
+    assert!(
+        matches!(rt.get("ttl"), Some(BoltValue::Int(n)) if *n > 0),
+        "ttl should be positive"
+    );
+    assert_eq!(rt.get("db").and_then(|v| v.as_str()), Some("neo4j"));
 }
 
 #[tokio::test]

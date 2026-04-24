@@ -59,7 +59,8 @@ use meshdb_bolt::{
     perform_server_handshake_with, read_message, write_message, BoltError, BoltMessage, BoltValue,
     BOLT_4_4, BOLT_5_0, BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4, SUPPORTED,
 };
-use meshdb_cluster::GraphCommand;
+use meshdb_cluster::raft::RaftCluster;
+use meshdb_cluster::{GraphCommand, Membership};
 use meshdb_executor::Row;
 use meshdb_rpc::MeshService;
 use std::path::Path;
@@ -67,6 +68,30 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+
+/// Context the ROUTE handler needs to assemble a spec-shaped Neo4j
+/// routing table. Assembled once at listener startup and cloned into
+/// each connection task.
+///
+/// Field semantics:
+///   * `local_advertised` — the address this server echoes back when
+///     the routing table would otherwise be empty (single-node mode,
+///     or a multi-peer config where no peer has declared a
+///     `bolt_address`). Also the fallback WRITE target when a Raft
+///     leader has no published Bolt endpoint.
+///   * `peers` — the full peer list with each peer's optional Bolt
+///     address. Built from `ServerConfig.peers` at startup; static
+///     for the server's lifetime. Single-node deploys pass an empty
+///     `Membership`.
+///   * `raft` — the local Raft handle when running in `mode = "raft"`.
+///     Used to resolve the current leader on every ROUTE so the WRITE
+///     role points at whoever's actually serving writes right now.
+///     `None` in routing and single-node modes.
+pub struct RouteContext {
+    pub local_advertised: String,
+    pub peers: Arc<Membership>,
+    pub raft: Option<Arc<RaftCluster>>,
+}
 
 /// Current connection phase used by the message-dispatch loop.
 #[derive(Debug)]
@@ -120,7 +145,7 @@ pub async fn run_listener(
     auth: Option<Arc<crate::config::BoltAuthConfig>>,
     tls: Option<TlsAcceptor>,
     advertised_versions: Option<Arc<Vec<[u8; 4]>>>,
-    advertised_address: Arc<String>,
+    route_ctx: Arc<RouteContext>,
 ) -> anyhow::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -129,7 +154,7 @@ pub async fn run_listener(
         let auth = auth.clone();
         let tls = tls.clone();
         let advertised = advertised_versions.clone();
-        let advertised_addr = advertised_address.clone();
+        let ctx = route_ctx.clone();
         tokio::spawn(async move {
             // If TLS is configured, negotiate it before handing the
             // socket to the Bolt state machine. `serve_connection` is
@@ -139,8 +164,7 @@ pub async fn run_listener(
                 Some(acceptor) => match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
                         if let Err(e) =
-                            serve_connection(tls_stream, service, auth, advertised, advertised_addr)
-                                .await
+                            serve_connection(tls_stream, service, auth, advertised, ctx).await
                         {
                             tracing::warn!(%peer, error = %e, "bolt connection terminated");
                         } else {
@@ -152,9 +176,7 @@ pub async fn run_listener(
                     }
                 },
                 None => {
-                    if let Err(e) =
-                        serve_connection(socket, service, auth, advertised, advertised_addr).await
-                    {
+                    if let Err(e) = serve_connection(socket, service, auth, advertised, ctx).await {
                         tracing::warn!(%peer, error = %e, "bolt connection terminated");
                     } else {
                         tracing::debug!(%peer, "bolt connection closed cleanly");
@@ -224,7 +246,7 @@ pub async fn serve_connection<S>(
     service: Arc<MeshService>,
     auth: Option<Arc<crate::config::BoltAuthConfig>>,
     advertised_versions: Option<Arc<Vec<[u8; 4]>>>,
-    advertised_address: Arc<String>,
+    route_ctx: Arc<RouteContext>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -356,7 +378,7 @@ where
             // Bolt 4.4+ ROUTE — reply with a single-node routing table
             // pointing at this server.
             (_, BoltMessage::Route { .. }) => {
-                send(&mut writer, &route_success(&advertised_address)).await?;
+                send(&mut writer, &route_success(&route_ctx)).await?;
             }
 
             // -- Authenticating phase (Bolt 5.1+) ----------------------
@@ -763,26 +785,73 @@ fn bolt_version_label(v: [u8; 4]) -> anyhow::Result<&'static str> {
     }
 }
 
-/// Reply to a ROUTE request with a proper routing table pointing at
-/// this server. Neo4j drivers expect three `{addresses, role}` entries
-/// — ROUTE, READ, and WRITE — each with at least one address the
-/// driver can reach.
+/// Reply to a ROUTE request with a Neo4j-spec routing table. The
+/// table has three `{addresses, role}` entries — ROUTE, READ, WRITE —
+/// each with at least one address the driver can reach.
 ///
-/// Single-node semantics (current Mesh): every role points at the
-/// same address — the server's configured `bolt_address`. Under
-/// `mode = "routing"` the routing table would ideally list every
-/// peer under ROUTE/READ and the 2PC coordinator under WRITE; until
-/// that's wired up, a single-address table still works because
-/// drivers retry and Mesh's 2PC coordinator sits on every peer.
+/// Shape depends on what the [`RouteContext`] has to work with:
 ///
-/// TTL is set long enough (~292 years) that drivers never re-query
-/// the routing table for a single-node deployment — there's nothing
-/// to learn that changes.
-fn route_success(advertised_address: &str) -> BoltMessage {
-    let one_address = BoltValue::List(vec![BoltValue::String(advertised_address.to_string())]);
-    let server_entry = |role: &str| -> BoltValue {
+///   * **Single-node** (empty peer list) or **no peer has a
+///     `bolt_address` configured yet**: every role lists
+///     `ctx.local_advertised`. This is the pre-Phase-4 behaviour and
+///     keeps existing configs working unchanged.
+///
+///   * **Routing mode** (`ctx.raft == None`) with at least one peer
+///     advertising a Bolt address: ROUTE, READ, WRITE all list every
+///     peer's Bolt address. Any peer can coordinate a 2PC round, so
+///     drivers spread writes across them.
+///
+///   * **Raft mode** (`ctx.raft == Some`): ROUTE and READ list every
+///     peer's Bolt address (all can serve reads). WRITE lists only
+///     the current leader's Bolt address — queried from Raft metrics
+///     at ROUTE time so a leader change is reflected on the next
+///     ROUTE. If the leader is unknown (election in progress) or
+///     has no published Bolt address, WRITE falls back to
+///     `local_advertised`; writes against a non-leader still reach
+///     the leader via the existing `ForwardToLeader` path.
+///
+/// TTL is ~292 years. Drivers that cache the table effectively never
+/// re-query; leader-handoff recovery is handled by the existing
+/// write-forwarding behaviour rather than table refresh.
+fn route_success(ctx: &RouteContext) -> BoltMessage {
+    // Assemble the per-peer Bolt address list, preserving the
+    // cluster's deterministic PeerId ordering so the routing table
+    // is stable across calls. `local_advertised` is always included
+    // as the first entry, so a driver connecting to this peer sees
+    // itself in the table.
+    let mut advertised: Vec<String> = Vec::new();
+    advertised.push(ctx.local_advertised.clone());
+    for (_, _, bolt) in ctx.peers.iter_full() {
+        if let Some(b) = bolt {
+            if b != ctx.local_advertised {
+                advertised.push(b.to_string());
+            }
+        }
+    }
+
+    // WRITE list. Raft mode wants just the leader; routing and
+    // single-node accept the full advertised list. Any fallback path
+    // lands on `local_advertised` so the table always has at least
+    // one WRITE entry.
+    let write_addrs: Vec<String> = match ctx.raft.as_ref() {
+        Some(raft) => {
+            let leader_bolt = raft
+                .current_leader()
+                .and_then(|id| ctx.peers.bolt_address(id).map(str::to_string));
+            match leader_bolt {
+                Some(addr) => vec![addr],
+                None => vec![ctx.local_advertised.clone()],
+            }
+        }
+        None => advertised.clone(),
+    };
+
+    let to_bolt_list = |addrs: &[String]| -> BoltValue {
+        BoltValue::List(addrs.iter().map(|a| BoltValue::String(a.clone())).collect())
+    };
+    let role_entry = |addrs: &[String], role: &str| -> BoltValue {
         BoltValue::map([
-            ("addresses", one_address.clone()),
+            ("addresses", to_bolt_list(addrs)),
             ("role", BoltValue::String(role.to_string())),
         ])
     };
@@ -791,9 +860,9 @@ fn route_success(advertised_address: &str) -> BoltMessage {
         (
             "servers",
             BoltValue::List(vec![
-                server_entry("ROUTE"),
-                server_entry("READ"),
-                server_entry("WRITE"),
+                role_entry(&advertised, "ROUTE"),
+                role_entry(&advertised, "READ"),
+                role_entry(&write_addrs, "WRITE"),
             ]),
         ),
         ("db", BoltValue::String("neo4j".into())),

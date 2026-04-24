@@ -146,6 +146,19 @@ fn default_num_partitions() -> u32 {
 pub struct PeerConfig {
     pub id: u64,
     pub address: String,
+    /// Optional Bolt listener address for this peer. When present,
+    /// cluster-aware Neo4j drivers (`neo4j://`-scheme connections)
+    /// see this peer in the routing table the server returns on
+    /// ROUTE messages. Peers without `bolt_address` are silently
+    /// skipped from the routing table — existing configs keep
+    /// working and just advertise a smaller set of endpoints.
+    ///
+    /// Format matches `bolt_address` at the top level of the
+    /// config (e.g. `"peer-b.internal:7687"`). Needed because
+    /// the gRPC `address` runs on a different port than the Bolt
+    /// listener, so drivers can't derive one from the other.
+    #[serde(default)]
+    pub bolt_address: Option<String>,
 }
 
 /// Authentication table for the Bolt listener. Enabled by adding a

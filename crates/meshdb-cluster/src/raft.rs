@@ -838,6 +838,24 @@ impl RaftCluster {
         Ok(cluster)
     }
 
+    /// Current leader according to the local Raft state machine, or
+    /// `None` when this peer hasn't heard from / elected a leader
+    /// yet (campaign in progress, freshly-restarted follower, etc.).
+    ///
+    /// Cheap — reads the local `watch::Receiver<RaftMetrics>` without
+    /// waiting. Callers that need an authoritative answer should retry
+    /// across short intervals or tolerate `None` as "unknown right
+    /// now"; the Bolt ROUTE handler falls back to the local advertised
+    /// address in that case, which yields `ForwardToLeader` redirects
+    /// via the normal write path once elections settle.
+    pub fn current_leader(&self) -> Option<crate::PeerId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .current_leader
+            .map(crate::PeerId)
+    }
+
     /// Propose a [`ClusterCommand`] entry. Wraps internally as
     /// [`MeshLogEntry::Cluster`] so existing callers don't need to touch
     /// the entry type.
