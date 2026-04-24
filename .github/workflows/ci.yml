@@ -174,3 +174,46 @@ jobs:
           name: driver-matrix-js-logs
           path: drivers/.run/logs/
           if-no-files-found: ignore
+
+  driver-matrix-go:
+    name: Driver matrix (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev openssl
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build meshdb-server (release)
+        run: cargo build --release -p meshdb-server
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: drivers/go/go.sum
+
+      - name: Fetch Go driver
+        run: (cd drivers/go && go mod download)
+
+      - name: Run baseline matrix cell (bolt=5.4, auth=none, tls=off)
+        run: drivers/run-matrix.sh --lang=go --auth=none --tls=off --bolt=5.4
+
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-matrix-go-logs
+          path: drivers/.run/logs/
+          if-no-files-found: ignore

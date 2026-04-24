@@ -45,10 +45,10 @@ for arg in "$@"; do
 done
 
 if [[ -z "$LANG" ]]; then
-  echo "--lang is required (one of: py, js)" >&2
+  echo "--lang is required (one of: py, js, go)" >&2
   exit 2
 fi
-case "$LANG" in py|js) ;; *) echo "unsupported --lang=$LANG" >&2; exit 2 ;; esac
+case "$LANG" in py|js|go) ;; *) echo "unsupported --lang=$LANG" >&2; exit 2 ;; esac
 case "$AUTH" in none|basic) ;; *) echo "--auth must be none|basic" >&2; exit 2 ;; esac
 case "$TLS"  in off|on)     ;; *) echo "--tls must be off|on" >&2; exit 2 ;; esac
 case "$MODE" in single)     ;; *) echo "Phase 1 only supports --mode=single" >&2; exit 2 ;; esac
@@ -154,6 +154,14 @@ case "$LANG" in
     fi
     if ! (cd drivers/js && npm test --silent); then
       echo "[run-matrix] js suite failed" >&2
+      echo "[run-matrix] server log: $LOG_FILE" >&2
+      exit 1
+    fi
+    ;;
+  go)
+    echo "[run-matrix] running drivers/go suite" >&2
+    if ! (cd drivers/go && go test -count=1 ./...); then
+      echo "[run-matrix] go suite failed" >&2
       echo "[run-matrix] server log: $LOG_FILE" >&2
       exit 1
     fi
