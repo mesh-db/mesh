@@ -1180,7 +1180,30 @@ async fn peer_restart_recovers_persistent_raft_state() {
 
     // Restart peer B on the same address + same data_dir. build_components
     // hits MemStore::open_persistent, which reads vote + log back from disk.
-    let listener_b2 = TcpListener::bind(addr_b).await.unwrap();
+    //
+    // Bind with a bounded retry: the previous listener's socket sits in
+    // the kernel's release path briefly after the server task stops, and
+    // on a loaded CI runner the 200ms sleep above isn't always enough to
+    // clear it. 20×50ms = 1s total ceiling, plenty of headroom without
+    // masking a real regression.
+    let listener_b2 = {
+        let mut last_err: Option<std::io::Error> = None;
+        let mut bound: Option<TcpListener> = None;
+        for _ in 0..20 {
+            match TcpListener::bind(addr_b).await {
+                Ok(l) => {
+                    bound = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        bound
+            .unwrap_or_else(|| panic!("could not rebind {addr_b} after 20 retries: {:?}", last_err))
+    };
     let components_b2 = meshdb_server::build_components(&config_b).await.unwrap();
     let _peer_b_v2 = spawn_peer(listener_b2, components_b2);
 
