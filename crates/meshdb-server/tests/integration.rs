@@ -2563,6 +2563,121 @@ async fn two_peer_raft_replicates_via_server_components() {
     );
 }
 
+/// Parsed server-side ROUTE response. `send_route` returns this to
+/// both the single-ROUTE and handoff tests below so they can assert
+/// on the shape without re-implementing the packstream dance.
+struct RouteReply {
+    route_addrs: Vec<String>,
+    read_addrs: Vec<String>,
+    write_addrs: Vec<String>,
+    ttl: i64,
+    db: String,
+}
+
+/// Drive a real `neo4j://`-flavoured ROUTE exchange against a Bolt
+/// listener: handshake, HELLO, LOGON (Bolt 5.1+ gates ROUTE behind
+/// it), ROUTE. Parses the `rt` metadata into per-role address lists
+/// plus the TTL and db name. Test-only helper — inline everything so
+/// a failure stack trace points at the caller, not a shared layer.
+async fn send_route(bolt_addr: &str) -> RouteReply {
+    use meshdb_bolt::{
+        perform_client_handshake, read_message, write_message, BoltMessage, BoltValue, BOLT_5_4,
+    };
+    use tokio::net::TcpStream;
+
+    let mut sock = TcpStream::connect(bolt_addr).await.unwrap();
+    let preferences = [BOLT_5_4, [0; 4], [0; 4], [0; 4]];
+    let agreed = perform_client_handshake(&mut sock, &preferences)
+        .await
+        .unwrap();
+    assert_eq!(agreed, BOLT_5_4);
+
+    write_message(
+        &mut sock,
+        &BoltMessage::Hello {
+            extra: BoltValue::map([
+                ("user_agent", BoltValue::String("mesh-test/0.1".into())),
+                ("scheme", BoltValue::String("none".into())),
+            ]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let _hello_ack = read_message(&mut sock).await.unwrap();
+    // Bolt 5.1+ needs LOGON before ROUTE.
+    write_message(
+        &mut sock,
+        &BoltMessage::Logon {
+            auth: BoltValue::map([("scheme", BoltValue::String("none".into()))]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let _logon_ack = read_message(&mut sock).await.unwrap();
+
+    write_message(
+        &mut sock,
+        &BoltMessage::Route {
+            routing: BoltValue::Map(vec![]),
+            bookmarks: BoltValue::List(vec![]),
+            extra: BoltValue::Map(vec![]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let raw = read_message(&mut sock).await.unwrap();
+    let reply = BoltMessage::decode(&raw).unwrap();
+    let metadata = match reply {
+        BoltMessage::Success { metadata } => metadata,
+        other => panic!("expected SUCCESS, got {other:?}"),
+    };
+    let rt = metadata.get("rt").expect("rt metadata").clone();
+    let servers = rt
+        .get("servers")
+        .and_then(|v| match v {
+            BoltValue::List(xs) => Some(xs.clone()),
+            _ => None,
+        })
+        .expect("servers list");
+    assert_eq!(servers.len(), 3, "ROUTE + READ + WRITE");
+    let addrs_for = |role: &str| -> Vec<String> {
+        servers
+            .iter()
+            .find_map(|s| {
+                let role_match = s.get("role").and_then(|v| v.as_str()) == Some(role);
+                if !role_match {
+                    return None;
+                }
+                s.get("addresses").map(|a| match a {
+                    BoltValue::List(xs) => xs
+                        .iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect(),
+                    _ => Vec::new(),
+                })
+            })
+            .unwrap_or_default()
+    };
+    let ttl = match rt.get("ttl") {
+        Some(BoltValue::Int(n)) => *n,
+        _ => 0,
+    };
+    let db = rt
+        .get("db")
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default();
+    RouteReply {
+        route_addrs: addrs_for("ROUTE"),
+        read_addrs: addrs_for("READ"),
+        write_addrs: addrs_for("WRITE"),
+        ttl,
+        db,
+    }
+}
+
 #[tokio::test]
 async fn route_success_lists_peers_and_leader_under_the_right_roles() {
     // 2-peer Raft cluster with Bolt listeners on both peers. Driver
@@ -2578,12 +2693,8 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
     // `peers[].bolt_address`, and spawn the Bolt listener ourselves
     // with a hand-crafted `RouteContext`. Exercises the same
     // `route_success` path the binary hits.
-    use meshdb_bolt::{
-        perform_client_handshake, read_message, write_message, BoltMessage, BoltValue, BOLT_5_4,
-    };
     use meshdb_cluster::{Membership, Peer};
     use meshdb_server::bolt::{run_listener, RouteContext};
-    use tokio::net::TcpStream;
     use tokio::time::{sleep, Duration};
 
     let dir_a = TempDir::new().unwrap();
@@ -2725,93 +2836,12 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
     let leader = leader_id.expect("raft should elect a leader within 6s");
     assert_eq!(leader, 1, "peer A bootstrapped so it should be leader");
 
-    // Connect to the follower (peer B) via Bolt and send ROUTE.
-    let mut sock = TcpStream::connect(&bolt_addr_b).await.unwrap();
-    let preferences = [BOLT_5_4, [0; 4], [0; 4], [0; 4]];
-    let agreed = perform_client_handshake(&mut sock, &preferences)
-        .await
-        .unwrap();
-    assert_eq!(agreed, BOLT_5_4);
-
-    write_message(
-        &mut sock,
-        &BoltMessage::Hello {
-            extra: BoltValue::map([
-                ("user_agent", BoltValue::String("mesh-test/0.1".into())),
-                ("scheme", BoltValue::String("none".into())),
-            ]),
-        }
-        .encode(),
-    )
-    .await
-    .unwrap();
-    let _hello_ack = read_message(&mut sock).await.unwrap();
-    // Bolt 5.1+ needs LOGON before ROUTE; 5.4 hits that gate.
-    write_message(
-        &mut sock,
-        &BoltMessage::Logon {
-            auth: BoltValue::map([("scheme", BoltValue::String("none".into()))]),
-        }
-        .encode(),
-    )
-    .await
-    .unwrap();
-    let _logon_ack = read_message(&mut sock).await.unwrap();
-
-    write_message(
-        &mut sock,
-        &BoltMessage::Route {
-            routing: BoltValue::Map(vec![]),
-            bookmarks: BoltValue::List(vec![]),
-            extra: BoltValue::Map(vec![]),
-        }
-        .encode(),
-    )
-    .await
-    .unwrap();
-    let raw = read_message(&mut sock).await.unwrap();
-    let reply = BoltMessage::decode(&raw).unwrap();
-
-    let metadata = match reply {
-        BoltMessage::Success { metadata } => metadata,
-        other => panic!("expected SUCCESS, got {other:?}"),
-    };
-    let rt = metadata.get("rt").expect("rt metadata").clone();
-    let servers = rt
-        .get("servers")
-        .and_then(|v| match v {
-            BoltValue::List(xs) => Some(xs.clone()),
-            _ => None,
-        })
-        .expect("servers list");
-    assert_eq!(servers.len(), 3, "ROUTE + READ + WRITE");
-
-    // Collect per-role address sets for assertion.
-    let addrs_for = |role: &str| -> Vec<String> {
-        servers
-            .iter()
-            .find_map(|s| {
-                let role_match = s.get("role").and_then(|v| v.as_str()) == Some(role);
-                if !role_match {
-                    return None;
-                }
-                s.get("addresses").map(|a| match a {
-                    BoltValue::List(xs) => xs
-                        .iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect(),
-                    _ => Vec::new(),
-                })
-            })
-            .unwrap_or_default()
-    };
-    let route_addrs = addrs_for("ROUTE");
-    let read_addrs = addrs_for("READ");
-    let write_addrs = addrs_for("WRITE");
+    // Ask the follower for its routing table.
+    let reply = send_route(&bolt_addr_b).await;
 
     // ROUTE and READ both contain both peer addresses (order may vary,
     // self goes first). We check set membership, not order.
-    for role_addrs in [&route_addrs, &read_addrs] {
+    for role_addrs in [&reply.route_addrs, &reply.read_addrs] {
         assert!(
             role_addrs.iter().any(|a| a == &bolt_addr_a),
             "role list should include leader {bolt_addr_a}: {role_addrs:?}"
@@ -2823,17 +2853,221 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
     }
     // WRITE lists only the leader (peer A).
     assert_eq!(
-        write_addrs,
+        reply.write_addrs,
         vec![bolt_addr_a.clone()],
-        "WRITE should name the leader only: {write_addrs:?}"
+        "WRITE should name the leader only: {:?}",
+        reply.write_addrs
+    );
+    assert!(reply.ttl > 0, "ttl should be positive");
+    assert_eq!(reply.db, "neo4j");
+}
+
+#[tokio::test]
+async fn route_write_role_tracks_raft_leader_across_handoff() {
+    // 3-peer Raft cluster. After a steady-state ROUTE confirms the
+    // seed is leader, shut down the seed's Raft and wait for the
+    // survivors to elect a new one. A second ROUTE on a still-running
+    // peer must reflect the new leader under WRITE — proving the
+    // handler resolves `current_leader` dynamically per request
+    // rather than snapshotting at listener-startup time.
+    //
+    // Needs 3 peers: with 2, quorum is 2 and losing one leaves the
+    // survivor unable to win an election, so a handoff test would
+    // never converge. With 3, quorum is 2 and killing any one peer
+    // still lets the remaining pair elect.
+    use meshdb_cluster::{Membership, Peer};
+    use meshdb_server::bolt::{run_listener, RouteContext};
+    use tokio::time::{sleep, Duration};
+
+    // --- Setup: 3 peers × (gRPC listener, Bolt listener, dir). ---
+    let dirs: [TempDir; 3] = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let mut grpc_listeners = Vec::new();
+    let mut bolt_listeners = Vec::new();
+    let mut grpc_addrs = Vec::new();
+    let mut bolt_addrs = Vec::new();
+    for _ in 0..3 {
+        let g = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        grpc_addrs.push(g.local_addr().unwrap().to_string());
+        bolt_addrs.push(b.local_addr().unwrap().to_string());
+        grpc_listeners.push(g);
+        bolt_listeners.push(b);
+    }
+
+    let peers = (0..3)
+        .map(|i| PeerConfig {
+            id: (i + 1) as u64,
+            address: grpc_addrs[i].clone(),
+            bolt_address: Some(bolt_addrs[i].clone()),
+        })
+        .collect::<Vec<_>>();
+
+    let mk_config = |self_id: u64, data_dir: PathBuf, grpc: &str, bootstrap: bool| ServerConfig {
+        self_id,
+        listen_address: grpc.to_string(),
+        data_dir,
+        num_partitions: 4,
+        peers: peers.clone(),
+        bootstrap,
+        bolt_address: None,
+        metrics_address: None,
+        bolt_auth: None,
+        bolt_tls: None,
+        bolt_advertised_versions: None,
+        grpc_tls: None,
+        mode: None,
+        #[cfg(feature = "apoc-load")]
+        apoc_import: None,
+    };
+    let configs = [
+        mk_config(1, dirs[0].path().to_path_buf(), &grpc_addrs[0], true),
+        mk_config(2, dirs[1].path().to_path_buf(), &grpc_addrs[1], false),
+        mk_config(3, dirs[2].path().to_path_buf(), &grpc_addrs[2], false),
+    ];
+
+    // --- Build components for all three peers. ---
+    let mut rafts = Vec::new();
+    let mut services: Vec<Arc<meshdb_rpc::MeshService>> = Vec::new();
+    let mut raft_services = Vec::new();
+    for cfg in &configs {
+        let comp = meshdb_server::build_components(cfg).await.unwrap();
+        rafts.push(comp.raft.clone().unwrap());
+        let ServerComponents {
+            service,
+            raft: _,
+            raft_service,
+        } = comp;
+        services.push(Arc::new(service));
+        raft_services.push(raft_service.unwrap());
+    }
+
+    // --- Spawn gRPC + Bolt for each peer. ---
+    // `raft_services` holds owned values that must each be consumed
+    // exactly once by `.into_server()`; drain in sync with
+    // `grpc_listeners` so a zip gives each spawn its own pair.
+    for ((grpc_l, svc), raft_svc) in grpc_listeners
+        .into_iter()
+        .zip(services.iter().cloned())
+        .zip(raft_services.into_iter())
+    {
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service((*svc).clone().into_query_server())
+                .add_service((*svc).clone().into_write_server())
+                .add_service(raft_svc.into_server())
+                .serve_with_incoming(TcpListenerStream::new(grpc_l))
+                .await;
+        });
+    }
+
+    let membership_for_route = Arc::new(Membership::new(
+        (0..3)
+            .map(|i| {
+                Peer::new(PeerId((i + 1) as u64), grpc_addrs[i].clone())
+                    .with_bolt_address(bolt_addrs[i].clone())
+            })
+            .collect::<Vec<_>>(),
+    ));
+
+    for (i, bolt_l) in bolt_listeners.into_iter().enumerate() {
+        let service = services[i].clone();
+        let ctx = Arc::new(RouteContext {
+            local_advertised: bolt_addrs[i].clone(),
+            peers: membership_for_route.clone(),
+            raft: Some(rafts[i].clone()),
+        });
+        tokio::spawn(async move {
+            let _ = run_listener(bolt_l, service, None, None, None, ctx).await;
+        });
+    }
+
+    sleep(Duration::from_millis(80)).await;
+
+    meshdb_server::initialize_if_seed(&configs[0], &rafts[0])
+        .await
+        .unwrap();
+
+    // Wait for the seed to become leader.
+    for _ in 0..60 {
+        sleep(Duration::from_millis(100)).await;
+        if rafts[0].raft.metrics().borrow().current_leader == Some(1) {
+            break;
+        }
+    }
+    assert_eq!(
+        rafts[0].raft.metrics().borrow().current_leader,
+        Some(1),
+        "peer 1 (seed) should become leader within 6s"
     );
 
-    // TTL and db fields present.
-    assert!(
-        matches!(rt.get("ttl"), Some(BoltValue::Int(n)) if *n > 0),
-        "ttl should be positive"
+    // Steady-state ROUTE: WRITE = peer 1.
+    let pre = send_route(&bolt_addrs[2]).await;
+    assert_eq!(
+        pre.write_addrs,
+        vec![bolt_addrs[0].clone()],
+        "pre-handoff WRITE should name the leader (peer 1)"
     );
-    assert_eq!(rt.get("db").and_then(|v| v.as_str()), Some("neo4j"));
+
+    // Stop peer 1's Raft. Its gRPC + Bolt listeners keep running, but
+    // it no longer participates in consensus — peers 2 and 3 lose
+    // heartbeats, time out, and one wins the new election.
+    rafts[0]
+        .raft
+        .shutdown()
+        .await
+        .expect("shutdown peer 1 raft");
+
+    // Wait for a new leader ≠ 1. Poll both survivors — whichever
+    // campaigns wins first.
+    let mut new_leader: Option<u64> = None;
+    for _ in 0..80 {
+        sleep(Duration::from_millis(100)).await;
+        for idx in [1usize, 2] {
+            if let Some(id) = rafts[idx].raft.metrics().borrow().current_leader {
+                if id != 1 {
+                    new_leader = Some(id);
+                    break;
+                }
+            }
+        }
+        if new_leader.is_some() {
+            break;
+        }
+    }
+    let new_leader = new_leader.expect("survivors should elect a new leader within 8s");
+    assert!(matches!(new_leader, 2 | 3), "new leader must be 2 or 3");
+    let new_leader_bolt = bolt_addrs[(new_leader - 1) as usize].clone();
+
+    // Ask a survivor for the new routing table. Pick the non-leader
+    // survivor so we're exercising follower-path ROUTE.
+    let follower_bolt = if new_leader == 2 {
+        &bolt_addrs[2]
+    } else {
+        &bolt_addrs[1]
+    };
+    let post = send_route(follower_bolt).await;
+    assert_eq!(
+        post.write_addrs,
+        vec![new_leader_bolt.clone()],
+        "post-handoff WRITE should name the new leader ({new_leader}): {post:?}",
+        post = post.write_addrs
+    );
+
+    // ROUTE/READ still list all three peers (Membership is static —
+    // we don't drop peer 1 from the routing table just because its
+    // Raft is down; the driver will discover the outage itself).
+    for role_addrs in [&post.route_addrs, &post.read_addrs] {
+        for addr in &bolt_addrs {
+            assert!(
+                role_addrs.iter().any(|a| a == addr),
+                "role list should include {addr}: {role_addrs:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
