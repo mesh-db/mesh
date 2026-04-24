@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-24
+
 First stable minor cut from the alpha line. No breaking changes to
 on-disk format, network protocols, or config shape from
 `0.1.0-alpha.9`; upgrade is a process restart on the same data

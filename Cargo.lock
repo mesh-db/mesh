@@ -1901,7 +1901,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "meshdb-apoc"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "md-5",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-bolt"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "thiserror 2.0.18",
  "tokio",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-client"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-cluster"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "meshdb-core",
@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-core"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1975,7 +1975,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-cypher"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "meshdb-core",
  "pest",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-executor"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-rpc"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "meshdb-cluster",
@@ -2035,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-server"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2070,7 +2070,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-storage"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "meshdb-core",
@@ -2083,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "meshdb-tck"
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "cucumber",

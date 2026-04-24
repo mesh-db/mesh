@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-alpha.9"
+version = "0.1.0"
 edition = "2021"
 description = "A distributed, Cypher-compliant graph database written in Rust."
 license = "MIT"
@@ -25,14 +25,14 @@ repository = "https://github.com/mesh-db/mesh"
 # Internal crates. Version is required (in addition to `path`) so
 # `cargo package` / `cargo publish` can resolve them against crates.io
 # when path deps are stripped on publish.
-meshdb-core = { path = "crates/meshdb-core", version = "0.1.0-alpha.9" }
-meshdb-storage = { path = "crates/meshdb-storage", version = "0.1.0-alpha.9" }
-meshdb-cypher = { path = "crates/meshdb-cypher", version = "0.1.0-alpha.9" }
-meshdb-executor = { path = "crates/meshdb-executor", version = "0.1.0-alpha.9" }
-meshdb-cluster = { path = "crates/meshdb-cluster", version = "0.1.0-alpha.9" }
-meshdb-rpc = { path = "crates/meshdb-rpc", version = "0.1.0-alpha.9" }
-meshdb-bolt = { path = "crates/meshdb-bolt", version = "0.1.0-alpha.9" }
-meshdb-apoc = { path = "crates/meshdb-apoc", version = "0.1.0-alpha.9" }
+meshdb-core = { path = "crates/meshdb-core", version = "0.1.0" }
+meshdb-storage = { path = "crates/meshdb-storage", version = "0.1.0" }
+meshdb-cypher = { path = "crates/meshdb-cypher", version = "0.1.0" }
+meshdb-executor = { path = "crates/meshdb-executor", version = "0.1.0" }
+meshdb-cluster = { path = "crates/meshdb-cluster", version = "0.1.0" }
+meshdb-rpc = { path = "crates/meshdb-rpc", version = "0.1.0" }
+meshdb-bolt = { path = "crates/meshdb-bolt", version = "0.1.0" }
+meshdb-apoc = { path = "crates/meshdb-apoc", version = "0.1.0" }
 
 thiserror = "2"
 anyhow = "1"
