@@ -44,9 +44,10 @@ See `drivers/python/README.md` for the per-language venv bootstrap.
 
 ## Known gaps
 
-- **Bolt 4.4 DateTime encoding** — Mesh hardcodes the Bolt 5.x
-  DateTime struct tag (`0x49`, UTC semantics). Bolt 4.4 expects
-  `0x46` with local-wall-clock semantics. Tests that exercise
-  tz-aware DateTime are `SKIP_ON_BOLT_44` until the encoder learns
-  to switch on negotiated version. Tracked in
-  `crates/meshdb-server/src/value_conv.rs::property_to_bolt`.
+- **Zoned DateTime with `tz_name`** — `Property::DateTime` carries an
+  optional IANA region name (`Europe/Stockholm`, etc.) but the
+  encoder currently ignores it and emits offset-only DateTime
+  (`0x49` / `0x46`) rather than DateTimeZoneId (`0x69` / `0x66`).
+  Offset-aware tz-aware values round-trip correctly; zone names are
+  silently dropped. Fix: teach `property_to_bolt`'s DateTime arm to
+  switch on `tz_name.is_some()`.

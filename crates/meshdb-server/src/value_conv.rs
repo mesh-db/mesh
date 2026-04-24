@@ -14,8 +14,8 @@
 //! set to the full UUID string.
 
 use meshdb_bolt::{
-    BoltValue, TAG_DATE, TAG_DURATION, TAG_LOCAL_DATE_TIME, TAG_NODE, TAG_PATH, TAG_RELATIONSHIP,
-    TAG_UNBOUND_RELATIONSHIP,
+    is_bolt_4_4, BoltValue, TAG_DATE, TAG_DATE_TIME, TAG_DATE_TIME_LEGACY, TAG_DURATION,
+    TAG_LOCAL_DATE_TIME, TAG_NODE, TAG_PATH, TAG_RELATIONSHIP, TAG_UNBOUND_RELATIONSHIP,
 };
 use meshdb_core::{Duration, Edge, Node, NodeId, Property};
 use meshdb_executor::{ParamMap, Row, Value};
@@ -25,11 +25,16 @@ use std::collections::HashMap;
 /// Bolt `RECORD` message carries. Values are emitted in `fields`
 /// order — the same field list that was advertised in the `RUN`
 /// response's `SUCCESS` metadata.
-pub fn row_to_bolt_fields(row: &Row, fields: &[String]) -> Vec<BoltValue> {
+///
+/// `bolt_version` is the negotiated handshake tuple. Encoding for
+/// most types is version-agnostic; the only branch today is the
+/// timezone-aware DateTime, which uses tag 0x46 + local wall-clock
+/// seconds under Bolt 4.4 and tag 0x49 + UTC seconds under 5.0+.
+pub fn row_to_bolt_fields(row: &Row, fields: &[String], bolt_version: [u8; 4]) -> Vec<BoltValue> {
     fields
         .iter()
         .map(|name| match row.get(name) {
-            Some(v) => value_to_bolt(v),
+            Some(v) => value_to_bolt(v, bolt_version),
             None => BoltValue::Null,
         })
         .collect()
@@ -52,11 +57,16 @@ pub fn field_names_from_rows(rows: &[Row]) -> Vec<String> {
     seen.into_iter().collect()
 }
 
-fn value_to_bolt(value: &Value) -> BoltValue {
+fn value_to_bolt(value: &Value, bolt_version: [u8; 4]) -> BoltValue {
     match value {
         Value::Null => BoltValue::Null,
-        Value::Property(p) => property_to_bolt(p),
-        Value::List(items) => BoltValue::List(items.iter().map(value_to_bolt).collect()),
+        Value::Property(p) => property_to_bolt(p, bolt_version),
+        Value::List(items) => BoltValue::List(
+            items
+                .iter()
+                .map(|v| value_to_bolt(v, bolt_version))
+                .collect(),
+        ),
         Value::Map(m) => {
             // Bolt map wire format: keys as strings + each value
             // converted independently. `Value::Map` (graph-aware)
@@ -65,14 +75,14 @@ fn value_to_bolt(value: &Value) -> BoltValue {
             // need to distinguish them.
             let mut pairs: Vec<(String, BoltValue)> = m
                 .iter()
-                .map(|(k, v)| (k.clone(), value_to_bolt(v)))
+                .map(|(k, v)| (k.clone(), value_to_bolt(v, bolt_version)))
                 .collect();
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             BoltValue::Map(pairs)
         }
-        Value::Node(n) => node_to_bolt(n),
-        Value::Edge(e) => edge_to_bolt(e),
-        Value::Path { nodes, edges } => path_to_bolt(nodes, edges),
+        Value::Node(n) => node_to_bolt(n, bolt_version),
+        Value::Edge(e) => edge_to_bolt(e, bolt_version),
+        Value::Path { nodes, edges } => path_to_bolt(nodes, edges, bolt_version),
     }
 }
 
@@ -93,7 +103,7 @@ fn value_to_bolt(value: &Value) -> BoltValue {
 /// similarly — a cyclic path that returns to its start still
 /// produces a single entry in `nodes` and a sequence that
 /// references it twice, matching Neo4j's shape.
-fn path_to_bolt(nodes: &[Node], edges: &[Edge]) -> BoltValue {
+fn path_to_bolt(nodes: &[Node], edges: &[Edge], bolt_version: [u8; 4]) -> BoltValue {
     use std::collections::HashMap as StdHashMap;
 
     let mut unique_nodes: Vec<BoltValue> = Vec::new();
@@ -101,7 +111,7 @@ fn path_to_bolt(nodes: &[Node], edges: &[Edge]) -> BoltValue {
     for n in nodes {
         if !node_index.contains_key(&n.id) {
             node_index.insert(n.id, unique_nodes.len() as i64);
-            unique_nodes.push(node_to_bolt(n));
+            unique_nodes.push(node_to_bolt(n, bolt_version));
         }
     }
 
@@ -114,7 +124,7 @@ fn path_to_bolt(nodes: &[Node], edges: &[Edge]) -> BoltValue {
             // 1-based slot here and push the unbound rel into
             // the deduped list.
             rel_index.insert(e.id, (unique_rels.len() as i64) + 1);
-            unique_rels.push(unbound_relationship_to_bolt(e));
+            unique_rels.push(unbound_relationship_to_bolt(e, bolt_version));
         }
     }
 
@@ -142,11 +152,11 @@ fn path_to_bolt(nodes: &[Node], edges: &[Edge]) -> BoltValue {
 /// endpoints are reconstructed from the `sequence` indices into
 /// the accompanying `nodes` list. Fields:
 /// `{id, type, properties, element_id}`.
-fn unbound_relationship_to_bolt(edge: &Edge) -> BoltValue {
+fn unbound_relationship_to_bolt(edge: &Edge, bolt_version: [u8; 4]) -> BoltValue {
     let mut props: Vec<(String, BoltValue)> = edge
         .properties
         .iter()
-        .map(|(k, v)| (k.clone(), property_to_bolt(v)))
+        .map(|(k, v)| (k.clone(), property_to_bolt(v, bolt_version)))
         .collect();
     props.sort_by(|a, b| a.0.cmp(&b.0));
     BoltValue::Struct {
@@ -160,20 +170,25 @@ fn unbound_relationship_to_bolt(edge: &Edge) -> BoltValue {
     }
 }
 
-fn property_to_bolt(p: &Property) -> BoltValue {
+fn property_to_bolt(p: &Property, bolt_version: [u8; 4]) -> BoltValue {
     match p {
         Property::Null => BoltValue::Null,
         Property::Bool(b) => BoltValue::Bool(*b),
         Property::Int64(i) => BoltValue::Int(*i),
         Property::Float64(f) => BoltValue::Float(*f),
         Property::String(s) => BoltValue::String(s.clone()),
-        Property::List(items) => BoltValue::List(items.iter().map(property_to_bolt).collect()),
+        Property::List(items) => BoltValue::List(
+            items
+                .iter()
+                .map(|p| property_to_bolt(p, bolt_version))
+                .collect(),
+        ),
         Property::Map(entries) => {
             // Maps in Property use a BTreeMap-like structure, sorted
             // to keep the Bolt representation deterministic.
             let mut pairs: Vec<(String, BoltValue)> = entries
                 .iter()
-                .map(|(k, v)| (k.clone(), property_to_bolt(v)))
+                .map(|(k, v)| (k.clone(), property_to_bolt(v, bolt_version)))
                 .collect();
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             BoltValue::Map(pairs)
@@ -183,15 +198,30 @@ fn property_to_bolt(p: &Property) -> BoltValue {
             tz_offset_secs,
             ..
         } => {
-            // Bolt 5 DateTime (tag 0x49): [seconds, nanos, tz_offset_secs].
-            // The offset rides on the wire so drivers can reconstruct
-            // the original presentation zone. We default to 0 ("Z")
-            // when the value was parsed without an explicit offset.
-            let seconds = nanos.div_euclid(1_000_000_000) as i64;
+            // Timezone-aware DateTime. The wire struct has the same
+            // three fields in both versions — `[seconds, nanos,
+            // tz_offset_secs]` — but the tag and the semantics of
+            // `seconds` diverge:
+            //   * Bolt 5.0+: tag 0x49 (TAG_DATE_TIME), `seconds` is
+            //     the UTC instant. The driver reconstructs local
+            //     wall-clock from `seconds + tz_offset_secs`.
+            //   * Bolt 4.4:  tag 0x46 (TAG_DATE_TIME_LEGACY),
+            //     `seconds` is the *local wall-clock* instant (the
+            //     UTC instant with the offset already added). The
+            //     driver reads the offset for display only.
+            // Our storage is always UTC (`Property::DateTime.nanos`
+            // is UTC epoch-nanos), so under 4.4 we shift by the
+            // offset to produce local seconds.
+            let utc_seconds = nanos.div_euclid(1_000_000_000) as i64;
             let subsec = nanos.rem_euclid(1_000_000_000) as i64;
             let offset = tz_offset_secs.unwrap_or(0) as i64;
+            let (tag, seconds) = if is_bolt_4_4(bolt_version) {
+                (TAG_DATE_TIME_LEGACY, utc_seconds + offset)
+            } else {
+                (TAG_DATE_TIME, utc_seconds)
+            };
             BoltValue::Struct {
-                tag: meshdb_bolt::TAG_DATE_TIME,
+                tag,
                 fields: vec![
                     BoltValue::Int(seconds),
                     BoltValue::Int(subsec),
@@ -265,11 +295,11 @@ fn duration_to_bolt(d: Duration) -> BoltValue {
     }
 }
 
-fn node_to_bolt(node: &Node) -> BoltValue {
+fn node_to_bolt(node: &Node, bolt_version: [u8; 4]) -> BoltValue {
     let mut props: Vec<(String, BoltValue)> = node
         .properties
         .iter()
-        .map(|(k, v)| (k.clone(), property_to_bolt(v)))
+        .map(|(k, v)| (k.clone(), property_to_bolt(v, bolt_version)))
         .collect();
     // Node.properties is a HashMap; iteration order is non-deterministic.
     // Sort by key so the Bolt representation is stable across runs.
@@ -290,11 +320,11 @@ fn node_to_bolt(node: &Node) -> BoltValue {
     }
 }
 
-fn edge_to_bolt(edge: &Edge) -> BoltValue {
+fn edge_to_bolt(edge: &Edge, bolt_version: [u8; 4]) -> BoltValue {
     let mut props: Vec<(String, BoltValue)> = edge
         .properties
         .iter()
-        .map(|(k, v)| (k.clone(), property_to_bolt(v)))
+        .map(|(k, v)| (k.clone(), property_to_bolt(v, bolt_version)))
         .collect();
     props.sort_by(|a, b| a.0.cmp(&b.0));
     BoltValue::Struct {
@@ -435,11 +465,11 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             Ok(Property::LocalDateTime(epoch_nanos))
         }
         meshdb_bolt::TAG_DATE_TIME | meshdb_bolt::TAG_DATE_TIME_LEGACY => {
-            // Bolt 5 DateTime (0x49) or Bolt 4.4 legacy (0x46):
-            // [seconds, nanos, tz_offset_secs]. In Bolt 5 these are
-            // UTC; in 4.4 legacy they're local wall-clock with offset
-            // applied. We approximate by treating them all as UTC
-            // since our DateTime storage has no offset field.
+            // [seconds, nanos, tz_offset_secs].
+            //   * Bolt 5 tag 0x49: `seconds` is the UTC instant.
+            //   * Bolt 4.4 tag 0x46 (legacy): `seconds` is the local
+            //     wall-clock instant (UTC + offset). We subtract the
+            //     offset to normalize to UTC for `Property::DateTime`.
             if fields.len() != 3 {
                 return Err(ParamConversionError::MalformedTemporal {
                     tag,
@@ -449,7 +479,12 @@ fn bolt_temporal_struct(tag: u8, fields: &[BoltValue]) -> Result<Property, Param
             let seconds = temporal_int(fields, 0, tag, "DateTime seconds")?;
             let nanos = temporal_int(fields, 1, tag, "DateTime nanos")?;
             let tz_offset = temporal_int(fields, 2, tag, "DateTime tz_offset")?;
-            let epoch_nanos: i128 = (seconds as i128) * 1_000_000_000 + (nanos as i128);
+            let utc_seconds = if tag == meshdb_bolt::TAG_DATE_TIME_LEGACY {
+                seconds - tz_offset
+            } else {
+                seconds
+            };
+            let epoch_nanos: i128 = (utc_seconds as i128) * 1_000_000_000 + (nanos as i128);
             Ok(Property::DateTime {
                 nanos: epoch_nanos,
                 tz_offset_secs: Some(tz_offset as i32),

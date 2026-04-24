@@ -473,7 +473,7 @@ where
                     Phase::Streaming { rows, fields } => (rows, fields),
                     _ => unreachable!(),
                 };
-                stream_records(&mut writer, &rows, &fields).await?;
+                stream_records(&mut writer, &rows, &fields, agreed).await?;
             }
             (Phase::Streaming { .. }, BoltMessage::Discard { .. }) => {
                 phase = Phase::Ready;
@@ -586,7 +586,7 @@ where
                     } => (buffered, rows, fields),
                     _ => unreachable!(),
                 };
-                stream_records(&mut writer, &rows, &fields).await?;
+                stream_records(&mut writer, &rows, &fields, agreed).await?;
                 // Stay in the tx — only PULL drains the rows, the
                 // accumulated write buffer is preserved.
                 phase = Phase::InTxReady { buffered };
@@ -632,13 +632,21 @@ where
 
 /// Stream RECORDs for one buffered result set, then send the trailing
 /// SUCCESS with `type=r`, `has_more=false`, and the record count.
-async fn stream_records<W>(writer: &mut W, rows: &[Row], fields: &[String]) -> anyhow::Result<()>
+/// `bolt_version` is the handshake-negotiated version; the encoder
+/// uses it to pick version-specific struct tags (notably DateTime:
+/// 0x46 local-wall-clock under 4.4 vs 0x49 UTC under 5.0+).
+async fn stream_records<W>(
+    writer: &mut W,
+    rows: &[Row],
+    fields: &[String],
+    bolt_version: [u8; 4],
+) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     let rows_len = rows.len();
     for row in rows {
-        let values = row_to_bolt_fields(row, fields);
+        let values = row_to_bolt_fields(row, fields, bolt_version);
         send(writer, &BoltMessage::Record { fields: values }).await?;
     }
     send(

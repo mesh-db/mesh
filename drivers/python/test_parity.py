@@ -15,7 +15,6 @@ Coverage in this file:
 
 from __future__ import annotations
 
-import os
 from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
@@ -23,17 +22,6 @@ from neo4j import Session
 from neo4j.exceptions import ClientError, CypherSyntaxError, Neo4jError
 from neo4j.spatial import CartesianPoint, WGS84Point
 from neo4j.time import Date, DateTime, Duration, Time
-
-# Bolt 4.4 uses different DateTime/DateTimeZoneId struct tags (0x46,
-# 0x66) with local-wall-clock semantics, while Bolt 5.0+ uses 0x49 /
-# 0x69 with UTC semantics. Mesh's encoder currently hardcodes the
-# 5.x tags — see drivers/README.md TODO. Tests that exercise tz-aware
-# DateTime are skipped on the 4.4 cell and re-enabled when the
-# encoder is taught to switch on negotiated version.
-SKIP_ON_BOLT_44 = pytest.mark.skipif(
-    os.environ.get("MESH_BOLT_VERSION") == "4.4",
-    reason="DateTime encoder uses Bolt 5.x tags (0x49); 4.4 needs 0x46 — fix pending",
-)
 
 
 # --- Scalar round-trip ------------------------------------------------
@@ -83,7 +71,6 @@ def test_scalar_roundtrip(session: Session, value: object) -> None:
     assert record["v"] == value
 
 
-@SKIP_ON_BOLT_44
 def test_temporal_datetime_roundtrip(session: Session) -> None:
     sent = datetime(2024, 6, 15, 12, 30, 45, tzinfo=timezone.utc)
     record = session.run("RETURN $v AS v", v=sent).single()
@@ -91,6 +78,22 @@ def test_temporal_datetime_roundtrip(session: Session) -> None:
     received = record["v"]
     # neo4j.time.DateTime → standard datetime.
     assert received.to_native() == sent
+
+
+def test_temporal_datetime_nonzero_offset_roundtrip(session: Session) -> None:
+    # Non-UTC offset exercises the Bolt 4.4 local-wall-clock semantics
+    # (seconds = UTC + offset); under UTC the adjustment is zero and a
+    # bug in the offset-addition path would pass silently.
+    sent = datetime(
+        2024, 6, 15, 14, 30, 45, tzinfo=timezone(timedelta(hours=2))
+    )
+    record = session.run("RETURN $v AS v", v=sent).single()
+    assert record is not None
+    # Compare as UTC — the driver may render the returned datetime in
+    # a different offset/zone, but the underlying instant must match.
+    assert record["v"].to_native().astimezone(timezone.utc) == sent.astimezone(
+        timezone.utc
+    )
 
 
 def test_temporal_date_roundtrip(session: Session) -> None:

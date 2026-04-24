@@ -22,7 +22,7 @@ mod value;
 pub use error::{BoltError, Result};
 pub use framing::{read_message, write_message, MAX_CHUNK_SIZE};
 pub use handshake::{
-    perform_client_handshake, perform_server_handshake, perform_server_handshake_with,
+    is_bolt_4_4, perform_client_handshake, perform_server_handshake, perform_server_handshake_with,
     version_bytes, BOLT_4_4, BOLT_5_0, BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4, PREAMBLE, SUPPORTED,
 };
 pub use message::{

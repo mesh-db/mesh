@@ -34,7 +34,7 @@ fn roundtrip_property(p: Property) -> Property {
     let mut row = Row::new();
     row.insert("v".to_string(), Value::Property(p));
     let fields = field_names_from_rows(&[row.clone()]);
-    let bolt = row_to_bolt_fields(&row, &fields);
+    let bolt = row_to_bolt_fields(&row, &fields, meshdb_bolt::BOLT_5_4);
     assert_eq!(bolt.len(), 1, "exactly one field");
     let bytes = encode(&bolt[0]);
     let (decoded, consumed) = decode(&bytes).expect("packstream decode");
@@ -69,6 +69,84 @@ fn datetime_roundtrip_with_sub_second_fraction() {
     };
     let out = roundtrip_property(input.clone());
     assert_eq!(out, input);
+}
+
+#[test]
+fn datetime_encoder_uses_legacy_tag_under_bolt_4_4() {
+    // Under Bolt 4.4 the DateTime struct tag is 0x46 (LEGACY) with
+    // local-wall-clock seconds — `seconds = utc_seconds + offset`.
+    // Under 5.0+ the tag is 0x49 with UTC seconds and the offset as
+    // a separate field. Both versions share the same three-field
+    // layout; only the tag + seconds-semantics differ.
+    let input = Property::DateTime {
+        nanos: 2_000_000_000_000_000_000, // 2_000_000_000 seconds UTC
+        tz_offset_secs: Some(7200),       // +02:00
+        tz_name: None,
+    };
+    let mut row = Row::new();
+    row.insert("v".to_string(), Value::Property(input.clone()));
+    let fields = vec!["v".to_string()];
+
+    let bolt_44 = &row_to_bolt_fields(&row, &fields, meshdb_bolt::BOLT_4_4)[0];
+    match bolt_44 {
+        BoltValue::Struct { tag, fields } => {
+            assert_eq!(
+                *tag,
+                meshdb_bolt::TAG_DATE_TIME_LEGACY,
+                "4.4 should emit 0x46"
+            );
+            // Seconds field is local wall-clock = 2_000_000_000 + 7200.
+            match &fields[0] {
+                BoltValue::Int(s) => assert_eq!(*s, 2_000_000_000 + 7200),
+                _ => panic!("seconds field wrong type"),
+            }
+            match &fields[2] {
+                BoltValue::Int(o) => assert_eq!(*o, 7200),
+                _ => panic!("offset field wrong type"),
+            }
+        }
+        _ => panic!("expected Struct, got {bolt_44:?}"),
+    }
+
+    let bolt_54 = &row_to_bolt_fields(&row, &fields, meshdb_bolt::BOLT_5_4)[0];
+    match bolt_54 {
+        BoltValue::Struct { tag, fields } => {
+            assert_eq!(*tag, meshdb_bolt::TAG_DATE_TIME, "5.x should emit 0x49");
+            // Seconds field is UTC instant.
+            match &fields[0] {
+                BoltValue::Int(s) => assert_eq!(*s, 2_000_000_000),
+                _ => panic!("seconds field wrong type"),
+            }
+        }
+        _ => panic!("expected Struct, got {bolt_54:?}"),
+    }
+}
+
+#[test]
+fn datetime_legacy_tag_roundtrips_through_decoder_back_to_utc() {
+    // Symmetric decode: a driver sending a Bolt 4.4 legacy DateTime
+    // should land in storage as UTC. Build the legacy struct by hand
+    // so this test covers the ingress path (not the encoder's shape).
+    let legacy = BoltValue::Struct {
+        tag: meshdb_bolt::TAG_DATE_TIME_LEGACY,
+        fields: vec![
+            BoltValue::Int(2_000_000_000 + 7200), // local wall-clock
+            BoltValue::Int(0),                    // sub-second nanos
+            BoltValue::Int(7200),                 // +02:00 offset
+        ],
+    };
+    let property = bolt_value_to_property(&legacy).expect("legacy decode");
+    match property {
+        Property::DateTime {
+            nanos,
+            tz_offset_secs,
+            ..
+        } => {
+            assert_eq!(nanos, 2_000_000_000_000_000_000, "seconds should be UTC");
+            assert_eq!(tz_offset_secs, Some(7200));
+        }
+        other => panic!("expected DateTime, got {other:?}"),
+    }
 }
 
 #[test]
@@ -231,7 +309,7 @@ fn path_roundtrip_shape_survives_packstream() {
     let mut row = Row::new();
     row.insert("p".to_string(), path);
     let fields = field_names_from_rows(&[row.clone()]);
-    let bolt = row_to_bolt_fields(&row, &fields);
+    let bolt = row_to_bolt_fields(&row, &fields, meshdb_bolt::BOLT_5_4);
     let bytes = encode(&bolt[0]);
     let (decoded, consumed) = decode(&bytes).expect("packstream decode");
     assert_eq!(consumed, bytes.len());
@@ -291,7 +369,7 @@ fn path_with_repeated_node_dedupes_in_wire() {
     let mut row = Row::new();
     row.insert("p".to_string(), path);
     let fields = field_names_from_rows(&[row.clone()]);
-    let bolt = row_to_bolt_fields(&row, &fields);
+    let bolt = row_to_bolt_fields(&row, &fields, meshdb_bolt::BOLT_5_4);
     let bytes = encode(&bolt[0]);
     let (decoded, _) = decode(&bytes).unwrap();
 
@@ -323,7 +401,7 @@ fn local_datetime_emits_local_date_time_tag() {
     let input = Property::LocalDateTime(1_735_689_600_000);
     let mut row = Row::new();
     row.insert("v".into(), Value::Property(input));
-    let bolt = row_to_bolt_fields(&row, &["v".to_string()]);
+    let bolt = row_to_bolt_fields(&row, &["v".to_string()], meshdb_bolt::BOLT_5_4);
     match &bolt[0] {
         BoltValue::Struct { tag, fields } => {
             assert_eq!(*tag, TAG_LOCAL_DATE_TIME);
@@ -338,7 +416,7 @@ fn date_emits_date_tag() {
     let input = Property::Date(20089);
     let mut row = Row::new();
     row.insert("v".into(), Value::Property(input));
-    let bolt = row_to_bolt_fields(&row, &["v".to_string()]);
+    let bolt = row_to_bolt_fields(&row, &["v".to_string()], meshdb_bolt::BOLT_5_4);
     match &bolt[0] {
         BoltValue::Struct { tag, fields } => {
             assert_eq!(*tag, TAG_DATE);
@@ -358,7 +436,7 @@ fn duration_emits_duration_tag_with_four_fields() {
     });
     let mut row = Row::new();
     row.insert("v".into(), Value::Property(input));
-    let bolt = row_to_bolt_fields(&row, &["v".to_string()]);
+    let bolt = row_to_bolt_fields(&row, &["v".to_string()], meshdb_bolt::BOLT_5_4);
     match &bolt[0] {
         BoltValue::Struct { tag, fields } => {
             assert_eq!(*tag, TAG_DURATION);
@@ -384,7 +462,7 @@ fn unbound_relationship_tag_surfaces_inside_path() {
     };
     let mut row = Row::new();
     row.insert("p".to_string(), path);
-    let bolt = row_to_bolt_fields(&row, &["p".to_string()]);
+    let bolt = row_to_bolt_fields(&row, &["p".to_string()], meshdb_bolt::BOLT_5_4);
     let rels_list = match &bolt[0] {
         BoltValue::Struct { fields, .. } => fields[1].as_list().unwrap(),
         _ => panic!("expected Struct"),

@@ -49,6 +49,16 @@ pub const BOLT_5_4: [u8; 4] = version_bytes(5, 4, 0);
 /// All server-supported versions, in preference order (newest first).
 pub const SUPPORTED: &[[u8; 4]] = &[BOLT_5_4, BOLT_5_3, BOLT_5_2, BOLT_5_1, BOLT_5_0, BOLT_4_4];
 
+/// True iff `v` is Bolt 4.4. Bolt 4.4 uses distinct struct tags for
+/// timezone-aware datetimes (0x46 / 0x66 with local-wall-clock
+/// seconds) where Bolt 5.0+ uses 0x49 / 0x69 with UTC seconds. The
+/// encoder / decoder both branch on this to emit the right tag and
+/// apply the right seconds-semantics transform.
+pub fn is_bolt_4_4(v: [u8; 4]) -> bool {
+    // Version bytes are [0, range, minor, major]. Bolt 4.4 = major 4, minor 4.
+    v[3] == 4 && v[2] == 4
+}
+
 /// Read the client's preamble + four version slots, decide which
 /// version to speak, and write the agreed version back. Returns the
 /// chosen version bytes on success; emits `NoCompatibleVersion` when
