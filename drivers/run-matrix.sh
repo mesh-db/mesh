@@ -142,7 +142,14 @@ CONFIG_B="$RUN_DIR/config-b.toml"
   echo "self_id = 1"
   echo "listen_address = \"127.0.0.1:$GRPC_PORT_A\""
   echo "data_dir = \"$RUN_DIR/data-a\""
-  echo "bolt_address = \"localhost:$BOLT_PORT_A\""
+  # Bind Bolt to `127.0.0.1` — explicit IPv4. `localhost` here is
+  # non-deterministic across platforms (Ubuntu CI resolves it to
+  # `::1` first, which leaves drivers that connect via
+  # `bolt://127.0.0.1:7687` unable to reach the listener). Advertise
+  # `localhost` so `neo4j://` routing sessions get a DNS name
+  # that Node's tls + JSSE will accept as SNI under TLS.
+  echo "bolt_address = \"127.0.0.1:$BOLT_PORT_A\""
+  echo "bolt_advertised_address = \"localhost:$BOLT_PORT_A\""
   if [[ "$MODE" == "routing" ]]; then
     echo 'bootstrap = true'
     echo 'mode = "raft"'
@@ -160,7 +167,8 @@ if [[ "$MODE" == "routing" ]]; then
     echo "self_id = 2"
     echo "listen_address = \"127.0.0.1:$GRPC_PORT_B\""
     echo "data_dir = \"$RUN_DIR/data-b\""
-    echo "bolt_address = \"localhost:$BOLT_PORT_B\""
+    echo "bolt_address = \"127.0.0.1:$BOLT_PORT_B\""
+    echo "bolt_advertised_address = \"localhost:$BOLT_PORT_B\""
     echo 'bootstrap = false'
     echo 'mode = "raft"'
     emit_bolt_sections

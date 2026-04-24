@@ -66,6 +66,23 @@ pub struct ServerConfig {
     #[serde(default)]
     pub bolt_address: Option<String>,
 
+    /// Optional override for what the Bolt listener advertises in
+    /// its ROUTE response. Defaults to `bolt_address` — fine when
+    /// the bind address is also what clients should reach. Needed
+    /// when the two diverge:
+    ///
+    ///   * Production clusters that bind to a private IP but
+    ///     advertise a public DNS name.
+    ///   * Test harnesses that bind to `127.0.0.1` (deterministic
+    ///     IPv4, dodges the `localhost`→IPv6-first resolution that
+    ///     Ubuntu CI uses) but advertise `localhost` (Node's tls
+    ///     and JSSE refuse SNI on bare IP literals under TLS).
+    ///
+    /// Consumed by the ROUTE handler only; does not affect which
+    /// interface the listener binds to.
+    #[serde(default)]
+    pub bolt_advertised_address: Option<String>,
+
     /// Optional address for the Prometheus metrics endpoint (e.g.
     /// `127.0.0.1:9090`). When present, the server binds a tiny
     /// HTTP listener serving `GET /metrics` with the Prometheus

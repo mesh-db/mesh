@@ -446,8 +446,20 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 }
             })
             .collect();
+        // `local_advertised` is what the ROUTE handler echoes back
+        // in the routing table. Default to the literal bind string
+        // (e.g. `"localhost:7687"`) so a `bolt_address = "localhost"`
+        // config works as-is, but let operators override with
+        // `bolt_advertised_address` when the two must diverge — bind
+        // to a private IP, advertise a public DNS name. The test
+        // harness also uses the override to bind IPv4-deterministic
+        // `127.0.0.1` while advertising `localhost` for SNI.
+        let local_advertised = config
+            .bolt_advertised_address
+            .clone()
+            .unwrap_or_else(|| bolt_addr.to_string());
         let route_ctx = Arc::new(bolt::RouteContext {
-            local_advertised: bolt_addr.to_string(),
+            local_advertised,
             peers: Arc::new(Membership::new(peers_for_route)),
             raft: raft_handle.clone(),
         });
