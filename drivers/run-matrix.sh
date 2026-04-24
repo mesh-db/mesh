@@ -45,10 +45,10 @@ for arg in "$@"; do
 done
 
 if [[ -z "$LANG" ]]; then
-  echo "--lang is required (one of: py, js, go)" >&2
+  echo "--lang is required (one of: py, js, go, java)" >&2
   exit 2
 fi
-case "$LANG" in py|js|go) ;; *) echo "unsupported --lang=$LANG" >&2; exit 2 ;; esac
+case "$LANG" in py|js|go|java) ;; *) echo "unsupported --lang=$LANG" >&2; exit 2 ;; esac
 case "$AUTH" in none|basic) ;; *) echo "--auth must be none|basic" >&2; exit 2 ;; esac
 case "$TLS"  in off|on)     ;; *) echo "--tls must be off|on" >&2; exit 2 ;; esac
 case "$MODE" in single)     ;; *) echo "Phase 1 only supports --mode=single" >&2; exit 2 ;; esac
@@ -162,6 +162,16 @@ case "$LANG" in
     echo "[run-matrix] running drivers/go suite" >&2
     if ! (cd drivers/go && go test -count=1 ./...); then
       echo "[run-matrix] go suite failed" >&2
+      echo "[run-matrix] server log: $LOG_FILE" >&2
+      exit 1
+    fi
+    ;;
+  java)
+    echo "[run-matrix] running drivers/java suite" >&2
+    # -q silences maven's banner / transfer chatter but keeps test
+    # output; failing tests still surface individually.
+    if ! (cd drivers/java && mvn -q test); then
+      echo "[run-matrix] java suite failed" >&2
       echo "[run-matrix] server log: $LOG_FILE" >&2
       exit 1
     fi
