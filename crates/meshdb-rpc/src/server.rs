@@ -276,6 +276,13 @@ pub struct MeshService {
     /// `MeshService` itself. Arc so cheap-to-clone for the
     /// spawned per-request closures.
     procedure_registry_factory: Arc<dyn Fn() -> ProcedureRegistry + Send + Sync>,
+    /// Test-only fault-injection handle. `None` in release builds
+    /// (the field itself is cfg-gated). Threaded into every
+    /// [`TxCoordinator`] spawned off this service and consulted
+    /// inside the participant `batch_write` and
+    /// `resolve_transaction` handlers.
+    #[cfg(any(test, feature = "fault-inject"))]
+    fault_points: Option<Arc<crate::FaultPoints>>,
 }
 
 impl MeshService {
@@ -291,6 +298,8 @@ impl MeshService {
             tx_timeouts: crate::TxCoordinatorTimeouts::default(),
             client_tls: None,
             procedure_registry_factory: default_registry_factory(),
+            #[cfg(any(test, feature = "fault-inject"))]
+            fault_points: None,
         }
     }
 
@@ -319,6 +328,8 @@ impl MeshService {
             tx_timeouts: crate::TxCoordinatorTimeouts::default(),
             client_tls: None,
             procedure_registry_factory: default_registry_factory(),
+            #[cfg(any(test, feature = "fault-inject"))]
+            fault_points: None,
         }
     }
 
@@ -355,6 +366,8 @@ impl MeshService {
             tx_timeouts: crate::TxCoordinatorTimeouts::default(),
             client_tls: None,
             procedure_registry_factory: default_registry_factory(),
+            #[cfg(any(test, feature = "fault-inject"))]
+            fault_points: None,
         }
     }
 
@@ -408,6 +421,26 @@ impl MeshService {
     pub fn with_staging(mut self, staging: Arc<crate::ParticipantStaging>) -> Self {
         self.pending_batches = staging;
         self
+    }
+
+    /// Attach a shared [`FaultPoints`](crate::FaultPoints) handle so
+    /// integration tests can drive deterministic crash paths
+    /// through the coordinator and participant 2PC code. Zero cost
+    /// in release builds — both the field and the checkpoint
+    /// branches are cfg-gated behind `fault-inject`.
+    #[cfg(any(test, feature = "fault-inject"))]
+    pub fn with_fault_points(mut self, fp: Option<Arc<crate::FaultPoints>>) -> Self {
+        self.fault_points = fp;
+        self
+    }
+
+    /// Borrow the currently-attached [`FaultPoints`], if any. The
+    /// meshdb-server test harness uses this to pull the handle back
+    /// out of a freshly-built [`ServerComponents`] so the test can
+    /// flip flags mid-run.
+    #[cfg(any(test, feature = "fault-inject"))]
+    pub fn fault_points(&self) -> Option<Arc<crate::FaultPoints>> {
+        self.fault_points.clone()
     }
 
     /// Spawn the participant-staging TTL sweeper as a background
@@ -1379,6 +1412,10 @@ impl MeshService {
                     .with_timeouts(self.tx_timeouts);
             if let Some(log) = self.coordinator_log.as_deref() {
                 coordinator = coordinator.with_log(log);
+            }
+            #[cfg(any(test, feature = "fault-inject"))]
+            {
+                coordinator = coordinator.with_fault_points(self.fault_points.clone());
             }
             #[cfg(feature = "apoc-trigger")]
             let routing_diff = if from_trigger {
@@ -4106,6 +4143,25 @@ impl MeshWrite for MeshService {
                 //    recovery path can re-PREPARE.
                 match self.pending_batches.take(&txid) {
                     Some(cmds) => {
+                        #[cfg(any(test, feature = "fault-inject"))]
+                        if let Some(fp) = &self.fault_points {
+                            if fp
+                                .reject_commit_before_apply
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                // Re-stage the taken batch so recovery
+                                // sees the same `Prepared`-only state
+                                // it would after a real crash between
+                                // the `take()` and the apply. Without
+                                // this, the staging map drops the
+                                // entry and the restart path treats
+                                // the txid as never-staged.
+                                self.pending_batches.rehydrate(txid.clone(), cmds);
+                                return Err(Status::internal(
+                                    "injected fault: reject_commit_before_apply",
+                                ));
+                            }
+                        }
                         apply_prepared_batch(self.store.as_ref(), &cmds).map_err(internal)?;
                         if let Some(log) = &self.participant_log {
                             log.append(&crate::ParticipantLogEntry::Committed {
@@ -4339,6 +4395,12 @@ impl MeshWrite for MeshService {
         let req = request.into_inner();
         let txid = req.txid;
         tracing::Span::current().record("txid", txid.as_str());
+
+        #[cfg(any(test, feature = "fault-inject"))]
+        if let Some(fp) = &self.fault_points {
+            fp.resolve_transaction_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
 
         let Some(log) = self.coordinator_log.as_ref() else {
             // This peer isn't a coordinator (no log) — can't possibly

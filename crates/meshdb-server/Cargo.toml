@@ -44,6 +44,11 @@ rustls-pemfile = "2"
 tempfile = "3"
 serde_json = { workspace = true }
 meshdb-bolt = { workspace = true }
+# Activate meshdb-rpc's `fault-inject` feature for the
+# `two_pc_fault_injection` integration test. A dev-dependency row
+# here turns the feature on for every meshdb-server test build
+# without affecting the release binary / library.
+meshdb-rpc = { workspace = true, features = ["fault-inject"] }
 reqwest = { version = "0.12", default-features = false }
 bcrypt = { workspace = true }
 rcgen = "0.13"

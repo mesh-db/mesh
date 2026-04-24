@@ -66,6 +66,12 @@ pub(crate) struct TxCoordinator<'a> {
     /// via [`TxCoordinator::with_timeouts`] in tests that need
     /// millisecond-scale deadlines to exercise the timeout paths.
     timeouts: TxCoordinatorTimeouts,
+    /// Test-only deterministic crash points. Consulted at three
+    /// checkpoints inside [`Self::run`] so an integration test can
+    /// drive the coordinator into each of its recovery branches
+    /// without timing races.
+    #[cfg(any(test, feature = "fault-inject"))]
+    fault_points: Option<Arc<crate::FaultPoints>>,
 }
 
 impl<'a> TxCoordinator<'a> {
@@ -80,7 +86,19 @@ impl<'a> TxCoordinator<'a> {
             routing,
             log: None,
             timeouts: TxCoordinatorTimeouts::default(),
+            #[cfg(any(test, feature = "fault-inject"))]
+            fault_points: None,
         }
+    }
+
+    /// Attach a [`FaultPoints`](crate::FaultPoints) handle so the
+    /// integration-test harness can fire deterministic crashes at
+    /// the three checkpoints inside [`Self::run`]. Zero cost in
+    /// release builds — the field and checkpoint checks are cfg-gated.
+    #[cfg(any(test, feature = "fault-inject"))]
+    pub fn with_fault_points(mut self, fp: Option<Arc<crate::FaultPoints>>) -> Self {
+        self.fault_points = fp;
+        self
     }
 
     /// Attach a durable coordinator log to this coordinator instance.
@@ -131,6 +149,16 @@ impl<'a> TxCoordinator<'a> {
             .map_err(|e| {
                 Status::internal(format!("coordinator log write (Prepared) failed: {e}"))
             })?;
+        }
+
+        #[cfg(any(test, feature = "fault-inject"))]
+        if let Some(fp) = &self.fault_points {
+            if fp
+                .crash_after_prepare_log
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Status::internal("injected fault: crash_after_prepare_log"));
+            }
         }
 
         // PREPARE phase. Track which peers ack'd so we can target ABORT
@@ -187,12 +215,39 @@ impl<'a> TxCoordinator<'a> {
                 })?;
         }
 
+        #[cfg(any(test, feature = "fault-inject"))]
+        if let Some(fp) = &self.fault_points {
+            if fp
+                .crash_after_commit_decision_log
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Status::internal(
+                    "injected fault: crash_after_commit_decision_log",
+                ));
+            }
+        }
+
         // COMMIT phase. A COMMIT failure is harder to recover from
         // (some peers may already have applied), but we still try to
         // commit every peer so the transaction makes maximum progress.
         // The first commit error is returned to the caller.
         let mut first_commit_err: Option<Status> = None;
         for peer_id in &prepared {
+            #[cfg(any(test, feature = "fault-inject"))]
+            if let Some(fp) = &self.fault_points {
+                // `crash_after_kth_commit_rpc` is a countdown: fire
+                // when the remaining-allowed-sends counter has
+                // decremented to zero, so setting it to `N` crashes
+                // after the Nth COMMIT has been attempted.
+                let remaining = fp
+                    .crash_after_kth_commit_rpc
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if remaining == 0 {
+                    return Err(Status::internal(
+                        "injected fault: crash_after_kth_commit_rpc",
+                    ));
+                }
+            }
             if let Err(e) = self.commit(*peer_id, &txid).await {
                 if first_commit_err.is_none() {
                     first_commit_err = Some(e);

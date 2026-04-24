@@ -34,6 +34,14 @@ once_cell = "1"
 # documented in the `apoc_trigger` module).
 apoc-trigger = ["meshdb-executor/apoc-trigger"]
 
+# Expose the test-only 2PC fault-injection surface (the
+# `FaultPoints` struct + the crash-point checks inside the
+# coordinator and participant). Gated so a release build of
+# meshdb-rpc has zero fault-inject surface; enabled by the
+# meshdb-server dev-dependency row for the
+# `two_pc_fault_injection` integration test.
+fault-inject = []
+
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
