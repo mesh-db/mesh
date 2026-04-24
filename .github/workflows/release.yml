@@ -60,7 +60,20 @@ jobs:
             echo "Workspace is already at $VERSION — skipping bump."
             exit 0
           fi
+          # Bump the umbrella workspace package version that every
+          # crate inherits via `version.workspace = true`.
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version = .*/version = "'"$VERSION"'"/;}' Cargo.toml
+          # Keep the internal crate-to-crate version requirements in
+          # [workspace.dependencies] in lockstep with the package
+          # version. Without this, published 0.1.0 crates would keep
+          # declaring a dep on "0.1.0-alpha.<old>", which is sloppy
+          # (still resolvable via semver pre-release → release) and
+          # becomes a real publish blocker at the next minor bump
+          # because the old alpha's implicit `< 0.2.0` upper bound
+          # excludes 0.2.0.
+          sed -i -E '/^\[workspace\.dependencies\]/,/^\[/{
+            s|^(meshdb-[a-zA-Z0-9_-]+ = \{ path = "crates/meshdb-[a-zA-Z0-9_-]+", version = )"[^"]*"|\1"'"$VERSION"'"|
+          }' Cargo.toml
           # Sync Cargo.lock. `--workspace` updates only workspace members;
           # transitive deps are left pinned.
           cargo update --workspace --quiet
