@@ -56,8 +56,8 @@
 use crate::value_conv::{bolt_params_to_param_map, field_names_from_rows, row_to_bolt_fields};
 use anyhow::Context;
 use meshdb_bolt::{
-    perform_server_handshake, read_message, write_message, BoltError, BoltMessage, BoltValue,
-    BOLT_4_4, BOLT_5_0, BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4,
+    perform_server_handshake_with, read_message, write_message, BoltError, BoltMessage, BoltValue,
+    BOLT_4_4, BOLT_5_0, BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4, SUPPORTED,
 };
 use meshdb_cluster::GraphCommand;
 use meshdb_executor::Row;
@@ -119,6 +119,7 @@ pub async fn run_listener(
     service: Arc<MeshService>,
     auth: Option<Arc<crate::config::BoltAuthConfig>>,
     tls: Option<TlsAcceptor>,
+    advertised_versions: Option<Arc<Vec<[u8; 4]>>>,
 ) -> anyhow::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -126,6 +127,7 @@ pub async fn run_listener(
         let service = service.clone();
         let auth = auth.clone();
         let tls = tls.clone();
+        let advertised = advertised_versions.clone();
         tokio::spawn(async move {
             // If TLS is configured, negotiate it before handing the
             // socket to the Bolt state machine. `serve_connection` is
@@ -134,7 +136,9 @@ pub async fn run_listener(
             match tls {
                 Some(acceptor) => match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
-                        if let Err(e) = serve_connection(tls_stream, service, auth).await {
+                        if let Err(e) =
+                            serve_connection(tls_stream, service, auth, advertised).await
+                        {
                             tracing::warn!(%peer, error = %e, "bolt connection terminated");
                         } else {
                             tracing::debug!(%peer, "bolt connection closed cleanly");
@@ -145,7 +149,7 @@ pub async fn run_listener(
                     }
                 },
                 None => {
-                    if let Err(e) = serve_connection(socket, service, auth).await {
+                    if let Err(e) = serve_connection(socket, service, auth, advertised).await {
                         tracing::warn!(%peer, error = %e, "bolt connection terminated");
                     } else {
                         tracing::debug!(%peer, "bolt connection closed cleanly");
@@ -214,6 +218,7 @@ pub async fn serve_connection<S>(
     socket: S,
     service: Arc<MeshService>,
     auth: Option<Arc<crate::config::BoltAuthConfig>>,
+    advertised_versions: Option<Arc<Vec<[u8; 4]>>>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -224,13 +229,19 @@ where
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
 
-    // Phase 1: handshake. perform_server_handshake reads the preamble
-    // + 4 version slots and writes back the chosen version.
+    // Phase 1: handshake. perform_server_handshake_with reads the
+    // preamble + 4 version slots and writes back the chosen version.
+    // `advertised_versions` clamps the candidate list — None falls back
+    // to the full SUPPORTED set.
     let mut handshake_io = ReadWritePair {
         r: &mut reader,
         w: &mut writer,
     };
-    let agreed = match perform_server_handshake(&mut handshake_io).await {
+    let advertised: &[[u8; 4]] = advertised_versions
+        .as_deref()
+        .map(|v| v.as_slice())
+        .unwrap_or(SUPPORTED);
+    let agreed = match perform_server_handshake_with(&mut handshake_io, advertised).await {
         Ok(v) => v,
         Err(BoltError::BadPreamble) => {
             tracing::warn!("bolt client sent bad preamble; closing");
@@ -271,8 +282,19 @@ where
             return Ok(());
         }
     }
+    // Server agent string. The official Neo4j drivers (Python, JS,
+    // Java, Go, .NET) gate connection setup on a `Neo4j/` prefix —
+    // anything else is rejected client-side as `UnsupportedServerProduct`,
+    // which makes them unusable against alternative Bolt servers.
+    // Standard workaround used by Memgraph, FalkorDB, Neptune, etc.:
+    // announce ourselves as Neo4j-compatible. We tag the build version
+    // suffix-style (`Neo4j/5.4-mesh-<v>`) so the impersonation is
+    // honest — operators inspecting the wire still see Mesh.
     let hello_success_meta = BoltValue::map([
-        ("server", BoltValue::String("Mesh/0.1.0".into())),
+        (
+            "server",
+            BoltValue::String(concat!("Neo4j/5.4-mesh-", env!("CARGO_PKG_VERSION")).into()),
+        ),
         ("connection_id", BoltValue::String("meshdb-bolt-1".into())),
         ("hints", BoltValue::Map(vec![])),
     ]);

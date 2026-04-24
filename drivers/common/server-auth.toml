@@ -1,0 +1,11 @@
+self_id = 1
+listen_address = "127.0.0.1:7401"
+data_dir = "drivers/.run/data-auth"
+bolt_address = "127.0.0.1:7687"
+
+[[bolt_auth.users]]
+username = "neo4j"
+# Plain-text "password" — fine for the matrix harness, the listener
+# never leaves loopback. Production deployments use the bcrypt form
+# (see mesh.toml at the repo root).
+password = "password"

@@ -54,7 +54,23 @@ pub const SUPPORTED: &[[u8; 4]] = &[BOLT_5_4, BOLT_5_3, BOLT_5_2, BOLT_5_1, BOLT
 /// chosen version bytes on success; emits `NoCompatibleVersion` when
 /// the client offered nothing we support (after writing `00000000`
 /// to the client so it can disconnect cleanly).
+///
+/// Picks from the full [`SUPPORTED`] list. To restrict the advertised
+/// set (e.g. to force a driver to negotiate down to Bolt 4.4 for a
+/// matrix-test cell), use [`perform_server_handshake_with`].
 pub async fn perform_server_handshake<IO>(io: &mut IO) -> Result<[u8; 4]>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    perform_server_handshake_with(io, SUPPORTED).await
+}
+
+/// Same as [`perform_server_handshake`] but picks from `allowed`
+/// instead of the full [`SUPPORTED`] list. The driver-matrix harness
+/// uses this to clamp the advertised versions per test cell — pinning
+/// drivers to specific Bolt versions without depending on driver-side
+/// version flags (which most Neo4j drivers don't expose).
+pub async fn perform_server_handshake_with<IO>(io: &mut IO, allowed: &[[u8; 4]]) -> Result<[u8; 4]>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
@@ -69,7 +85,7 @@ where
         io.read_exact(slot).await?;
     }
 
-    match pick_version(&slots) {
+    match pick_version_from(&slots, allowed) {
         Some(v) => {
             io.write_all(&v).await?;
             io.flush().await?;
@@ -117,9 +133,9 @@ where
     Ok(agreed)
 }
 
-/// Return the first supported version offered by the client, honoring
-/// each slot's `range` field. Empty slots are skipped.
-fn pick_version(slots: &[[u8; 4]; 4]) -> Option<[u8; 4]> {
+/// Return the first version from `allowed` that the client offered,
+/// honoring each slot's `range` field. Empty slots are skipped.
+fn pick_version_from(slots: &[[u8; 4]; 4], allowed: &[[u8; 4]]) -> Option<[u8; 4]> {
     for slot in slots {
         if *slot == [0, 0, 0, 0] {
             continue;
@@ -132,7 +148,7 @@ fn pick_version(slots: &[[u8; 4]; 4]) -> Option<[u8; 4]> {
                 break;
             }
             let candidate = [0, 0, minor - offset, major];
-            if SUPPORTED.iter().any(|v| *v == candidate) {
+            if allowed.iter().any(|v| *v == candidate) {
                 return Some(candidate);
             }
         }
@@ -218,6 +234,44 @@ mod tests {
             .unwrap();
         assert_eq!(agreed, BOLT_4_4);
         assert_eq!(server_task.await.unwrap().unwrap(), BOLT_4_4);
+    }
+
+    #[tokio::test]
+    async fn allowed_list_clamps_negotiation_to_4_4() {
+        // Client offers 5.4 + 5.0 + 4.4. Server's allowed list contains
+        // only 4.4 — verifies the matrix-test cell can pin a driver to
+        // a specific Bolt version even though the driver advertises
+        // newer ones first.
+        let (mut client, mut server) = duplex(64);
+        let server_task =
+            tokio::spawn(
+                async move { perform_server_handshake_with(&mut server, &[BOLT_4_4]).await },
+            );
+        let preferences = [BOLT_5_4, BOLT_5_0, BOLT_4_4, [0; 4]];
+        let agreed = perform_client_handshake(&mut client, &preferences)
+            .await
+            .unwrap();
+        assert_eq!(agreed, BOLT_4_4);
+        assert_eq!(server_task.await.unwrap().unwrap(), BOLT_4_4);
+    }
+
+    #[tokio::test]
+    async fn allowed_list_rejects_when_no_overlap() {
+        // Client offers only 5.4; server's allowed list is 4.4 only.
+        // Negotiation fails — the server writes 0000 and surfaces
+        // NoCompatibleVersion to its caller.
+        let (mut client, mut server) = duplex(64);
+        let server_task =
+            tokio::spawn(
+                async move { perform_server_handshake_with(&mut server, &[BOLT_4_4]).await },
+            );
+        let preferences = [BOLT_5_4, [0; 4], [0; 4], [0; 4]];
+        let err = perform_client_handshake(&mut client, &preferences)
+            .await
+            .unwrap_err();
+        matches!(err, BoltError::NoCompatibleVersion(_));
+        let server_err = server_task.await.unwrap().unwrap_err();
+        matches!(server_err, BoltError::NoCompatibleVersion(_));
     }
 
     #[tokio::test]

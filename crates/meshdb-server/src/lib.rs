@@ -401,12 +401,26 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         } else {
             "disabled"
         };
-        tracing::info!(addr = %bolt_local, auth = auth_state, tls = tls_state, "meshdb-server bolt listening");
+        let advertised = config
+            .resolved_bolt_versions()
+            .map_err(|e| anyhow::anyhow!("bolt_advertised_versions: {e}"))?
+            .map(Arc::new);
+        let advertised_state = match advertised.as_deref() {
+            Some(v) => format!("clamped to {} version(s)", v.len()),
+            None => "default (all 6)".to_string(),
+        };
+        tracing::info!(addr = %bolt_local, auth = auth_state, tls = tls_state, advertised = %advertised_state, "meshdb-server bolt listening");
         let bolt_service = service_arc.clone();
         let bolt_auth_clone = bolt_auth.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                bolt::run_listener(bolt_listener, bolt_service, bolt_auth_clone, tls_acceptor).await
+            if let Err(e) = bolt::run_listener(
+                bolt_listener,
+                bolt_service,
+                bolt_auth_clone,
+                tls_acceptor,
+                advertised,
+            )
+            .await
             {
                 tracing::error!(error = %e, "bolt listener exited");
             }

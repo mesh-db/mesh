@@ -102,6 +102,7 @@ async fn spawn_single_node_server() -> Harness {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -160,6 +161,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
         #[cfg(feature = "apoc-load")]
@@ -176,6 +178,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
         #[cfg(feature = "apoc-load")]
@@ -552,6 +555,7 @@ async fn build_components_single_node_has_no_raft() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -585,6 +589,7 @@ async fn build_components_multi_peer_builds_raft() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -621,6 +626,7 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
         #[cfg(feature = "apoc-load")]
@@ -677,6 +683,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -693,6 +700,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -846,6 +854,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -862,6 +871,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1062,6 +1072,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1078,6 +1089,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1215,6 +1227,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1231,6 +1244,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1371,6 +1385,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1387,6 +1402,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1622,6 +1638,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1638,6 +1655,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1737,6 +1755,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1893,6 +1912,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -1909,6 +1929,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -2074,6 +2095,7 @@ async fn cypher_merge_replicates_through_raft() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -2090,6 +2112,7 @@ async fn cypher_merge_replicates_through_raft() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -2234,6 +2257,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -2250,6 +2274,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -2397,6 +2422,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -2413,6 +2439,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]
@@ -2533,6 +2560,7 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
         metrics_address: None,
         bolt_auth: None,
         bolt_tls: None,
+        bolt_advertised_versions: None,
         grpc_tls: None,
         mode: None,
         #[cfg(feature = "apoc-load")]

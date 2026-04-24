@@ -74,3 +74,59 @@ jobs:
         env:
           TCK_FEATURES: ${{ github.workspace }}/tck/opencypher/tck/features
         run: cargo test --release -p meshdb-tck --test tck
+
+  driver-matrix-python:
+    name: Driver matrix (Python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Run after the Rust test job — driver-matrix burn isn't worth it on
+    # a tree that doesn't compile or fails its in-tree tests.
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev openssl
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build meshdb-server (release)
+        # Release binary so the listener latency is realistic — debug
+        # builds add 10–20ms per RUN, which masks driver timeouts on
+        # CPU-starved CI runners.
+        run: cargo build --release -p meshdb-server
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python driver
+        # Pinned to drivers/python/requirements.txt so a driver upgrade
+        # is an explicit commit, not a silent green-to-flaky shift.
+        run: |
+          python -m venv drivers/python/.venv
+          drivers/python/.venv/bin/pip install -q -r drivers/python/requirements.txt
+
+      - name: Run baseline matrix cell (bolt=5.4, auth=none, tls=off)
+        # Phase 1 wires a single representative cell. Phase 3 will
+        # expand to the per-PR matrix; the nightly full-axis run
+        # lives in a separate workflow file added at that point.
+        env:
+          PATH: ${{ github.workspace }}/drivers/python/.venv/bin:${{ env.PATH }}
+        run: drivers/run-matrix.sh --lang=py --auth=none --tls=off --bolt=5.4
+
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-matrix-python-logs
+          path: drivers/.run/logs/
+          if-no-files-found: ignore

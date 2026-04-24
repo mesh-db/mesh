@@ -95,6 +95,19 @@ pub struct ServerConfig {
     #[serde(default)]
     pub bolt_tls: Option<BoltTlsConfig>,
 
+    /// Optional clamp on which Bolt versions the listener advertises.
+    /// Each entry is one of `"4.4"`, `"5.0"`, `"5.1"`, `"5.2"`, `"5.3"`,
+    /// `"5.4"`. Omitted (or empty) → advertise the full
+    /// [`meshdb_bolt::SUPPORTED`] set, which is the default behaviour
+    /// every existing config relies on.
+    ///
+    /// Used by the driver-matrix harness to pin a connecting driver to
+    /// a specific Bolt version per test cell — Neo4j drivers don't
+    /// expose a wire-version flag, so the only way to force them to
+    /// negotiate down is to trim what the server advertises.
+    #[serde(default)]
+    pub bolt_advertised_versions: Option<Vec<String>>,
+
     /// Optional TLS for the gRPC listener and outgoing inter-peer gRPC
     /// channels. Every peer is both a gRPC server and a gRPC client
     /// (Raft heartbeats, leader forwarding, scatter-gather reads), so
@@ -357,6 +370,44 @@ impl ServerConfig {
             .map_err(|e| anyhow::anyhow!("reading config file {}: {}", path.display(), e))?;
         Self::from_toml_str(&contents)
             .map_err(|e| anyhow::anyhow!("parsing config file {}: {}", path.display(), e))
+    }
+
+    /// Resolve `bolt_advertised_versions` to the wire-format byte
+    /// triples consumed by [`meshdb_bolt::perform_server_handshake_with`].
+    /// Returns `None` when the config doesn't restrict the set (the
+    /// listener should advertise the full [`meshdb_bolt::SUPPORTED`]
+    /// list); returns `Some(vec)` ordered newest-first so the
+    /// negotiation honours preference even on a clamped set.
+    /// `Err` on an unrecognised label.
+    pub fn resolved_bolt_versions(&self) -> Result<Option<Vec<[u8; 4]>>, String> {
+        let Some(labels) = &self.bolt_advertised_versions else {
+            return Ok(None);
+        };
+        if labels.is_empty() {
+            return Ok(None);
+        }
+        let mut bytes = Vec::with_capacity(labels.len());
+        for label in labels {
+            let v = match label.as_str() {
+                "4.4" => meshdb_bolt::BOLT_4_4,
+                "5.0" => meshdb_bolt::BOLT_5_0,
+                "5.1" => meshdb_bolt::BOLT_5_1,
+                "5.2" => meshdb_bolt::BOLT_5_2,
+                "5.3" => meshdb_bolt::BOLT_5_3,
+                "5.4" => meshdb_bolt::BOLT_5_4,
+                other => {
+                    return Err(format!(
+                        "bolt_advertised_versions entry `{other}` is not one of \
+                         4.4, 5.0, 5.1, 5.2, 5.3, 5.4"
+                    ))
+                }
+            };
+            bytes.push(v);
+        }
+        // Sort newest-first to match SUPPORTED's preference order.
+        bytes.sort_by(|a, b| (b[3], b[2]).cmp(&(a[3], a[2])));
+        bytes.dedup();
+        Ok(Some(bytes))
     }
 
     /// Resolve the cluster mode, falling back to the legacy implicit

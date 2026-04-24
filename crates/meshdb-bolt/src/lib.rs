@@ -22,8 +22,8 @@ mod value;
 pub use error::{BoltError, Result};
 pub use framing::{read_message, write_message, MAX_CHUNK_SIZE};
 pub use handshake::{
-    perform_client_handshake, perform_server_handshake, version_bytes, BOLT_4_4, BOLT_5_0,
-    BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4, PREAMBLE, SUPPORTED,
+    perform_client_handshake, perform_server_handshake, perform_server_handshake_with,
+    version_bytes, BOLT_4_4, BOLT_5_0, BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4, PREAMBLE, SUPPORTED,
 };
 pub use message::{
     BoltMessage, TAG_BEGIN, TAG_COMMIT, TAG_DATE, TAG_DATE_TIME, TAG_DATE_TIME_LEGACY,

@@ -94,6 +94,7 @@ impl Cli {
             metrics_address: self.metrics_address,
             bolt_auth: None,
             bolt_tls: None,
+            bolt_advertised_versions: None,
             grpc_tls: None,
             mode: self.mode,
             #[cfg(feature = "apoc-load")]
@@ -242,6 +243,7 @@ mod tests {
             metrics_address: None,
             bolt_auth: None,
             bolt_tls: None,
+            bolt_advertised_versions: None,
             grpc_tls: None,
             mode: None,
             #[cfg(feature = "apoc-load")]
@@ -265,6 +267,7 @@ mod tests {
             metrics_address: None,
             bolt_auth: None,
             bolt_tls: None,
+            bolt_advertised_versions: None,
             grpc_tls: None,
             mode: None,
             #[cfg(feature = "apoc-load")]

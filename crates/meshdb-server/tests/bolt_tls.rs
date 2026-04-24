@@ -51,7 +51,7 @@ async fn spawn_tls_bolt_server() -> (String, TempDir) {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let _ = run_listener(listener, service, None, Some(acceptor)).await;
+        let _ = run_listener(listener, service, None, Some(acceptor), None).await;
     });
 
     // Give the listener a moment to enter its accept loop.

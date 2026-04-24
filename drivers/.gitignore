@@ -1,0 +1,9 @@
+.run/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/node_modules/
+**/target/
+**/*.iml
+**/.gradle/
+**/.idea/

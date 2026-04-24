@@ -1,0 +1,5 @@
+self_id = 1
+listen_address = "127.0.0.1:7401"
+data_dir = "drivers/.run/data-bolt44"
+bolt_address = "127.0.0.1:7687"
+bolt_advertised_versions = ["4.4"]
