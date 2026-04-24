@@ -2,6 +2,7 @@ use crate::{EdgeId, NodeId};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("invalid property type: expected {expected}, got {actual}")]
     InvalidPropertyType {

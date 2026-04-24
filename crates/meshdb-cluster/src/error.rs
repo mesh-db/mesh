@@ -2,6 +2,7 @@ use crate::PeerId;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("cluster must have at least one peer")]
     NoPeers,

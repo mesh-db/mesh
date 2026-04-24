@@ -2,6 +2,7 @@ use meshdb_core::{EdgeId, NodeId};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("rocksdb: {0}")]
     RocksDb(#[from] rocksdb::Error),

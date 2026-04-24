@@ -4841,6 +4841,10 @@ fn call_apoc_scalar(name: &str, arg_exprs: &[Expr], ctx: &EvalCtx) -> Result<Val
             "{name} expects {expected} argument(s), got {got}",
         ))),
         Err(meshdb_apoc::ApocError::TypeMismatch { .. }) => Err(Error::TypeMismatch),
+        // `ApocError` is `#[non_exhaustive]`; future variants fall
+        // back to the generic type-mismatch shape until we decide
+        // on a dedicated Cypher-level surface.
+        Err(_) => Err(Error::TypeMismatch),
     }
 }
 

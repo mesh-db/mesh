@@ -72,6 +72,7 @@ pub mod meta;
 /// translate them into a user-facing `Error::Unsupported` /
 /// `Error::TypeMismatch` without further context.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApocError {
     /// The caller asked for a function this build of `meshdb-apoc`
     /// doesn't export. Either the name is mistyped or it's part of
