@@ -39,6 +39,15 @@ deployment" cell):
 drivers/run-matrix.sh --lang=java --auth=basic --tls=on --bolt=5.4
 ```
 
+`--mode=routing` spins up two Raft peers with cross-linked
+`peers[].bolt_address` so the ROUTE table the driver receives
+lists both. Drivers still connect to peer A; `neo4j://` sessions
+exercise the ROUTE path and the leader-aware WRITE role.
+
+```sh
+drivers/run-matrix.sh --lang=py --mode=routing
+```
+
 See the per-language READMEs for venv / npm / go mod / Maven
 bootstrap.
 
@@ -49,10 +58,11 @@ bootstrap.
   baseline and the `auth=basic, tls=on` production shape. 8
   cells total, parallelized across four jobs.
 - **Nightly full axis** (`.github/workflows/driver-matrix-full.yml`):
-  Monday 06:00 UTC. Walks the full Bolt version × auth × TLS grid
-  per language — 12 cells × 4 drivers = 48 cells, parallelized
-  via matrix strategy. Failures open (or refresh) a GitHub issue;
-  the next green run closes it. Also manually dispatchable.
+  Monday 06:00 UTC. Walks the full Bolt version × auth × TLS ×
+  mode grid per language — 24 cells × 4 drivers = 96 cells,
+  parallelized via matrix strategy. Failures open (or refresh) a
+  GitHub issue; the next green run closes it. Also manually
+  dispatchable.
 
 ## Known gaps
 

@@ -1,9 +1,10 @@
 name: Driver matrix (full axis)
 
-# Walks the complete Bolt version × auth × TLS grid across every
-# language driver. Per-PR CI (ci.yml) runs the two representative
-# cells per language; this workflow covers the other 10 per language
-# = 40 cells total, parallelized via a matrix strategy.
+# Walks the complete Bolt version × auth × TLS × mode grid across
+# every language driver. Per-PR CI (ci.yml) runs two representative
+# cells per language; this workflow covers everything else —
+# 3 × 2 × 2 × 2 = 24 cells per language × 4 drivers = 96 cells total,
+# parallelized via a matrix strategy.
 #
 # Schedule: Monday 06:00 UTC. Weekly cadence is enough signal for a
 # compat surface that otherwise moves on driver-release cadence
@@ -57,7 +58,7 @@ jobs:
           retention-days: 7
 
   python:
-    name: "python / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }}"
+    name: "python / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }} / mode=${{ matrix.mode }}"
     needs: build-server
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -67,6 +68,7 @@ jobs:
         bolt: ['5.4', '5.0', '4.4']
         auth: ['none', 'basic']
         tls: ['off', 'on']
+        mode: ['single', 'routing']
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -95,16 +97,17 @@ jobs:
           --bolt=${{ matrix.bolt }}
           --auth=${{ matrix.auth }}
           --tls=${{ matrix.tls }}
+          --mode=${{ matrix.mode }}
       - name: Upload server logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-python-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}
+          name: logs-python-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}-${{ matrix.mode }}
           path: drivers/.run/logs/
           if-no-files-found: ignore
 
   js:
-    name: "js / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }}"
+    name: "js / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }} / mode=${{ matrix.mode }}"
     needs: build-server
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -114,6 +117,7 @@ jobs:
         bolt: ['5.4', '5.0', '4.4']
         auth: ['none', 'basic']
         tls: ['off', 'on']
+        mode: ['single', 'routing']
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -137,16 +141,17 @@ jobs:
           --bolt=${{ matrix.bolt }}
           --auth=${{ matrix.auth }}
           --tls=${{ matrix.tls }}
+          --mode=${{ matrix.mode }}
       - name: Upload server logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-js-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}
+          name: logs-js-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}-${{ matrix.mode }}
           path: drivers/.run/logs/
           if-no-files-found: ignore
 
   go:
-    name: "go / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }}"
+    name: "go / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }} / mode=${{ matrix.mode }}"
     needs: build-server
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -156,6 +161,7 @@ jobs:
         bolt: ['5.4', '5.0', '4.4']
         auth: ['none', 'basic']
         tls: ['off', 'on']
+        mode: ['single', 'routing']
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -180,16 +186,17 @@ jobs:
           --bolt=${{ matrix.bolt }}
           --auth=${{ matrix.auth }}
           --tls=${{ matrix.tls }}
+          --mode=${{ matrix.mode }}
       - name: Upload server logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-go-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}
+          name: logs-go-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}-${{ matrix.mode }}
           path: drivers/.run/logs/
           if-no-files-found: ignore
 
   java:
-    name: "java / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }}"
+    name: "java / bolt=${{ matrix.bolt }} / auth=${{ matrix.auth }} / tls=${{ matrix.tls }} / mode=${{ matrix.mode }}"
     needs: build-server
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -199,6 +206,7 @@ jobs:
         bolt: ['5.4', '5.0', '4.4']
         auth: ['none', 'basic']
         tls: ['off', 'on']
+        mode: ['single', 'routing']
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -223,11 +231,12 @@ jobs:
           --bolt=${{ matrix.bolt }}
           --auth=${{ matrix.auth }}
           --tls=${{ matrix.tls }}
+          --mode=${{ matrix.mode }}
       - name: Upload server logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-java-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}
+          name: logs-java-${{ matrix.bolt }}-${{ matrix.auth }}-${{ matrix.tls }}-${{ matrix.mode }}
           path: drivers/.run/logs/
           if-no-files-found: ignore
 
@@ -288,7 +297,7 @@ jobs:
           - java: ${{ needs.java.result }}
 
           Server logs for failing cells are attached as artifacts
-          named \`logs-<lang>-<bolt>-<auth>-<tls>\`."
+          named \`logs-<lang>-<bolt>-<auth>-<tls>-<mode>\`."
 
           if [ -n "$EXISTING_URL" ]; then
             echo "Refreshing $EXISTING_URL"
