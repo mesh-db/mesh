@@ -287,6 +287,24 @@ fn put_node_on_owner(node: &Node, h: &TwoPeer) -> PeerId {
     owner
 }
 
+/// Generate fresh nodes until one hashes onto `peer`. Used by
+/// scatter-gather tests that need a guaranteed per-peer source
+/// count — `Node::new()` uses random UUID v7 ids, and at low
+/// sample sizes the hash partitioner can land every node on one
+/// side, trivially defeating any scatter-gather coverage. Looping
+/// until we get a desired-owner id keeps the distribution
+/// deterministic. Bounded to 256 tries so a wedged partitioner
+/// fails the test instead of hanging.
+fn fresh_node_owned_by(cluster: &Cluster, peer: PeerId) -> Node {
+    for _ in 0..256 {
+        let n = Node::new();
+        if cluster.owner_of(n.id) == peer {
+            return n;
+        }
+    }
+    panic!("could not find a node owned by {peer:?} after 256 tries");
+}
+
 /// Two-peer harness extended with an on-disk coordinator log for peer
 /// A, so recovery tests can manipulate the log directly and then call
 /// `service_a.recover_pending_transactions()` through the local
@@ -478,44 +496,37 @@ async fn edges_by_property_scatter_gathers_across_peers() {
     h.store_a.create_edge_property_index("R", "k").unwrap();
     h.store_b.create_edge_property_index("R", "k").unwrap();
 
-    // Build 20 edges, distributing sources across both peers so the
-    // union-across-peers path is actually exercised.
-    let mut owned_by_a = 0;
-    let mut owned_by_b = 0;
+    // Build 20 edges with source ownership split 10/10 across the two
+    // peers, so the scatter-gather path is guaranteed to be exercised.
+    // Previously the test used random `Node::new()` sources and relied
+    // on hash partitioning to balance the distribution — at this small
+    // sample size that's ~0.2% per-run flake risk (CI run 24871287307
+    // hit it). Pre-choosing sources by owner removes the flake by
+    // construction. Five k=42 + five k=99 per peer: k=42 is the seek
+    // target (total 10), k=99 rows verify the filter is applied.
     let mut edge_ids_with_k_42: Vec<_> = Vec::new();
-    for i in 0..20 {
-        let src = Node::new();
-        let dst = Node::new();
-        put_node_on_owner(&src, &h);
-        put_node_on_owner(&dst, &h);
-        // Half the edges carry k=42 (the seek target); the other half
-        // carry k=99 so we also confirm the filter is applied.
-        let k_val: i64 = if i % 2 == 0 { 42 } else { 99 };
-        let edge = Edge::new("R", src.id, dst.id).with_property("k", k_val);
-        // Edges live on the source-owner's partition.
-        match h.cluster_a.owner_of(src.id) {
-            PeerId(1) => {
-                h.store_a.put_edge(&edge).unwrap();
-                if k_val == 42 {
-                    owned_by_a += 1;
-                }
+    for peer in [PeerId(1), PeerId(2)] {
+        let store = match peer {
+            PeerId(1) => &h.store_a,
+            PeerId(2) => &h.store_b,
+            other => panic!("unexpected peer {other:?}"),
+        };
+        for k_val in [42, 42, 42, 42, 42, 99, 99, 99, 99, 99] {
+            let src = fresh_node_owned_by(&h.cluster_a, peer);
+            let dst = Node::new();
+            put_node_on_owner(&src, &h);
+            put_node_on_owner(&dst, &h);
+            let edge = Edge::new("R", src.id, dst.id).with_property("k", k_val);
+            store.put_edge(&edge).unwrap();
+            if k_val == 42 {
+                edge_ids_with_k_42.push(edge.id);
             }
-            PeerId(2) => {
-                h.store_b.put_edge(&edge).unwrap();
-                if k_val == 42 {
-                    owned_by_b += 1;
-                }
-            }
-            other => panic!("unexpected owner {other:?}"),
-        }
-        if k_val == 42 {
-            edge_ids_with_k_42.push(edge.id);
         }
     }
-    assert!(
-        owned_by_a > 0 && owned_by_b > 0,
-        "edge distribution is too lopsided for the scatter-gather test: a={owned_by_a}, b={owned_by_b}"
-    );
+    // Sanity: 5 targets per peer, 10 total — no randomness, but an
+    // explicit count keeps this readable alongside the scatter-gather
+    // assertion below.
+    assert_eq!(edge_ids_with_k_42.len(), 10);
 
     let mut client = MeshQueryClient::connect(h.client_addr_a.clone())
         .await
@@ -533,7 +544,8 @@ async fn edges_by_property_scatter_gathers_across_peers() {
     let got = resp.into_inner().ids.len();
     assert_eq!(got, edge_ids_with_k_42.len(), "scatter-gather result size");
 
-    // local_only=true on peer A must omit peer B's edges.
+    // local_only=true on peer A must omit peer B's edges — 5 k=42
+    // edges sourced on peer A, by construction.
     let resp_local = client
         .edges_by_property(EdgesByPropertyRequest {
             edge_type: "R".into(),
@@ -543,7 +555,7 @@ async fn edges_by_property_scatter_gathers_across_peers() {
         })
         .await
         .unwrap();
-    assert_eq!(resp_local.into_inner().ids.len(), owned_by_a);
+    assert_eq!(resp_local.into_inner().ids.len(), 5);
 }
 
 #[tokio::test]
