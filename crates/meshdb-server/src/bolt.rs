@@ -120,6 +120,7 @@ pub async fn run_listener(
     auth: Option<Arc<crate::config::BoltAuthConfig>>,
     tls: Option<TlsAcceptor>,
     advertised_versions: Option<Arc<Vec<[u8; 4]>>>,
+    advertised_address: Arc<String>,
 ) -> anyhow::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -128,6 +129,7 @@ pub async fn run_listener(
         let auth = auth.clone();
         let tls = tls.clone();
         let advertised = advertised_versions.clone();
+        let advertised_addr = advertised_address.clone();
         tokio::spawn(async move {
             // If TLS is configured, negotiate it before handing the
             // socket to the Bolt state machine. `serve_connection` is
@@ -137,7 +139,8 @@ pub async fn run_listener(
                 Some(acceptor) => match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
                         if let Err(e) =
-                            serve_connection(tls_stream, service, auth, advertised).await
+                            serve_connection(tls_stream, service, auth, advertised, advertised_addr)
+                                .await
                         {
                             tracing::warn!(%peer, error = %e, "bolt connection terminated");
                         } else {
@@ -149,7 +152,9 @@ pub async fn run_listener(
                     }
                 },
                 None => {
-                    if let Err(e) = serve_connection(socket, service, auth, advertised).await {
+                    if let Err(e) =
+                        serve_connection(socket, service, auth, advertised, advertised_addr).await
+                    {
                         tracing::warn!(%peer, error = %e, "bolt connection terminated");
                     } else {
                         tracing::debug!(%peer, "bolt connection closed cleanly");
@@ -219,6 +224,7 @@ pub async fn serve_connection<S>(
     service: Arc<MeshService>,
     auth: Option<Arc<crate::config::BoltAuthConfig>>,
     advertised_versions: Option<Arc<Vec<[u8; 4]>>>,
+    advertised_address: Arc<String>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -350,7 +356,7 @@ where
             // Bolt 4.4+ ROUTE — reply with a single-node routing table
             // pointing at this server.
             (_, BoltMessage::Route { .. }) => {
-                send(&mut writer, &route_success()).await?;
+                send(&mut writer, &route_success(&advertised_address)).await?;
             }
 
             // -- Authenticating phase (Bolt 5.1+) ----------------------
@@ -757,26 +763,38 @@ fn bolt_version_label(v: [u8; 4]) -> anyhow::Result<&'static str> {
     }
 }
 
-/// Reply to a ROUTE request with a single-node routing table pointing at
-/// this server. Mesh is single-node today; a real routing table for a
-/// clustered deployment would come from the cluster membership layer.
-fn route_success() -> BoltMessage {
-    // Routing-table shape expected by Neo4j drivers: `{rt: {ttl,
-    // servers, db}}` where servers is a list of `{addresses, role}`.
-    // Setting a long TTL and one "ROUTE/READ/WRITE" entry pointing to
-    // the driver's own address effectively tells the driver "talk
-    // directly to me".
+/// Reply to a ROUTE request with a proper routing table pointing at
+/// this server. Neo4j drivers expect three `{addresses, role}` entries
+/// — ROUTE, READ, and WRITE — each with at least one address the
+/// driver can reach.
+///
+/// Single-node semantics (current Mesh): every role points at the
+/// same address — the server's configured `bolt_address`. Under
+/// `mode = "routing"` the routing table would ideally list every
+/// peer under ROUTE/READ and the 2PC coordinator under WRITE; until
+/// that's wired up, a single-address table still works because
+/// drivers retry and Mesh's 2PC coordinator sits on every peer.
+///
+/// TTL is set long enough (~292 years) that drivers never re-query
+/// the routing table for a single-node deployment — there's nothing
+/// to learn that changes.
+fn route_success(advertised_address: &str) -> BoltMessage {
+    let one_address = BoltValue::List(vec![BoltValue::String(advertised_address.to_string())]);
+    let server_entry = |role: &str| -> BoltValue {
+        BoltValue::map([
+            ("addresses", one_address.clone()),
+            ("role", BoltValue::String(role.to_string())),
+        ])
+    };
     let rt = BoltValue::map([
         ("ttl", BoltValue::Int(9_223_372_036)),
         (
             "servers",
-            BoltValue::List(vec![BoltValue::map([
-                (
-                    "addresses",
-                    BoltValue::List(vec![BoltValue::String("".into())]),
-                ),
-                ("role", BoltValue::String("ROUTE".into())),
-            ])]),
+            BoltValue::List(vec![
+                server_entry("ROUTE"),
+                server_entry("READ"),
+                server_entry("WRITE"),
+            ]),
         ),
         ("db", BoltValue::String("neo4j".into())),
     ]);

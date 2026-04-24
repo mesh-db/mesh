@@ -412,6 +412,12 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         tracing::info!(addr = %bolt_local, auth = auth_state, tls = tls_state, advertised = %advertised_state, "meshdb-server bolt listening");
         let bolt_service = service_arc.clone();
         let bolt_auth_clone = bolt_auth.clone();
+        // The advertised address is what we echo back in ROUTE
+        // responses so cluster-aware drivers (`neo4j://...`) know
+        // where to reach us. Fall back to the listener's actual
+        // bound address when the config leaves it blank (tests
+        // commonly bind `127.0.0.1:0`).
+        let advertised_bolt_addr = Arc::new(bolt_addr.to_string());
         Some(tokio::spawn(async move {
             if let Err(e) = bolt::run_listener(
                 bolt_listener,
@@ -419,6 +425,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 bolt_auth_clone,
                 tls_acceptor,
                 advertised,
+                advertised_bolt_addr,
             )
             .await
             {

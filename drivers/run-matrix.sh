@@ -89,7 +89,13 @@ fi
   echo "self_id = 1"
   echo 'listen_address = "127.0.0.1:7401"'
   echo "data_dir = \"$DATA_DIR\""
-  echo 'bolt_address = "127.0.0.1:7687"'
+  # Bind Bolt to `localhost` rather than `127.0.0.1`. The server
+  # echoes this address back in its ROUTE reply, and some drivers
+  # (neo4j-javascript-driver via Node's tls layer, JSSE) refuse
+  # SNI on bare IP literals under TLS. `localhost` resolves to
+  # 127.0.0.1 on every Linux + macOS runner we care about, so the
+  # bind target is identical — only the advertised string differs.
+  echo 'bolt_address = "localhost:7687"'
   if [[ "$BOLT" != "auto" ]]; then
     echo "bolt_advertised_versions = [\"$BOLT\"]"
   fi

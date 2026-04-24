@@ -48,4 +48,31 @@ class SmokeTest {
             assertNotNull(result.consume());
         }
     }
+
+    @Test
+    void routingSchemeConnectsAndRuns() {
+        // `neo4j://` triggers the driver's cluster-aware path: it
+        // sends ROUTE on first connect, parses the routing table,
+        // and opens role-specific connection pools. Validates
+        // Mesh's ROUTE response is spec-compliant.
+        String host = System.getenv().getOrDefault("MESH_BOLT_HOST", "127.0.0.1");
+        String port = System.getenv().getOrDefault("MESH_BOLT_PORT", "7687");
+        String tls = System.getenv().getOrDefault("MESH_BOLT_TLS", "off");
+        String auth = System.getenv().getOrDefault("MESH_BOLT_AUTH", "none");
+        // JSSE refuses SNI on IP literals — swap for the TLS cell.
+        if ("on".equals(tls) && "127.0.0.1".equals(host)) {
+            host = "localhost";
+        }
+        String scheme = "on".equals(tls) ? "neo4j+ssc" : "neo4j";
+        String uri = scheme + "://" + host + ":" + port;
+        org.neo4j.driver.AuthToken token = "basic".equals(auth)
+            ? org.neo4j.driver.AuthTokens.basic("neo4j", "password")
+            : org.neo4j.driver.AuthTokens.none();
+        try (org.neo4j.driver.Driver routing =
+                 org.neo4j.driver.GraphDatabase.driver(uri, token);
+             Session session = routing.session()) {
+            long n = session.run("RETURN 1 AS n").single().get("n").asLong();
+            assertEquals(1L, n);
+        }
+    }
 }

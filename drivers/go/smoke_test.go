@@ -56,3 +56,44 @@ func TestHelloCompletes(t *testing.T) {
 		t.Fatalf("VerifyConnectivity: %v", err)
 	}
 }
+
+func TestRoutingSchemeConnectsAndRuns(t *testing.T) {
+	// `neo4j://` triggers the driver's cluster-aware path: it sends
+	// ROUTE on first connect, parses the routing table, and opens
+	// role-specific connection pools. Validates Mesh's ROUTE
+	// response is spec-compliant (3-entry ROUTE/READ/WRITE table).
+	ctx := context.Background()
+	host := envOr("MESH_BOLT_HOST", "127.0.0.1")
+	port := envOr("MESH_BOLT_PORT", "7687")
+	tls := envOr("MESH_BOLT_TLS", "off")
+	// Go's crypto/tls refuses SNI on IP literals; swap to localhost
+	// for the TLS cell (cert's SAN covers both).
+	if tls == "on" && host == "127.0.0.1" {
+		host = "localhost"
+	}
+	scheme := "neo4j"
+	if tls == "on" {
+		scheme = "neo4j+ssc"
+	}
+	uri := scheme + "://" + host + ":" + port
+	drv, err := neo4j.NewDriverWithContext(uri, authToken())
+	if err != nil {
+		t.Fatalf("open routing driver: %v", err)
+	}
+	defer drv.Close(ctx)
+
+	session := drv.NewSession(ctx, neo4j.SessionConfig{})
+	defer session.Close(ctx)
+	result, err := session.Run(ctx, "RETURN 1 AS n", nil)
+	if err != nil {
+		t.Fatalf("routing RUN: %v", err)
+	}
+	record, err := result.Single(ctx)
+	if err != nil {
+		t.Fatalf("routing Single: %v", err)
+	}
+	got, _ := record.Get("n")
+	if got.(int64) != 1 {
+		t.Errorf("routing RETURN 1 got %v, want 1", got)
+	}
+}
