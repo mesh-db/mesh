@@ -541,9 +541,6 @@ pair, `ca_path` to the shared CA bundle.
 - **GQL quantified path patterns** — parenthesized-subpath form like
   `((a)-[:T]-(b))+` — aren't parsed. The Neo4j 5 relationship-level
   shorthand (`->+`, `->*`, `->{n,m}`) is fully supported.
-- **`allShortestPaths`** parses but the planner rejects it; single
-  `shortestPath(...)` works. Multi-shortest-path support is a
-  post-0.1 item.
 - **Vectorized / columnar execution** — Mesh uses a Volcano/iterator
   model throughout. Analytical workloads at 100M+ rows would
   eventually want vectorization; OLTP and bounded-traversal workloads

@@ -8152,6 +8152,289 @@ fn all_shortest_paths_respects_max_hops() {
 }
 
 #[test]
+fn all_shortest_paths_with_cycle_off_path() {
+    // Graph: A→B→C plus a B↔X cycle hanging off B. The cycle must
+    // not produce duplicate or longer paths from A to C — BFS's
+    // visited check is what guarantees that, so this is a
+    // regression assertion against the parent-DAG accidentally
+    // recording cycle edges.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), \
+                 (:Person {name: 'C'}), (:Person {name: 'X'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}), (c:Person {name: 'C'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}), (x:Person {name: 'X'}) \
+         CREATE (b)-[:KNOWS]->(x)",
+    );
+    run(
+        &store,
+        "MATCH (x:Person {name: 'X'}), (b:Person {name: 'B'}) \
+         CREATE (x)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(c)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 2);
+}
+
+#[test]
+fn all_shortest_paths_parallel_edges_yield_distinct_paths() {
+    // Two `:KNOWS` edges between the same pair. Each is a distinct
+    // shortest path of length 1, so allShortestPaths should return
+    // two rows referencing different edge ids.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(b)) \
+         RETURN length(p) AS len, relationships(p) AS rs",
+    );
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        assert_eq!(int_prop(r, "len"), 1);
+    }
+    let edge_ids: Vec<_> = rows
+        .iter()
+        .map(|r| match r.get("rs") {
+            Some(Value::List(items)) if items.len() == 1 => match &items[0] {
+                Value::Edge(e) => e.id,
+                other => panic!("expected Edge, got {other:?}"),
+            },
+            other => panic!("expected single-element list, got {other:?}"),
+        })
+        .collect();
+    assert_ne!(edge_ids[0], edge_ids[1]);
+}
+
+#[test]
+fn all_shortest_paths_undirected_pattern_traverses_both_directions() {
+    // A→B and C→B (both edges point to B). Undirected
+    // (a)-[:KNOWS*..N]-(c) follows out + in, so finds A→B←C as a
+    // 2-hop shortest path.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), (:Person {name: 'C'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (c:Person {name: 'C'}), (b:Person {name: 'B'}) \
+         CREATE (c)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]-(c)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 2);
+}
+
+#[test]
+fn all_shortest_paths_reverse_direction_follows_incoming_edges() {
+    // B→A and C→B (both forward-directed). The reverse-arrow query
+    // (a)<-[:KNOWS*..N]-(c) walks incoming edges, finding A←B←C.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), (:Person {name: 'C'})",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}), (a:Person {name: 'A'}) \
+         CREATE (b)-[:KNOWS]->(a)",
+    );
+    run(
+        &store,
+        "MATCH (c:Person {name: 'C'}), (b:Person {name: 'B'}) \
+         CREATE (c)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) \
+         MATCH p = allShortestPaths((a)<-[:KNOWS*..5]-(c)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 2);
+}
+
+#[test]
+fn all_shortest_paths_edge_type_union_includes_both() {
+    // A-[:KNOWS]→B and A-[:FRIEND]→B. Querying `[:KNOWS|FRIEND]`
+    // should treat both edges as alternative shortest paths of
+    // length 1.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:FRIEND]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS|FRIEND*..5]->(b)) \
+         RETURN length(p) AS len, relationships(p) AS rs",
+    );
+    assert_eq!(rows.len(), 2);
+    let edge_types: std::collections::BTreeSet<String> = rows
+        .iter()
+        .map(|r| match r.get("rs") {
+            Some(Value::List(items)) if items.len() == 1 => match &items[0] {
+                Value::Edge(e) => e.edge_type.clone(),
+                other => panic!("expected Edge, got {other:?}"),
+            },
+            other => panic!("expected single-element list, got {other:?}"),
+        })
+        .collect();
+    let expected: std::collections::BTreeSet<String> =
+        ["KNOWS", "FRIEND"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(edge_types, expected);
+}
+
+#[test]
+fn all_shortest_paths_self_loop_does_not_pollute_results() {
+    // A→B→C plus a B→B self-loop. The self-loop creates a
+    // length-3 path A→B→B→C, but BFS's visited check should
+    // prefer the length-2 path. Exactly one path of length 2 is
+    // returned.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), (:Person {name: 'C'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}), (c:Person {name: 'C'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}) CREATE (b)-[:KNOWS]->(b)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(c)) \
+         RETURN length(p) AS len",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_prop(&rows[0], "len"), 2);
+}
+
+#[test]
+fn all_shortest_paths_diamond_returns_distinct_node_lists() {
+    // Diamond A→{B,C}→D. Beyond just length, the two returned
+    // paths should pass through distinct middle nodes B and C —
+    // this catches a regression where the parent-DAG walk
+    // collapses to a single path or duplicates one of them.
+    let (store, _d) = open_store();
+    run(
+        &store,
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), \
+                 (:Person {name: 'C'}), (:Person {name: 'D'})",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    );
+    run(
+        &store,
+        "MATCH (b:Person {name: 'B'}), (d:Person {name: 'D'}) \
+         CREATE (b)-[:KNOWS]->(d)",
+    );
+    run(
+        &store,
+        "MATCH (c:Person {name: 'C'}), (d:Person {name: 'D'}) \
+         CREATE (c)-[:KNOWS]->(d)",
+    );
+    let rows = run(
+        &store,
+        "MATCH (a:Person {name: 'A'}), (d:Person {name: 'D'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(d)) \
+         RETURN nodes(p) AS ns",
+    );
+    assert_eq!(rows.len(), 2);
+    let mid_names: std::collections::BTreeSet<String> = rows
+        .iter()
+        .map(|r| match r.get("ns") {
+            Some(Value::List(items)) if items.len() == 3 => match &items[1] {
+                Value::Node(n) => n
+                    .properties
+                    .get("name")
+                    .and_then(|p| match p {
+                        Property::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .expect("middle node has name"),
+                other => panic!("expected Node, got {other:?}"),
+            },
+            other => panic!("expected 3-element list, got {other:?}"),
+        })
+        .collect();
+    let expected: std::collections::BTreeSet<String> =
+        ["B", "C"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(mid_names, expected);
+}
+
+#[test]
 fn shortest_path_without_upper_bound_rejected() {
     let parsed = meshdb_cypher::parse(
         "MATCH (a:Person), (b:Person) \

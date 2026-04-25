@@ -3561,15 +3561,17 @@ fn plan_pattern_from_bound(
     Ok(wrap_with_bind_path(plan, &working, &start_var, pattern_idx))
 }
 
-/// Lower a `shortestPath((a)-[:R*..N]->(b))` pattern to a
-/// `LogicalPlan::ShortestPath` operator. Enforces the v1
-/// restrictions: the start must be a bound variable, the
-/// pattern must have exactly one hop with a variable-length
-/// spec (`[*..N]` or `[*M..N]`), that spec must carry an
-/// upper bound, the target must be a bound variable, no
-/// path-less hops (would be covered by a plain expand), and
-/// `allShortestPaths` is rejected outright since v1 only
-/// implements `shortestPath`.
+/// Lower a `shortestPath((a)-[:R*..N]->(b))` or
+/// `allShortestPaths(...)` pattern to a
+/// `LogicalPlan::ShortestPath` operator. Both kinds share the
+/// same logical operator and the same executor BFS — `kind`
+/// only changes whether the parent-DAG reconstruction stops
+/// at the first complete path or enumerates every minimum-
+/// length path. Enforces the same restrictions for both: the
+/// start must be a bound variable, the pattern must have
+/// exactly one hop with a variable-length spec (`[*..N]` or
+/// `[*M..N]`), that spec must carry an upper bound, and the
+/// target must be a bound variable.
 fn plan_shortest_path(
     input: LogicalPlan,
     pattern: &Pattern,

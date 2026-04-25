@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`allShortestPaths(...)`** is now a supported planner +
+  executor surface. The shared layered-BFS operator builds a
+  parent DAG that records every `(parent, edge)` pair at each
+  shortest-path level, and the reconstruction walk enumerates
+  every minimum-length path (vs. `shortestPath(...)`'s single-
+  path early exit). Cycles, parallel edges, undirected
+  patterns, reverse direction, edge-type unions, and self-loops
+  are all covered by integration tests in
+  `crates/meshdb-executor/tests/integration.rs`. The capability
+  was already present in code but documented as deferred — this
+  release sheds the deferral and locks in the behavior with
+  paranoia tests.
+
 ## [0.1.0] - 2026-04-24
 
 First stable minor cut from the alpha line. No breaking changes to
@@ -46,8 +61,6 @@ directory.
 
 ### Known limitations deferred past 0.1.0
 
-- `allShortestPaths` parses but the planner rejects it. Single
-  `shortestPath(...)` works.
 - LDG streaming partitioner is not implemented — only the
   FNV-1a hash partitioner. Adequate for uniform workloads;
   skew-sensitive workloads will want the streaming partitioner.

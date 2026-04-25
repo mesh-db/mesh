@@ -532,8 +532,12 @@ pub enum ShortestKind {
     /// given RocksDB snapshot.
     Shortest,
     /// `allShortestPaths(...)` — returns every path of the
-    /// minimum length. v1 rejects this at plan time; listed
-    /// here so the grammar and AST can still represent it.
+    /// minimum length. The planner lowers this to the same
+    /// `LogicalPlan::ShortestPath` operator as `Shortest`; the
+    /// executor's BFS records every `(parent, edge)` pair at
+    /// each shortest-path level and the reconstruction walk
+    /// enumerates every distinct minimum-length path instead
+    /// of stopping at the first.
     AllShortest,
 }
 
