@@ -531,20 +531,19 @@ pair, `ca_path` to the shared CA bundle.
 
 ## Known limitations
 
-- **APOC coverage is partial** — see the *APOC compatibility* section
-  above. The big remaining namespaces are `apoc.path.*` (configurable
-  graph-traversal expansions), `apoc.cypher.run*` (runtime evaluation
-  of Cypher strings), `apoc.load.*` / `apoc.export.*` (file I/O), and
-  `apoc.trigger.*` (DB-level event hooks). Each blocks on
-  infrastructure that isn't there yet rather than more of the same
-  registration plumbing.
 - **GQL quantified path patterns** — parenthesized-subpath form like
   `((a)-[:T]-(b))+` — aren't parsed. The Neo4j 5 relationship-level
   shorthand (`->+`, `->*`, `->{n,m}`) is fully supported.
+- **LDG streaming partitioner** is not implemented — only the FNV-1a
+  hash partitioner. Adequate for uniform workloads; skew-sensitive
+  workloads will eventually want the streaming partitioner.
 - **Vectorized / columnar execution** — Mesh uses a Volcano/iterator
   model throughout. Analytical workloads at 100M+ rows would
   eventually want vectorization; OLTP and bounded-traversal workloads
   don't benefit.
+- **Criterion bench CI gate** — the storage and query bench suites
+  run locally only. A regression gate (baseline + variance budget,
+  or instruction-count instrumentation) is a follow-up.
 
 ---
 
