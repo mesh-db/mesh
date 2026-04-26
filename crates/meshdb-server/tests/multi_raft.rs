@@ -551,6 +551,62 @@ async fn multi_raft_concurrent_create_index_is_idempotent() {
 }
 
 #[tokio::test]
+async fn multi_raft_remove_partition_replica_shrinks_voters() {
+    // 3 peers, 2 partitions, rf=3 → every peer is a voter of every
+    // partition. Find partition 0's leader, call
+    // remove_partition_replica to evict the highest-id peer, and
+    // confirm the partition's voter set shrinks. Demonstrates the
+    // dynamic rebalancing scaffolding even though full orchestration
+    // (replica_map updates, runtime group teardown) is v2.
+    let peers = spawn_multi_raft_cluster(3, 2, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+    let leader_id = peers[0].multi_raft.leader_of(p0).expect("p0 leader known");
+    let leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == leader_id)
+        .expect("leader peer in cluster");
+
+    // Pick a non-leader voter to evict so the leadership stays
+    // stable through the remove call.
+    let evict_id = peers
+        .iter()
+        .map(|p| p.config.self_id)
+        .find(|id| *id != leader_id)
+        .expect("at least one non-leader peer");
+
+    peers[leader_idx]
+        .multi_raft
+        .remove_partition_replica(p0, evict_id)
+        .await
+        .expect("remove_partition_replica");
+
+    // Confirm the membership change committed: the leader's Raft
+    // metrics now report a smaller voter set.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let metrics = peers[leader_idx]
+            .multi_raft
+            .partitions
+            .get(&p0)
+            .unwrap()
+            .raft
+            .metrics()
+            .borrow()
+            .clone();
+        let voters: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
+        if voters.len() == 2 && !voters.contains(&evict_id) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("voter set didn't shrink within 5s; current = {voters:?}, evicted {evict_id}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_per_partition_storage_dirs_are_isolated() {
     // 3 peers, 4 partitions, rf=2 → not every peer hosts every
     // partition. Verifies storage-layout isolation per group and

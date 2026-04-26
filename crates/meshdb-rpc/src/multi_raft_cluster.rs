@@ -191,6 +191,83 @@ impl MultiRaftCluster {
     pub fn is_local_leader(&self, partition: PartitionId) -> bool {
         self.leader_of(partition) == Some(self.self_id)
     }
+
+    /// Add a peer as a voter of `partition`'s Raft group. Wraps
+    /// openraft's `change_membership` with `ChangeMembers::AddVoters`.
+    /// The new peer's address is looked up from the cluster's meta
+    /// state — any peer in the cluster's `Membership` is eligible.
+    ///
+    /// Useful for growing a partition's replica set (e.g. promoting
+    /// a learner to handle increased read traffic, or recovering
+    /// after a permanent peer loss).
+    ///
+    /// **v1 limitations** — same as [`remove_partition_replica`]:
+    /// * Caller is responsible for updating
+    ///   [`PartitionReplicaMap`] separately so write routing sees
+    ///   the new replica.
+    /// * The new peer must already be running with the partition's
+    ///   Raft group instantiated locally (i.e. it bootstrapped
+    ///   with that partition in its replica set, even if it isn't
+    ///   currently a voter). Runtime group spin-up is a v2 concern.
+    pub async fn add_partition_replica(
+        &self,
+        partition: PartitionId,
+        peer_id: NodeId,
+    ) -> Result<(), String> {
+        let raft = self
+            .partitions
+            .get(&partition)
+            .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
+        let state = self.meta.current_state().await;
+        let addr = state
+            .membership
+            .iter()
+            .find_map(|(id, addr)| {
+                if id.0 == peer_id {
+                    Some(addr.to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                format!("peer {peer_id} not in cluster membership; add to meta group first")
+            })?;
+        drop(state);
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(peer_id, openraft::BasicNode::new(addr));
+        raft.raft
+            .change_membership(openraft::ChangeMembers::AddVoters(members), false)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("partition {} AddVoters: {e}", partition.0))
+    }
+
+    /// Remove a peer as a voter of `partition`'s Raft group. Wraps
+    /// `ChangeMembers::RemoveVoters`. Useful for shrinking a replica
+    /// set or evacuating a peer scheduled for decommissioning.
+    ///
+    /// Caller is responsible for updating [`PartitionReplicaMap`]
+    /// separately so write routing stops targeting the removed
+    /// peer. Runtime group teardown on the removed peer (so its
+    /// rocksdb instance can be reclaimed) is a v2 concern; for now
+    /// the disk artifacts stay until the operator deletes them.
+    pub async fn remove_partition_replica(
+        &self,
+        partition: PartitionId,
+        peer_id: NodeId,
+    ) -> Result<(), String> {
+        let raft = self
+            .partitions
+            .get(&partition)
+            .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
+        let mut to_remove = std::collections::BTreeSet::new();
+        to_remove.insert(peer_id);
+        raft.raft
+            .change_membership(openraft::ChangeMembers::RemoveVoters(to_remove), false)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("partition {} RemoveVoters: {e}", partition.0))
+    }
 }
 
 /// Lazy cache of `PartitionId -> Option<NodeId>` mapping the current
