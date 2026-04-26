@@ -1579,6 +1579,11 @@ impl MeshService {
         let Some(multi_raft) = self.multi_raft.clone() else {
             return Ok(());
         };
+        #[cfg(any(test, feature = "fault-inject"))]
+        if let Some(fp) = &self.fault_points {
+            fp.recover_multi_raft_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         for (partition, applier) in &multi_raft.partition_appliers {
             // Run recovery on every replica that hosts this partition.
             // Non-leader proposals route through `forward_write` to
@@ -1801,7 +1806,23 @@ impl MeshService {
 
         // COMMIT phase.
         let mut commit_errs: Vec<Status> = Vec::new();
+        let mut commit_idx: usize = 0;
         for partition in &prepared {
+            // Fault injection: simulate a coordinator crash after the
+            // K-th CommitTx commits but before the (K+1)-th. Some
+            // partitions are committed; the rest stay PREPAREd.
+            // Recovery resolves the holdouts forward.
+            #[cfg(any(test, feature = "fault-inject"))]
+            if let Some(fp) = &self.fault_points {
+                let trigger = fp
+                    .multi_raft_crash_after_kth_commit_tx
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if trigger >= 0 && (commit_idx as i32) == trigger {
+                    return Err(Status::internal(
+                        "injected fault: multi_raft_crash_after_kth_commit_tx",
+                    ));
+                }
+            }
             let entry = GraphCommand::CommitTx { txid: txid.clone() };
             if let Err(e) = self
                 .propose_partition_command(multi_raft, *partition, entry)
@@ -1809,6 +1830,7 @@ impl MeshService {
             {
                 commit_errs.push(e);
             }
+            commit_idx += 1;
         }
         if !commit_errs.is_empty() {
             return Err(commit_errs.into_iter().next().unwrap());

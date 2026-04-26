@@ -82,6 +82,20 @@ pub struct FaultPoints {
     /// served. Tests read this to confirm the forwarding path
     /// actually fired, not just an in-process direct propose.
     pub forward_write_call_count: AtomicU32,
+
+    /// Multi-raft coordinator: fire `N` CommitTx proposes, then on
+    /// the (N+1)th return the injected error. `-1` disables; `0`
+    /// fires on the very first CommitTx send. Used to simulate a
+    /// coordinator crash mid-COMMIT-fanout where some partitions
+    /// have applied CommitTx and some are still in PREPAREd state.
+    /// Recovery resolves the holdouts forward to committed via
+    /// `ResolveTransaction` polling.
+    pub multi_raft_crash_after_kth_commit_tx: AtomicI32,
+
+    /// Observability counter: bumped once per `recover_multi_raft_in_doubt`
+    /// call. Tests read this to confirm the recovery path actually
+    /// ran (vs. being skipped because pending_txs was empty).
+    pub recover_multi_raft_call_count: AtomicU32,
 }
 
 impl FaultPoints {
@@ -97,6 +111,8 @@ impl FaultPoints {
             multi_raft_crash_after_commit_decision: AtomicBool::new(false),
             multi_raft_reject_forward_write: AtomicBool::new(false),
             forward_write_call_count: AtomicU32::new(0),
+            multi_raft_crash_after_kth_commit_tx: AtomicI32::new(-1),
+            recover_multi_raft_call_count: AtomicU32::new(0),
         }
     }
 }

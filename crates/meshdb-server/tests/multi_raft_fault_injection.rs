@@ -511,3 +511,150 @@ async fn multi_raft_reject_forward_write_retries_after_cache_refresh() {
         );
     }
 }
+
+#[tokio::test]
+async fn multi_raft_crash_after_first_commit_tx_recovers_holdouts() {
+    // Coordinator runs PREPARE on every touched partition, fsyncs
+    // CommitDecision, fires CommitTx on the FIRST partition (it
+    // applies on every replica), then crashes before the next
+    // partition's CommitTx ships. After the crash we have a split
+    // state: some partitions committed, the rest still PREPAREd.
+    // Recovery on every replica polls `ResolveTransaction`, finds
+    // `Committed` in the coordinator log, and proposes CommitTx on
+    // the holdout partitions to converge.
+    let mut peers = spawn_three_peer_multi_raft(4).await;
+
+    peers[0]
+        .fault_points
+        .multi_raft_crash_after_kth_commit_tx
+        .store(1, Ordering::SeqCst);
+    let res = peers[0]
+        .service
+        .execute_cypher_local(cross_partition_cypher(), std::collections::HashMap::new())
+        .await;
+    peers[0]
+        .fault_points
+        .multi_raft_crash_after_kth_commit_tx
+        .store(-1, Ordering::SeqCst);
+    let err = res.expect_err("kth-commit fault should have fired");
+    assert!(
+        err.message()
+            .contains("multi_raft_crash_after_kth_commit_tx"),
+        "unexpected error: {err}"
+    );
+
+    // Restart peer 0 and trigger recovery on every peer — the
+    // PREPAREd-but-not-committed partitions need a CommitTx to
+    // converge.
+    let peer0 = peers.remove(0);
+    let suspended = peer0.shutdown_and_wait().await;
+    let listener = rebind(suspended.addr).await;
+    let fp = Arc::new(FaultPoints::new());
+    let peer0_restart = spawn_peer(suspended.config, listener, fp, suspended.dir).await;
+    for peer in &peers {
+        let _ = peer.service.recover_multi_raft_in_doubt().await;
+    }
+
+    // Both labels should reach 10 nodes everywhere.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    'outer: loop {
+        for peer in [&peer0_restart, &peers[0], &peers[1]] {
+            for label in ["FaultA", "FaultB"] {
+                if count_label(peer, label).await != 10 {
+                    if Instant::now() > deadline {
+                        panic!(
+                            "peer {} stuck at count(:{label}) != 10",
+                            peer.config.self_id
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue 'outer;
+                }
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
+async fn multi_raft_concurrent_in_doubt_recovery_is_idempotent() {
+    // Pin the contract that running `recover_multi_raft_in_doubt`
+    // simultaneously on every replica produces the same result as
+    // running it once. The first replica's CommitTx propose drains
+    // pending_txs everywhere via the partition Raft; subsequent
+    // attempts on the same txid are no-ops because pending_txs is
+    // already cleared. Without this property, every periodic
+    // recovery tick on a busy cluster would proliferate redundant
+    // CommitTx entries in the partition Raft log.
+    let mut peers = spawn_three_peer_multi_raft(4).await;
+
+    // Get the cluster into a "post-decision, pre-fanout" state by
+    // injecting the commit-decision fault.
+    peers[0]
+        .fault_points
+        .multi_raft_crash_after_commit_decision
+        .store(true, Ordering::SeqCst);
+    let res = peers[0]
+        .service
+        .execute_cypher_local(cross_partition_cypher(), std::collections::HashMap::new())
+        .await;
+    peers[0]
+        .fault_points
+        .multi_raft_crash_after_commit_decision
+        .store(false, Ordering::SeqCst);
+    let _err = res.expect_err("commit-decision fault should have fired");
+
+    // Restart peer 0 (its in-process recovery runs once during spawn).
+    // Then concurrently fire recovery on every peer to race them
+    // against each other.
+    let peer0 = peers.remove(0);
+    let suspended = peer0.shutdown_and_wait().await;
+    let listener = rebind(suspended.addr).await;
+    let fp = Arc::new(FaultPoints::new());
+    let peer0_restart = spawn_peer(suspended.config, listener, fp, suspended.dir).await;
+
+    // Concurrent recovery on every peer. tokio::join! waits for all
+    // three to complete; any "redundant CommitTx" race surfaces as
+    // an inconsistent count or a hard error.
+    let (r0, r1, r2) = tokio::join!(
+        peer0_restart.service.recover_multi_raft_in_doubt(),
+        peers[0].service.recover_multi_raft_in_doubt(),
+        peers[1].service.recover_multi_raft_in_doubt(),
+    );
+    r0.expect("peer 0 recovery");
+    r1.expect("peer 1 recovery");
+    r2.expect("peer 2 recovery");
+
+    // Convergence: every label has 10 nodes on every peer.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    'outer: loop {
+        for peer in [&peer0_restart, &peers[0], &peers[1]] {
+            for label in ["FaultA", "FaultB"] {
+                if count_label(peer, label).await != 10 {
+                    if Instant::now() > deadline {
+                        panic!(
+                            "concurrent recovery didn't converge: peer {} count(:{label}) != 10",
+                            peer.config.self_id
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue 'outer;
+                }
+            }
+        }
+        break;
+    }
+
+    // Recovery should have fired on every peer at least once each.
+    for peer in [&peer0_restart, &peers[0], &peers[1]] {
+        let n = peer
+            .fault_points
+            .recover_multi_raft_call_count
+            .load(Ordering::SeqCst);
+        assert!(
+            n >= 1,
+            "peer {} didn't run recovery at least once (count = {n})",
+            peer.config.self_id
+        );
+    }
+}
