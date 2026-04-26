@@ -1323,6 +1323,115 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_session_pinned_to_dead_replica_falls_back_to_remote_leader() {
+    // The hardest case for explicit-tx affinity: the session is
+    // pinned to the partition's *current leader*, and that peer's
+    // local partition Raft replica is then shut down (admin
+    // intervention, fatal storage error, planned drain). The
+    // session peer's local raft can no longer report a leader, but
+    // the cluster still has one — the rest of the replicas elect
+    // a new leader after heartbeats stop. Without the
+    // remote-PartitionLeader fallback, the session's COMMIT would
+    // surface "no known leader" to the user.
+    let peers = spawn_multi_raft_cluster(3, 1, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+    let original_leader = peers[0].multi_raft.leader_of(p0).expect("leader known");
+    let session_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == original_leader)
+        .expect("session pinned to original leader");
+
+    // Open the tx and accumulate a write while the session peer is
+    // still leader (the standard happy path).
+    let mut buffered: Vec<meshdb_cluster::GraphCommand> = Vec::new();
+    let (_, new_cmds) = peers[session_idx]
+        .service
+        .execute_cypher_in_tx(
+            "CREATE (a:DeadReplica {seq: 1})".to_string(),
+            std::collections::HashMap::new(),
+            buffered.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+    buffered.extend(new_cmds);
+
+    // Kill the session peer's partition replica. The other two
+    // peers' replicas keep running and elect a new leader.
+    peers[session_idx]
+        .multi_raft
+        .shutdown_partition(p0)
+        .await
+        .unwrap();
+
+    // Wait for survivors to converge on the new leader.
+    let survivor_idxs: Vec<usize> = (0..peers.len()).filter(|i| *i != session_idx).collect();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut leaders = Vec::new();
+        for idx in &survivor_idxs {
+            leaders.push(peers[*idx].multi_raft.partition_current_leader(p0));
+        }
+        let agreed = leaders
+            .iter()
+            .copied()
+            .reduce(|a, b| if a == b { a } else { None })
+            .flatten();
+        if matches!(agreed, Some(l) if l != original_leader) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("survivors did not converge on a new leader within 15s: {leaders:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Invalidate the session peer's leader cache so the COMMIT
+    // path goes through cache-miss → local-poll-None →
+    // remote-PartitionLeader fallback.
+    peers[session_idx].multi_raft.leader_cache.invalidate(p0);
+
+    // COMMIT — must succeed via remote-leader fallback.
+    peers[session_idx]
+        .service
+        .commit_buffered_commands(buffered)
+        .await
+        .expect("COMMIT through dead-replica session must succeed via remote leader fallback");
+
+    // Verify the write applied on every survivor.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for idx in &survivor_idxs {
+            let rows = peers[*idx]
+                .service
+                .execute_cypher_local(
+                    "MATCH (n:DeadReplica) RETURN count(n) AS c".to_string(),
+                    std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let count = match rows.first().and_then(|r| r.get("c")) {
+                Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+                other => panic!("expected Int64, got {other:?}"),
+            };
+            if count != 1 {
+                if Instant::now() > deadline {
+                    panic!(
+                        "survivor {} sees count = {count}, expected 1",
+                        peers[*idx].config.self_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_explicit_tx_session_affinity_survives_leader_change() {
     // Bolt explicit transactions accumulate commands in-memory on
     // the session peer (single TCP connection). At COMMIT, the peer

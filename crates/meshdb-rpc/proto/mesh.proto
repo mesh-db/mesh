@@ -357,6 +357,15 @@ service MeshWrite {
   // raft (which the caller treats as "skip; not a meta replica").
   rpc MetaLastApplied(MetaLastAppliedRequest)
       returns (MetaLastAppliedResponse);
+  // Multi-raft mode only: report the leader the caller's local
+  // partition Raft replica observes for `partition`. Used as a
+  // fallback when the caller's own local replica can't resolve
+  // the leader (shut down, freshly-restarted, mid-election).
+  // Returns leader_id = 0 when the receiver doesn't host the
+  // partition or its replica doesn't know who leads. Cheap —
+  // reads the local watch-channel metrics; no I/O.
+  rpc PartitionLeader(PartitionLeaderRequest)
+      returns (PartitionLeaderResponse);
 }
 
 enum BatchPhase {
@@ -439,6 +448,18 @@ message MetaLastAppliedResponse {
   // peer isn't running multi-raft (no meta replica) or the meta
   // applier hasn't applied any entry yet.
   uint64 last_applied = 1;
+}
+
+message PartitionLeaderRequest {
+  uint32 partition = 1;
+}
+
+message PartitionLeaderResponse {
+  // The NodeId the receiver's local partition Raft replica
+  // observes as leader. `0` means the receiver doesn't host the
+  // partition, isn't running multi-raft, or its replica doesn't
+  // yet know who leads.
+  uint64 leader_id = 1;
 }
 
 message PutNodeRequest {

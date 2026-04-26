@@ -1822,6 +1822,50 @@ impl MeshService {
         }
     }
 
+    /// Resolve the leader of `partition` by polling other peers'
+    /// `PartitionLeader` RPC. Used as a fallback when the local
+    /// replica can't answer (shutdown, freshly-restarted, doesn't
+    /// host the partition). Walks every peer in the meta cluster
+    /// state's membership list and returns the first non-zero
+    /// answer, caching it in the leader cache. Returns `None` if
+    /// no peer has a known leader yet.
+    async fn resolve_partition_leader_remote(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+        partition: meshdb_cluster::PartitionId,
+    ) -> Option<meshdb_cluster::raft::NodeId> {
+        let state = multi_raft.meta.current_state().await;
+        let peers: Vec<(u64, String)> = state
+            .membership
+            .iter()
+            .filter(|(id, _)| id.0 != multi_raft.self_id)
+            .map(|(id, addr)| (id.0, addr.to_string()))
+            .collect();
+        drop(state);
+        for (_id, addr) in peers {
+            let mut client = match self.leader_write_client(&addr) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            match client
+                .partition_leader(crate::proto::PartitionLeaderRequest {
+                    partition: partition.0,
+                })
+                .await
+            {
+                Ok(resp) => {
+                    let leader = resp.into_inner().leader_id;
+                    if leader != 0 {
+                        multi_raft.leader_cache.set(partition, leader);
+                        return Some(leader);
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
     /// Spanner-style 2PC over partition leaders. Each touched
     /// partition's leader proposes a `PreparedTx` entry through its
     /// Raft group; once all PREPAREs ACK, the coordinator proposes
@@ -2250,14 +2294,27 @@ impl MeshService {
             let leader_id = match multi_raft.leader_of(partition) {
                 Some(l) => l,
                 None => {
-                    last_err = Some(Status::unavailable(format!(
-                        "no known leader for partition {} yet; retry shortly",
-                        partition.0
-                    )));
-                    // Brief settle before retrying — election may be
-                    // mid-flight.
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
+                    // Local replica can't resolve — fall back to a
+                    // remote PartitionLeader RPC against any peer
+                    // that hosts the partition. Covers the case
+                    // where this session peer's local partition Raft
+                    // is shut down: the cluster has a leader, this
+                    // peer just doesn't know about it locally.
+                    if let Some(remote) = self
+                        .resolve_partition_leader_remote(multi_raft, partition)
+                        .await
+                    {
+                        remote
+                    } else {
+                        last_err = Some(Status::unavailable(format!(
+                            "no known leader for partition {} yet; retry shortly",
+                            partition.0
+                        )));
+                        // Brief settle before retrying — election
+                        // may be mid-flight.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
                 }
             };
 
@@ -5860,6 +5917,23 @@ impl MeshWrite for MeshService {
         };
         Ok(Response::new(crate::proto::MetaLastAppliedResponse {
             last_applied,
+        }))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "partition_leader", partition))]
+    async fn partition_leader(
+        &self,
+        request: Request<crate::proto::PartitionLeaderRequest>,
+    ) -> Result<Response<crate::proto::PartitionLeaderResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("partition", req.partition);
+        let leader_id = self
+            .multi_raft
+            .as_ref()
+            .and_then(|mr| mr.partition_current_leader(meshdb_cluster::PartitionId(req.partition)))
+            .unwrap_or(0);
+        Ok(Response::new(crate::proto::PartitionLeaderResponse {
+            leader_id,
         }))
     }
 }
