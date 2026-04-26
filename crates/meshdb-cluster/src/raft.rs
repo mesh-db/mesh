@@ -752,6 +752,12 @@ pub struct RaftCluster {
     pub id: NodeId,
     pub raft: Raft<MeshRaftConfig>,
     store: MemStore,
+    /// Human-readable label distinguishing this Raft group's log
+    /// output. Single-Raft mode leaves this at `"single"`; multi-raft
+    /// mode sets it to `"meta"` for the metadata group and `"p-<N>"`
+    /// for partition groups, so `tracing` spans on adjacent groups
+    /// don't collide.
+    label: Arc<str>,
 }
 
 impl RaftCluster {
@@ -813,7 +819,31 @@ impl RaftCluster {
         let raft = Raft::new(id, config, network, log_store, state_machine)
             .await
             .map_err(|e| Error::Raft(e.to_string()))?;
-        Ok(Self { id, raft, store })
+        Ok(Self {
+            id,
+            raft,
+            store,
+            label: Arc::from("single"),
+        })
+    }
+
+    /// Set the tracing label on this cluster instance. Used by the
+    /// multi-raft bootstrap to distinguish per-group log output:
+    ///
+    ///   * `with_label("meta")` for the metadata group.
+    ///   * `with_label("p-3")` for partition group 3.
+    ///
+    /// Single-Raft mode skips this and leaves the default `"single"`
+    /// label so existing log greps keep matching.
+    pub fn with_label(mut self, label: impl Into<Arc<str>>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// The tracing label for this cluster's Raft group. See
+    /// [`with_label`].
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Bootstrap the cluster with the provided member set. Only call on the
@@ -874,7 +904,11 @@ impl RaftCluster {
     /// caller can route the request to the actual leader, and
     /// [`Error::Apply`] when the entry committed through Raft but the
     /// local state machine rejected it (e.g. duplicate AddPeer).
-    #[tracing::instrument(level = "debug", skip_all, fields(node_id = self.id))]
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(node_id = self.id, group = %self.label)
+    )]
     pub async fn propose_entry(&self, entry: MeshLogEntry) -> Result<ApplyResponse> {
         use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
         match self.raft.client_write(entry).await {
