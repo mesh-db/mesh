@@ -40,13 +40,15 @@ pub struct MultiRaftCluster {
     pub meta: Arc<RaftCluster>,
     /// Per-partition Raft groups this peer is a replica of. Not
     /// every partition appears here — only the ones whose replica
-    /// set includes `self_id`.
-    pub partitions: HashMap<PartitionId, Arc<RaftCluster>>,
+    /// set includes `self_id`. RwLock-wrapped so a runtime
+    /// rebalance can grow the set without restart (see
+    /// `instantiate_partition_group`).
+    partitions: Arc<RwLock<HashMap<PartitionId, Arc<RaftCluster>>>>,
     /// Concrete applier handles for the partitions hosted on this
-    /// peer. Stored separately from the `Arc<dyn GraphStateMachine>`
-    /// the `RaftCluster` holds so the recovery path can call
-    /// `PartitionGraphApplier::pending_tx_ids` without downcasting.
-    pub partition_appliers: HashMap<PartitionId, Arc<PartitionGraphApplier>>,
+    /// peer. Same RwLock semantics as `partitions` — kept in lockstep
+    /// so a partition addition updates both atomically from the
+    /// caller's perspective.
+    partition_appliers: Arc<RwLock<HashMap<PartitionId, Arc<PartitionGraphApplier>>>>,
     /// The deterministic placement map shared by every peer.
     /// Lookup-only — multi-raft v1 does not rebalance at runtime.
     pub replica_map: Arc<PartitionReplicaMap>,
@@ -68,13 +70,30 @@ pub struct MultiRaftCluster {
     ///     value greater than the current.
     /// Read by partition write paths via [`await_meta_barrier`].
     pub min_meta_index: AtomicU64,
+    /// Clone of the `RaftGroupRegistry` handed to
+    /// [`MeshRaftService::with_registry`]. The two share the same
+    /// `Arc<RwLock<HashMap>>` for partitions, so a runtime spin-up
+    /// can register the new partition Raft via this handle and the
+    /// dispatch path picks it up immediately. `None` until the
+    /// bootstrap path attaches one (test harnesses that build a
+    /// registry post-hoc don't always set it; their missing
+    /// registry is non-fatal — the runtime spin-up just can't
+    /// register inbound RPCs without it).
+    pub dispatch_registry: RwLock<Option<RaftGroupRegistry>>,
 }
 
 impl std::fmt::Debug for MultiRaftCluster {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MultiRaftCluster")
             .field("self_id", &self.self_id)
-            .field("partitions", &self.partitions.keys().collect::<Vec<_>>())
+            .field(
+                "partitions",
+                &self
+                    .partitions
+                    .read()
+                    .map(|g| g.keys().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
             .field("num_replicas", &self.replica_map.num_partitions())
             .finish_non_exhaustive()
     }
@@ -92,12 +111,94 @@ impl MultiRaftCluster {
         Self {
             self_id,
             meta,
-            partitions,
-            partition_appliers,
+            partitions: Arc::new(RwLock::new(partitions)),
+            partition_appliers: Arc::new(RwLock::new(partition_appliers)),
             replica_map,
             leader_cache,
             min_meta_index: AtomicU64::new(0),
+            dispatch_registry: RwLock::new(None),
         }
+    }
+
+    /// Stash a clone of the dispatch [`RaftGroupRegistry`] so
+    /// runtime partition spin-up can register the new group. Pass
+    /// the same registry instance handed to
+    /// [`MeshRaftService::with_registry`] — the registry's
+    /// `partitions` field is `Arc<RwLock<...>>`, so the clone shares
+    /// the live dispatch table.
+    pub fn attach_dispatch_registry(&self, registry: RaftGroupRegistry) {
+        *self
+            .dispatch_registry
+            .write()
+            .expect("dispatch_registry lock poisoned") = Some(registry);
+    }
+
+    /// Look up the partition Raft handle for `partition`, returning
+    /// `None` when this peer doesn't host the partition's replica.
+    /// Replaces the previous public `partitions.get(&p)` access —
+    /// hides the RwLock.
+    pub fn partition(&self, partition: PartitionId) -> Option<Arc<RaftCluster>> {
+        self.partitions
+            .read()
+            .expect("partitions lock poisoned")
+            .get(&partition)
+            .cloned()
+    }
+
+    /// Snapshot every `(PartitionId, Arc<RaftCluster>)` pair this
+    /// peer hosts. Used by callers that need to walk every group
+    /// (registry construction, recovery, leader-readiness loops in
+    /// tests). Holds the read lock only for the snapshot duration.
+    pub fn partitions_snapshot(&self) -> Vec<(PartitionId, Arc<RaftCluster>)> {
+        let guard = self.partitions.read().expect("partitions lock poisoned");
+        guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    /// Snapshot every `(PartitionId, Arc<PartitionGraphApplier>)`
+    /// pair. Used by `recover_multi_raft_in_doubt` to walk every
+    /// partition's `pending_tx_ids`.
+    pub fn partition_appliers_snapshot(&self) -> Vec<(PartitionId, Arc<PartitionGraphApplier>)> {
+        let guard = self
+            .partition_appliers
+            .read()
+            .expect("partition_appliers lock poisoned");
+        guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    /// `true` when this peer hosts a Raft replica for `partition`.
+    pub fn hosts_partition(&self, partition: PartitionId) -> bool {
+        self.partitions
+            .read()
+            .expect("partitions lock poisoned")
+            .contains_key(&partition)
+    }
+
+    /// Insert a runtime-instantiated partition Raft group. Called
+    /// post-rebalance when a peer is added as a replica of a
+    /// partition it didn't bootstrap with. Idempotent — re-adding
+    /// the same partition replaces the prior entry, which is how
+    /// a re-issued rebalance reconciles after a transient failure.
+    ///
+    /// Caller is responsible for opening the rocksdb dir, building
+    /// the `RaftCluster` and `PartitionGraphApplier`, and (if the
+    /// new group needs to receive RPCs from existing peers)
+    /// updating the dispatch registry — see
+    /// [`MeshRaftService::register_partition_group`]. Future
+    /// orchestration will roll all of these into one helper.
+    pub fn add_runtime_partition_group(
+        &self,
+        partition: PartitionId,
+        raft: Arc<RaftCluster>,
+        applier: Arc<PartitionGraphApplier>,
+    ) {
+        self.partitions
+            .write()
+            .expect("partitions lock poisoned")
+            .insert(partition, raft);
+        self.partition_appliers
+            .write()
+            .expect("partition_appliers lock poisoned")
+            .insert(partition, applier);
     }
 
     /// Snapshot the local meta-Raft applier's `last_applied` index.
@@ -157,8 +258,8 @@ impl MultiRaftCluster {
     /// dispatch incoming RPCs to the right group on this peer.
     pub fn build_registry(&self) -> RaftGroupRegistry {
         let mut reg = RaftGroupRegistry::new().with_meta(Arc::new(self.meta.raft.clone()));
-        for (p, raft) in &self.partitions {
-            reg = reg.with_partition(*p, Arc::new(raft.raft.clone()));
+        for (p, raft) in self.partitions_snapshot() {
+            reg = reg.with_partition(p, Arc::new(raft.raft.clone()));
         }
         reg
     }
@@ -177,7 +278,7 @@ impl MultiRaftCluster {
         // Slow path: poll the local Raft replica's metrics if we
         // host this partition. If we don't, the cache miss is the
         // best we can do — caller should ask another replica.
-        if let Some(raft) = self.partitions.get(&partition) {
+        if let Some(raft) = self.partition(partition) {
             if let Some(leader) = raft.current_leader() {
                 self.leader_cache.set(partition, leader.0);
                 return Some(leader.0);
@@ -215,8 +316,7 @@ impl MultiRaftCluster {
         peer_id: NodeId,
     ) -> Result<(), String> {
         let raft = self
-            .partitions
-            .get(&partition)
+            .partition(partition)
             .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
         let state = self.meta.current_state().await;
         let addr = state
@@ -259,8 +359,7 @@ impl MultiRaftCluster {
         peer_id: NodeId,
     ) -> Result<(), String> {
         let raft = self
-            .partitions
-            .get(&partition)
+            .partition(partition)
             .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
         let mut to_remove = std::collections::BTreeSet::new();
         to_remove.insert(peer_id);
@@ -310,7 +409,7 @@ impl MultiRaftCluster {
         &self,
         partition: PartitionId,
     ) -> Vec<meshdb_cluster::PeerId> {
-        let Some(raft) = self.partitions.get(&partition) else {
+        let Some(raft) = self.partition(partition) else {
             return Vec::new();
         };
         let metrics = raft.raft.metrics().borrow().clone();

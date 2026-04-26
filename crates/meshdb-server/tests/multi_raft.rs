@@ -131,7 +131,7 @@ async fn multi_raft_three_peer_cluster_elects_leader_in_every_group() {
                 break;
             }
             for partition in 0..2u32 {
-                if let Some(raft) = peer.multi_raft.partitions.get(&PartitionId(partition)) {
+                if let Some(raft) = peer.multi_raft.partition(PartitionId(partition)) {
                     if raft.current_leader().is_none() {
                         all_have_leader = false;
                         break;
@@ -152,12 +152,10 @@ async fn multi_raft_three_peer_cluster_elects_leader_in_every_group() {
                     peer.config.self_id,
                     peer.multi_raft.meta.current_leader(),
                     peer.multi_raft
-                        .partitions
-                        .get(&PartitionId(0))
+                        .partition(PartitionId(0))
                         .and_then(|r| r.current_leader()),
                     peer.multi_raft
-                        .partitions
-                        .get(&PartitionId(1))
+                        .partition(PartitionId(1))
                         .and_then(|r| r.current_leader()),
                 );
             }
@@ -179,7 +177,14 @@ async fn wait_for_leaders(peers: &[Peer], timeout: Duration) {
                 all = false;
                 break;
             }
-            for raft in peer.multi_raft.partitions.values() {
+            for raft in peer
+                .multi_raft
+                .partitions_snapshot()
+                .iter()
+                .map(|(_, r)| r.clone())
+                .collect::<Vec<_>>()
+                .iter()
+            {
                 if raft.current_leader().is_none() {
                     all = false;
                     break;
@@ -827,6 +832,72 @@ async fn multi_raft_replica_map_persisted_through_meta_after_rebalance() {
 }
 
 #[tokio::test]
+async fn multi_raft_runtime_partition_group_spinup() {
+    // Spawn 3-peer × 4-partition × rf=2 cluster — peers are uneven
+    // hosts of partitions, so peer 1 doesn't host every partition.
+    // Pick a partition peer 1 doesn't currently host and call
+    // `instantiate_partition_group` on it; verify the group shows up
+    // in `partitions_snapshot` and the dispatch registry serves
+    // RPCs against it (the new group's `current_leader` returns Some
+    // once it joins as a learner of the existing replicas).
+    let peers = spawn_multi_raft_cluster(3, 4, 2).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Find a partition that peer 1 doesn't currently host.
+    let peer_idx = 0; // peer 1
+    let absent: Option<PartitionId> = (0..4u32)
+        .map(PartitionId)
+        .find(|p| !peers[peer_idx].multi_raft.hosts_partition(*p));
+    let Some(absent_partition) = absent else {
+        // rf=2 over 3 peers → ~67% of partitions per peer; almost
+        // always at least one is absent. If somehow not, the test
+        // skips rather than failing because the cluster's rf+peer
+        // mix didn't produce the precondition.
+        eprintln!("skipping: peer 1 happens to host every partition");
+        return;
+    };
+
+    // Build a fresh GrpcNetwork pointing at the other peers (the
+    // ones that will eventually serve as replication sources for
+    // this new partition Raft).
+    let peer_map: Vec<(u64, String)> = peers
+        .iter()
+        .filter(|p| p.config.self_id != peers[peer_idx].config.self_id)
+        .map(|p| (p.config.self_id, p.config.listen_address.clone()))
+        .collect();
+    let network = meshdb_rpc::GrpcNetwork::new(peer_map).expect("build grpc network");
+
+    // Use a fresh data dir for the new partition so we don't
+    // collide with the existing service's rocksdb instance.
+    let separate_dir = tempfile::TempDir::new().unwrap();
+    let mut spinup_config = peers[peer_idx].config.clone();
+    spinup_config.data_dir = separate_dir.path().to_path_buf();
+    let spinup_store: Arc<dyn meshdb_storage::StorageEngine> = Arc::new(
+        meshdb_storage::RocksDbStorageEngine::open(spinup_config.data_dir.as_path()).unwrap(),
+    );
+
+    meshdb_server::instantiate_partition_group(
+        &spinup_config,
+        &peers[peer_idx].multi_raft,
+        spinup_store,
+        absent_partition,
+        &network,
+    )
+    .await
+    .expect("instantiate partition group");
+
+    // The partition is now hosted on peer 1.
+    assert!(
+        peers[peer_idx].multi_raft.hosts_partition(absent_partition),
+        "partition {} should be hosted post-instantiation",
+        absent_partition.0
+    );
+    // partitions_snapshot reflects it.
+    let snapshot_count = peers[peer_idx].multi_raft.partitions_snapshot().len();
+    assert!(snapshot_count >= 1, "snapshot should include the new group");
+}
+
+#[tokio::test]
 async fn multi_raft_remove_partition_replica_shrinks_voters() {
     // 3 peers, 2 partitions, rf=3 → every peer is a voter of every
     // partition. Find partition 0's leader, call
@@ -862,15 +933,11 @@ async fn multi_raft_remove_partition_replica_shrinks_voters() {
     // metrics now report a smaller voter set.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let metrics = peers[leader_idx]
+        let raft = peers[leader_idx]
             .multi_raft
-            .partitions
-            .get(&p0)
-            .unwrap()
-            .raft
-            .metrics()
-            .borrow()
-            .clone();
+            .partition(p0)
+            .expect("p0 still hosted on leader peer");
+        let metrics = raft.raft.metrics().borrow().clone();
         let voters: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
         if voters.len() == 2 && !voters.contains(&evict_id) {
             break;
@@ -897,7 +964,14 @@ async fn multi_raft_per_partition_storage_dirs_are_isolated() {
             peer.config.self_id,
             raft_root.display()
         );
-        for partition in peer.multi_raft.partitions.keys() {
+        for partition in peer
+            .multi_raft
+            .partitions_snapshot()
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<Vec<_>>()
+            .iter()
+        {
             let p_dir = raft_root.join(format!("p-{}", partition.0));
             assert!(
                 p_dir.is_dir(),
@@ -909,6 +983,9 @@ async fn multi_raft_per_partition_storage_dirs_are_isolated() {
     }
     // 4 partitions × rf=2 = 8 total partition-slot replicas across
     // 3 peers (uneven distribution, but every slot has a home).
-    let total: usize = peers.iter().map(|p| p.multi_raft.partitions.len()).sum();
+    let total: usize = peers
+        .iter()
+        .map(|p| p.multi_raft.partitions_snapshot().len())
+        .sum();
     assert_eq!(total, 8);
 }

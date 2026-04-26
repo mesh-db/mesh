@@ -494,8 +494,14 @@ async fn build_multi_raft_components(
         replica_map,
     ));
 
-    // Dispatch table for inbound MeshRaft RPCs.
+    // Dispatch table for inbound MeshRaft RPCs. Cloned so we can
+    // hand one clone to the gRPC service (which moves it into
+    // tonic) and stash another in `MultiRaftCluster` for the
+    // runtime-spin-up path. Both clones share the same
+    // `Arc<RwLock<...>>` for the partitions table — registering a
+    // new partition through either becomes visible to the other.
     let registry = multi_raft.build_registry();
+    multi_raft.attach_dispatch_registry(registry.clone());
     let raft_service = MeshRaftService::with_registry(registry);
 
     // Open the coordinator log so cross-partition decisions are
@@ -550,6 +556,77 @@ pub async fn initialize_if_seed(config: &ServerConfig, raft: &RaftCluster) -> Re
         .context("seeding raft cluster")
 }
 
+/// Instantiate a partition Raft group at runtime — used by the
+/// rebalancing path when a peer is added as a replica of a
+/// partition it didn't bootstrap with. Builds the rocksdb dir, the
+/// `RaftCluster`, and the `PartitionGraphApplier`, then registers
+/// the group with both `MultiRaftCluster` (so the local write path
+/// finds it) and the dispatch `RaftGroupRegistry` (so inbound
+/// `MeshRaft` RPCs from the existing replicas land).
+///
+/// Caller is responsible for ensuring the partition Raft on at
+/// least one existing peer subsequently calls `change_membership`
+/// to add this peer as a voter — otherwise this function builds
+/// an isolated group that never replicates from anyone.
+pub async fn instantiate_partition_group(
+    config: &ServerConfig,
+    multi_raft: &Arc<MultiRaftCluster>,
+    store: Arc<dyn StorageEngine>,
+    partition: PartitionId,
+    base_network: &GrpcNetwork,
+) -> Result<()> {
+    if multi_raft.hosts_partition(partition) {
+        // Already instantiated on this peer — re-running the API
+        // is idempotent so a partial failure can be retried safely.
+        return Ok(());
+    }
+    let dir = config
+        .data_dir
+        .join("raft")
+        .join(format!("p-{}", partition.0));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating partition raft dir {}", dir.display()))?;
+    let partitioner = Partitioner::new(config.num_partitions);
+    let applier_concrete = Arc::new(PartitionGraphApplier::new(
+        partition,
+        store.clone(),
+        partitioner,
+    ));
+    let applier: Arc<dyn GraphStateMachine> = applier_concrete.clone();
+    // Build initial state from the meta replica's current view —
+    // openraft uses it only as the fallback for a fresh data dir,
+    // and on a learner-join replication will overwrite anyway.
+    let initial_state = multi_raft.meta.current_state().await;
+    let raft = Arc::new(
+        RaftCluster::open_persistent(
+            config.self_id,
+            &dir,
+            initial_state,
+            base_network.for_group(RaftGroupTarget::Partition(partition)),
+            Some(applier),
+        )
+        .await
+        .with_context(|| format!("building partition {} raft cluster", partition.0))?
+        .with_label(format!("p-{}", partition.0)),
+    );
+    // Register with both maps. Order matters: the dispatch table
+    // before MultiRaftCluster so an inbound RPC that lands during
+    // the brief window can still be served (it'll find the new
+    // group in the dispatch table; the multi-raft cluster is only
+    // needed by the local write path, which the operator hasn't
+    // started routing here yet).
+    if let Some(reg) = multi_raft
+        .dispatch_registry
+        .read()
+        .expect("dispatch_registry lock poisoned")
+        .as_ref()
+    {
+        reg.register_partition(partition, Arc::new(raft.raft.clone()));
+    }
+    multi_raft.add_runtime_partition_group(partition, raft, applier_concrete);
+    Ok(())
+}
+
 /// Initialize the multi-raft groups this peer is responsible for
 /// seeding on first startup. Each Raft group's "seed" peer is
 /// chosen deterministically — the lowest-id replica in the group's
@@ -580,8 +657,8 @@ pub async fn initialize_multi_raft_if_seed(
     // Each partition group's seed is the first peer in its replica
     // set (lowest NodeId). Skip when this peer isn't that one — the
     // designated seed will run on its own peer.
-    for (partition, raft) in &multi_raft.partitions {
-        let replicas = multi_raft.replica_map.replicas(*partition);
+    for (partition, raft) in multi_raft.partitions_snapshot() {
+        let replicas = multi_raft.replica_map.replicas(partition);
         let seed = replicas
             .iter()
             .map(|p| p.0)
@@ -865,7 +942,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         } else {
             tracing::info!(
                 peers = config.peers.len(),
-                partitions = mr.partitions.len(),
+                partitions = mr.partitions_snapshot().len(),
                 "multi-raft groups bootstrapped on this peer"
             );
         }

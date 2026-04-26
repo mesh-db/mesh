@@ -128,9 +128,9 @@ async fn spawn_three_peer_cluster(num_partitions: u32, rf: usize) -> Cluster {
         let all = peers.iter().all(|p| {
             p.multi_raft.meta.current_leader().is_some()
                 && p.multi_raft
-                    .partitions
-                    .values()
-                    .all(|r| r.current_leader().is_some())
+                    .partitions_snapshot()
+                    .iter()
+                    .all(|(_, r)| r.current_leader().is_some())
         });
         if all {
             break;

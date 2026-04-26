@@ -23,7 +23,7 @@ use openraft::raft::{
 };
 use openraft::Raft;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tonic::{Request, Response, Status};
 
 /// Lookup table for which Raft group a given RPC routes to. A peer
@@ -31,6 +31,12 @@ use tonic::{Request, Response, Status};
 /// some subset of `partitions`); the two are mutually exclusive but
 /// the registry itself doesn't enforce that — it just dispatches what
 /// the bootstrap code wired in.
+///
+/// `partitions` is RwLock-wrapped so a runtime rebalance can grow the
+/// dispatch table mid-flight without restart — see
+/// [`Self::register_partition`]. Reads are short read-locks; the
+/// dispatch path clones the matched `Arc<Raft>` out of the lock so
+/// the lock guard doesn't outlive the RPC handler.
 #[derive(Default, Clone)]
 pub struct RaftGroupRegistry {
     /// Single-Raft mode's one-and-only group. Targeted by RPCs with no
@@ -40,9 +46,9 @@ pub struct RaftGroupRegistry {
     meta: Option<Arc<Raft<MeshRaftConfig>>>,
     /// Multi-raft per-partition groups. Only populated for partitions
     /// this peer is a replica of, so a routed RPC for an unknown
-    /// partition surfaces as "not found" rather than dispatching to a
-    /// uninitialized group.
-    partitions: HashMap<PartitionId, Arc<Raft<MeshRaftConfig>>>,
+    /// partition surfaces as "not found" rather than dispatching to
+    /// an uninitialized group.
+    partitions: Arc<RwLock<HashMap<PartitionId, Arc<Raft<MeshRaftConfig>>>>>,
 }
 
 impl RaftGroupRegistry {
@@ -64,24 +70,54 @@ impl RaftGroupRegistry {
         self
     }
 
-    pub fn with_partition(
-        mut self,
-        partition: PartitionId,
-        raft: Arc<Raft<MeshRaftConfig>>,
-    ) -> Self {
-        self.partitions.insert(partition, raft);
+    pub fn with_partition(self, partition: PartitionId, raft: Arc<Raft<MeshRaftConfig>>) -> Self {
+        self.partitions
+            .write()
+            .expect("registry partitions lock poisoned")
+            .insert(partition, raft);
         self
     }
 
-    fn route(&self, target: Option<&Target>) -> Result<&Arc<Raft<MeshRaftConfig>>, Status> {
+    /// Register a partition Raft handle at runtime. Used by the
+    /// rebalancing path when a peer is added as a replica of a
+    /// partition it didn't bootstrap with: after spinning up the
+    /// new partition Raft, the dispatch table needs to know about
+    /// it so other peers' AppendEntries land. Idempotent — re-
+    /// registering replaces the existing entry, which is how a
+    /// re-issued rebalance reconciles after a transient failure.
+    pub fn register_partition(&self, partition: PartitionId, raft: Arc<Raft<MeshRaftConfig>>) {
+        self.partitions
+            .write()
+            .expect("registry partitions lock poisoned")
+            .insert(partition, raft);
+    }
+
+    /// Drop a partition Raft handle from the dispatch table. Used
+    /// when a peer is evacuated from a partition's replica set —
+    /// after the partition Raft's `change_membership` removes this
+    /// peer, the dispatch table should reject inbound RPCs targeting
+    /// the now-orphaned local replica. Idempotent.
+    pub fn unregister_partition(&self, partition: PartitionId) {
+        self.partitions
+            .write()
+            .expect("registry partitions lock poisoned")
+            .remove(&partition);
+    }
+
+    fn route(&self, target: Option<&Target>) -> Result<Arc<Raft<MeshRaftConfig>>, Status> {
         match target {
-            None => self.single.as_ref().ok_or_else(|| {
+            None => self.single.clone().ok_or_else(|| {
                 // Legacy unset target = single-Raft mode caller.
                 // If this peer is running multi-raft (meta or
                 // partitions populated), the caller is mixed-mode,
                 // which we don't support; surface the diagnosis
                 // explicitly so the operator can fix the config.
-                if self.meta.is_some() || !self.partitions.is_empty() {
+                let has_partitions = !self
+                    .partitions
+                    .read()
+                    .expect("registry partitions lock poisoned")
+                    .is_empty();
+                if self.meta.is_some() || has_partitions {
                     Status::failed_precondition(
                         "received single-Raft RPC on a multi-raft peer — \
                          all peers in a cluster must run the same `mode` \
@@ -91,7 +127,7 @@ impl RaftGroupRegistry {
                     Status::not_found("no single-Raft group configured on this peer")
                 }
             }),
-            Some(Target::Meta(true)) => self.meta.as_ref().ok_or_else(|| {
+            Some(Target::Meta(true)) => self.meta.clone().ok_or_else(|| {
                 if self.single.is_some() {
                     Status::failed_precondition(
                         "received multi-raft meta RPC on a single-Raft peer — \
@@ -104,18 +140,24 @@ impl RaftGroupRegistry {
             Some(Target::Meta(false)) => Err(Status::invalid_argument(
                 "RaftRpcRequest.target.meta = false; pass `true` or omit the field",
             )),
-            Some(Target::Partition(p)) => self.partitions.get(&PartitionId(*p)).ok_or_else(|| {
-                if self.single.is_some() {
-                    Status::failed_precondition(
-                        "received multi-raft partition RPC on a single-Raft peer — \
-                         all peers in a cluster must run the same `mode`",
-                    )
-                } else {
-                    Status::not_found(format!(
-                        "partition Raft group {p} is not hosted on this peer"
-                    ))
-                }
-            }),
+            Some(Target::Partition(p)) => {
+                let guard = self
+                    .partitions
+                    .read()
+                    .expect("registry partitions lock poisoned");
+                guard.get(&PartitionId(*p)).cloned().ok_or_else(|| {
+                    if self.single.is_some() {
+                        Status::failed_precondition(
+                            "received multi-raft partition RPC on a single-Raft peer — \
+                             all peers in a cluster must run the same `mode`",
+                        )
+                    } else {
+                        Status::not_found(format!(
+                            "partition Raft group {p} is not hosted on this peer"
+                        ))
+                    }
+                })
+            }
         }
     }
 }
@@ -201,7 +243,7 @@ mod tests {
     /// `Result::unwrap_err` requires `Debug` on the Ok branch, but
     /// `Raft<MeshRaftConfig>` doesn't implement it. This helper
     /// extracts the `Status` without that bound.
-    fn err(result: Result<&Arc<Raft<MeshRaftConfig>>, Status>) -> Status {
+    fn err(result: Result<Arc<Raft<MeshRaftConfig>>, Status>) -> Status {
         match result {
             Ok(_) => panic!("expected error, got Ok"),
             Err(e) => e,

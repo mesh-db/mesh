@@ -1615,7 +1615,7 @@ impl MeshService {
             fp.recover_multi_raft_call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        for (partition, applier) in &multi_raft.partition_appliers {
+        for (partition, applier) in multi_raft.partition_appliers_snapshot() {
             // Run recovery on every replica that hosts this partition.
             // Non-leader proposals route through `forward_write` to
             // the current leader; the first successful CommitTx /
@@ -1635,7 +1635,7 @@ impl MeshService {
                     None => continue, // unknown — try again later
                 };
                 if let Err(e) = self
-                    .propose_partition_command(&multi_raft, *partition, resolution)
+                    .propose_partition_command(&multi_raft, partition, resolution)
                     .await
                 {
                     tracing::warn!(
@@ -1956,7 +1956,7 @@ impl MeshService {
             }
         }
         if multi_raft.is_local_leader(partition) {
-            if let Some(raft) = multi_raft.partitions.get(&partition) {
+            if let Some(raft) = multi_raft.partition(partition) {
                 return match raft.propose_graph(entry).await {
                     Ok(_) => Ok(()),
                     Err(meshdb_cluster::Error::ForwardToLeader { leader_id, .. }) => {
@@ -2041,7 +2041,7 @@ impl MeshService {
         };
 
         if multi_raft.is_local_leader(partition) {
-            if let Some(raft) = multi_raft.partitions.get(&partition) {
+            if let Some(raft) = multi_raft.partition(partition) {
                 return match raft.propose_graph(entry).await {
                     Ok(_) => Ok(()),
                     Err(meshdb_cluster::Error::ForwardToLeader { leader_id, .. }) => {
@@ -5462,7 +5462,7 @@ impl MeshWrite for MeshService {
         }
 
         let partition_id = meshdb_cluster::PartitionId(req.partition);
-        let partition_raft = match multi_raft.partitions.get(&partition_id) {
+        let partition_raft = match multi_raft.partition(partition_id) {
             Some(r) => r,
             None => {
                 // We don't host this partition's Raft replica; the
