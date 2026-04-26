@@ -2003,12 +2003,8 @@ impl MeshService {
                 // Once this clears, any subsequent write — anywhere
                 // in the cluster — observes the DDL on its
                 // partition leader's local meta replica.
-                self.await_cluster_meta_apply(
-                    multi_raft,
-                    target,
-                    crate::DEFAULT_DDL_STRICT_TIMEOUT,
-                )
-                .await?;
+                self.await_cluster_meta_apply(multi_raft, target, multi_raft.ddl_strict_timeout())
+                    .await?;
                 Ok(())
             }
             Err(meshdb_cluster::Error::ForwardToLeader { leader_address, .. }) => {
@@ -5717,7 +5713,7 @@ impl MeshWrite for MeshService {
         // forwarding hop.
         let target = multi_raft.meta_last_applied();
         if let Err(e) = self
-            .await_cluster_meta_apply(multi_raft, target, crate::DEFAULT_DDL_STRICT_TIMEOUT)
+            .await_cluster_meta_apply(multi_raft, target, multi_raft.ddl_strict_timeout())
             .await
         {
             return Ok(Response::new(crate::proto::ForwardDdlResponse {

@@ -1218,6 +1218,72 @@ async fn multi_raft_per_partition_storage_dirs_are_isolated() {
 }
 
 #[tokio::test]
+async fn multi_raft_ddl_gate_times_out_when_peer_unreachable() {
+    // 3 peers. Crash one peer's gRPC server (so its meta_last_applied
+    // RPC will fail) without touching its Raft handle — the meta
+    // proposal still commits with a 2-of-3 quorum, but the gate
+    // can't observe the third peer catching up. Set a short
+    // strict-timeout so the deadline trips in bounded wall time;
+    // assert the CREATE INDEX returns DeadlineExceeded and the
+    // timeout metric increments.
+    use meshdb_rpc::metrics::MULTI_RAFT_DDL_GATE_TOTAL;
+
+    let peers = spawn_multi_raft_cluster(3, 1, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Pick a non-meta-leader peer to crash so the DDL propose can
+    // still commit with the remaining 2-of-3 quorum (the meta
+    // leader plus one other peer).
+    let meta_leader = peers[0].multi_raft.meta_leader().expect("meta leader");
+    let crash_idx = peers
+        .iter()
+        .position(|p| p.config.self_id != meta_leader)
+        .expect("non-leader exists");
+    peers[crash_idx].server_task.abort();
+    // Brief settle so the gate's polling loop sees ConnectionRefused.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Configure a short DDL strict timeout on every peer (the gate
+    // runs on whichever peer the DDL was issued through).
+    for peer in &peers {
+        peer.multi_raft
+            .set_ddl_strict_timeout(Duration::from_millis(300));
+    }
+
+    let timeout_before = MULTI_RAFT_DDL_GATE_TOTAL
+        .with_label_values(&["timeout"])
+        .get();
+
+    // Issue CREATE INDEX through a survivor; it will commit the
+    // meta proposal, then trip the gate trying to await the dead peer.
+    let alive_idx = (0..peers.len())
+        .find(|i| *i != crash_idx)
+        .expect("a survivor exists");
+    let result = peers[alive_idx]
+        .service
+        .execute_cypher_local(
+            "CREATE INDEX FOR (n:GateTimeout) ON (n.x)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await;
+
+    let err = result.expect_err("CREATE INDEX must surface the gate timeout");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ddl strict-apply gate") || msg.contains("strict-apply gate"),
+        "expected gate timeout error, got: {msg}"
+    );
+
+    let timeout_after = MULTI_RAFT_DDL_GATE_TOTAL
+        .with_label_values(&["timeout"])
+        .get();
+    assert!(
+        timeout_after > timeout_before,
+        "ddl_gate_total{{timeout}} should increment on a tripped gate: {timeout_before} -> {timeout_after}"
+    );
+}
+
+#[tokio::test]
 async fn multi_raft_metrics_increment_on_forward_write_and_ddl_gate() {
     // Smoke test: a single-partition write through a non-leader peer
     // should bump `mesh_multiraft_forward_writes_total{outcome="committed"}`

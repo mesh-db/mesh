@@ -90,6 +90,14 @@ pub struct MultiRaftCluster {
     /// registry is non-fatal — the runtime spin-up just can't
     /// register inbound RPCs without it).
     pub dispatch_registry: RwLock<Option<RaftGroupRegistry>>,
+    /// Synchronous DDL gate strict timeout. After a meta-Raft
+    /// proposal commits locally, the gate polls every other peer's
+    /// `meta_last_applied` until they catch up to the proposal's
+    /// commit index, or this duration elapses. Default
+    /// [`DEFAULT_DDL_STRICT_TIMEOUT`]; tests override via
+    /// [`Self::set_ddl_strict_timeout`] to exercise the timeout path
+    /// in bounded wall time.
+    pub ddl_strict_timeout: std::sync::RwLock<std::time::Duration>,
 }
 
 impl std::fmt::Debug for MultiRaftCluster {
@@ -127,7 +135,27 @@ impl MultiRaftCluster {
             leader_cache,
             min_meta_index: AtomicU64::new(0),
             dispatch_registry: RwLock::new(None),
+            ddl_strict_timeout: std::sync::RwLock::new(DEFAULT_DDL_STRICT_TIMEOUT),
         }
+    }
+
+    /// Returns the currently-configured synchronous DDL gate strict
+    /// timeout. Defaults to [`DEFAULT_DDL_STRICT_TIMEOUT`].
+    pub fn ddl_strict_timeout(&self) -> std::time::Duration {
+        *self
+            .ddl_strict_timeout
+            .read()
+            .expect("ddl_strict_timeout lock poisoned")
+    }
+
+    /// Override the synchronous DDL gate strict timeout. Test-only
+    /// hook for exercising the deadline-exceeded path in bounded
+    /// wall time. Production sites use the default.
+    pub fn set_ddl_strict_timeout(&self, timeout: std::time::Duration) {
+        *self
+            .ddl_strict_timeout
+            .write()
+            .expect("ddl_strict_timeout lock poisoned") = timeout;
     }
 
     /// Stash a clone of the dispatch [`RaftGroupRegistry`] so
