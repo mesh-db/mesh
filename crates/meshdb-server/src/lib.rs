@@ -14,13 +14,16 @@ pub mod value_conv;
 use anyhow::{anyhow, Context, Result};
 use config::{ClusterMode, ServerConfig};
 use meshdb_cluster::raft::{BasicNode, GraphStateMachine, RaftCluster};
-use meshdb_cluster::{Cluster, ClusterState, Membership, PartitionMap, Peer, PeerId};
+use meshdb_cluster::{
+    Cluster, ClusterState, Membership, PartitionId, PartitionMap, PartitionReplicaMap, Partitioner,
+    Peer, PeerId,
+};
 use meshdb_rpc::{
-    CoordinatorLog, GrpcNetwork, MeshRaftService, MeshService, ParticipantLog, Routing,
-    StoreGraphApplier,
+    CoordinatorLog, GrpcNetwork, MeshRaftService, MeshService, MetaGraphApplier, MultiRaftCluster,
+    ParticipantLog, PartitionGraphApplier, RaftGroupTarget, Routing, StoreGraphApplier,
 };
 use meshdb_storage::{RocksDbStorageEngine, StorageEngine};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -38,6 +41,11 @@ pub struct ServerComponents {
     pub service: MeshService,
     pub raft: Option<Arc<RaftCluster>>,
     pub raft_service: Option<MeshRaftService>,
+    /// Multi-raft cluster handles, populated only in
+    /// [`ClusterMode::MultiRaft`]. Holds the metadata Raft group plus
+    /// every partition Raft group this peer is a replica of. Tests
+    /// destructure this for direct access to per-group Raft handles.
+    pub multi_raft: Option<Arc<MultiRaftCluster>>,
 }
 
 /// Build the storage-backed [`MeshService`] synchronously. Supports
@@ -221,6 +229,7 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
                 service: apply_apoc_import(MeshService::new(store), config, &store_for_triggers),
                 raft: None,
                 raft_service: None,
+                multi_raft: None,
             });
         }
         ClusterMode::Routing => {
@@ -228,19 +237,14 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
                 service: build_routing_service(config, store)?,
                 raft: None,
                 raft_service: None,
+                multi_raft: None,
             });
         }
         ClusterMode::Raft => {
             // Fall through to the Raft bootstrap path below.
         }
         ClusterMode::MultiRaft => {
-            // Multi-raft bootstrap lands in Phase 5 (MultiRaftCluster
-            // wrapper). Until then, surface the gap loudly so a
-            // misconfiguration doesn't silently degrade.
-            return Err(anyhow!(
-                "mode = \"multi-raft\" is configured but the bootstrap path is not \
-                 yet implemented; this branch wires it up in a later commit"
-            ));
+            return build_multi_raft_components(config, store).await;
         }
     }
 
@@ -308,6 +312,135 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
         service,
         raft: Some(raft),
         raft_service: Some(raft_service),
+        multi_raft: None,
+    })
+}
+
+/// Build the per-group Raft handles + dispatch registry for
+/// `mode = "multi-raft"`. One metadata Raft group spans every peer;
+/// per-partition Raft groups are instantiated only on this peer's
+/// replicas of the [`PartitionReplicaMap`].
+///
+/// This phase wires up the bootstrap and leader-election machinery —
+/// `MeshService` itself is built in single-node configuration so the
+/// existing read path keeps working. The write path is rerouted
+/// through `MultiRaftCluster` in a follow-up commit (Phase 6).
+async fn build_multi_raft_components(
+    config: &ServerConfig,
+    store: Arc<dyn StorageEngine>,
+) -> Result<ServerComponents> {
+    let rf = config
+        .resolved_replication_factor()
+        .ok_or_else(|| anyhow!("multi-raft mode requires a replication factor"))?;
+
+    // Build peer list and replica map.
+    let peers: Vec<Peer> = config
+        .peers
+        .iter()
+        .map(|p| {
+            let base = Peer::new(PeerId(p.id), p.address.clone());
+            match &p.bolt_address {
+                Some(ba) => base.with_bolt_address(ba),
+                None => base,
+            }
+        })
+        .collect();
+    let membership = Membership::new(peers);
+    let peer_ids: Vec<PeerId> = membership.peer_ids().collect();
+    let replica_map = Arc::new(
+        PartitionReplicaMap::round_robin_replicas(&peer_ids, config.num_partitions, rf)
+            .context("building partition replica map")?,
+    );
+    // The legacy PartitionMap (single owner per partition) still
+    // populates ClusterState — multi-raft routing reads from
+    // replica_map, but ClusterState's structure stays unchanged so
+    // the meta group's snapshot/restore is shared with single-Raft.
+    let partition_map = PartitionMap::round_robin(&peer_ids, config.num_partitions)
+        .context("building partition map")?;
+    let initial_state = ClusterState::new(membership, partition_map);
+
+    // One channel pool, shared across every group via for_group().
+    let peer_map: Vec<(u64, String)> = config
+        .peers
+        .iter()
+        .filter(|p| p.id != config.self_id)
+        .map(|p| (p.id, p.address.clone()))
+        .collect();
+    let client_tls = build_grpc_client_tls(config)?;
+    let base_network = match client_tls.clone() {
+        Some(tls) => GrpcNetwork::with_tls(peer_map, tls).context("building grpc network")?,
+        None => GrpcNetwork::new(peer_map).context("building grpc network")?,
+    };
+
+    // Metadata group — every peer is a member.
+    let meta_dir = config.data_dir.join("raft").join("meta");
+    std::fs::create_dir_all(&meta_dir)
+        .with_context(|| format!("creating meta raft dir {}", meta_dir.display()))?;
+    let meta_applier: Arc<dyn GraphStateMachine> = Arc::new(MetaGraphApplier::new(store.clone()));
+    let meta_raft = RaftCluster::open_persistent(
+        config.self_id,
+        &meta_dir,
+        initial_state.clone(),
+        base_network.for_group(RaftGroupTarget::Meta),
+        Some(meta_applier),
+    )
+    .await
+    .context("building meta raft cluster")?
+    .with_label("meta");
+
+    // Per-partition groups — only the ones whose replica set
+    // contains this peer.
+    let partitioner = Partitioner::new(config.num_partitions);
+    let mut partitions: HashMap<PartitionId, Arc<RaftCluster>> = HashMap::new();
+    for p in 0..config.num_partitions {
+        let partition_id = PartitionId(p);
+        if !replica_map.contains(partition_id, PeerId(config.self_id)) {
+            continue;
+        }
+        let dir = config.data_dir.join("raft").join(format!("p-{p}"));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating partition raft dir {}", dir.display()))?;
+        let applier: Arc<dyn GraphStateMachine> = Arc::new(PartitionGraphApplier::new(
+            partition_id,
+            store.clone(),
+            partitioner.clone(),
+        ));
+        let raft = RaftCluster::open_persistent(
+            config.self_id,
+            &dir,
+            initial_state.clone(),
+            base_network.for_group(RaftGroupTarget::Partition(partition_id)),
+            Some(applier),
+        )
+        .await
+        .with_context(|| format!("building partition {p} raft cluster"))?
+        .with_label(format!("p-{p}"));
+        partitions.insert(partition_id, Arc::new(raft));
+    }
+
+    let multi_raft = Arc::new(MultiRaftCluster::new(
+        config.self_id,
+        Arc::new(meta_raft),
+        partitions,
+        replica_map,
+    ));
+
+    // Dispatch table for inbound MeshRaft RPCs.
+    let registry = multi_raft.build_registry();
+    let raft_service = MeshRaftService::with_registry(registry);
+
+    // Until Phase 6 wires writes through partition Raft groups, the
+    // user-facing service stays in single-node configuration. Reads
+    // hit the local store directly; writes will route through
+    // multi_raft once `MeshService::with_multi_raft` lands.
+    let store_for_triggers = store.clone();
+    let service = apply_apoc_import(MeshService::new(store), config, &store_for_triggers);
+
+    Ok(ServerComponents {
+        service,
+        raft: None,
+        raft_service: Some(raft_service),
+        multi_raft: Some(multi_raft),
     })
 }
 
@@ -327,6 +460,62 @@ pub async fn initialize_if_seed(config: &ServerConfig, raft: &RaftCluster) -> Re
         .context("seeding raft cluster")
 }
 
+/// Initialize the multi-raft groups this peer is responsible for
+/// seeding on first startup. Each Raft group's "seed" peer is
+/// chosen deterministically — the lowest-id replica in the group's
+/// replica set initializes that group. The metadata group's seed is
+/// the peer with `bootstrap = true` (matching the legacy single-Raft
+/// convention so an existing TOML config keeps working).
+///
+/// On a non-fresh data directory this re-call surfaces openraft's
+/// `NotAllowed` error, which is treated as a no-op since the
+/// persisted state is the source of truth after restart.
+pub async fn initialize_multi_raft_if_seed(
+    config: &ServerConfig,
+    multi_raft: &MultiRaftCluster,
+) -> Result<()> {
+    let all_members: BTreeMap<u64, BasicNode> = config
+        .peers
+        .iter()
+        .map(|p| (p.id, BasicNode::new(p.address.clone())))
+        .collect();
+
+    if config.bootstrap {
+        if let Err(e) = multi_raft.meta.initialize(all_members.clone()).await {
+            // Already initialized → fine, the persisted state takes over.
+            tracing::info!(error = %e, "meta-raft initialize skipped (likely already initialized)");
+        }
+    }
+
+    // Each partition group's seed is the first peer in its replica
+    // set (lowest NodeId). Skip when this peer isn't that one — the
+    // designated seed will run on its own peer.
+    for (partition, raft) in &multi_raft.partitions {
+        let replicas = multi_raft.replica_map.replicas(*partition);
+        let seed = replicas
+            .iter()
+            .map(|p| p.0)
+            .min()
+            .expect("non-empty replicas");
+        if seed != config.self_id {
+            continue;
+        }
+        let members: BTreeMap<u64, BasicNode> = replicas
+            .iter()
+            .filter_map(|peer_id| all_members.get(&peer_id.0).map(|n| (peer_id.0, n.clone())))
+            .collect();
+        if let Err(e) = raft.initialize(members).await {
+            tracing::info!(
+                partition = ?partition,
+                error = %e,
+                "partition raft initialize skipped (likely already initialized)"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Bind the configured listen address and serve until Ctrl-C.
 ///
 /// For multi-peer configs this also bootstraps the Raft cluster (if
@@ -341,10 +530,12 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     tracing::info!(addr = %local_addr, "meshdb-server listening");
 
     let raft_handle = components.raft.clone();
+    let multi_raft_handle = components.multi_raft.clone();
     let ServerComponents {
         service,
         raft: _,
         raft_service,
+        multi_raft: _,
     } = components;
 
     // Rehydrate 2PC participant-side state from the on-disk log
@@ -563,6 +754,18 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             tracing::warn!("raft bootstrap failed: {e:#}");
         } else if config.bootstrap {
             tracing::info!(peers = config.peers.len(), "raft cluster bootstrapped");
+        }
+    }
+
+    if let Some(mr) = &multi_raft_handle {
+        if let Err(e) = initialize_multi_raft_if_seed(&config, mr).await {
+            tracing::warn!("multi-raft bootstrap failed: {e:#}");
+        } else {
+            tracing::info!(
+                peers = config.peers.len(),
+                partitions = mr.partitions.len(),
+                "multi-raft groups bootstrapped on this peer"
+            );
         }
     }
 

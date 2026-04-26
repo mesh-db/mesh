@@ -740,11 +740,13 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -917,11 +919,13 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
 
     let raft_service_a = raft_service_a.unwrap();
@@ -1034,6 +1038,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
             service,
             raft: _,
             raft_service,
+            multi_raft: _,
         } = components;
         let raft_service = raft_service.unwrap();
         let join = tokio::spawn(async move {
@@ -1324,11 +1329,13 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -1488,11 +1495,13 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -1661,6 +1670,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
             service,
             raft: _,
             raft_service,
+            multi_raft: _,
         } = components;
         let raft_service = raft_service.unwrap();
         let join = tokio::spawn(async move {
@@ -1933,6 +1943,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
             service,
             raft: _,
             raft_service,
+            multi_raft: _,
         } = components;
         let raft_service = raft_service.unwrap();
         let join = tokio::spawn(async move {
@@ -2218,11 +2229,13 @@ async fn cypher_merge_replicates_through_raft() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -2386,11 +2399,13 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -2561,11 +2576,13 @@ async fn two_peer_raft_replicates_via_server_components() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
 
     let raft_service_a = raft_service_a.unwrap();
@@ -2828,11 +2845,13 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -3021,6 +3040,7 @@ async fn route_write_role_tracks_raft_leader_across_handoff() {
             service,
             raft: _,
             raft_service,
+            multi_raft: _,
         } = comp;
         services.push(Arc::new(service));
         raft_services.push(raft_service.unwrap());

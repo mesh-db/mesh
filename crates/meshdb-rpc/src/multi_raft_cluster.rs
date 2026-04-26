@@ -1,0 +1,159 @@
+//! Multi-raft cluster wrapper.
+//!
+//! In `mode = "multi-raft"` each peer hosts:
+//!
+//!   * One **metadata** Raft group, spanning every peer. Replicates
+//!     DDL (`CreateIndex`, `CreateConstraint`, `InstallTrigger`, ...)
+//!     and cluster-membership entries.
+//!   * One Raft group **per partition** this peer is a replica of —
+//!     determined deterministically by [`PartitionReplicaMap`].
+//!     Replicates the data writes targeting that partition.
+//!
+//! This module holds the [`MultiRaftCluster`] wrapper that bundles
+//! those handles together plus a [`PartitionLeaderCache`] used by the
+//! write-routing path to find the right peer for a partition.
+
+use crate::raft_service::RaftGroupRegistry;
+use meshdb_cluster::raft::{NodeId, RaftCluster};
+use meshdb_cluster::{PartitionId, PartitionReplicaMap};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+/// Bundle of every Raft group this peer is a replica of in
+/// `mode = "multi-raft"`.
+pub struct MultiRaftCluster {
+    /// This peer's NodeId. Stored so leader-resolution can
+    /// short-circuit when we lead a partition and don't need to
+    /// proxy the write.
+    pub self_id: NodeId,
+    /// Metadata Raft group — every peer is a member.
+    pub meta: Arc<RaftCluster>,
+    /// Per-partition Raft groups this peer is a replica of. Not
+    /// every partition appears here — only the ones whose replica
+    /// set includes `self_id`.
+    pub partitions: HashMap<PartitionId, Arc<RaftCluster>>,
+    /// The deterministic placement map shared by every peer.
+    /// Lookup-only — multi-raft v1 does not rebalance at runtime.
+    pub replica_map: Arc<PartitionReplicaMap>,
+    /// Lazy cache of partition leadership, refreshed from each
+    /// partition Raft's own metrics. See [`PartitionLeaderCache`].
+    pub leader_cache: PartitionLeaderCache,
+}
+
+impl std::fmt::Debug for MultiRaftCluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiRaftCluster")
+            .field("self_id", &self.self_id)
+            .field("partitions", &self.partitions.keys().collect::<Vec<_>>())
+            .field("num_replicas", &self.replica_map.num_partitions())
+            .finish_non_exhaustive()
+    }
+}
+
+impl MultiRaftCluster {
+    pub fn new(
+        self_id: NodeId,
+        meta: Arc<RaftCluster>,
+        partitions: HashMap<PartitionId, Arc<RaftCluster>>,
+        replica_map: Arc<PartitionReplicaMap>,
+    ) -> Self {
+        let leader_cache = PartitionLeaderCache::new(replica_map.num_partitions());
+        Self {
+            self_id,
+            meta,
+            partitions,
+            replica_map,
+            leader_cache,
+        }
+    }
+
+    /// Build a [`RaftGroupRegistry`] that lets [`MeshRaftService`]
+    /// dispatch incoming RPCs to the right group on this peer.
+    pub fn build_registry(&self) -> RaftGroupRegistry {
+        let mut reg = RaftGroupRegistry::new().with_meta(Arc::new(self.meta.raft.clone()));
+        for (p, raft) in &self.partitions {
+            reg = reg.with_partition(*p, Arc::new(raft.raft.clone()));
+        }
+        reg
+    }
+
+    /// Returns the cached or freshly-polled leader of `partition`.
+    /// `None` means this peer doesn't know the leader yet (election
+    /// in progress, freshly-restarted follower, etc.). Callers
+    /// should treat that as "retry shortly" — the write path's
+    /// server-side forwarding wraps this with a refresh-on-stale
+    /// retry loop.
+    pub fn leader_of(&self, partition: PartitionId) -> Option<NodeId> {
+        // Fast path: cached.
+        if let Some(leader) = self.leader_cache.get(partition) {
+            return Some(leader);
+        }
+        // Slow path: poll the local Raft replica's metrics if we
+        // host this partition. If we don't, the cache miss is the
+        // best we can do — caller should ask another replica.
+        if let Some(raft) = self.partitions.get(&partition) {
+            if let Some(leader) = raft.current_leader() {
+                self.leader_cache.set(partition, leader.0);
+                return Some(leader.0);
+            }
+        }
+        None
+    }
+
+    /// True when this peer leads `partition`. Used by the write
+    /// path to decide between local-propose and forward-to-leader.
+    pub fn is_local_leader(&self, partition: PartitionId) -> bool {
+        self.leader_of(partition) == Some(self.self_id)
+    }
+}
+
+/// Lazy cache of `PartitionId -> Option<NodeId>` mapping the current
+/// leader for each partition group. Updated on demand by
+/// [`MultiRaftCluster::leader_of`]; staleness is acceptable because
+/// the write-routing path retries once on a `leader_hint` mismatch.
+#[derive(Clone)]
+pub struct PartitionLeaderCache {
+    inner: Arc<RwLock<Vec<Option<NodeId>>>>,
+}
+
+impl PartitionLeaderCache {
+    pub fn new(num_partitions: u32) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(vec![None; num_partitions as usize])),
+        }
+    }
+
+    pub fn get(&self, partition: PartitionId) -> Option<NodeId> {
+        let cache = self.inner.read().expect("leader cache poisoned");
+        *cache.get(partition.0 as usize)?
+    }
+
+    pub fn set(&self, partition: PartitionId, leader: NodeId) {
+        let mut cache = self.inner.write().expect("leader cache poisoned");
+        if let Some(slot) = cache.get_mut(partition.0 as usize) {
+            *slot = Some(leader);
+        }
+    }
+
+    pub fn invalidate(&self, partition: PartitionId) {
+        let mut cache = self.inner.write().expect("leader cache poisoned");
+        if let Some(slot) = cache.get_mut(partition.0 as usize) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leader_cache_round_trips_set_get() {
+        let cache = PartitionLeaderCache::new(4);
+        assert_eq!(cache.get(PartitionId(0)), None);
+        cache.set(PartitionId(0), 7);
+        assert_eq!(cache.get(PartitionId(0)), Some(7));
+        cache.invalidate(PartitionId(0));
+        assert_eq!(cache.get(PartitionId(0)), None);
+    }
+}
