@@ -4720,6 +4720,7 @@ fn update_multi_raft_apply_metrics(multi_raft: &Arc<crate::MultiRaftCluster>) {
     crate::metrics::MULTI_RAFT_APPLY_LAG
         .with_label_values(&["meta"])
         .set(meta_lag);
+    let mut led_count = 0i64;
     for (partition, raft) in multi_raft.partitions_snapshot() {
         let (last_applied, lag) = sample(&raft);
         let label = format!("p-{}", partition.0);
@@ -4729,7 +4730,11 @@ fn update_multi_raft_apply_metrics(multi_raft: &Arc<crate::MultiRaftCluster>) {
         crate::metrics::MULTI_RAFT_APPLY_LAG
             .with_label_values(&[&label])
             .set(lag);
+        if matches!(raft.current_leader(), Some(leader) if leader.0 == multi_raft.self_id) {
+            led_count += 1;
+        }
     }
+    crate::metrics::MULTI_RAFT_PARTITIONS_LED.set(led_count);
 }
 
 fn raft_propose_failed<E: std::fmt::Display>(e: E) -> Status {

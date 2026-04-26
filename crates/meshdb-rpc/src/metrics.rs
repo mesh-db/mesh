@@ -275,6 +275,22 @@ pub static MULTI_RAFT_LAST_APPLIED: Lazy<prometheus::IntGaugeVec> = Lazy::new(||
     )
 });
 
+/// `mesh_multiraft_partitions_led` — number of partition Raft groups
+/// this peer is currently the leader of. Used by operators to
+/// detect leader skew across peers (an even cluster has roughly
+/// `num_partitions / num_peers` per peer; persistent imbalance
+/// signals a missing rebalance). Updated by the same periodic
+/// poller that fills the per-group apply-lag gauges.
+pub static MULTI_RAFT_PARTITIONS_LED: Lazy<IntGauge> = Lazy::new(|| {
+    register(
+        IntGauge::new(
+            "mesh_multiraft_partitions_led",
+            "Number of partition Raft groups this peer currently leads",
+        )
+        .expect("gauge spec"),
+    )
+});
+
 /// Mode label values for [`CYPHER_QUERIES_TOTAL`] /
 /// [`CYPHER_QUERY_DURATION_SECONDS`]. Stringly so call sites can
 /// just pass the same value to both.
