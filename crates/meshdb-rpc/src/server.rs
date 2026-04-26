@@ -1694,6 +1694,84 @@ impl MeshService {
         None
     }
 
+    /// Synchronous-DDL gate: wait for every other peer's meta
+    /// replica to apply at least `target_index`. Polled via the
+    /// `MeshWrite::MetaLastApplied` RPC every 20ms until every peer
+    /// is caught up or the deadline expires.
+    ///
+    /// Skips this peer (its meta has already applied — we got the
+    /// target_index from it in the first place). A peer that's
+    /// transiently unreachable surfaces as a poll error and counts
+    /// as "not caught up" — if it stays down, the deadline fires
+    /// and the caller gets `Status::DeadlineExceeded`. The DDL is
+    /// durably committed in that case; the operator can re-issue
+    /// or accept the transient inconsistency.
+    async fn await_cluster_meta_apply(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+        target_index: u64,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<(), Status> {
+        if target_index == 0 {
+            return Ok(());
+        }
+        let state = multi_raft.meta.current_state().await;
+        let peers: Vec<(u64, String)> = state
+            .membership
+            .iter()
+            .filter(|(id, _)| id.0 != multi_raft.self_id)
+            .map(|(id, addr)| (id.0, addr.to_string()))
+            .collect();
+        drop(state);
+        if peers.is_empty() {
+            // Single-peer cluster — meta is local; we already applied.
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut not_caught_up: std::collections::HashSet<u64> =
+            peers.iter().map(|(id, _)| *id).collect();
+        loop {
+            let mut still_behind: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for (id, addr) in &peers {
+                if !not_caught_up.contains(id) {
+                    continue;
+                }
+                let mut client = match self.leader_write_client(addr) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        still_behind.insert(*id);
+                        continue;
+                    }
+                };
+                match client
+                    .meta_last_applied(crate::proto::MetaLastAppliedRequest {})
+                    .await
+                {
+                    Ok(resp) => {
+                        if resp.into_inner().last_applied < target_index {
+                            still_behind.insert(*id);
+                        }
+                    }
+                    Err(_) => {
+                        still_behind.insert(*id);
+                    }
+                }
+            }
+            not_caught_up = still_behind;
+            if not_caught_up.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "ddl strict-apply gate: peers {not_caught_up:?} did not catch up to \
+                     meta index {target_index} within {timeout:?} — DDL is durably \
+                     committed; retry or query directly"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// Spanner-style 2PC over partition leaders. Each touched
     /// partition's leader proposes a `PreparedTx` entry through its
     /// Raft group; once all PREPAREs ACK, the coordinator proposes
@@ -1895,7 +1973,19 @@ impl MeshService {
                 // Local meta has applied. Snapshot the latest
                 // applied index as the new barrier so partition
                 // writes from this peer wait for it to propagate.
-                multi_raft.observe_meta_barrier(multi_raft.meta_last_applied());
+                let target = multi_raft.meta_last_applied();
+                multi_raft.observe_meta_barrier(target);
+                // Synchronous-DDL gate: wait for every peer's meta
+                // replica to apply before returning to the user.
+                // Once this clears, any subsequent write — anywhere
+                // in the cluster — observes the DDL on its
+                // partition leader's local meta replica.
+                self.await_cluster_meta_apply(
+                    multi_raft,
+                    target,
+                    crate::DEFAULT_DDL_STRICT_TIMEOUT,
+                )
+                .await?;
                 Ok(())
             }
             Err(meshdb_cluster::Error::ForwardToLeader { leader_address, .. }) => {
@@ -5558,10 +5648,40 @@ impl MeshWrite for MeshService {
                 }
             }
         }
+        // Synchronous-DDL gate: don't ACK the forwarded DDL until
+        // every peer's meta replica has applied. The originating
+        // user-visible call only completes once we return here, so
+        // the strict-apply guarantee holds end-to-end across the
+        // forwarding hop.
+        let target = multi_raft.meta_last_applied();
+        if let Err(e) = self
+            .await_cluster_meta_apply(multi_raft, target, crate::DEFAULT_DDL_STRICT_TIMEOUT)
+            .await
+        {
+            return Ok(Response::new(crate::proto::ForwardDdlResponse {
+                ok: false,
+                leader_hint: 0,
+                error_message: format!("strict-apply gate: {}", e.message()),
+            }));
+        }
         Ok(Response::new(crate::proto::ForwardDdlResponse {
             ok: true,
             leader_hint: 0,
             error_message: String::new(),
+        }))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "meta_last_applied"))]
+    async fn meta_last_applied(
+        &self,
+        _request: Request<crate::proto::MetaLastAppliedRequest>,
+    ) -> Result<Response<crate::proto::MetaLastAppliedResponse>, Status> {
+        let last_applied = match &self.multi_raft {
+            Some(mr) => mr.meta_last_applied(),
+            None => 0,
+        };
+        Ok(Response::new(crate::proto::MetaLastAppliedResponse {
+            last_applied,
         }))
     }
 }

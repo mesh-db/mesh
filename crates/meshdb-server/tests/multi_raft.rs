@@ -395,6 +395,97 @@ async fn multi_raft_create_index_replicates_through_meta_group() {
 }
 
 #[tokio::test]
+async fn multi_raft_create_index_synchronous_ddl_gate() {
+    // Stricter than `multi_raft_create_index_replicates_through_meta_group`:
+    // verifies the synchronous DDL gate. After `CREATE INDEX` returns
+    // OK on the issuing peer, every other peer's metadata applier
+    // must have already applied the entry — no polling, no settle
+    // sleep. This is the load-bearing guarantee of Option A.
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Issue CREATE INDEX through peer 0. The await returns only
+    // after every peer has confirmed apply (or the strict timeout
+    // tripped, in which case the call would error out — the .unwrap()
+    // would explode).
+    peers[0]
+        .service
+        .execute_cypher_local(
+            "CREATE INDEX FOR (n:GatedLabel) ON (n.email)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    // No polling, no sleep. Every peer must already see it.
+    for peer in &peers {
+        let rows = peer
+            .service
+            .execute_cypher_local("SHOW INDEXES".to_string(), std::collections::HashMap::new())
+            .await
+            .unwrap();
+        let saw_it = rows.iter().any(|row| {
+            let label = row.get("label").and_then(|v| match v {
+                meshdb_executor::Value::Property(meshdb_core::Property::String(s)) => {
+                    Some(s.clone())
+                }
+                _ => None,
+            });
+            label.as_deref() == Some("GatedLabel")
+        });
+        assert!(
+            saw_it,
+            "peer {} did not see GatedLabel index immediately after CREATE INDEX returned — \
+             synchronous DDL gate (Option A) is broken",
+            peer.config.self_id
+        );
+    }
+
+    // Also test the forwarded-DDL path: issue from a non-leader of
+    // the metadata group, which routes through `forward_ddl`.
+    let meta_leader = peers[0]
+        .multi_raft
+        .meta_leader()
+        .expect("meta leader known");
+    let non_leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id != meta_leader)
+        .expect("at least one non-leader exists");
+
+    peers[non_leader_idx]
+        .service
+        .execute_cypher_local(
+            "CREATE INDEX FOR (n:Forwarded) ON (n.id)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    for peer in &peers {
+        let rows = peer
+            .service
+            .execute_cypher_local("SHOW INDEXES".to_string(), std::collections::HashMap::new())
+            .await
+            .unwrap();
+        let saw_it = rows.iter().any(|row| {
+            let label = row.get("label").and_then(|v| match v {
+                meshdb_executor::Value::Property(meshdb_core::Property::String(s)) => {
+                    Some(s.clone())
+                }
+                _ => None,
+            });
+            label.as_deref() == Some("Forwarded")
+        });
+        assert!(
+            saw_it,
+            "peer {} did not see Forwarded index immediately after CREATE INDEX returned via \
+             forward_ddl — DDL forwarding does not honor the synchronous gate",
+            peer.config.self_id
+        );
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_survives_partition_leader_shutdown() {
     // 3 peers, 1 partition, rf=3. Pick the partition's leader and
     // shut down its Raft handle so the other two replicas have to

@@ -348,6 +348,15 @@ service MeshWrite {
   // any peer transparently reach the meta leader without surfacing
   // a ForwardToLeader to the client.
   rpc ForwardDdl(ForwardDdlRequest) returns (ForwardDdlResponse);
+  // Multi-raft mode only: report this peer's meta-Raft applier
+  // `last_applied.index`. Used by the synchronous-DDL gate — after
+  // the meta leader proposes a DDL, it polls every peer via this
+  // RPC until they've all caught up past the DDL's log index, then
+  // returns OK to the user. Cheap — reads the local watch-channel
+  // metrics; no I/O. Returns 0 when the peer isn't running multi-
+  // raft (which the caller treats as "skip; not a meta replica").
+  rpc MetaLastApplied(MetaLastAppliedRequest)
+      returns (MetaLastAppliedResponse);
 }
 
 enum BatchPhase {
@@ -421,6 +430,15 @@ message ForwardDdlResponse {
   // `0` means "leader unknown".
   uint64 leader_hint = 2;
   string error_message = 3;
+}
+
+message MetaLastAppliedRequest {}
+
+message MetaLastAppliedResponse {
+  // The peer's local meta-Raft `last_applied.index`. `0` when the
+  // peer isn't running multi-raft (no meta replica) or the meta
+  // applier hasn't applied any entry yet.
+  uint64 last_applied = 1;
 }
 
 message PutNodeRequest {

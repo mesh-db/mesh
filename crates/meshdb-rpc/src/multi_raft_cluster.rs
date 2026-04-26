@@ -29,6 +29,16 @@ use std::time::{Duration, Instant};
 /// `ResolveTransaction` traffic.
 pub const DEFAULT_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Default deadline for the synchronous-DDL gate — `CREATE INDEX` /
+/// `CREATE CONSTRAINT` / `apoc.trigger.install` won't return to the
+/// caller until every peer's meta replica has applied the entry, or
+/// this deadline expires (in which case the DDL is durably committed
+/// but the user gets a `Status::DeadlineExceeded` so they know one
+/// or more peers are lagging). 5 seconds is loose enough to absorb
+/// normal Raft replication + apply latency, tight enough that a
+/// single dead peer can't make every DDL hang indefinitely.
+pub const DEFAULT_DDL_STRICT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Bundle of every Raft group this peer is a replica of in
 /// `mode = "multi-raft"`.
 pub struct MultiRaftCluster {
@@ -291,6 +301,13 @@ impl MultiRaftCluster {
     /// path to decide between local-propose and forward-to-leader.
     pub fn is_local_leader(&self, partition: PartitionId) -> bool {
         self.leader_of(partition) == Some(self.self_id)
+    }
+
+    /// Returns the current leader of the metadata Raft group, or
+    /// `None` if no leader is known on this peer (election in
+    /// progress, freshly-restarted follower, etc.).
+    pub fn meta_leader(&self) -> Option<NodeId> {
+        self.meta.current_leader().map(|id| id.0)
     }
 
     /// Add a peer as a voter of `partition`'s Raft group. Wraps
