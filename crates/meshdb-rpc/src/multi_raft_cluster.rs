@@ -20,6 +20,13 @@ use meshdb_cluster::{PartitionId, PartitionReplicaMap};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+/// Default interval for the periodic in-doubt recovery loop. Matches
+/// the spirit of [`crate::DEFAULT_ROTATION_INTERVAL`] — frequent
+/// enough to catch a stale PREPARE within a minute, infrequent
+/// enough that an idle cluster's recovery polls don't overwhelm
+/// `ResolveTransaction` traffic.
+pub const DEFAULT_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Bundle of every Raft group this peer is a replica of in
 /// `mode = "multi-raft"`.
 pub struct MultiRaftCluster {

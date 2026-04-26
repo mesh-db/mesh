@@ -4,6 +4,10 @@
 //! `tokio-rustls` client with certificate verification disabled (the
 //! cert is self-signed; we're testing the transport, not a PKI).
 
+// Same recursion_limit bump as meshdb-server::lib — Bolt's nested
+// async dispatch overflows the default 128 query depth.
+#![recursion_limit = "256"]
+
 use meshdb_bolt::{
     perform_client_handshake, read_message, write_message, BoltMessage, BoltValue, BOLT_4_4,
 };

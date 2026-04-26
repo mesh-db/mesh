@@ -611,6 +611,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         meshdb_rpc::DEFAULT_MIN_COMPLETED,
     );
 
+    // Periodic in-doubt recovery loop for multi-raft mode. Catches
+    // a coordinator that fsynced CommitDecision then crashed while
+    // the cluster otherwise stayed healthy — startup recovery
+    // already ran inline; this loop covers PREPAREs that arrive
+    // post-startup. Returns None in every other mode.
+    let multi_raft_recovery_loop =
+        service.spawn_multi_raft_recovery_loop(meshdb_rpc::DEFAULT_RECOVERY_INTERVAL);
+
     // Optional Bolt listener. Binds before we start the gRPC server so
     // that a port-in-use error at startup is immediately fatal rather
     // than surfacing only on the first Bolt client connection.
@@ -810,6 +818,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let _ = staging_sweeper.await;
 
     if let Some(handle) = log_rotator {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    if let Some(handle) = multi_raft_recovery_loop {
         handle.abort();
         let _ = handle.await;
     }

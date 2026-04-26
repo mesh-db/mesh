@@ -500,6 +500,36 @@ impl MeshService {
         self.pending_batches.clone().spawn_sweeper(interval)
     }
 
+    /// Spawn a periodic in-doubt-recovery loop for multi-raft mode.
+    /// Calls [`Self::recover_multi_raft_in_doubt`] every `interval`
+    /// so a coordinator that crashes after fsyncing CommitDecision —
+    /// while the rest of the cluster keeps running — still has its
+    /// in-doubt PREPAREs resolved without operator intervention.
+    /// Returns `None` when the service isn't running multi-raft;
+    /// the caller is responsible for aborting the returned handle
+    /// on shutdown.
+    pub fn spawn_multi_raft_recovery_loop(
+        &self,
+        interval: std::time::Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if self.multi_raft.is_none() {
+            return None;
+        }
+        let svc = self.clone();
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            // Skip the immediate first tick — startup recovery already
+            // ran inline through `serve()` before the listener bound.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if let Err(e) = svc.recover_multi_raft_in_doubt().await {
+                    tracing::warn!(error = %e, "periodic multi-raft recovery failed; will retry on next tick");
+                }
+            }
+        }))
+    }
+
     /// Spawn the coordinator-log rotator as a background task.
     /// Returns `None` when the service has no coordinator log (i.e.
     /// single-node or Raft mode), since there's nothing to rotate.

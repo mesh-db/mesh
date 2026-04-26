@@ -4,6 +4,13 @@
 //! framing / encoding. Validates the full pipeline: handshake, HELLO,
 //! RUN (CREATE + MATCH), PULL, RECORD decoding, and GOODBYE.
 
+// Bolt's deeply-nested async dispatch (HELLO → BEGIN → RUN → PULL →
+// COMMIT, each its own `#[tracing::instrument]`-decorated async fn)
+// blows the default 128 query depth on stable rustc when this test
+// imports the meshdb_server lib's nested async stack. Same fix as
+// meshdb-server::lib's own `#![recursion_limit = "256"]`.
+#![recursion_limit = "256"]
+
 use meshdb_bolt::{
     perform_client_handshake, read_message, version_bytes, write_message, BoltMessage, BoltValue,
     BOLT_4_4,

@@ -577,6 +577,36 @@ async fn multi_raft_crash_after_first_commit_tx_recovers_holdouts() {
 }
 
 #[tokio::test]
+async fn multi_raft_periodic_recovery_loop_fires_on_interval() {
+    // The periodic recovery loop should call
+    // `recover_multi_raft_in_doubt` at the configured interval. Use
+    // a 100ms tick so the test bounds at <1s. After waiting for a
+    // few ticks the call count should be at least 2.
+    let peers = spawn_three_peer_multi_raft(2).await;
+
+    let handle = peers[0]
+        .service
+        .spawn_multi_raft_recovery_loop(Duration::from_millis(100));
+    let handle = handle.expect("multi-raft mode → recovery loop spawned");
+
+    // Wait three ticks. The loop skips the immediate first tick
+    // (startup recovery already ran), so n ticks ≈ n calls.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+
+    let count = peers[0]
+        .fault_points
+        .recover_multi_raft_call_count
+        .load(Ordering::SeqCst);
+    handle.abort();
+    let _ = handle.await;
+
+    assert!(
+        count >= 2,
+        "expected periodic recovery to fire >= 2 times in 450ms, got {count}"
+    );
+}
+
+#[tokio::test]
 async fn multi_raft_concurrent_in_doubt_recovery_is_idempotent() {
     // Pin the contract that running `recover_multi_raft_in_doubt`
     // simultaneously on every replica produces the same result as

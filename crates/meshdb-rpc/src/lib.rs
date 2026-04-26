@@ -46,7 +46,7 @@ pub use executor_writer::{BufferingGraphWriter, RaftGraphWriter};
 #[cfg(any(test, feature = "fault-inject"))]
 pub use fault_points::FaultPoints;
 pub use multi_raft_applier::{MetaGraphApplier, PartitionGraphApplier};
-pub use multi_raft_cluster::{MultiRaftCluster, PartitionLeaderCache};
+pub use multi_raft_cluster::{MultiRaftCluster, PartitionLeaderCache, DEFAULT_RECOVERY_INTERVAL};
 pub use participant_log::{
     replay_in_doubt_commands, replay_outcomes, ParticipantLog, ParticipantLogEntry,
     ParticipantOutcome, PARTICIPANT_LOG_MIN_TERMINAL, PARTICIPANT_LOG_ROTATION_INTERVAL,
