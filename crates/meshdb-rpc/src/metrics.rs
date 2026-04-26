@@ -149,12 +149,102 @@ pub static COORDINATOR_LOG_ENTRIES: Lazy<IntGauge> = Lazy::new(|| {
     )
 });
 
+/// `mesh_multiraft_forward_writes_total{outcome}` — single-partition
+/// writes that arrived on a non-leader peer and proxied through
+/// `MeshWrite::ForwardWrite`. `outcome` is `committed` (the proxy
+/// hop succeeded on first try), `retried` (first try hit a stale
+/// leader cache, retry succeeded), or `exhausted` (both attempts
+/// failed — surfaced to the client as `Unavailable`).
+pub static MULTI_RAFT_FORWARD_WRITES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register(
+        IntCounterVec::new(
+            Opts::new(
+                "mesh_multiraft_forward_writes_total",
+                "Multi-raft single-partition forward_write proxy hops by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("counter spec"),
+    )
+});
+
+/// `mesh_multiraft_ddl_gate_total{outcome}` — synchronous DDL gate
+/// invocations. `outcome` is `ok` (every peer's metadata replica
+/// caught up to the proposal index before the strict timeout) or
+/// `timeout` (timeout tripped — the DDL is durably committed but
+/// not yet visible everywhere). A timeout rate above zero is the
+/// signal that meta-Raft replication is degraded.
+pub static MULTI_RAFT_DDL_GATE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register(
+        IntCounterVec::new(
+            Opts::new(
+                "mesh_multiraft_ddl_gate_total",
+                "Multi-raft synchronous DDL gate invocations by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("counter spec"),
+    )
+});
+
+/// `mesh_multiraft_indoubt_resolved_total{outcome}` — in-doubt
+/// PreparedTx entries that the partition-leader recovery path
+/// resolved by polling `ResolveTransaction` against the coordinator.
+/// `outcome` is `committed` / `aborted` / `failed` (recovery
+/// couldn't reach any peer with the decision — left for the next
+/// recovery loop tick).
+pub static MULTI_RAFT_INDOUBT_RESOLVED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register(
+        IntCounterVec::new(
+            Opts::new(
+                "mesh_multiraft_indoubt_resolved_total",
+                "Multi-raft in-doubt PreparedTx resolutions by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("counter spec"),
+    )
+});
+
+/// `mesh_multiraft_cross_partition_total{outcome}` — completed
+/// multi-raft cross-partition Spanner-style 2PC transactions, with
+/// `outcome` in `committed` / `aborted`. Distinct from
+/// `mesh_two_phase_commit_total`, which tracks routing-mode 2PC.
+pub static MULTI_RAFT_CROSS_PARTITION_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register(
+        IntCounterVec::new(
+            Opts::new(
+                "mesh_multiraft_cross_partition_total",
+                "Multi-raft cross-partition 2PC transactions by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("counter spec"),
+    )
+});
+
+/// `mesh_multiraft_pending_tx_staged` — gauge of the total number
+/// of `PreparedTx` entries currently staged across every partition
+/// applier on this peer, awaiting `CommitTx` or `AbortTx`. A
+/// healthy steady state is near zero; persistent drift indicates
+/// a stuck cross-partition transaction.
+pub static MULTI_RAFT_PENDING_TX_STAGED: Lazy<IntGauge> = Lazy::new(|| {
+    register(
+        IntGauge::new(
+            "mesh_multiraft_pending_tx_staged",
+            "Currently-staged PreparedTx entries across all partitions on this peer",
+        )
+        .expect("gauge spec"),
+    )
+});
+
 /// Mode label values for [`CYPHER_QUERIES_TOTAL`] /
 /// [`CYPHER_QUERY_DURATION_SECONDS`]. Stringly so call sites can
 /// just pass the same value to both.
 pub const MODE_SINGLE: &str = "single";
 pub const MODE_ROUTING: &str = "routing";
 pub const MODE_RAFT: &str = "raft";
+pub const MODE_MULTI_RAFT: &str = "multi-raft";
 
 /// Render the global registry as Prometheus text-format bytes,
 /// suitable for an HTTP `/metrics` endpoint response body.

@@ -726,7 +726,9 @@ impl MeshService {
         // histogram so dashboards can compute a per-mode mean
         // latency (sum / count). The IndexSeek count walks the
         // plan tree once — cheap relative to the query itself.
-        let mode_label = if self.routing.is_some() {
+        let mode_label = if self.multi_raft.is_some() {
+            crate::metrics::MODE_MULTI_RAFT
+        } else if self.routing.is_some() {
             crate::metrics::MODE_ROUTING
         } else if self.raft.is_some() {
             crate::metrics::MODE_RAFT
@@ -1627,23 +1629,32 @@ impl MeshService {
             let pending = applier.pending_tx_ids();
             for txid in pending {
                 let decision = self.resolve_decision_across_peers(&multi_raft, &txid).await;
-                let resolution = match decision {
+                let (resolution, outcome_label) = match decision {
                     Some(crate::TxDecision::Commit) => {
-                        GraphCommand::CommitTx { txid: txid.clone() }
+                        (GraphCommand::CommitTx { txid: txid.clone() }, "committed")
                     }
-                    Some(crate::TxDecision::Abort) => GraphCommand::AbortTx { txid: txid.clone() },
+                    Some(crate::TxDecision::Abort) => {
+                        (GraphCommand::AbortTx { txid: txid.clone() }, "aborted")
+                    }
                     None => continue, // unknown — try again later
                 };
                 if let Err(e) = self
                     .propose_partition_command(&multi_raft, partition, resolution)
                     .await
                 {
+                    crate::metrics::MULTI_RAFT_INDOUBT_RESOLVED_TOTAL
+                        .with_label_values(&["failed"])
+                        .inc();
                     tracing::warn!(
                         partition = ?partition,
                         txid = %txid,
                         error = %e,
                         "in-doubt resolution propose failed; will retry"
                     );
+                } else {
+                    crate::metrics::MULTI_RAFT_INDOUBT_RESOLVED_TOTAL
+                        .with_label_values(&[outcome_label])
+                        .inc();
                 }
             }
         }
@@ -1759,9 +1770,15 @@ impl MeshService {
             }
             not_caught_up = still_behind;
             if not_caught_up.is_empty() {
+                crate::metrics::MULTI_RAFT_DDL_GATE_TOTAL
+                    .with_label_values(&["ok"])
+                    .inc();
                 return Ok(());
             }
             if std::time::Instant::now() > deadline {
+                crate::metrics::MULTI_RAFT_DDL_GATE_TOTAL
+                    .with_label_values(&["timeout"])
+                    .inc();
                 return Err(Status::deadline_exceeded(format!(
                     "ddl strict-apply gate: peers {not_caught_up:?} did not catch up to \
                      meta index {target_index} within {timeout:?} — DDL is durably \
@@ -1882,6 +1899,9 @@ impl MeshService {
             if let Some(log) = &self.coordinator_log {
                 let _ = log.append(&crate::TxLogEntry::Completed { txid: txid.clone() });
             }
+            crate::metrics::MULTI_RAFT_CROSS_PARTITION_TOTAL
+                .with_label_values(&["aborted"])
+                .inc();
             return Err(err);
         }
 
@@ -1950,6 +1970,9 @@ impl MeshService {
         if let Some(log) = &self.coordinator_log {
             let _ = log.append(&crate::TxLogEntry::Completed { txid });
         }
+        crate::metrics::MULTI_RAFT_CROSS_PARTITION_TOTAL
+            .with_label_values(&["committed"])
+            .inc();
         Ok(())
     }
 
@@ -2226,6 +2249,10 @@ impl MeshService {
                 }
             };
             if resp.ok {
+                let outcome = if attempt == 0 { "committed" } else { "retried" };
+                crate::metrics::MULTI_RAFT_FORWARD_WRITES_TOTAL
+                    .with_label_values(&[outcome])
+                    .inc();
                 return Ok(());
             }
             // Refresh the leader cache from the hint so the next
@@ -2244,6 +2271,9 @@ impl MeshService {
             // is surfaced to the caller.
             let _ = attempt;
         }
+        crate::metrics::MULTI_RAFT_FORWARD_WRITES_TOTAL
+            .with_label_values(&["exhausted"])
+            .inc();
         Err(last_err.unwrap_or_else(|| Status::unavailable("forward_write retry exhausted")))
     }
 

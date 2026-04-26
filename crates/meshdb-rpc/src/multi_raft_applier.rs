@@ -110,6 +110,12 @@ impl PartitionGraphApplier {
                 }
             }
         }
+        // Account restored entries on the process-wide gauge so a
+        // restart with in-doubt PreparedTx state surfaces immediately
+        // in `/metrics`.
+        if !pending.is_empty() {
+            crate::metrics::MULTI_RAFT_PENDING_TX_STAGED.add(pending.len() as i64);
+        }
         Self {
             partition_id,
             store,
@@ -201,10 +207,14 @@ impl GraphStateMachine for PartitionGraphApplier {
                 self.store
                     .put_pending_tx(&key, &value)
                     .map_err(|e| e.to_string())?;
-                self.pending_txs
+                let prior = self
+                    .pending_txs
                     .lock()
                     .expect("pending_txs mutex poisoned")
                     .insert(txid.clone(), commands.clone());
+                if prior.is_none() {
+                    crate::metrics::MULTI_RAFT_PENDING_TX_STAGED.inc();
+                }
                 Ok(())
             }
             GraphCommand::CommitTx { txid } => {
@@ -213,6 +223,9 @@ impl GraphStateMachine for PartitionGraphApplier {
                     .lock()
                     .expect("pending_txs mutex poisoned")
                     .remove(txid);
+                if staged.is_some() {
+                    crate::metrics::MULTI_RAFT_PENDING_TX_STAGED.dec();
+                }
                 let key = encode_pending_tx_key(self.partition_id, txid);
                 // Always clear the durable row, even when the in-
                 // memory entry is missing — a CommitTx after restart
@@ -238,10 +251,14 @@ impl GraphStateMachine for PartitionGraphApplier {
                 }
             }
             GraphCommand::AbortTx { txid } => {
-                self.pending_txs
+                let removed = self
+                    .pending_txs
                     .lock()
                     .expect("pending_txs mutex poisoned")
                     .remove(txid);
+                if removed.is_some() {
+                    crate::metrics::MULTI_RAFT_PENDING_TX_STAGED.dec();
+                }
                 let key = encode_pending_tx_key(self.partition_id, txid);
                 let _ = self.store.delete_pending_tx(&key);
                 Ok(())
@@ -345,6 +362,7 @@ impl GraphStateMachine for PartitionGraphApplier {
         // restored on-disk rows. Same logic as `new` after a
         // restart — list_pending_txs filtered by partition.
         let mut pending = self.pending_txs.lock().expect("pending_txs mutex poisoned");
+        let prior_len = pending.len();
         pending.clear();
         for (key, value) in self.store.list_pending_txs().map_err(|e| e.to_string())? {
             if let Some((p, txid)) = decode_pending_tx_key(&key) {
@@ -354,6 +372,12 @@ impl GraphStateMachine for PartitionGraphApplier {
                     }
                 }
             }
+        }
+        // Adjust the gauge to reflect the snapshot-restored state.
+        let new_len = pending.len();
+        let delta = new_len as i64 - prior_len as i64;
+        if delta != 0 {
+            crate::metrics::MULTI_RAFT_PENDING_TX_STAGED.add(delta);
         }
         Ok(())
     }

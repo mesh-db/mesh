@@ -1216,3 +1216,58 @@ async fn multi_raft_per_partition_storage_dirs_are_isolated() {
         .sum();
     assert_eq!(total, 8);
 }
+
+#[tokio::test]
+async fn multi_raft_metrics_increment_on_forward_write_and_ddl_gate() {
+    // Smoke test: a single-partition write through a non-leader peer
+    // should bump `mesh_multiraft_forward_writes_total{outcome="committed"}`
+    // by at least 1, and a `CREATE INDEX` should bump
+    // `mesh_multiraft_ddl_gate_total{outcome="ok"}`. Counters are
+    // process-wide, so we record before/after deltas rather than
+    // assert absolute values — other tests may have already incremented.
+    use meshdb_rpc::metrics::{MULTI_RAFT_DDL_GATE_TOTAL, MULTI_RAFT_FORWARD_WRITES_TOTAL};
+
+    let peers = spawn_multi_raft_cluster(3, 1, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+    let leader_id = peers[0].multi_raft.leader_of(p0).expect("leader known");
+    let non_leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id != leader_id)
+        .expect("at least one non-leader exists");
+
+    let fw_before = MULTI_RAFT_FORWARD_WRITES_TOTAL
+        .with_label_values(&["committed"])
+        .get();
+    peers[non_leader_idx]
+        .service
+        .execute_cypher_local(
+            "CREATE (:MetricsTest)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let fw_after = MULTI_RAFT_FORWARD_WRITES_TOTAL
+        .with_label_values(&["committed"])
+        .get();
+    assert!(
+        fw_after > fw_before,
+        "forward_writes_total{{committed}} should increment on a non-leader write: {fw_before} -> {fw_after}"
+    );
+
+    let ddl_before = MULTI_RAFT_DDL_GATE_TOTAL.with_label_values(&["ok"]).get();
+    peers[0]
+        .service
+        .execute_cypher_local(
+            "CREATE INDEX FOR (n:MetricsTest) ON (n.x)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let ddl_after = MULTI_RAFT_DDL_GATE_TOTAL.with_label_values(&["ok"]).get();
+    assert!(
+        ddl_after > ddl_before,
+        "ddl_gate_total{{ok}} should increment on a successful CREATE INDEX: {ddl_before} -> {ddl_after}"
+    );
+}
