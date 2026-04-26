@@ -53,6 +53,11 @@ reqwest = { version = "0.12", default-features = false }
 bcrypt = { workspace = true }
 rcgen = "0.13"
 rustls-pki-types = "1"
+criterion = { workspace = true }
+
+[[bench]]
+name = "multi_raft_bench"
+harness = false
 
 [features]
 # APOC-compatible scalars and procedures ship enabled by

@@ -2043,6 +2043,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "criterion",
  "meshdb-bolt",
  "meshdb-cluster",
  "meshdb-core",
