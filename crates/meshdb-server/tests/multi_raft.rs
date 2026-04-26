@@ -1177,6 +1177,69 @@ async fn multi_raft_remove_partition_replica_shrinks_voters() {
 }
 
 #[tokio::test]
+async fn multi_raft_drain_peer_removes_from_every_partition() {
+    // 3 peers, 4 partitions, rf=3 — every peer hosts every
+    // partition. Drain peer 3 from one of the survivors; it must
+    // be removed as a voter of every partition group, and each
+    // remaining group's voter set must have shrunk to 2.
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let drain_target = 3u64; // The highest-id peer.
+                             // Issue the drain call from peer 0 (which is a voter of every
+                             // partition group and not the drain target).
+    let (drained, errors) = peers[0].multi_raft.drain_peer(drain_target).await;
+    assert!(
+        errors.is_empty(),
+        "drain_peer reported per-partition errors: {errors:?}"
+    );
+    assert_eq!(
+        drained.len(),
+        4,
+        "drained partitions should be {{0,1,2,3}}, got {drained:?}"
+    );
+
+    // Wait for each partition's membership change to commit. After
+    // settle, every surviving peer's local Raft metrics for every
+    // partition should show 2 voters and the drain target must not
+    // be among them.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    'outer: loop {
+        for peer_idx in 0..peers.len() {
+            if peers[peer_idx].config.self_id == drain_target {
+                continue;
+            }
+            for partition in 0..4u32 {
+                let p = PartitionId(partition);
+                let raft = peers[peer_idx]
+                    .multi_raft
+                    .partition(p)
+                    .expect("partition still hosted on survivor");
+                let voters: Vec<u64> = raft
+                    .raft
+                    .metrics()
+                    .borrow()
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .collect();
+                if voters.len() != 2 || voters.contains(&drain_target) {
+                    if Instant::now() > deadline {
+                        panic!(
+                            "peer {} partition {} voters = {voters:?} (expected 2 without {drain_target})",
+                            peers[peer_idx].config.self_id, partition
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'outer;
+                }
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_per_partition_storage_dirs_are_isolated() {
     // 3 peers, 4 partitions, rf=2 → not every peer hosts every
     // partition. Verifies storage-layout isolation per group and

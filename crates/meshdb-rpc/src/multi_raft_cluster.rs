@@ -452,6 +452,56 @@ impl MultiRaftCluster {
         Ok(())
     }
 
+    /// Drain a peer: remove `peer_id` as a voter from every
+    /// partition Raft group it currently belongs to. Called against
+    /// any peer in the cluster (typically a healthy survivor); the
+    /// drain target itself does not need to be reachable. Returns
+    /// the list of partitions that were successfully drained, plus
+    /// per-partition errors for the rest. Partial failures are
+    /// non-fatal — the operator can rerun the call to retry the
+    /// remaining partitions.
+    ///
+    /// **Doesn't touch the meta group.** Removing the peer from
+    /// meta would risk taking down the cluster's DDL path if the
+    /// drain target was the meta leader; the operator is expected
+    /// to verify with `meta_leader()` before draining the meta
+    /// member separately. Future work: a single all-in-one
+    /// `decommission` that handles meta + partitions atomically.
+    ///
+    /// **Caller is responsible for the post-drain rocksdb cleanup**
+    /// on the drained peer. The on-disk partition data sticks
+    /// around until manually deleted, mirroring `remove_partition_replica`.
+    pub async fn drain_peer(
+        &self,
+        peer_id: NodeId,
+    ) -> (Vec<PartitionId>, Vec<(PartitionId, String)>) {
+        let mut drained = Vec::new();
+        let mut errors = Vec::new();
+        // Collect the partition list under the read lock, then
+        // release before doing any async work.
+        let partitions: Vec<PartitionId> = self
+            .partitions
+            .read()
+            .expect("partitions lock poisoned")
+            .keys()
+            .copied()
+            .collect();
+        for partition in partitions {
+            // Only attempt to remove if the peer is currently a
+            // voter — otherwise change_membership would surface a
+            // confusing "not a voter" error.
+            let voters = self.current_partition_voters(partition).await;
+            if !voters.iter().any(|p| p.0 == peer_id) {
+                continue;
+            }
+            match self.remove_partition_replica(partition, peer_id).await {
+                Ok(()) => drained.push(partition),
+                Err(e) => errors.push((partition, e)),
+            }
+        }
+        (drained, errors)
+    }
+
     /// Publish the partition's current voter set through the meta
     /// Raft as a `ClusterCommand::SetPartitionReplicas` so the
     /// cluster's persisted view of placement matches the partition
