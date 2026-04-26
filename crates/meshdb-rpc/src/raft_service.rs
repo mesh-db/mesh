@@ -75,21 +75,46 @@ impl RaftGroupRegistry {
 
     fn route(&self, target: Option<&Target>) -> Result<&Arc<Raft<MeshRaftConfig>>, Status> {
         match target {
-            None => self
-                .single
-                .as_ref()
-                .ok_or_else(|| Status::not_found("no single-Raft group configured on this peer")),
-            Some(Target::Meta(true)) => self
-                .meta
-                .as_ref()
-                .ok_or_else(|| Status::not_found("no metadata Raft group configured on this peer")),
+            None => self.single.as_ref().ok_or_else(|| {
+                // Legacy unset target = single-Raft mode caller.
+                // If this peer is running multi-raft (meta or
+                // partitions populated), the caller is mixed-mode,
+                // which we don't support; surface the diagnosis
+                // explicitly so the operator can fix the config.
+                if self.meta.is_some() || !self.partitions.is_empty() {
+                    Status::failed_precondition(
+                        "received single-Raft RPC on a multi-raft peer — \
+                         all peers in a cluster must run the same `mode` \
+                         (mixed `raft` / `multi-raft` clusters are not supported)",
+                    )
+                } else {
+                    Status::not_found("no single-Raft group configured on this peer")
+                }
+            }),
+            Some(Target::Meta(true)) => self.meta.as_ref().ok_or_else(|| {
+                if self.single.is_some() {
+                    Status::failed_precondition(
+                        "received multi-raft meta RPC on a single-Raft peer — \
+                         all peers in a cluster must run the same `mode`",
+                    )
+                } else {
+                    Status::not_found("no metadata Raft group configured on this peer")
+                }
+            }),
             Some(Target::Meta(false)) => Err(Status::invalid_argument(
                 "RaftRpcRequest.target.meta = false; pass `true` or omit the field",
             )),
             Some(Target::Partition(p)) => self.partitions.get(&PartitionId(*p)).ok_or_else(|| {
-                Status::not_found(format!(
-                    "partition Raft group {p} is not hosted on this peer"
-                ))
+                if self.single.is_some() {
+                    Status::failed_precondition(
+                        "received multi-raft partition RPC on a single-Raft peer — \
+                         all peers in a cluster must run the same `mode`",
+                    )
+                } else {
+                    Status::not_found(format!(
+                        "partition Raft group {p} is not hosted on this peer"
+                    ))
+                }
             }),
         }
     }

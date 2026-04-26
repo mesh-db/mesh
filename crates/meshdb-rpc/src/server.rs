@@ -2225,9 +2225,27 @@ impl MeshService {
             } else {
                 self.snapshot_trigger_diff(&commands)
             };
+            // Snapshot whether the batch touches trigger DDL before
+            // commands move into commit_multi_raft — same logic as
+            // the single-node branch. Refresh the procedure
+            // factory's TriggerRegistry post-commit so a follow-up
+            // `apoc.trigger.list()` reflects the change.
+            #[cfg(feature = "apoc-trigger")]
+            let touched_triggers = commands.iter().any(|c| {
+                matches!(
+                    c,
+                    GraphCommand::InstallTrigger { .. } | GraphCommand::DropTrigger { .. }
+                )
+            });
             let outcome = self.commit_multi_raft(&multi_raft, commands).await;
             return match outcome {
                 Ok(()) => {
+                    #[cfg(feature = "apoc-trigger")]
+                    if touched_triggers {
+                        if let Some(reg) = (self.procedure_registry_factory)().trigger_registry() {
+                            let _ = reg.refresh();
+                        }
+                    }
                     #[cfg(feature = "apoc-trigger")]
                     if !from_trigger {
                         self.fire_post_commit_triggers(mr_diff).await;

@@ -81,4 +81,11 @@ apoc-cypher = ["meshdb-executor/apoc-cypher"]
 apoc-load = ["meshdb-executor/apoc-load"]
 apoc-export = ["meshdb-executor/apoc-export"]
 apoc-trigger = ["meshdb-executor/apoc-trigger", "meshdb-rpc/apoc-trigger"]
-apoc = ["meshdb-executor/apoc"]
+# `apoc` umbrella enables the executor's full apoc surface plus
+# the RPC-side trigger plumbing — so the default-features build
+# of meshdb-server has live `apoc.trigger.*` install/fire support
+# end-to-end. (Without `meshdb-rpc/apoc-trigger`, the
+# `MeshService` write path's trigger hooks compile out and
+# `apoc.trigger.install` would land in storage but no fires would
+# ever happen.)
+apoc = ["meshdb-executor/apoc", "apoc-trigger"]

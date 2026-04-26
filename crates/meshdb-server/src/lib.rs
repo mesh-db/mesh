@@ -93,18 +93,43 @@ fn apply_apoc_import(
     config: &ServerConfig,
     store: &Arc<dyn StorageEngine>,
 ) -> MeshService {
+    apply_apoc_import_with_registry(
+        service,
+        config,
+        store,
+        #[cfg(feature = "apoc-trigger")]
+        None,
+    )
+}
+
+/// `apply_apoc_import` variant that accepts a pre-built
+/// [`TriggerRegistry`] — used by the multi-raft bootstrap so the
+/// same registry instance shared by the meta applier (refreshed on
+/// `InstallTrigger` apply) is also exposed via the procedure
+/// factory (used by `apoc.trigger.list()` and the firing path).
+/// Without sharing, the applier would refresh its private copy
+/// and the user-visible registry would never reflect the change.
+#[allow(unused_variables)]
+fn apply_apoc_import_with_registry(
+    service: MeshService,
+    config: &ServerConfig,
+    store: &Arc<dyn StorageEngine>,
+    #[cfg(feature = "apoc-trigger")] preset_trigger_registry: Option<
+        meshdb_executor::apoc_trigger::TriggerRegistry,
+    >,
+) -> MeshService {
     #[cfg(feature = "apoc-load")]
     let import_cfg = config.apoc_import.clone();
     #[cfg(feature = "apoc-trigger")]
-    let trigger_registry = match meshdb_executor::apoc_trigger::TriggerRegistry::from_storage(
-        store.clone(),
-    ) {
-        Ok(r) => Some(r),
-        Err(e) => {
-            tracing::warn!(error = %e, "loading triggers from storage failed; apoc.trigger.* disabled");
-            None
+    let trigger_registry = preset_trigger_registry.or_else(|| {
+        match meshdb_executor::apoc_trigger::TriggerRegistry::from_storage(store.clone()) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(error = %e, "loading triggers from storage failed; apoc.trigger.* disabled");
+                None
+            }
         }
-    };
+    });
     // No-op short-circuit when neither feature is on.
     #[cfg(not(any(feature = "apoc-load", feature = "apoc-trigger")))]
     {
@@ -376,7 +401,30 @@ async fn build_multi_raft_components(
     let meta_dir = config.data_dir.join("raft").join("meta");
     std::fs::create_dir_all(&meta_dir)
         .with_context(|| format!("creating meta raft dir {}", meta_dir.display()))?;
-    let meta_applier: Arc<dyn GraphStateMachine> = Arc::new(MetaGraphApplier::new(store.clone()));
+    let meta_applier_concrete = MetaGraphApplier::new(store.clone());
+    // Single TriggerRegistry instance shared between the meta
+    // applier (so InstallTrigger / DropTrigger entries replicated
+    // through meta refresh it) and the procedure-registry factory
+    // below (so `apoc.trigger.list()` reads from the same map).
+    // Without this sharing, the applier would refresh its own
+    // private copy and the user-visible registry would never see
+    // the new triggers.
+    #[cfg(feature = "apoc-trigger")]
+    let shared_trigger_registry = match meshdb_executor::apoc_trigger::TriggerRegistry::from_storage(
+        store.clone(),
+    ) {
+        Ok(reg) => Some(reg),
+        Err(e) => {
+            tracing::warn!(error = %e, "loading triggers from storage failed; trigger surface disabled");
+            None
+        }
+    };
+    #[cfg(feature = "apoc-trigger")]
+    let meta_applier_concrete = match &shared_trigger_registry {
+        Some(reg) => meta_applier_concrete.with_trigger_registry(reg.clone()),
+        None => meta_applier_concrete,
+    };
+    let meta_applier: Arc<dyn GraphStateMachine> = Arc::new(meta_applier_concrete);
     let meta_raft = RaftCluster::open_persistent(
         config.self_id,
         &meta_dir,
@@ -446,14 +494,19 @@ async fn build_multi_raft_components(
     // writes propose through the partition Raft (server-side
     // forwarded to the leader peer when this isn't it); cross-
     // partition writes ride a Spanner-style 2PC. Reads still hit
-    // the local store directly.
+    // the local store directly. The trigger registry was opened
+    // above (and attached to the meta applier); pass it through
+    // to the procedure factory so `apoc.trigger.list()` reads
+    // from the same instance the applier refreshes.
     let store_for_triggers = store.clone();
-    let service = apply_apoc_import(
+    let service = apply_apoc_import_with_registry(
         MeshService::with_multi_raft(store, multi_raft.clone())
             .with_coordinator_log(Some(coordinator_log))
             .with_client_tls(client_tls),
         config,
         &store_for_triggers,
+        #[cfg(feature = "apoc-trigger")]
+        shared_trigger_registry,
     );
 
     Ok(ServerComponents {

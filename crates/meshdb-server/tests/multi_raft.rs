@@ -551,6 +551,227 @@ async fn multi_raft_concurrent_create_index_is_idempotent() {
 }
 
 #[tokio::test]
+async fn multi_raft_concurrent_ddl_and_writes_converge() {
+    // Concurrency stress: every peer issues an interleaved mix of
+    // CREATE INDEX and cross-partition writes. The DDL barrier
+    // (`min_meta_index`) must keep writes from racing ahead of
+    // their meta replica, and every replica must eventually agree
+    // on the set of indexes + nodes after the dust settles.
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let mut handles = Vec::new();
+    for (i, peer) in peers.iter().enumerate() {
+        let svc = peer.service.clone();
+        // Each peer does one CREATE INDEX (idempotent across peers)
+        // and one CREATE-of-2-nodes writing into different
+        // partitions. The two operations interleave with the other
+        // peers' operations.
+        handles.push(tokio::spawn(async move {
+            svc.execute_cypher_local(
+                format!("CREATE INDEX FOR (n:Stress{i}) ON (n.k)"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+            svc.execute_cypher_local(
+                format!("CREATE (a:StressA), (b:StressB) RETURN 0"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Convergence: every peer should see the three indexes (Stress0,
+    // Stress1, Stress2) and the right node counts (3 StressA, 3 StressB).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    'outer: loop {
+        for peer in &peers {
+            let rows = peer
+                .service
+                .execute_cypher_local("SHOW INDEXES".to_string(), std::collections::HashMap::new())
+                .await
+                .unwrap();
+            for label in ["Stress0", "Stress1", "Stress2"] {
+                let saw = rows.iter().any(|r| {
+                    r.get("label")
+                        .and_then(|v| match v {
+                            meshdb_executor::Value::Property(meshdb_core::Property::String(s)) => {
+                                Some(s.as_str())
+                            }
+                            _ => None,
+                        })
+                        .map(|s| s == label)
+                        .unwrap_or(false)
+                });
+                if !saw {
+                    if Instant::now() > deadline {
+                        panic!("peer {} missing {label} index", peer.config.self_id);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'outer;
+                }
+            }
+            for (label, expected) in [("StressA", 3i64), ("StressB", 3)] {
+                let q = format!("MATCH (n:{label}) RETURN count(n) AS c");
+                let rows = peer
+                    .service
+                    .execute_cypher_local(q, std::collections::HashMap::new())
+                    .await
+                    .unwrap();
+                let count = match rows.first().and_then(|r| r.get("c")) {
+                    Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+                    other => panic!("expected Int64, got {other:?}"),
+                };
+                if count != expected {
+                    if Instant::now() > deadline {
+                        panic!(
+                            "peer {} count(:{label}) = {count}, expected {expected}",
+                            peer.config.self_id
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'outer;
+                }
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
+async fn multi_raft_trigger_install_and_fire() {
+    // Trigger DDL (apoc.trigger.install) routes through the meta
+    // Raft group like any other DDL — every peer's local trigger
+    // registry should pick it up. Trigger firing happens on the
+    // proposing peer's commit path; the trigger body's writes ride
+    // the same multi-raft commit machinery (single- or multi-
+    // partition) under the from-trigger suppression guard, so
+    // every replica converges.
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Install via peer 0. The DDL forwards to the meta leader;
+    // every peer's storage gets the trigger spec.
+    peers[0]
+        .service
+        .execute_cypher_local(
+            "CALL apoc.trigger.install('meshdb', 'markSource', \
+               'UNWIND $createdNodes AS n \
+                WITH n WHERE \"Source\" IN labels(n) \
+                CREATE (:Marker)', \
+               null, null) \
+             YIELD name RETURN name"
+                .to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("trigger install");
+
+    // Confirm the trigger replicated to every peer's registry.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut all_have = true;
+        for peer in &peers {
+            let rows = peer
+                .service
+                .execute_cypher_local(
+                    "CALL apoc.trigger.list() YIELD name RETURN name".to_string(),
+                    std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let saw = rows.iter().any(|r| {
+                r.get("name")
+                    .and_then(|v| match v {
+                        meshdb_executor::Value::Property(meshdb_core::Property::String(s)) => {
+                            Some(s.as_str())
+                        }
+                        _ => None,
+                    })
+                    .map(|s| s == "markSource")
+                    .unwrap_or(false)
+            });
+            if !saw {
+                all_have = false;
+                break;
+            }
+        }
+        if all_have {
+            break;
+        }
+        if Instant::now() > deadline {
+            for peer in &peers {
+                let rows = peer
+                    .service
+                    .execute_cypher_local(
+                        "CALL apoc.trigger.list() YIELD name RETURN name".to_string(),
+                        std::collections::HashMap::new(),
+                    )
+                    .await
+                    .unwrap();
+                eprintln!(
+                    "peer {} triggers: {:?}",
+                    peer.config.self_id,
+                    rows.iter()
+                        .filter_map(|r| r.get("name").cloned())
+                        .collect::<Vec<_>>()
+                );
+            }
+            panic!("trigger 'markSource' didn't replicate to every peer within 5s");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Create a Source through peer 1 — the trigger should fire on
+    // commit and emit a Marker. The Marker creation rides the same
+    // multi-raft commit path as the user-visible write.
+    peers[1]
+        .service
+        .execute_cypher_local(
+            "CREATE (:Source)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("source create");
+
+    // Every replica should see exactly one Marker. Allow a brief
+    // settle for follower applies to catch up.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for peer in &peers {
+            let rows = peer
+                .service
+                .execute_cypher_local(
+                    "MATCH (n:Marker) RETURN count(n) AS c".to_string(),
+                    std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let count = match rows.first().and_then(|r| r.get("c")) {
+                Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+                other => panic!("expected Int64, got {other:?}"),
+            };
+            if count != 1 {
+                if Instant::now() > deadline {
+                    panic!(
+                        "peer {} sees count(:Marker) = {count}, expected 1",
+                        peer.config.self_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_remove_partition_replica_shrinks_voters() {
     // 3 peers, 2 partitions, rf=3 → every peer is a voter of every
     // partition. Find partition 0's leader, call
