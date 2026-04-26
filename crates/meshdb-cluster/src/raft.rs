@@ -950,4 +950,24 @@ impl RaftCluster {
             .await
             .map_err(|e| Error::Raft(e.to_string()))
     }
+
+    /// Force this peer's Raft replica to start an election right
+    /// now, bypassing the normal election timer. Wraps openraft's
+    /// `Raft::trigger().elect()`.
+    ///
+    /// **Does not guarantee success.** If the current leader is
+    /// healthy and its heartbeats are still reaching a quorum, the
+    /// triggered election fails (the leader retains its term). The
+    /// realistic use case is composing this with leader stepdown
+    /// or membership change to transfer leadership: the operator
+    /// quiesces the current leader (e.g., temporarily pauses its
+    /// heartbeat, or removes it from voters), then triggers an
+    /// election on the desired target.
+    pub async fn force_election(&self) -> Result<()> {
+        self.raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|e| Error::Raft(e.to_string()))
+    }
 }

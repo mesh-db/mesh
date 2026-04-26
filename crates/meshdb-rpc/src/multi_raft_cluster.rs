@@ -373,6 +373,37 @@ impl MultiRaftCluster {
             .map_err(|e| format!("meta shutdown: {e}"))
     }
 
+    /// Force this peer's local replica of `partition` to start an
+    /// election right now, bypassing the election timer. Wraps
+    /// openraft's `Raft::trigger().elect()`. Does NOT guarantee
+    /// leadership transfer — see [`RaftCluster::force_election`]
+    /// for the caveats. Returns `Err("partition not hosted")`
+    /// when this peer doesn't host the partition's replica.
+    ///
+    /// Operator-facing primitive for leader balancing: pair this
+    /// with `shutdown_partition` on the current leader (or a
+    /// transient `change_membership` round-trip) to land
+    /// leadership where you want it.
+    pub async fn force_partition_election(&self, partition: PartitionId) -> Result<(), String> {
+        let raft = self
+            .partition(partition)
+            .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
+        raft.force_election()
+            .await
+            .map_err(|e| format!("force election on partition {}: {e}", partition.0))
+    }
+
+    /// Force this peer's local replica of the metadata Raft group
+    /// to start an election right now. Same caveats as
+    /// [`Self::force_partition_election`] — doesn't guarantee
+    /// transfer.
+    pub async fn force_meta_election(&self) -> Result<(), String> {
+        self.meta
+            .force_election()
+            .await
+            .map_err(|e| format!("force election on meta: {e}"))
+    }
+
     /// Linearizable-read primitive for `partition`. Calls openraft's
     /// `ensure_linearizable` on the local partition Raft replica,
     /// which:

@@ -1323,6 +1323,63 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_force_partition_election_lands_leadership() {
+    // Operator-pattern leader transfer: shut down the current
+    // leader's partition Raft, force-elect on a chosen survivor,
+    // verify leadership lands on the chosen target.
+    let peers = spawn_multi_raft_cluster(3, 1, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+    let original_leader = peers[0].multi_raft.leader_of(p0).expect("leader known");
+    let leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == original_leader)
+        .unwrap();
+
+    let target_idx = (0..peers.len())
+        .find(|i| *i != leader_idx)
+        .expect("at least one survivor");
+    let target_id = peers[target_idx].config.self_id;
+
+    // Shut down the current leader's partition Raft so its
+    // heartbeats stop. The meta Raft and other partitions stay
+    // alive — just this partition's leader is silenced.
+    peers[leader_idx]
+        .multi_raft
+        .shutdown_partition(p0)
+        .await
+        .unwrap();
+
+    // Force an election on the target. With the original leader
+    // silent, the target's election should win.
+    peers[target_idx]
+        .multi_raft
+        .force_partition_election(p0)
+        .await
+        .expect("force_partition_election");
+
+    // Wait for the target to be observed as leader on its own
+    // metrics. The new leader id must equal target_id.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(leader) = peers[target_idx].multi_raft.partition_current_leader(p0) {
+            if leader == target_id {
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "force-elected target {target_id} did not become leader within 15s; \
+                 current = {:?}",
+                peers[target_idx].multi_raft.partition_current_leader(p0)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_apply_lag_metric_reports_per_group() {
     // Spawn a 3-peer cluster, generate writes, run the metrics
     // poller manually (we don't spawn the long-lived task in
