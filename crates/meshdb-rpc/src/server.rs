@@ -1806,12 +1806,14 @@ impl MeshService {
 
         // COMMIT phase.
         let mut commit_errs: Vec<Status> = Vec::new();
-        let mut commit_idx: usize = 0;
-        for partition in &prepared {
+        for (commit_idx, partition) in prepared.iter().enumerate() {
             // Fault injection: simulate a coordinator crash after the
             // K-th CommitTx commits but before the (K+1)-th. Some
             // partitions are committed; the rest stay PREPAREd.
-            // Recovery resolves the holdouts forward.
+            // Recovery resolves the holdouts forward. `commit_idx` is
+            // only read inside the cfg-gated block — release builds
+            // get it through `enumerate()` without an unused-variable
+            // warning.
             #[cfg(any(test, feature = "fault-inject"))]
             if let Some(fp) = &self.fault_points {
                 let trigger = fp
@@ -1823,6 +1825,8 @@ impl MeshService {
                     ));
                 }
             }
+            #[cfg(not(any(test, feature = "fault-inject")))]
+            let _ = commit_idx;
             let entry = GraphCommand::CommitTx { txid: txid.clone() };
             if let Err(e) = self
                 .propose_partition_command(multi_raft, *partition, entry)
@@ -1830,7 +1834,6 @@ impl MeshService {
             {
                 commit_errs.push(e);
             }
-            commit_idx += 1;
         }
         if !commit_errs.is_empty() {
             return Err(commit_errs.into_iter().next().unwrap());
