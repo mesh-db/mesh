@@ -603,9 +603,23 @@ Multi-peer configs pick one of three modes via the top-level `mode` field:
   replicated by the time PREPARE-ACK returns and there's no in-doubt
   window dependent on a participant log fsync. Single-partition writes
   arriving on a non-leader peer are server-side proxied to the
-  partition leader via internal `MeshWrite::ForwardWrite` — Bolt
-  clients see one consistent endpoint for the lifetime of a session,
-  no client-visible redirects. Combines the durability of `raft` with
+  partition leader via internal `MeshWrite::ForwardWrite`; DDL through
+  `MeshWrite::ForwardDdl` — Bolt clients see one consistent endpoint
+  for the lifetime of a session, no client-visible redirects. A
+  periodic recovery loop (default 60s) re-resolves any in-doubt
+  PREPAREs left by a coordinator that crashed mid-flight while the
+  cluster stayed up. **DDL barrier:** every peer tracks the highest
+  meta-Raft index it's seen committed; partition writes await the
+  local meta replica to catch up before applying, so a `CREATE INDEX`
+  issued through any peer is guaranteed visible by the time a
+  follow-up write lands. **Per-partition snapshots:** each partition's
+  applier packs only its own nodes + edges (~1/N of cluster data),
+  so a new replica catching up via `InstallSnapshot` doesn't download
+  the full graph. **Dynamic rebalancing scaffolding:**
+  `add_partition_replica` / `remove_partition_replica` wrap openraft's
+  per-partition `change_membership` for voter set changes; full
+  orchestration (runtime group spin-up on new peers, hot data
+  migration) is a follow-up. Combines the durability of `raft` with
   the capacity scaling of `routing`. Never inferred — opting in
   changes data placement, so the operator must request it explicitly.
 
