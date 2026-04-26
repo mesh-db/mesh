@@ -579,7 +579,7 @@ self-signed certs.
 
 ## Cluster mode (multi-peer)
 
-Multi-peer configs pick one of two modes via the top-level `mode` field:
+Multi-peer configs pick one of three modes via the top-level `mode` field:
 
 - `mode = "raft"` — single Raft group replicates the full graph to every
   peer. Reads are cheap-local everywhere; writes go through the leader
@@ -594,6 +594,20 @@ Multi-peer configs pick one of two modes via the top-level `mode` field:
   recovery). No consensus, so a peer crash loses that peer's shard
   until it restarts — but the 2PC recovery logs guarantee no
   in-flight transaction is lost in the process.
+- `mode = "multi-raft"` — sharding **with** replication. Each partition
+  has its own openraft group, replicated across `replication_factor`
+  peers (default `min(3, peers.len())`). DDL and cluster membership
+  ride a separate metadata Raft group spanning every peer. Cross-
+  partition writes use a Spanner-style 2PC where both PREPARE and
+  COMMIT are proposed through the partition Raft, so staged state is
+  replicated by the time PREPARE-ACK returns and there's no in-doubt
+  window dependent on a participant log fsync. Single-partition writes
+  arriving on a non-leader peer are server-side proxied to the
+  partition leader via internal `MeshWrite::ForwardWrite` — Bolt
+  clients see one consistent endpoint for the lifetime of a session,
+  no client-visible redirects. Combines the durability of `raft` with
+  the capacity scaling of `routing`. Never inferred — opting in
+  changes data placement, so the operator must request it explicitly.
 
 A three-peer Raft cluster, one bootstrap seed, all speaking Bolt:
 
@@ -704,6 +718,41 @@ address = "127.0.0.1:7002"
 id = 3
 address = "127.0.0.1:7003"
 ```
+
+For `mode = "multi-raft"`, set the mode plus an optional
+`replication_factor`, and keep `bootstrap = true` on the seed peer
+(it initializes the metadata Raft group; per-partition groups
+auto-seed on their lowest-id replica's first start):
+
+```toml
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/mesh-data-a"
+bolt_address = "127.0.0.1:7687"
+num_partitions = 4
+mode = "multi-raft"
+replication_factor = 3
+bootstrap = true
+
+[[peers]]
+id = 1
+address = "127.0.0.1:7001"
+
+[[peers]]
+id = 2
+address = "127.0.0.1:7002"
+
+[[peers]]
+id = 3
+address = "127.0.0.1:7003"
+```
+
+With the trio above, every peer is a replica of every partition (rf=3
+over 3 peers degenerates to "every replica everywhere"). Scaling out
+to 5 peers with `replication_factor = 3` puts each partition on 3 of
+the 5 — that's where capacity scaling kicks in (each peer holds 3/5
+of the partitions worth of data). Multi-raft requires `peers.len() >= 2`
+and `replication_factor` in `[1, peers.len()]`.
 
 ---
 
