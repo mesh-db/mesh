@@ -382,6 +382,13 @@ message ForwardWriteRequest {
   // ack was lost. Currently unused — reserved for v2 once we add a
   // dedupe table.
   bytes idempotency_key = 3;
+  // DDL barrier: highest meta-Raft log index the caller has seen
+  // applied (or proposed). Receiver waits for its local meta
+  // replica to apply at least this index before proposing the
+  // write, so a CREATE INDEX issued through a different peer
+  // shortly before this write is guaranteed visible. `0` means
+  // the caller hasn't observed any DDL.
+  uint64 min_meta_index = 4;
 }
 
 message ForwardWriteResponse {

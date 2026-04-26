@@ -1879,6 +1879,9 @@ impl MeshService {
     /// Local-leader proposes directly; non-leader forwards via
     /// `MeshWrite::ForwardDdl` to the meta leader's peer. Mirrors
     /// `propose_partition_command` for the per-partition case.
+    /// On success, advances the local DDL barrier to the latest
+    /// meta-applied index — subsequent partition writes through
+    /// this peer await their leaders' meta replicas to catch up.
     async fn propose_meta_command(
         &self,
         multi_raft: &Arc<crate::MultiRaftCluster>,
@@ -1888,7 +1891,13 @@ impl MeshService {
         // entry commits immediately; if not, openraft returns
         // ForwardToLeader and we proxy.
         match multi_raft.meta.propose_graph(entry.clone()).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // Local meta has applied. Snapshot the latest
+                // applied index as the new barrier so partition
+                // writes from this peer wait for it to propagate.
+                multi_raft.observe_meta_barrier(multi_raft.meta_last_applied());
+                Ok(())
+            }
             Err(meshdb_cluster::Error::ForwardToLeader { leader_address, .. }) => {
                 let leader_addr = leader_address.ok_or_else(|| {
                     Status::unavailable("meta-raft leader unknown; retry after election")
@@ -1918,13 +1927,34 @@ impl MeshService {
     /// Propose a single `GraphCommand` through `partition`'s Raft
     /// group. Local-leader path proposes directly; non-leader path
     /// forwards via `MeshWrite::ForwardWrite`. Refreshes the leader
-    /// cache on stale-leader hints.
+    /// cache on stale-leader hints. Awaits the DDL barrier on the
+    /// local meta replica before any propose so a write doesn't
+    /// race ahead of a CREATE INDEX visible on the proposing peer.
     async fn propose_partition_command(
         &self,
         multi_raft: &Arc<crate::MultiRaftCluster>,
         partition: meshdb_cluster::PartitionId,
         entry: GraphCommand,
     ) -> std::result::Result<(), Status> {
+        // DDL barrier: wait up to 500ms for our meta replica to
+        // catch up to whatever DDL the cluster has committed. The
+        // tx-coordination markers (PreparedTx / CommitTx / AbortTx)
+        // are out-of-band — they don't depend on schema state, so
+        // skipping the wait keeps recovery latency-bounded.
+        let skip_barrier = matches!(
+            entry,
+            GraphCommand::PreparedTx { .. }
+                | GraphCommand::CommitTx { .. }
+                | GraphCommand::AbortTx { .. }
+        );
+        if !skip_barrier {
+            if let Err(e) = multi_raft
+                .await_meta_barrier(std::time::Duration::from_millis(500))
+                .await
+            {
+                return Err(Status::unavailable(format!("ddl barrier: {e}")));
+            }
+        }
         if multi_raft.is_local_leader(partition) {
             if let Some(raft) = multi_raft.partitions.get(&partition) {
                 return match raft.propose_graph(entry).await {
@@ -1973,6 +2003,9 @@ impl MeshService {
                 partition: partition.0,
                 commands_json,
                 idempotency_key: Vec::new(),
+                min_meta_index: multi_raft
+                    .min_meta_index
+                    .load(std::sync::atomic::Ordering::SeqCst),
             })
             .await?
             .into_inner();
@@ -2069,6 +2102,9 @@ impl MeshService {
                 partition: partition.0,
                 commands_json,
                 idempotency_key: Vec::new(),
+                min_meta_index: multi_raft
+                    .min_meta_index
+                    .load(std::sync::atomic::Ordering::SeqCst),
             })
             .await
             .map_err(|s| s)?
@@ -5396,6 +5432,16 @@ impl MeshWrite for MeshService {
                 "ForwardWrite called on a peer not running mode = \"multi-raft\"",
             ));
         };
+
+        // Absorb the caller's DDL barrier into our cluster's
+        // `min_meta_index`. The propose path's `await_meta_barrier`
+        // will block until our meta replica has applied at least
+        // this much DDL — guarantees a CREATE INDEX issued through
+        // a different peer right before this write is visible by
+        // the time the partition Raft applies it.
+        if req.min_meta_index > 0 {
+            multi_raft.observe_meta_barrier(req.min_meta_index);
+        }
 
         let partition_id = meshdb_cluster::PartitionId(req.partition);
         let partition_raft = match multi_raft.partitions.get(&partition_id) {

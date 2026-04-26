@@ -18,7 +18,9 @@ use crate::raft_service::RaftGroupRegistry;
 use meshdb_cluster::raft::{NodeId, RaftCluster};
 use meshdb_cluster::{PartitionId, PartitionReplicaMap};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 /// Default interval for the periodic in-doubt recovery loop. Matches
 /// the spirit of [`crate::DEFAULT_ROTATION_INTERVAL`] — frequent
@@ -51,6 +53,21 @@ pub struct MultiRaftCluster {
     /// Lazy cache of partition leadership, refreshed from each
     /// partition Raft's own metrics. See [`PartitionLeaderCache`].
     pub leader_cache: PartitionLeaderCache,
+    /// Highest meta-Raft log index this peer has either proposed or
+    /// learned about from a forwarded write. Partition writes await
+    /// the local meta replica to apply at least up to this index
+    /// before proposing — guarantees DDL committed before the write
+    /// is visible at apply time, so e.g. a CREATE INDEX followed by
+    /// a write through any peer doesn't observe a stale index on
+    /// the partition leader.
+    ///
+    /// Updated by:
+    ///   * Successful local DDL propose (sets to leader's
+    ///     `last_applied.index` post-commit).
+    ///   * Inbound forward_write / forward_ddl carrying a `min_meta_index`
+    ///     value greater than the current.
+    /// Read by partition write paths via [`await_meta_barrier`].
+    pub min_meta_index: AtomicU64,
 }
 
 impl std::fmt::Debug for MultiRaftCluster {
@@ -79,6 +96,60 @@ impl MultiRaftCluster {
             partition_appliers,
             replica_map,
             leader_cache,
+            min_meta_index: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot the local meta-Raft applier's `last_applied` index.
+    /// Returns 0 when nothing has applied yet (fresh cluster pre-
+    /// any-DDL). Cheap — reads the watch-channel metrics.
+    pub fn meta_last_applied(&self) -> u64 {
+        self.meta
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0)
+    }
+
+    /// Advance the cluster's `min_meta_index` to `at_least` if it's
+    /// higher than the current value. Idempotent and lock-free.
+    pub fn observe_meta_barrier(&self, at_least: u64) {
+        let mut current = self.min_meta_index.load(Ordering::SeqCst);
+        while at_least > current {
+            match self.min_meta_index.compare_exchange_weak(
+                current,
+                at_least,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Wait until the local meta-Raft applier has applied at least
+    /// `min_meta_index`. Returns immediately if already caught up;
+    /// returns `Err` if the deadline expires (deadline-exceeded
+    /// surfaces to the caller as a retryable Status::Unavailable).
+    /// Polls every 5ms — meta-Raft apply lag is sub-millisecond
+    /// under normal load, so this is hot-path-cheap.
+    pub async fn await_meta_barrier(&self, timeout: Duration) -> Result<(), &'static str> {
+        let target = self.min_meta_index.load(Ordering::SeqCst);
+        if target == 0 {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.meta_last_applied() >= target {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err("meta barrier timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
