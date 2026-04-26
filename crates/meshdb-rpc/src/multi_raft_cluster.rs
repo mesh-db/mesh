@@ -404,6 +404,22 @@ impl MultiRaftCluster {
             .map_err(|e| format!("force election on meta: {e}"))
     }
 
+    /// Returns the partitions this peer currently leads. Used by
+    /// the graceful-shutdown path to decide which leadership
+    /// transfers to perform. Bypasses the leader cache and reads
+    /// each partition Raft's live metrics — the cache may be stale
+    /// (e.g. mid-shutdown the replica reports it's no longer leader,
+    /// but the cache still names self).
+    pub fn partitions_led_locally(&self) -> Vec<PartitionId> {
+        self.partitions_snapshot()
+            .into_iter()
+            .filter_map(|(p, raft)| match raft.current_leader() {
+                Some(leader) if leader.0 == self.self_id => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Linearizable-read primitive for `partition`. Calls openraft's
     /// `ensure_linearizable` on the local partition Raft replica,
     /// which:

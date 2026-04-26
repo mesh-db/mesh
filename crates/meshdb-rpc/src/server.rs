@@ -1822,6 +1822,46 @@ impl MeshService {
         }
     }
 
+    /// Graceful-shutdown helper: for each partition this peer
+    /// currently leads, step the local replica down by shutting
+    /// it down. The remaining replicas elect a new leader among
+    /// themselves; this peer's binary can then exit without
+    /// leaving a dangling leader behind. After restart, the
+    /// rocksdb-persisted state on this peer's data dir lets the
+    /// replica re-instantiate and rejoin the cluster as a
+    /// follower (no membership change needed).
+    ///
+    /// Why shutdown instead of a true leader transfer: openraft 0.9
+    /// has no TimeoutNow / leader-transfer primitive, so a
+    /// `force_election` on a target follower races the source's
+    /// continuing heartbeats — leadership can oscillate back. For
+    /// graceful shutdown we don't need to keep the local replica
+    /// alive (the binary is exiting), so the simpler-and-correct
+    /// move is to shut it down outright. Returns `(stepped_down,
+    /// errors)` — `errors` records partitions where shutdown
+    /// failed.
+    pub async fn drain_leadership(
+        &self,
+        _per_partition_timeout: std::time::Duration,
+    ) -> (
+        Vec<meshdb_cluster::PartitionId>,
+        Vec<(meshdb_cluster::PartitionId, String)>,
+    ) {
+        let Some(multi_raft) = self.multi_raft.clone() else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut stepped_down = Vec::new();
+        let mut errors = Vec::new();
+        let leads = multi_raft.partitions_led_locally();
+        for partition in leads {
+            match multi_raft.shutdown_partition(partition).await {
+                Ok(()) => stepped_down.push(partition),
+                Err(e) => errors.push((partition, e)),
+            }
+        }
+        (stepped_down, errors)
+    }
+
     /// Resolve the leader of `partition` by polling other peers'
     /// `PartitionLeader` RPC. Used as a fallback when the local
     /// replica can't answer (shutdown, freshly-restarted, doesn't
@@ -5935,5 +5975,40 @@ impl MeshWrite for MeshService {
         Ok(Response::new(crate::proto::PartitionLeaderResponse {
             leader_id,
         }))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "force_partition_election", partition))]
+    async fn force_partition_election(
+        &self,
+        request: Request<crate::proto::ForcePartitionElectionRequest>,
+    ) -> Result<Response<crate::proto::ForcePartitionElectionResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("partition", req.partition);
+        let Some(multi_raft) = self.multi_raft.as_ref() else {
+            return Ok(Response::new(
+                crate::proto::ForcePartitionElectionResponse {
+                    ok: false,
+                    error_message: "ForcePartitionElection called on a peer not running multi-raft"
+                        .into(),
+                },
+            ));
+        };
+        match multi_raft
+            .force_partition_election(meshdb_cluster::PartitionId(req.partition))
+            .await
+        {
+            Ok(()) => Ok(Response::new(
+                crate::proto::ForcePartitionElectionResponse {
+                    ok: true,
+                    error_message: String::new(),
+                },
+            )),
+            Err(e) => Ok(Response::new(
+                crate::proto::ForcePartitionElectionResponse {
+                    ok: false,
+                    error_message: e,
+                },
+            )),
+        }
     }
 }

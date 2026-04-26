@@ -366,6 +366,15 @@ service MeshWrite {
   // reads the local watch-channel metrics; no I/O.
   rpc PartitionLeader(PartitionLeaderRequest)
       returns (PartitionLeaderResponse);
+  // Multi-raft mode only: ask the receiving peer to force an
+  // election on its local replica of `partition`. Used by the
+  // graceful-shutdown / drain-leadership path on the source peer:
+  // for each partition the source leads, it asks a follower replica
+  // to take over so the source can exit without leaving a dangling
+  // leader. Returns ok=false if the receiver doesn't host the
+  // partition (caller should pick a different target).
+  rpc ForcePartitionElection(ForcePartitionElectionRequest)
+      returns (ForcePartitionElectionResponse);
 }
 
 enum BatchPhase {
@@ -460,6 +469,15 @@ message PartitionLeaderResponse {
   // partition, isn't running multi-raft, or its replica doesn't
   // yet know who leads.
   uint64 leader_id = 1;
+}
+
+message ForcePartitionElectionRequest {
+  uint32 partition = 1;
+}
+
+message ForcePartitionElectionResponse {
+  bool ok = 1;
+  string error_message = 2;
 }
 
 message PutNodeRequest {

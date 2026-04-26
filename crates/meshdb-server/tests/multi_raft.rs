@@ -1323,6 +1323,71 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_drain_leadership_transfers_every_led_partition() {
+    // Graceful-shutdown contract: after `drain_leadership`, the
+    // peer leads no partitions, so a binary that exits afterwards
+    // doesn't leave a dangling leader. 3 peers × 4 partitions × rf=3
+    // — every peer hosts every partition, so leadership can land
+    // anywhere. Pick a peer that leads at least one partition,
+    // drain it, and confirm.
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let drain_idx = (0..peers.len())
+        .find(|i| !peers[*i].multi_raft.partitions_led_locally().is_empty())
+        .expect("at least one peer leads something");
+    let drain_id = peers[drain_idx].config.self_id;
+    let pre_drain_leads = peers[drain_idx].multi_raft.partitions_led_locally();
+    assert!(!pre_drain_leads.is_empty());
+
+    let (transferred, errors) = peers[drain_idx]
+        .service
+        .drain_leadership(Duration::from_secs(5))
+        .await;
+    assert!(
+        errors.is_empty(),
+        "drain_leadership reported per-partition errors: {errors:?}"
+    );
+    assert_eq!(
+        transferred.len(),
+        pre_drain_leads.len(),
+        "drain should have transferred every partition the peer led"
+    );
+
+    let post_drain_leads = peers[drain_idx].multi_raft.partitions_led_locally();
+    assert!(
+        post_drain_leads.is_empty(),
+        "drain target still leads {post_drain_leads:?} after drain_leadership"
+    );
+
+    // Wait for the surviving peers to elect a new leader for each
+    // drained partition. After shutdown_partition the source's
+    // heartbeats stop; followers' election timers (default ~150ms)
+    // fire and a new leader emerges among them. Be patient — the
+    // first few elections may race each other across multiple
+    // partitions.
+    let other_idx = (0..peers.len()).find(|i| *i != drain_idx).unwrap();
+    for partition in pre_drain_leads {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let new_leader = peers[other_idx]
+                .multi_raft
+                .partition_current_leader(partition);
+            if matches!(new_leader, Some(l) if l != drain_id) {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "partition {partition:?} new leader should not be the drained peer {drain_id} \
+                     within 15s; got {new_leader:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_session_pinned_to_dead_replica_falls_back_to_remote_leader() {
     // The hardest case for explicit-tx affinity: the session is
     // pinned to the partition's *current leader*, and that peer's
