@@ -333,6 +333,14 @@ service MeshWrite {
   // expire.
   rpc ResolveTransaction(ResolveTransactionRequest)
       returns (ResolveTransactionResponse);
+  // Multi-raft mode only: forward a single-partition write to the
+  // partition's leader for proposal through that partition's Raft
+  // group. Used when a write lands on a non-leader peer — instead of
+  // returning ForwardToLeader to the client (which Bolt cannot
+  // transparently follow), the receiving peer proxies the proposal
+  // internally and the client sees one consistent gRPC endpoint for
+  // its session.
+  rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
 }
 
 enum BatchPhase {
@@ -353,6 +361,35 @@ message BatchWriteRequest {
 }
 
 message BatchWriteResponse {}
+
+message ForwardWriteRequest {
+  // Which partition's Raft group should propose these commands.
+  uint32 partition = 1;
+  // serde-json-serialized Vec<meshdb_cluster::GraphCommand>. The
+  // caller is responsible for ensuring every command targets the
+  // identified partition; the receiver applies them as a single
+  // proposed `GraphCommand::Batch` entry.
+  bytes commands_json = 2;
+  // Optional client-supplied idempotency key. The receiver can use
+  // it to dedupe a retry where the original RPC succeeded but the
+  // ack was lost. Currently unused — reserved for v2 once we add a
+  // dedupe table.
+  bytes idempotency_key = 3;
+}
+
+message ForwardWriteResponse {
+  // True iff the receiver successfully proposed and the partition
+  // Raft committed the entry.
+  bool ok = 1;
+  // When `ok = false`, the NodeId the receiver believes is the
+  // current partition leader. Caller should refresh its leader
+  // cache and retry against this peer once. `0` means "leader
+  // unknown" — caller should retry shortly after a poll delay.
+  uint64 leader_hint = 2;
+  // Human-readable error message when `ok = false`. Empty on
+  // success.
+  string error_message = 3;
+}
 
 message PutNodeRequest {
   Node node = 1;

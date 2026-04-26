@@ -2405,6 +2405,12 @@ impl meshdb_rpc::proto::mesh_write_server::MeshWrite for StallingMeshWrite {
     ) -> Result<tonic::Response<meshdb_rpc::proto::DropTriggerResponse>, tonic::Status> {
         std::future::pending().await
     }
+    async fn forward_write(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::ForwardWriteRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::ForwardWriteResponse>, tonic::Status> {
+        std::future::pending().await
+    }
 }
 
 /// Spawn a two-peer cluster where peer A is a real `MeshService`

@@ -239,6 +239,13 @@ pub struct MeshService {
     store: Arc<dyn StorageEngine>,
     routing: Option<Arc<Routing>>,
     raft: Option<Arc<RaftCluster>>,
+    /// Multi-raft cluster handle for `mode = "multi-raft"`. When
+    /// present, single-partition writes are routed through the
+    /// partition's Raft group (forwarded to the leader's peer when
+    /// this isn't it); cross-partition writes ride a Spanner-style
+    /// 2PC over partition Rafts. Mutually exclusive with `routing`
+    /// and `raft` — at most one of the three is set.
+    multi_raft: Option<Arc<crate::MultiRaftCluster>>,
     /// Per-service 2PC participant staging. Bounded-lifetime map of
     /// txid → staged commands with a background sweeper that drops
     /// entries older than the configured TTL. Shared across all
@@ -291,6 +298,7 @@ impl MeshService {
         Self {
             store,
             routing: None,
+            multi_raft: None,
             raft: None,
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
@@ -321,6 +329,7 @@ impl MeshService {
         Self {
             store,
             routing: Some(routing),
+            multi_raft: None,
             raft: None,
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log,
@@ -359,7 +368,34 @@ impl MeshService {
         Self {
             store,
             routing: None,
+            multi_raft: None,
             raft: Some(raft),
+            pending_batches: crate::ParticipantStaging::with_default_ttl(),
+            coordinator_log: None,
+            participant_log: None,
+            tx_timeouts: crate::TxCoordinatorTimeouts::default(),
+            client_tls: None,
+            procedure_registry_factory: default_registry_factory(),
+            #[cfg(any(test, feature = "fault-inject"))]
+            fault_points: None,
+        }
+    }
+
+    /// Multi-raft-backed service: per-partition Raft groups for data
+    /// writes, a metadata Raft group for DDL. Single-partition writes
+    /// arriving on a non-leader peer are server-side proxied to the
+    /// partition leader via `MeshWrite::ForwardWrite` — clients see
+    /// one consistent endpoint for the lifetime of a session, even
+    /// when partition leadership shifts.
+    pub fn with_multi_raft(
+        store: Arc<dyn StorageEngine>,
+        multi_raft: Arc<crate::MultiRaftCluster>,
+    ) -> Self {
+        Self {
+            store,
+            routing: None,
+            raft: None,
+            multi_raft: Some(multi_raft),
             pending_batches: crate::ParticipantStaging::with_default_ttl(),
             coordinator_log: None,
             participant_log: None,
@@ -1456,6 +1492,162 @@ impl MeshService {
 
     /// Internal entry point. `from_trigger` flips on for the
     /// recursive commit that follows trigger firing — it
+    /// Commit `commands` through the multi-raft path. Single-partition
+    /// writes are proposed through the partition's Raft (locally if
+    /// this peer is the leader, otherwise proxied via
+    /// `MeshWrite::ForwardWrite` to the leader's peer). Multi-partition
+    /// writes ride a Spanner-style 2PC over partition Rafts —
+    /// implementation lands in Phase 7; for now they error.
+    async fn commit_multi_raft(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+        commands: Vec<GraphCommand>,
+    ) -> std::result::Result<(), Status> {
+        // Phase 9 (DDL through meta group) wires this branch up; for
+        // Phase 6 we surface a clear error if a DDL command shows up
+        // alongside data writes. DDL-only batches will land on the
+        // meta group via the same routing once Phase 9 ships.
+        let (ddl, graph) = split_ddl(commands);
+        if !ddl.is_empty() {
+            // Forward DDL through the meta-raft group. This handles
+            // both the DDL-only and the DDL-mixed-with-data cases —
+            // Cypher in practice doesn't mix the two, but we apply
+            // DDL first so a follow-up data write sees the new index.
+            for entry in ddl {
+                if let Err(e) = multi_raft.meta.propose_graph(entry).await {
+                    return Err(raft_propose_failed(e));
+                }
+            }
+            if graph.is_empty() {
+                return Ok(());
+            }
+        }
+
+        // Determine which partitions the data writes touch.
+        let cluster = self.store.as_ref();
+        let _ = cluster;
+        let partitioner = meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions());
+        let mut touched: std::collections::BTreeSet<meshdb_cluster::PartitionId> =
+            std::collections::BTreeSet::new();
+        for cmd in &graph {
+            partitions_touched_by_command(cmd, &partitioner, &mut touched);
+        }
+
+        if touched.is_empty() {
+            return Ok(());
+        }
+
+        if touched.len() == 1 {
+            let partition = *touched.iter().next().unwrap();
+            return self
+                .commit_multi_raft_single_partition(multi_raft, partition, graph)
+                .await;
+        }
+
+        Err(Status::unimplemented(
+            "multi-partition writes through multi-raft mode require Phase 7 (PREPARE-Raft); \
+             not yet implemented",
+        ))
+    }
+
+    /// Single-partition multi-raft commit. Local-leader path proposes
+    /// directly; non-leader path proxies via `MeshWrite::ForwardWrite`
+    /// to the partition leader's peer. The proxy hop reuses the
+    /// shared `GrpcNetwork` channel pool — no new TCP connections.
+    async fn commit_multi_raft_single_partition(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+        partition: meshdb_cluster::PartitionId,
+        commands: Vec<GraphCommand>,
+    ) -> std::result::Result<(), Status> {
+        let entry = if commands.len() == 1 {
+            commands.into_iter().next().unwrap()
+        } else {
+            GraphCommand::Batch(commands.clone())
+        };
+
+        if multi_raft.is_local_leader(partition) {
+            if let Some(raft) = multi_raft.partitions.get(&partition) {
+                return match raft.propose_graph(entry).await {
+                    Ok(_) => Ok(()),
+                    Err(meshdb_cluster::Error::ForwardToLeader { leader_id, .. }) => {
+                        // Lost leadership between cache check and propose —
+                        // refresh and surface a retryable error.
+                        if let Some(l) = leader_id {
+                            multi_raft.leader_cache.set(partition, l.0);
+                        } else {
+                            multi_raft.leader_cache.invalidate(partition);
+                        }
+                        Err(Status::unavailable(
+                            "partition leadership changed mid-propose; retry",
+                        ))
+                    }
+                    Err(e) => Err(raft_propose_failed(e)),
+                };
+            }
+        }
+
+        // Non-leader path: forward to the partition leader's peer.
+        let leader_id = match multi_raft.leader_of(partition) {
+            Some(l) => l,
+            None => {
+                return Err(Status::unavailable(format!(
+                    "no known leader for partition {} yet; retry shortly",
+                    partition.0
+                )))
+            }
+        };
+        // Encode the commands once.
+        let commands_json = serde_json::to_vec(&entry_to_vec(entry))
+            .map_err(|e| Status::internal(format!("encoding commands: {e}")))?;
+
+        // Resolve the leader's peer address from cluster membership.
+        // We rely on the meta cluster state's membership list (every
+        // peer is in the meta group, so it's the right place to look).
+        let state = multi_raft.meta.current_state().await;
+        let leader_addr = state
+            .membership
+            .iter()
+            .find_map(|(id, addr)| {
+                if id.0 == leader_id {
+                    Some(addr.to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                Status::internal(format!("leader {leader_id} not in cluster membership"))
+            })?;
+        drop(state);
+
+        let mut client = self
+            .leader_write_client(&leader_addr)
+            .map_err(|e| Status::unavailable(format!("connecting to partition leader: {e}")))?;
+        let resp = client
+            .forward_write(crate::proto::ForwardWriteRequest {
+                partition: partition.0,
+                commands_json,
+                idempotency_key: Vec::new(),
+            })
+            .await
+            .map_err(|s| s)?
+            .into_inner();
+        if resp.ok {
+            return Ok(());
+        }
+        // Refresh the leader cache from the hint so the next request
+        // routes correctly.
+        if resp.leader_hint != 0 {
+            multi_raft.leader_cache.set(partition, resp.leader_hint);
+        } else {
+            multi_raft.leader_cache.invalidate(partition);
+        }
+        Err(Status::unavailable(format!(
+            "forwarded write rejected by peer {leader_id}: {}",
+            resp.error_message
+        )))
+    }
+
     /// suppresses further trigger evaluation so a trigger's own
     /// writes don't infinitely re-fire. External callers always
     /// hit the public wrapper above with `from_trigger = false`.
@@ -1548,6 +1740,31 @@ impl MeshService {
                     return Err(e);
                 }
             }
+        }
+        if let Some(multi_raft) = self.multi_raft.clone() {
+            #[cfg(feature = "apoc-trigger")]
+            let mr_diff = if from_trigger {
+                None
+            } else {
+                self.snapshot_trigger_diff(&commands)
+            };
+            let outcome = self.commit_multi_raft(&multi_raft, commands).await;
+            return match outcome {
+                Ok(()) => {
+                    #[cfg(feature = "apoc-trigger")]
+                    if !from_trigger {
+                        self.fire_post_commit_triggers(mr_diff).await;
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    #[cfg(feature = "apoc-trigger")]
+                    if !from_trigger {
+                        self.fire_rollback_triggers(mr_diff).await;
+                    }
+                    Err(e)
+                }
+            };
         }
         if let Some(raft) = &self.raft {
             #[cfg(feature = "apoc-trigger")]
@@ -2427,6 +2644,60 @@ fn leader_redirect_address(status: &Status) -> Option<String> {
     let rest = msg.strip_prefix(prefix)?;
     let addr = rest.split(';').next()?.trim();
     Some(addr.to_string())
+}
+
+/// Return the set of `PartitionId`s that `cmd`'s data writes touch.
+/// `Batch` variants flatten into the same set; DDL is not partitioned
+/// and contributes nothing. Used by the multi-raft commit path to
+/// route a single-partition batch through one partition Raft and a
+/// multi-partition batch through 2PC.
+fn partitions_touched_by_command(
+    cmd: &GraphCommand,
+    partitioner: &meshdb_cluster::Partitioner,
+    out: &mut std::collections::BTreeSet<meshdb_cluster::PartitionId>,
+) {
+    match cmd {
+        GraphCommand::PutNode(n) => {
+            out.insert(partitioner.partition_for(n.id));
+        }
+        GraphCommand::PutEdge(e) => {
+            // Edges replicate to both endpoints' partitions for
+            // forward + reverse adjacency.
+            out.insert(partitioner.partition_for(e.source));
+            out.insert(partitioner.partition_for(e.target));
+        }
+        GraphCommand::DetachDeleteNode(id) => {
+            out.insert(partitioner.partition_for(*id));
+        }
+        GraphCommand::DeleteEdge(_) => {
+            // We don't have the edge's endpoints from the id alone
+            // here; the multi-raft commit path materializes
+            // DeleteEdge as a broadcast across every partition that
+            // could hold a copy. Adding every partition is the safe
+            // fallback — future optimization could plumb through
+            // the resolved endpoints.
+            for p in 0..partitioner.num_partitions() {
+                out.insert(meshdb_cluster::PartitionId(p));
+            }
+        }
+        GraphCommand::Batch(inner) => {
+            for c in inner {
+                partitions_touched_by_command(c, partitioner, out);
+            }
+        }
+        // DDL and tx markers don't contribute to data partition routing.
+        _ => {}
+    }
+}
+
+/// Wrap a single `GraphCommand` into a one-element vector or unwrap a
+/// `Batch` into its constituent vector. Used by the multi-raft
+/// forward path to round-trip the batched form across the wire.
+fn entry_to_vec(entry: GraphCommand) -> Vec<GraphCommand> {
+    match entry {
+        GraphCommand::Batch(inner) => inner,
+        other => vec![other],
+    }
 }
 
 /// Flatten a tree of [`GraphCommand`] (which may nest `Batch` variants)
@@ -4590,5 +4861,83 @@ impl MeshWrite for MeshService {
         Ok(Response::new(ResolveTransactionResponse {
             status: status as i32,
         }))
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "forward_write", partition))]
+    async fn forward_write(
+        &self,
+        request: Request<crate::proto::ForwardWriteRequest>,
+    ) -> Result<Response<crate::proto::ForwardWriteResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("partition", req.partition);
+
+        let Some(multi_raft) = self.multi_raft.as_ref() else {
+            return Err(Status::failed_precondition(
+                "ForwardWrite called on a peer not running mode = \"multi-raft\"",
+            ));
+        };
+
+        let partition_id = meshdb_cluster::PartitionId(req.partition);
+        let partition_raft = match multi_raft.partitions.get(&partition_id) {
+            Some(r) => r,
+            None => {
+                // We don't host this partition's Raft replica; the
+                // caller's leader cache is stale.
+                return Ok(Response::new(crate::proto::ForwardWriteResponse {
+                    ok: false,
+                    leader_hint: 0,
+                    error_message: format!("partition {} not hosted on this peer", partition_id.0),
+                }));
+            }
+        };
+
+        if !multi_raft.is_local_leader(partition_id) {
+            // Best-effort leader hint — None falls through as 0
+            // ("unknown"), which the caller treats as a retry-after-poll
+            // signal rather than a fixed redirect.
+            let leader_hint = multi_raft.leader_of(partition_id).unwrap_or(0);
+            return Ok(Response::new(crate::proto::ForwardWriteResponse {
+                ok: false,
+                leader_hint,
+                error_message: format!(
+                    "this peer is not the leader of partition {}",
+                    partition_id.0
+                ),
+            }));
+        }
+
+        // Decode the carried command list and propose as one Raft
+        // entry. The applier on every replica of this partition will
+        // converge through the partition Raft log.
+        let commands: Vec<meshdb_cluster::GraphCommand> =
+            serde_json::from_slice(&req.commands_json)
+                .map_err(|e| Status::invalid_argument(format!("decoding commands: {e}")))?;
+        let entry = if commands.len() == 1 {
+            commands.into_iter().next().unwrap()
+        } else {
+            meshdb_cluster::GraphCommand::Batch(commands)
+        };
+        match partition_raft.propose_graph(entry).await {
+            Ok(_) => Ok(Response::new(crate::proto::ForwardWriteResponse {
+                ok: true,
+                leader_hint: 0,
+                error_message: String::new(),
+            })),
+            Err(meshdb_cluster::Error::ForwardToLeader { leader_id, .. }) => {
+                // Lost leadership between is_local_leader check and
+                // propose. Surface the new hint so the caller retries.
+                let hint = leader_id.map(|id| id.0).unwrap_or(0);
+                if let Some(l) = leader_id {
+                    multi_raft.leader_cache.set(partition_id, l.0);
+                    let _ = l;
+                }
+                Ok(Response::new(crate::proto::ForwardWriteResponse {
+                    ok: false,
+                    leader_hint: hint,
+                    error_message: "leadership changed mid-propose".into(),
+                }))
+            }
+            Err(e) => Err(Status::internal(format!("propose_graph: {e}"))),
+        }
     }
 }

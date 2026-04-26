@@ -429,12 +429,17 @@ async fn build_multi_raft_components(
     let registry = multi_raft.build_registry();
     let raft_service = MeshRaftService::with_registry(registry);
 
-    // Until Phase 6 wires writes through partition Raft groups, the
-    // user-facing service stays in single-node configuration. Reads
-    // hit the local store directly; writes will route through
-    // multi_raft once `MeshService::with_multi_raft` lands.
+    // Wire writes through the multi-raft path: single-partition
+    // writes propose through the partition Raft (server-side
+    // forwarded to the leader peer when this isn't it); reads still
+    // hit the local store directly. Multi-partition writes ship in
+    // a follow-up commit (Phase 7: PREPARE-Raft).
     let store_for_triggers = store.clone();
-    let service = apply_apoc_import(MeshService::new(store), config, &store_for_triggers);
+    let service = apply_apoc_import(
+        MeshService::with_multi_raft(store, multi_raft.clone()).with_client_tls(client_tls),
+        config,
+        &store_for_triggers,
+    );
 
     Ok(ServerComponents {
         service,

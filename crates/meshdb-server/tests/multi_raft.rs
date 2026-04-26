@@ -5,6 +5,7 @@
 //! presence on each peer, leader election in every group.
 
 use meshdb_cluster::PartitionId;
+use meshdb_rpc::MeshService;
 use meshdb_server::config::{ClusterMode, PeerConfig, ServerConfig};
 use meshdb_server::{build_components, initialize_multi_raft_if_seed};
 use std::net::SocketAddr;
@@ -18,6 +19,7 @@ use tonic::transport::Server;
 struct Peer {
     config: ServerConfig,
     multi_raft: Arc<meshdb_rpc::MultiRaftCluster>,
+    service: MeshService,
     _dir: TempDir,
 }
 
@@ -71,15 +73,19 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
 
         let components = build_components(&config).await.unwrap();
         let multi_raft = components.multi_raft.clone().expect("multi-raft built");
+        let service = components.service.clone();
         // Build a fresh MeshRaftService from the same registry —
         // ServerComponents.raft_service was already consumed elsewhere
         // in production, but in tests we re-derive it.
         let registry = multi_raft.build_registry();
         let raft_service = meshdb_rpc::MeshRaftService::with_registry(registry);
 
+        let service_for_server = service.clone();
         tokio::spawn(async move {
             Server::builder()
                 .add_service(raft_service.into_server())
+                .add_service(service_for_server.clone().into_query_server())
+                .add_service(service_for_server.clone().into_write_server())
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -88,6 +94,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
         peers.push(Peer {
             config,
             multi_raft,
+            service,
             _dir: dir,
         });
     }
@@ -157,6 +164,93 @@ async fn multi_raft_three_peer_cluster_elects_leader_in_every_group() {
             panic!("multi-raft groups did not all elect leaders within 10s");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait for every Raft group on every peer to have a known leader.
+/// Used by tests that assume the cluster has finished bootstrapping
+/// before issuing writes.
+async fn wait_for_leaders(peers: &[Peer], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut all = true;
+        for peer in peers {
+            if peer.multi_raft.meta.current_leader().is_none() {
+                all = false;
+                break;
+            }
+            for raft in peer.multi_raft.partitions.values() {
+                if raft.current_leader().is_none() {
+                    all = false;
+                    break;
+                }
+            }
+            if !all {
+                break;
+            }
+        }
+        if all {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("leaders not elected within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn multi_raft_single_partition_write_through_any_peer() {
+    // 3 peers, 4 partitions, rf=3. Insert nodes through every peer's
+    // service — at least some peer will be a non-leader for some
+    // partition, exercising the server-side forwarding path. Verify
+    // every node lands on every replica (rf=3 = full replication so
+    // every peer has every node).
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Issue a Cypher CREATE through each peer in turn. Each CREATE
+    // emits one PutNode targeting one partition (FNV-1a of the new
+    // id) — at least some peers will not be the leader of that
+    // partition, exercising the server-side forwarding path.
+    for (i, peer) in peers.iter().enumerate() {
+        let cypher = format!("CREATE (:Origin{}) RETURN 0", i);
+        peer.service
+            .execute_cypher_local(cypher, std::collections::HashMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("peer {} write failed: {e}", peer.config.self_id));
+    }
+
+    // Every peer's local store should hold all three nodes — rf=3
+    // means each partition's replica set spans every peer.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for peer in &peers {
+            for label in ["Origin0", "Origin1", "Origin2"] {
+                let cypher = format!("MATCH (n:{label}) RETURN count(n) AS c");
+                let rows = peer
+                    .service
+                    .execute_cypher_local(cypher, std::collections::HashMap::new())
+                    .await
+                    .unwrap();
+                let count_value = rows.first().and_then(|r| r.get("c")).expect("count(n) row");
+                let count = match count_value {
+                    meshdb_executor::Value::Property(meshdb_core::Property::Int64(c)) => *c,
+                    other => panic!("expected Int64, got {other:?}"),
+                };
+                if count != 1 {
+                    if Instant::now() > deadline {
+                        panic!(
+                            "peer {} sees count(:{label}) = {count}, expected 1",
+                            peer.config.self_id
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'outer;
+                }
+            }
+        }
+        break;
     }
 }
 
