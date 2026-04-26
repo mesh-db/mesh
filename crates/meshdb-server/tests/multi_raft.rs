@@ -255,6 +255,84 @@ async fn multi_raft_single_partition_write_through_any_peer() {
 }
 
 #[tokio::test]
+async fn multi_raft_cross_partition_write_commits_atomically() {
+    // 3 peers, 4 partitions, rf=3. Issue a Cypher write that
+    // creates an edge between two nodes whose ids land in different
+    // partitions — exercises the Spanner-style PREPARE-Raft 2PC.
+    // Both partition Raft logs should get a PreparedTx → CommitTx
+    // pair; both replicas converge to the same applied state.
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Cypher that touches >1 partition: CREATE two labeled nodes +
+    // an edge between them. The new ids hash randomly across the 4
+    // partitions, so most runs pick different partitions for the
+    // two nodes. Even when they happen to land on the same
+    // partition, the commit path is still correct (it just
+    // degenerates to the single-partition fast path).
+    let cypher = "CREATE (a:Source)-[:TO]->(b:Target) RETURN 0".to_string();
+    peers[0]
+        .service
+        .execute_cypher_local(cypher, std::collections::HashMap::new())
+        .await
+        .unwrap();
+
+    // Verify every peer ends up with one Source, one Target, and
+    // one edge.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for peer in &peers {
+            for label in ["Source", "Target"] {
+                let q = format!("MATCH (n:{label}) RETURN count(n) AS c");
+                let rows = peer
+                    .service
+                    .execute_cypher_local(q, std::collections::HashMap::new())
+                    .await
+                    .unwrap();
+                let count = match rows.first().and_then(|r| r.get("c")) {
+                    Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+                    other => panic!("expected Int64, got {other:?}"),
+                };
+                if count != 1 {
+                    if Instant::now() > deadline {
+                        panic!(
+                            "peer {} sees count(:{label}) = {count}, expected 1",
+                            peer.config.self_id
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue 'outer;
+                }
+            }
+            // Edge count.
+            let rows = peer
+                .service
+                .execute_cypher_local(
+                    "MATCH ()-[r:TO]->() RETURN count(r) AS c".to_string(),
+                    std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let count = match rows.first().and_then(|r| r.get("c")) {
+                Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+                other => panic!("expected Int64, got {other:?}"),
+            };
+            if count != 1 {
+                if Instant::now() > deadline {
+                    panic!(
+                        "peer {} sees count(:TO) = {count}, expected 1",
+                        peer.config.self_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_per_partition_storage_dirs_are_isolated() {
     // 3 peers, 4 partitions, rf=2 → not every peer hosts every
     // partition. Verifies storage-layout isolation per group and

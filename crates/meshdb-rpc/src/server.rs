@@ -1544,10 +1544,169 @@ impl MeshService {
                 .await;
         }
 
-        Err(Status::unimplemented(
-            "multi-partition writes through multi-raft mode require Phase 7 (PREPARE-Raft); \
-             not yet implemented",
-        ))
+        // Multi-partition write — Spanner-style 2PC over partition
+        // Rafts. PREPARE *and* COMMIT both ride the partition Raft so
+        // staged state is replicated by the time PREPARE-ACK returns
+        // (no in-doubt window dependent on a participant log fsync).
+        self.commit_multi_raft_cross_partition(multi_raft, &touched, graph)
+            .await
+    }
+
+    /// Spanner-style 2PC over partition leaders. Each touched
+    /// partition's leader proposes a `PreparedTx` entry through its
+    /// Raft group; once all PREPAREs ACK, the coordinator proposes
+    /// `CommitTx` on each. A failed PREPARE rolls back via `AbortTx`
+    /// on the partitions that prepared.
+    async fn commit_multi_raft_cross_partition(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+        touched: &std::collections::BTreeSet<meshdb_cluster::PartitionId>,
+        commands: Vec<GraphCommand>,
+    ) -> std::result::Result<(), Status> {
+        let txid = uuid::Uuid::new_v4().to_string();
+
+        // Group commands by partition (edges go to both endpoints).
+        let partitioner = meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions());
+        let mut by_partition: std::collections::BTreeMap<
+            meshdb_cluster::PartitionId,
+            Vec<GraphCommand>,
+        > = std::collections::BTreeMap::new();
+        for p in touched {
+            by_partition.insert(*p, Vec::new());
+        }
+        flatten_commands_by_partition(&commands, &partitioner, &mut by_partition);
+
+        // PREPARE phase. Each propose goes through the partition Raft;
+        // ACKs only return after Raft quorum.
+        let mut prepared: Vec<meshdb_cluster::PartitionId> = Vec::new();
+        let mut prepare_err: Option<Status> = None;
+        for partition in touched {
+            let entry = GraphCommand::PreparedTx {
+                txid: txid.clone(),
+                commands: by_partition.remove(partition).unwrap_or_default(),
+            };
+            match self
+                .propose_partition_command(multi_raft, *partition, entry)
+                .await
+            {
+                Ok(()) => prepared.push(*partition),
+                Err(e) => {
+                    prepare_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = prepare_err {
+            // Best-effort abort on partitions that prepared.
+            for partition in &prepared {
+                let abort = GraphCommand::AbortTx { txid: txid.clone() };
+                if let Err(e) = self
+                    .propose_partition_command(multi_raft, *partition, abort)
+                    .await
+                {
+                    tracing::warn!(
+                        partition = ?partition,
+                        txid = %txid,
+                        error = %e,
+                        "abort propose failed during multi-raft 2PC rollback"
+                    );
+                }
+            }
+            return Err(err);
+        }
+
+        // COMMIT phase.
+        let mut commit_errs: Vec<Status> = Vec::new();
+        for partition in &prepared {
+            let entry = GraphCommand::CommitTx { txid: txid.clone() };
+            if let Err(e) = self
+                .propose_partition_command(multi_raft, *partition, entry)
+                .await
+            {
+                commit_errs.push(e);
+            }
+        }
+        if !commit_errs.is_empty() {
+            return Err(commit_errs.into_iter().next().unwrap());
+        }
+        Ok(())
+    }
+
+    /// Propose a single `GraphCommand` through `partition`'s Raft
+    /// group. Local-leader path proposes directly; non-leader path
+    /// forwards via `MeshWrite::ForwardWrite`. Refreshes the leader
+    /// cache on stale-leader hints.
+    async fn propose_partition_command(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+        partition: meshdb_cluster::PartitionId,
+        entry: GraphCommand,
+    ) -> std::result::Result<(), Status> {
+        if multi_raft.is_local_leader(partition) {
+            if let Some(raft) = multi_raft.partitions.get(&partition) {
+                return match raft.propose_graph(entry).await {
+                    Ok(_) => Ok(()),
+                    Err(meshdb_cluster::Error::ForwardToLeader { leader_id, .. }) => {
+                        if let Some(l) = leader_id {
+                            multi_raft.leader_cache.set(partition, l.0);
+                        } else {
+                            multi_raft.leader_cache.invalidate(partition);
+                        }
+                        Err(Status::unavailable(
+                            "partition leadership changed mid-propose; retry",
+                        ))
+                    }
+                    Err(e) => Err(raft_propose_failed(e)),
+                };
+            }
+        }
+
+        let leader_id = multi_raft.leader_of(partition).ok_or_else(|| {
+            Status::unavailable(format!("no leader for partition {}", partition.0))
+        })?;
+        let state = multi_raft.meta.current_state().await;
+        let leader_addr = state
+            .membership
+            .iter()
+            .find_map(|(id, addr)| {
+                if id.0 == leader_id {
+                    Some(addr.to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                Status::internal(format!("leader {leader_id} not in cluster membership"))
+            })?;
+        drop(state);
+
+        let commands_json = serde_json::to_vec(&entry_to_vec(entry))
+            .map_err(|e| Status::internal(format!("encoding commands: {e}")))?;
+        let mut client = self
+            .leader_write_client(&leader_addr)
+            .map_err(|e| Status::unavailable(format!("connecting to partition leader: {e}")))?;
+        let resp = client
+            .forward_write(crate::proto::ForwardWriteRequest {
+                partition: partition.0,
+                commands_json,
+                idempotency_key: Vec::new(),
+            })
+            .await?
+            .into_inner();
+        if resp.ok {
+            Ok(())
+        } else {
+            if resp.leader_hint != 0 {
+                multi_raft.leader_cache.set(partition, resp.leader_hint);
+            } else {
+                multi_raft.leader_cache.invalidate(partition);
+            }
+            Err(Status::unavailable(format!(
+                "forwarded propose rejected: {}",
+                resp.error_message
+            )))
+        }
     }
 
     /// Single-partition multi-raft commit. Local-leader path proposes
@@ -2697,6 +2856,71 @@ fn entry_to_vec(entry: GraphCommand) -> Vec<GraphCommand> {
     match entry {
         GraphCommand::Batch(inner) => inner,
         other => vec![other],
+    }
+}
+
+/// Walk `cmds`, distributing each leaf write into `by_partition`
+/// according to the same routing the partition applier uses:
+/// nodes / detach-deletes go to their owning partition only; edges
+/// go to both endpoints' partitions; `Batch` recurses; DDL and tx
+/// markers don't appear (caller has already split them out).
+///
+/// `DeleteEdge` is broadcast to every partition in the touched set
+/// because the edge's endpoints aren't recoverable from its id alone
+/// — we lean on the applier's idempotency for the no-op case.
+fn flatten_commands_by_partition(
+    cmds: &[GraphCommand],
+    partitioner: &meshdb_cluster::Partitioner,
+    by_partition: &mut std::collections::BTreeMap<meshdb_cluster::PartitionId, Vec<GraphCommand>>,
+) {
+    for cmd in cmds {
+        match cmd {
+            GraphCommand::PutNode(n) => {
+                let p = partitioner.partition_for(n.id);
+                by_partition
+                    .entry(p)
+                    .or_default()
+                    .push(GraphCommand::PutNode(n.clone()));
+            }
+            GraphCommand::PutEdge(e) => {
+                let src = partitioner.partition_for(e.source);
+                let dst = partitioner.partition_for(e.target);
+                by_partition
+                    .entry(src)
+                    .or_default()
+                    .push(GraphCommand::PutEdge(e.clone()));
+                if dst != src {
+                    by_partition
+                        .entry(dst)
+                        .or_default()
+                        .push(GraphCommand::PutEdge(e.clone()));
+                }
+            }
+            GraphCommand::DetachDeleteNode(id) => {
+                let p = partitioner.partition_for(*id);
+                by_partition
+                    .entry(p)
+                    .or_default()
+                    .push(GraphCommand::DetachDeleteNode(*id));
+            }
+            GraphCommand::DeleteEdge(id) => {
+                // Broadcast to every partition we're already
+                // visiting; the applier is idempotent on missing ids.
+                let entries: Vec<meshdb_cluster::PartitionId> =
+                    by_partition.keys().copied().collect();
+                for p in entries {
+                    by_partition
+                        .entry(p)
+                        .or_default()
+                        .push(GraphCommand::DeleteEdge(*id));
+                }
+            }
+            GraphCommand::Batch(inner) => {
+                flatten_commands_by_partition(inner, partitioner, by_partition)
+            }
+            // DDL + tx markers don't reach this routing path.
+            _ => {}
+        }
     }
 }
 
