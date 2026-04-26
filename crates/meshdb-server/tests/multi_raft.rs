@@ -1324,6 +1324,100 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_demote_voter_to_learner_keeps_replica_alive() {
+    // 3-peer × 1-partition × rf=3 cluster — every peer is a voter
+    // of partition 0. Demote a non-leader voter to a learner via
+    // `demote_partition_voter_to_learner`. Verify:
+    //   1. The peer is no longer in the voter set.
+    //   2. The peer IS in the learner set (membership.nodes()).
+    //   3. The leader can still propose writes (3-voter cluster
+    //      is now a 2-voter cluster, still has quorum).
+    //   4. The demoted peer's local store still receives the new
+    //      writes — learners replicate, they just don't vote.
+    let peers = spawn_multi_raft_cluster(3, 1, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+    let leader_id = peers[0].multi_raft.leader_of(p0).expect("leader known");
+    let leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == leader_id)
+        .unwrap();
+
+    // Demote a non-leader voter so leadership doesn't shift.
+    let demote_id = peers
+        .iter()
+        .map(|p| p.config.self_id)
+        .find(|id| *id != leader_id)
+        .unwrap();
+    let demote_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == demote_id)
+        .unwrap();
+
+    peers[leader_idx]
+        .multi_raft
+        .demote_partition_voter_to_learner(p0, demote_id)
+        .await
+        .expect("demote_partition_voter_to_learner");
+
+    // Wait for the membership change to commit on the leader.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (voters, learners) = peers[leader_idx]
+            .multi_raft
+            .partition_membership(p0)
+            .await
+            .expect("leader hosts p0");
+        if !voters.contains(&demote_id) && learners.contains(&demote_id) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "demoted peer {demote_id} should be a learner, not a voter; \
+                 voters={voters:?} learners={learners:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The leader can still propose — quorum is now 2-of-2 voters.
+    peers[leader_idx]
+        .service
+        .execute_cypher_local(
+            "CREATE (:LearnerCheck {seq: 1})".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("leader propose after demotion");
+
+    // The demoted peer is still a learner — it replicates, so a
+    // local-store query on that peer must surface the new write.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = peers[demote_idx]
+            .service
+            .execute_cypher_local(
+                "MATCH (n:LearnerCheck) RETURN count(n) AS c".to_string(),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let count = match rows.first().and_then(|r| r.get("c")) {
+            Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+            other => panic!("expected Int64, got {other:?}"),
+        };
+        if count == 1 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("demoted learner should have replicated the write; got count = {count}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_cluster_auth_rejects_unauthorized_grpc() {
     // Spin up a single MeshService with a cluster auth token and
     // verify the intercepted gRPC server:

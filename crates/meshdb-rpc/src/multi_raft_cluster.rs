@@ -420,6 +420,123 @@ impl MultiRaftCluster {
             .collect()
     }
 
+    /// Add `peer_id` as a non-voting *learner* of `partition`'s
+    /// Raft group. Learners receive every committed log entry but
+    /// don't participate in elections or counted toward quorum.
+    /// They're the canonical scaling story for read-heavy
+    /// workloads — adding learners absorbs read traffic without
+    /// adding write-quorum overhead.
+    ///
+    /// The same caveats as [`Self::add_partition_replica`] apply:
+    /// the new peer must already be running with a partition Raft
+    /// instance for this partition (use
+    /// `meshdb_server::instantiate_partition_group`), and the
+    /// caller is responsible for updating
+    /// [`PartitionReplicaMap`] separately if read routing should
+    /// see the new learner.
+    pub async fn add_partition_learner(
+        &self,
+        partition: PartitionId,
+        peer_id: NodeId,
+    ) -> Result<(), String> {
+        let raft = self
+            .partition(partition)
+            .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
+        let state = self.meta.current_state().await;
+        let addr = state
+            .membership
+            .iter()
+            .find_map(|(id, addr)| {
+                if id.0 == peer_id {
+                    Some(addr.to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                format!("peer {peer_id} not in cluster membership; add to meta group first")
+            })?;
+        drop(state);
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(peer_id, openraft::BasicNode::new(addr));
+        raft.raft
+            .change_membership(openraft::ChangeMembers::AddNodes(nodes), false)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("partition {} AddNodes (learner): {e}", partition.0))
+    }
+
+    /// Remove `peer_id` from `partition`'s Raft group entirely
+    /// (learner or voter). If the peer is currently a voter
+    /// openraft returns `LearnerNotFound`; demote it via
+    /// [`Self::remove_partition_replica`] first.
+    pub async fn remove_partition_learner(
+        &self,
+        partition: PartitionId,
+        peer_id: NodeId,
+    ) -> Result<(), String> {
+        let raft = self
+            .partition(partition)
+            .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
+        let mut nodes = std::collections::BTreeSet::new();
+        nodes.insert(peer_id);
+        raft.raft
+            .change_membership(openraft::ChangeMembers::RemoveNodes(nodes), false)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("partition {} RemoveNodes (learner): {e}", partition.0))
+    }
+
+    /// Demote an existing voter of `partition` to a learner —
+    /// the peer keeps receiving log entries but no longer counts
+    /// toward quorum or votes in elections. Useful for shifting a
+    /// peer from "active replica" to "read-only" without losing
+    /// the data it already has on disk.
+    ///
+    /// Composes openraft's `RemoveVoters` with `retain = true`
+    /// (demote rather than evict). Inverse operation:
+    /// [`Self::add_partition_replica`] (which upgrades a learner
+    /// to a voter via `AddVoters`).
+    pub async fn demote_partition_voter_to_learner(
+        &self,
+        partition: PartitionId,
+        peer_id: NodeId,
+    ) -> Result<(), String> {
+        let raft = self
+            .partition(partition)
+            .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
+        let mut to_demote = std::collections::BTreeSet::new();
+        to_demote.insert(peer_id);
+        raft.raft
+            .change_membership(openraft::ChangeMembers::RemoveVoters(to_demote), true)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("partition {} demote-to-learner: {e}", partition.0))
+    }
+
+    /// Returns the set of `(NodeId, role)` pairs for `partition`'s
+    /// Raft group — voters and learners. Useful for tests and
+    /// observability. Returns `None` when this peer doesn't host
+    /// the partition.
+    pub async fn partition_membership(
+        &self,
+        partition: PartitionId,
+    ) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
+        let raft = self.partition(partition)?;
+        let m = raft.raft.metrics().borrow().clone();
+        let voter_ids: std::collections::HashSet<u64> =
+            m.membership_config.membership().voter_ids().collect();
+        let voters: Vec<u64> = voter_ids.iter().copied().collect();
+        let learners: Vec<u64> = m
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .filter(|id| !voter_ids.contains(id))
+            .collect();
+        Some((voters, learners))
+    }
+
     /// Linearizable-read primitive for `partition`. Calls openraft's
     /// `ensure_linearizable` on the local partition Raft replica,
     /// which:
