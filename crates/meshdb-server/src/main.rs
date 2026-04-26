@@ -98,6 +98,7 @@ impl Cli {
             bolt_advertised_address: None,
             grpc_tls: None,
             mode: self.mode,
+            replication_factor: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         })
@@ -248,6 +249,7 @@ mod tests {
             bolt_advertised_address: None,
             grpc_tls: None,
             mode: None,
+            replication_factor: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         };
@@ -273,6 +275,7 @@ mod tests {
             bolt_advertised_address: None,
             grpc_tls: None,
             mode: None,
+            replication_factor: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         };

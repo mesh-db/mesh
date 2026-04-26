@@ -10,6 +10,12 @@ pub enum Error {
     #[error("partition count must be non-zero")]
     ZeroPartitions,
 
+    #[error("replication_factor {replication_factor} is invalid: must be in [1, {peer_count}]")]
+    InvalidReplicationFactor {
+        replication_factor: usize,
+        peer_count: usize,
+    },
+
     #[error("unknown peer: {0:?}")]
     UnknownPeer(PeerId),
 

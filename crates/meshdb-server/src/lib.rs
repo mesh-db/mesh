@@ -65,6 +65,9 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
         ClusterMode::Raft => Err(anyhow!(
             "Raft mode requires async bootstrap; call build_components instead"
         )),
+        ClusterMode::MultiRaft => Err(anyhow!(
+            "multi-raft mode requires async bootstrap; call build_components instead"
+        )),
     }
 }
 
@@ -229,6 +232,15 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
         }
         ClusterMode::Raft => {
             // Fall through to the Raft bootstrap path below.
+        }
+        ClusterMode::MultiRaft => {
+            // Multi-raft bootstrap lands in Phase 5 (MultiRaftCluster
+            // wrapper). Until then, surface the gap loudly so a
+            // misconfiguration doesn't silently degrade.
+            return Err(anyhow!(
+                "mode = \"multi-raft\" is configured but the bootstrap path is not \
+                 yet implemented; this branch wires it up in a later commit"
+            ));
         }
     }
 

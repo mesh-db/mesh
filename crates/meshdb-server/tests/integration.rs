@@ -106,6 +106,7 @@ async fn spawn_single_node_server() -> Harness {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -168,6 +169,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -186,6 +188,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -564,6 +567,7 @@ async fn build_components_single_node_has_no_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -601,6 +605,7 @@ async fn build_components_multi_peer_builds_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -641,6 +646,7 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -701,6 +707,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -719,6 +726,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -876,6 +884,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -894,6 +903,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1098,6 +1108,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1116,6 +1127,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1280,6 +1292,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1298,6 +1311,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1442,6 +1456,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1460,6 +1475,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1699,6 +1715,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1717,6 +1734,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1818,6 +1836,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1978,6 +1997,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -1996,6 +2016,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -2165,6 +2186,7 @@ async fn cypher_merge_replicates_through_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -2183,6 +2205,7 @@ async fn cypher_merge_replicates_through_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -2331,6 +2354,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -2349,6 +2373,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -2500,6 +2525,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -2518,6 +2544,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -2785,6 +2812,7 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -2972,6 +3000,7 @@ async fn route_write_role_tracks_raft_leader_across_handoff() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };
@@ -3149,6 +3178,7 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     };

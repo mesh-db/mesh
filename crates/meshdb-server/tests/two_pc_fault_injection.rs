@@ -101,6 +101,7 @@ fn make_server_config(
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: Some(ClusterMode::Routing),
+        replication_factor: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     }

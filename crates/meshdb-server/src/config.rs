@@ -25,6 +25,18 @@ pub enum ClusterMode {
     /// when `peers` is non-empty and `mode` is unset, for
     /// backward compatibility with configs from before `mode` existed.
     Raft,
+    /// Multi-Raft: per-partition Raft groups plus a metadata group.
+    /// Each partition is replicated across `replication_factor` peers
+    /// via its own openraft group; cross-partition writes ride a
+    /// Spanner-style 2PC where PREPARE and COMMIT are both proposed
+    /// through the partition Raft (so staged state survives a leader
+    /// crash without a separate participant log). DDL and cluster
+    /// membership go through a single metadata Raft group spanning
+    /// every peer. Selected explicitly via `mode = "multi-raft"`.
+    /// Never inferred — opting in is a placement-changing decision.
+    #[serde(rename = "multi-raft")]
+    #[clap(name = "multi-raft")]
+    MultiRaft,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,9 +151,22 @@ pub struct ServerConfig {
     /// → Single, non-empty → Raft) for backward compatibility with
     /// configs from before this field existed. Set explicitly to
     /// `"routing"` to run a hash-partitioned non-Raft cluster that
-    /// uses the 2PC coordinator + recovery log.
+    /// uses the 2PC coordinator + recovery log, or `"multi-raft"`
+    /// to run per-partition Raft groups (never inferred — opting in
+    /// changes data placement so the user must request it).
     #[serde(default)]
     pub mode: Option<ClusterMode>,
+
+    /// Number of replicas per partition Raft group. Only consulted
+    /// when `mode = "multi-raft"`; ignored in every other mode.
+    /// Omitted → defaults to `min(3, peers.len())` — the
+    /// production-standard quorum size, which degenerates to
+    /// "every replica everywhere" on a 3-peer cluster (same
+    /// durability shape as single-Raft) and to 3-of-N on larger
+    /// clusters (where the capacity-scaling win materializes).
+    /// Must be in `[1, peers.len()]`.
+    #[serde(default)]
+    pub replication_factor: Option<usize>,
 
     /// Configuration for `apoc.load.*` (and, in the future,
     /// `apoc.export.*`). Omitted → every load call fails with a
@@ -378,6 +403,112 @@ mod tests {
         println!("HASH={}", hash);
     }
 
+    /// Build a minimal `ServerConfig` for validation tests.
+    /// Defaults to two peers (the floor for multi-raft) so individual
+    /// tests only override the fields they care about.
+    fn cfg_with_peers(n: usize, mode: Option<ClusterMode>) -> ServerConfig {
+        ServerConfig {
+            self_id: 1,
+            listen_address: "127.0.0.1:7001".into(),
+            data_dir: "/tmp/d".into(),
+            num_partitions: 4,
+            peers: (1..=n as u64)
+                .map(|id| PeerConfig {
+                    id,
+                    address: format!("127.0.0.1:700{id}"),
+                    bolt_address: None,
+                })
+                .collect(),
+            bootstrap: false,
+            bolt_address: None,
+            metrics_address: None,
+            bolt_auth: None,
+            bolt_tls: None,
+            bolt_advertised_versions: None,
+            bolt_advertised_address: None,
+            grpc_tls: None,
+            mode,
+            replication_factor: None,
+            #[cfg(feature = "apoc-load")]
+            apoc_import: None,
+        }
+    }
+
+    #[test]
+    fn multi_raft_requires_at_least_two_peers() {
+        let cfg = cfg_with_peers(1, Some(ClusterMode::MultiRaft));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("at least 2 peers"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_raft_rejects_replication_factor_above_peer_count() {
+        let mut cfg = cfg_with_peers(3, Some(ClusterMode::MultiRaft));
+        cfg.replication_factor = Some(4);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("replication_factor"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_raft_rejects_replication_factor_zero() {
+        let mut cfg = cfg_with_peers(3, Some(ClusterMode::MultiRaft));
+        cfg.replication_factor = Some(0);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("replication_factor"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_raft_with_unset_rf_validates_and_resolves_to_min_three_peers() {
+        let cfg = cfg_with_peers(5, Some(ClusterMode::MultiRaft));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.resolved_replication_factor(), Some(3));
+    }
+
+    #[test]
+    fn multi_raft_with_two_peers_resolves_rf_to_two() {
+        let cfg = cfg_with_peers(2, Some(ClusterMode::MultiRaft));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.resolved_replication_factor(), Some(2));
+    }
+
+    #[test]
+    fn replication_factor_rejected_outside_multi_raft() {
+        let mut cfg = cfg_with_peers(3, Some(ClusterMode::Raft));
+        cfg.replication_factor = Some(2);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("only valid with mode"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_raft_is_never_inferred() {
+        let cfg = cfg_with_peers(3, None);
+        // Three peers + unset mode → Raft (legacy default), never MultiRaft.
+        assert_eq!(cfg.resolved_mode(), ClusterMode::Raft);
+    }
+
+    #[test]
+    fn multi_raft_parses_from_toml_with_dashed_name() {
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+mode = "multi-raft"
+replication_factor = 3
+[[peers]]
+id = 1
+address = "127.0.0.1:7001"
+[[peers]]
+id = 2
+address = "127.0.0.1:7002"
+[[peers]]
+id = 3
+address = "127.0.0.1:7003"
+"#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolved_mode(), ClusterMode::MultiRaft);
+        assert_eq!(cfg.resolved_replication_factor(), Some(3));
+    }
+
     #[test]
     fn is_bcrypt_hash_recognizes_all_canonical_prefixes() {
         assert!(is_bcrypt_hash("$2a$10$abc"));
@@ -442,7 +573,8 @@ impl ServerConfig {
 
     /// Resolve the cluster mode, falling back to the legacy implicit
     /// rules when `mode` is unset. Empty `peers` implies Single;
-    /// non-empty `peers` implies Raft. The fallback preserves every
+    /// non-empty `peers` implies Raft. MultiRaft is never inferred —
+    /// it must be requested explicitly. The fallback preserves every
     /// pre-`mode` config's behavior unchanged.
     pub fn resolved_mode(&self) -> ClusterMode {
         if let Some(mode) = self.mode {
@@ -453,6 +585,21 @@ impl ServerConfig {
         } else {
             ClusterMode::Raft
         }
+    }
+
+    /// Replication factor for `mode = "multi-raft"`. Falls back to
+    /// `min(3, peers.len())` — the production-standard quorum size.
+    /// Returns `None` for any other mode since the field is unused
+    /// outside multi-raft. Callers are expected to call `validate()`
+    /// first; this getter does not range-check the explicit value.
+    pub fn resolved_replication_factor(&self) -> Option<usize> {
+        if self.resolved_mode() != ClusterMode::MultiRaft {
+            return None;
+        }
+        if let Some(rf) = self.replication_factor {
+            return Some(rf);
+        }
+        Some(self.peers.len().min(3))
     }
 
     /// Check that the chosen mode and the peer list are consistent.
@@ -474,7 +621,31 @@ impl ServerConfig {
             (ClusterMode::Raft, false) => {
                 Err("mode = \"raft\" requires a non-empty `peers` list".into())
             }
+            (ClusterMode::MultiRaft, false) => {
+                Err("mode = \"multi-raft\" requires a non-empty `peers` list".into())
+            }
+            (ClusterMode::MultiRaft, true) if self.peers.len() < 2 => Err(
+                "mode = \"multi-raft\" requires at least 2 peers (rf=1 over a single \
+                 peer is single-node with extra steps; pick mode = \"single\" instead)"
+                    .into(),
+            ),
             _ => {
+                if mode == ClusterMode::MultiRaft {
+                    let rf = self
+                        .replication_factor
+                        .unwrap_or_else(|| self.peers.len().min(3));
+                    if rf == 0 || rf > self.peers.len() {
+                        return Err(format!(
+                            "replication_factor {rf} is invalid: must be in [1, {}]",
+                            self.peers.len()
+                        ));
+                    }
+                } else if self.replication_factor.is_some() {
+                    return Err(format!(
+                        "replication_factor is only valid with mode = \"multi-raft\" \
+                         (current mode: {mode:?})"
+                    ));
+                }
                 if has_peers && !self.peers.iter().any(|p| p.id == self.self_id) {
                     return Err(format!("self_id {} is not in the peers list", self.self_id));
                 }

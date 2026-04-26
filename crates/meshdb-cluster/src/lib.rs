@@ -9,7 +9,7 @@ mod state;
 pub use cluster::Cluster;
 pub use error::Error;
 pub use membership::{Membership, Peer, PeerId};
-pub use partition_map::PartitionMap;
+pub use partition_map::{PartitionMap, PartitionReplicaMap};
 pub use partitioner::{PartitionId, Partitioner};
 pub use state::{
     resolved_constraint_name, ClusterCommand, ClusterState, ConstraintKind, ConstraintScope,
