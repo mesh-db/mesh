@@ -24,6 +24,7 @@ use meshdb_rpc::{
 };
 use meshdb_storage::{RocksDbStorageEngine, StorageEngine};
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -238,10 +239,73 @@ pub fn participant_log_path(data_dir: &std::path::Path) -> std::path::PathBuf {
 /// - [`ClusterMode::Raft`] → single-Raft-group replication with a
 ///   [`StoreGraphApplier`] wiring the executor's writes into the
 ///   state machine.
+/// Path of the on-disk marker that records the `num_partitions`
+/// value used when this peer's data directory was first
+/// initialized. Used by [`check_num_partitions_marker`] to refuse
+/// silent resharding on restart.
+pub fn num_partitions_marker_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("num_partitions")
+}
+
+/// Verify the operator hasn't changed `num_partitions` since the
+/// data directory was first initialized. On first start (no
+/// marker), write the current value. On subsequent starts, compare
+/// the marker to `current` and bail with a descriptive error if
+/// they differ — the only safe path forward is the offline
+/// dump-and-restore workflow.
+pub fn check_num_partitions_marker(data_dir: &Path, current: u32) -> Result<()> {
+    let marker = num_partitions_marker_path(data_dir);
+    match std::fs::read_to_string(&marker) {
+        Ok(contents) => {
+            let persisted: u32 = contents.trim().parse().with_context(|| {
+                format!(
+                    "marker file {} is corrupted (expected u32, got {:?})",
+                    marker.display(),
+                    contents
+                )
+            })?;
+            if persisted != current {
+                return Err(anyhow!(
+                    "num_partitions changed across restart: data dir was \
+                     initialized with {persisted}, but the current config says \
+                     {current}. Hash-partitioned data on disk is invalidated by \
+                     this change — keys would re-hash to different partitions \
+                     and routing would silently miss them. To change the \
+                     partition count safely, dump the graph (apoc.export.cypher.all), \
+                     wipe the data directories on every peer, and re-import \
+                     against a fresh cluster started with the new value."
+                ));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Fresh data dir. Record the current value so a future
+            // restart catches the misconfiguration.
+            std::fs::write(&marker, current.to_string()).with_context(|| {
+                format!("writing num_partitions marker at {}", marker.display())
+            })?;
+            Ok(())
+        }
+        Err(e) => Err(anyhow::Error::from(e).context(format!(
+            "reading num_partitions marker at {}",
+            marker.display()
+        ))),
+    }
+}
+
 pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents> {
     config.validate().map_err(|e| anyhow!(e))?;
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
+    // Anti-footgun: refuse to start if the operator changed
+    // `num_partitions` across restarts. Hash-partitioned data on
+    // disk is sensitive to the partition count — every key would
+    // re-hash to a different partition under the new count, and
+    // our routing path would silently miss data. The marker file
+    // is written on first start; subsequent starts must match it.
+    // The escape hatch is the offline dump-and-restore workflow
+    // documented in CLAUDE.md ("Partition count change").
+    check_num_partitions_marker(&config.data_dir, config.num_partitions)?;
     let store: Arc<dyn StorageEngine> = Arc::new(
         RocksDbStorageEngine::open(&config.data_dir)
             .with_context(|| format!("opening store at {}", config.data_dir.display()))?,

@@ -1323,6 +1323,59 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_num_partitions_marker_blocks_silent_resharding() {
+    // Spawn a 3-peer cluster with num_partitions=4. After it's
+    // running, confirm the marker file exists. Then attempt to
+    // build_components against the same data_dir but with
+    // num_partitions=8 — must fail with a clear error.
+    use meshdb_server::{
+        build_components, check_num_partitions_marker, num_partitions_marker_path,
+    };
+
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Sanity: marker file exists in every peer's data_dir.
+    for peer in &peers {
+        let marker = num_partitions_marker_path(&peer.config.data_dir);
+        let contents = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("reading marker {}: {e}", marker.display()));
+        assert_eq!(contents.trim(), "4");
+    }
+
+    // Direct unit-test of the validator: changing the value must
+    // be rejected with a clear error.
+    let dir = peers[0].config.data_dir.clone();
+    let err =
+        check_num_partitions_marker(&dir, 8).expect_err("changing num_partitions must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("num_partitions changed across restart"),
+        "expected resharding error, got: {msg}"
+    );
+    assert!(
+        msg.contains("dump"),
+        "error must point at the dump-and-restore workflow, got: {msg}"
+    );
+
+    // build_components routes through check_num_partitions_marker.
+    // Capture a fresh config that points at peer[0]'s data_dir
+    // but with the wrong num_partitions.
+    let mut bad_config = peers[0].config.clone();
+    bad_config.num_partitions = 8;
+    let result = build_components(&bad_config).await;
+    let err = match result {
+        Ok(_) => panic!("build_components must reject the resharding-via-restart attempt"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("num_partitions changed across restart"),
+        "expected resharding error from build_components, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn multi_raft_linearizable_read_primitive() {
     // Verifies the `ensure_partition_linearizable` primitive that
     // future linearizable read paths build on:
