@@ -2,6 +2,14 @@ use crate::{Error, Membership, PartitionMap, Peer, PeerId, Result};
 use meshdb_core::{Edge, EdgeId, Node, NodeId};
 use serde::{Deserialize, Serialize};
 
+/// Transaction identifier for cross-partition writes in multi-raft
+/// mode. The coordinator generates one per Cypher write that touches
+/// more than one partition, embeds it in every `GraphCommand::*Tx`
+/// variant, and uses it to correlate the `coordinator_log` with the
+/// per-partition Raft entries. String-typed for compatibility with
+/// the existing `coordinator_log` / `participant_log` shape.
+pub type TxId = String;
+
 /// The replicated portion of a cluster: who the members are and which peer
 /// owns each partition. This is the type a consensus layer (Raft) will
 /// snapshot, apply entries against, and hand out to readers.
@@ -156,6 +164,32 @@ pub enum GraphCommand {
     /// without erroring.
     DropTrigger {
         name: String,
+    },
+    /// Multi-raft only — stage a partition's slice of a
+    /// cross-partition transaction. The PartitionGraphApplier
+    /// inserts the carried commands into its `pending_txs` map
+    /// keyed by `txid`; subsequent `CommitTx` applies them, `AbortTx`
+    /// drops them. Replicates through the partition Raft, so the
+    /// staged state survives a leader crash with no in-doubt
+    /// window. Single-Raft mode never sees this variant — the
+    /// legacy applier returns `unreachable!`-style errors if it
+    /// somehow does.
+    PreparedTx {
+        txid: TxId,
+        commands: Vec<GraphCommand>,
+    },
+    /// Multi-raft only — finalize a previously-staged transaction.
+    /// The PartitionGraphApplier moves the staged commands from
+    /// `pending_txs` into a single atomic `apply_batch`. Idempotent
+    /// when no matching staging exists (treats it as already-applied
+    /// or already-aborted).
+    CommitTx {
+        txid: TxId,
+    },
+    /// Multi-raft only — drop a previously-staged transaction
+    /// without applying it. Idempotent for unknown txids.
+    AbortTx {
+        txid: TxId,
     },
 }
 

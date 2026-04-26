@@ -13,7 +13,7 @@ pub use partition_map::{PartitionMap, PartitionReplicaMap};
 pub use partitioner::{PartitionId, Partitioner};
 pub use state::{
     resolved_constraint_name, ClusterCommand, ClusterState, ConstraintKind, ConstraintScope,
-    GraphCommand, MeshLogEntry, PropertyType,
+    GraphCommand, MeshLogEntry, PropertyType, TxId,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -236,6 +236,18 @@ impl GraphStateMachine for StoreGraphApplier {
                 self.notify_trigger_change();
                 Ok(())
             }
+            // The multi-raft tx-coordination variants are only valid
+            // for the per-partition `PartitionGraphApplier`; the
+            // single-Raft applier should never see them. Reject loudly
+            // so a misrouted entry is a config bug rather than silent
+            // data loss.
+            GraphCommand::PreparedTx { .. }
+            | GraphCommand::CommitTx { .. }
+            | GraphCommand::AbortTx { .. } => Err(
+                "multi-raft tx command applied through the single-Raft state machine; \
+                 routing bug — should have landed in a partition group's applier"
+                    .into(),
+            ),
         }
     }
 
@@ -591,6 +603,16 @@ fn apply_ddl_and_collect(
                 .map_err(|e| e.to_string())?,
             GraphCommand::DropTrigger { name } => {
                 store.delete_trigger(name).map_err(|e| e.to_string())?
+            }
+            // Tx-coordination markers are not DDL or leaf graph ops —
+            // they only flow through the partition applier in multi-
+            // raft mode. Surface a misroute loudly.
+            GraphCommand::PreparedTx { .. }
+            | GraphCommand::CommitTx { .. }
+            | GraphCommand::AbortTx { .. } => {
+                return Err(
+                    "multi-raft tx command leaked into the single-Raft batch applier".into(),
+                );
             }
         }
     }

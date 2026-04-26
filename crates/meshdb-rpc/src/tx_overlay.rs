@@ -114,6 +114,13 @@ impl TxOverlayState {
             | GraphCommand::DropConstraint { .. }
             | GraphCommand::InstallTrigger { .. }
             | GraphCommand::DropTrigger { .. } => {}
+            // Multi-raft tx markers describe staged-commit phases on
+            // the partition Raft log; they're not user-issued
+            // operations and never appear in the per-tx overlay
+            // visible to the executor's read path.
+            GraphCommand::PreparedTx { .. }
+            | GraphCommand::CommitTx { .. }
+            | GraphCommand::AbortTx { .. } => {}
         }
     }
 

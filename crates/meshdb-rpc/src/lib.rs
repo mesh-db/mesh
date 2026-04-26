@@ -22,6 +22,7 @@ mod executor_writer;
 #[cfg(any(test, feature = "fault-inject"))]
 pub mod fault_points;
 pub mod metrics;
+mod multi_raft_applier;
 mod participant_log;
 mod partitioned_reader;
 mod raft_applier;
@@ -43,6 +44,7 @@ pub use error::ConvertError;
 pub use executor_writer::{BufferingGraphWriter, RaftGraphWriter};
 #[cfg(any(test, feature = "fault-inject"))]
 pub use fault_points::FaultPoints;
+pub use multi_raft_applier::{MetaGraphApplier, PartitionGraphApplier};
 pub use participant_log::{
     replay_in_doubt_commands, replay_outcomes, ParticipantLog, ParticipantLogEntry,
     ParticipantOutcome, PARTICIPANT_LOG_MIN_TERMINAL, PARTICIPANT_LOG_ROTATION_INTERVAL,

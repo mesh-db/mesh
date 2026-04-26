@@ -2469,6 +2469,12 @@ pub(crate) fn flatten_commands(
             | GraphCommand::DropConstraint { .. }
             | GraphCommand::InstallTrigger { .. }
             | GraphCommand::DropTrigger { .. } => {}
+            // Multi-raft tx-coordination markers — only the
+            // PartitionGraphApplier consumes these; never reach the
+            // routing-mode / single-Raft flatten path.
+            GraphCommand::PreparedTx { .. }
+            | GraphCommand::CommitTx { .. }
+            | GraphCommand::AbortTx { .. } => {}
         }
     }
 }
