@@ -1218,6 +1218,148 @@ async fn multi_raft_per_partition_storage_dirs_are_isolated() {
 }
 
 #[tokio::test]
+async fn multi_raft_quorum_loss_blocks_writes_reads_still_work() {
+    // 3 peers, 1 partition, rf=3. Kill 2 of 3 replicas (gRPC server
+    // + Raft handle) so the partition has no quorum. Verify:
+    //   1. The pre-crash data is still readable from the surviving
+    //      replica's local store — Raft replicated it before the
+    //      crash, the data is durable on disk locally.
+    //   2. New writes do not silently succeed — they time out, which
+    //      is the openraft-correct behaviour when a write proposal
+    //      cannot achieve quorum.
+    let peers = spawn_multi_raft_cluster(3, 1, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+
+    // Establish baseline: a write that we'll later read back.
+    peers[0]
+        .service
+        .execute_cypher_local(
+            "CREATE (:Survivor {tag: 'before-quorum-loss'})".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    // Wait for the write to replicate to every replica's local
+    // store before we cut the cluster apart.
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut all_see_it = true;
+            for peer in &peers {
+                let rows = peer
+                    .service
+                    .execute_cypher_local(
+                        "MATCH (n:Survivor) RETURN count(n) AS c".to_string(),
+                        std::collections::HashMap::new(),
+                    )
+                    .await
+                    .unwrap();
+                let count = match rows.first().and_then(|r| r.get("c")) {
+                    Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+                    other => panic!("expected Int64, got {other:?}"),
+                };
+                if count != 1 {
+                    all_see_it = false;
+                    break;
+                }
+            }
+            if all_see_it {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("Survivor write did not replicate to all 3 peers within 5s");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // Pick a survivor — anyone, doesn't matter (they all have the data).
+    // Kill the other two: shut down their partition Raft handles AND
+    // abort their gRPC servers. Now the surviving peer is alone; any
+    // openraft propose on its replica will hang waiting for quorum.
+    let survivor_idx = 0;
+    let dead_idxs: Vec<usize> = (0..peers.len()).filter(|i| *i != survivor_idx).collect();
+    for &idx in &dead_idxs {
+        peers[idx].multi_raft.shutdown_partition(p0).await.unwrap();
+        peers[idx].server_task.abort();
+    }
+
+    // Read from the surviving peer's local store. The data is on
+    // disk, so this must succeed even though the partition has lost
+    // quorum.
+    let rows = peers[survivor_idx]
+        .service
+        .execute_cypher_local(
+            "MATCH (n:Survivor) RETURN n.tag AS tag".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("read from surviving replica must succeed");
+    let tag = match rows.first().and_then(|r| r.get("tag")) {
+        Some(meshdb_executor::Value::Property(meshdb_core::Property::String(s))) => s.clone(),
+        other => panic!("expected String, got {other:?}"),
+    };
+    assert_eq!(tag, "before-quorum-loss");
+
+    // Attempt a write through the survivor. With no quorum the
+    // openraft propose hangs; we cap it with a tokio timeout. The
+    // expected outcome is "did not complete in 3 seconds" — either
+    // because the surviving peer's propose blocks forever waiting
+    // for AppendEntries quorum, or because the forward_write proxy
+    // cannot reach a leader (none can be elected from a single peer).
+    // Either way: writes do not silently succeed.
+    let write_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        peers[survivor_idx].service.execute_cypher_local(
+            "CREATE (:WrittenAfterQuorumLoss)".to_string(),
+            std::collections::HashMap::new(),
+        ),
+    )
+    .await;
+
+    match write_result {
+        Err(_elapsed) => {
+            // The write hung waiting for quorum — correct outcome.
+        }
+        Ok(Err(_status)) => {
+            // The write surfaced an error rather than hanging — also
+            // an acceptable outcome. The surviving peer may detect
+            // it can never reach quorum and short-circuit faster
+            // than the test's timeout.
+        }
+        Ok(Ok(_)) => {
+            panic!(
+                "write succeeded against a partition with no quorum — \
+                 multi-raft must block writes when quorum is lost"
+            );
+        }
+    }
+
+    // Confirm the surviving replica's local store does not
+    // contain the would-be-written node — even if the write's
+    // RPC dispatched through some path, no quorum means no apply.
+    let rows = peers[survivor_idx]
+        .service
+        .execute_cypher_local(
+            "MATCH (n:WrittenAfterQuorumLoss) RETURN count(n) AS c".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let count = match rows.first().and_then(|r| r.get("c")) {
+        Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    assert_eq!(
+        count, 0,
+        "WrittenAfterQuorumLoss must not be visible — no quorum, no apply"
+    );
+}
+
+#[tokio::test]
 async fn multi_raft_ddl_gate_times_out_when_peer_unreachable() {
     // 3 peers. Crash one peer's gRPC server (so its meta_last_applied
     // RPC will fail) without touching its Raft handle — the meta
