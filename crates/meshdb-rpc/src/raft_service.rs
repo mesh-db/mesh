@@ -184,6 +184,43 @@ mod tests {
     }
 
     #[test]
+    fn raft_rpc_request_default_target_routes_to_legacy() {
+        // Pre-multi-raft peers serialize `RaftRpcRequest` without
+        // setting any `target` variant — prost decodes that as
+        // `target == None`, which the registry dispatches to the
+        // legacy single-Raft group. Pin the contract so a future
+        // proto change that flips the default doesn't silently
+        // re-route legacy traffic to the meta or a partition group.
+        let req = RaftRpcRequest {
+            payload: vec![1, 2, 3],
+            target: None,
+        };
+        // Sanity-round-trip through prost bytes — this is what an
+        // older binary on the wire produces.
+        use prost::Message;
+        let bytes = req.encode_to_vec();
+        let decoded = RaftRpcRequest::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded.payload, vec![1, 2, 3]);
+        assert!(
+            decoded.target.is_none(),
+            "decoded target should be None for unset wire field"
+        );
+
+        // Empty registry routes the unset target to the
+        // single-Raft slot, which is also unset → NotFound (vs.
+        // dispatching to the meta or partition slot, which would
+        // be a wire-compat regression).
+        let registry = RaftGroupRegistry::new();
+        let e = err(registry.route(decoded.target.as_ref()));
+        assert_eq!(e.code(), tonic::Code::NotFound);
+        assert!(
+            e.message().contains("single-Raft"),
+            "unset target must route to single-Raft slot; got {}",
+            e.message()
+        );
+    }
+
+    #[test]
     fn empty_registry_rejects_legacy_target_with_not_found() {
         let registry = RaftGroupRegistry::new();
         let e = err(registry.route(None));

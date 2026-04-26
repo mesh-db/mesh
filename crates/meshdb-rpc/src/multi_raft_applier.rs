@@ -270,27 +270,109 @@ impl GraphStateMachine for PartitionGraphApplier {
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, String> {
-        // Per-partition snapshots ride on top of the same checkpoint
-        // mechanism as single-Raft. The snapshot captures *the entire
-        // local store* — non-target partitions' data was never written
-        // here, so each replica's snapshot only contains its own
-        // partition's keys by construction.
-        crate::raft_applier::StoreGraphApplier::new(self.store.clone()).snapshot()
+        // Pack only this partition's nodes + edges + pending-tx
+        // staging into a JSON document. Smaller than the
+        // StoreGraphApplier checkpoint (which packs the whole
+        // store), so a new replica catching up via InstallSnapshot
+        // downloads ~1/N of the cluster's data instead of the full
+        // graph.
+        let mut nodes = Vec::new();
+        for node in self.store.all_nodes().map_err(|e| e.to_string())? {
+            if self.owns(node.id) {
+                nodes.push(node);
+            }
+        }
+        let mut edges = Vec::new();
+        for edge in self.store.all_edges().map_err(|e| e.to_string())? {
+            // Edges live on the source's partition, with a ghost
+            // copy on the target's. Both endpoints' replicas pack
+            // the edge so reverse adjacency stays intact.
+            if self.owns(edge.source) || self.owns(edge.target) {
+                edges.push(edge);
+            }
+        }
+        let mut pending_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (key, value) in self.store.list_pending_txs().map_err(|e| e.to_string())? {
+            if let Some((p, _)) = decode_pending_tx_key(&key) {
+                if p == self.partition_id {
+                    pending_rows.push((key, value));
+                }
+            }
+        }
+        let snap = PartitionSnapshot {
+            partition_id: self.partition_id.0,
+            nodes,
+            edges,
+            pending_rows,
+        };
+        serde_json::to_vec(&snap).map_err(|e| format!("encoding partition snapshot: {e}"))
     }
 
     fn restore(&self, snapshot: &[u8]) -> Result<(), String> {
-        crate::raft_applier::StoreGraphApplier::new(self.store.clone()).restore(snapshot)?;
-        // A fresh snapshot install replaces the on-disk state, so any
-        // in-memory pending tx staging is now stale — drop it. The
-        // new leader will replay the partition Raft log past the
-        // snapshot index and reconstruct staging from `PreparedTx`
-        // entries naturally.
-        self.pending_txs
-            .lock()
-            .expect("pending_txs mutex poisoned")
-            .clear();
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        let snap: PartitionSnapshot = serde_json::from_slice(snapshot)
+            .map_err(|e| format!("decoding partition snapshot: {e}"))?;
+        if snap.partition_id != self.partition_id.0 {
+            return Err(format!(
+                "snapshot partition_id {} does not match this applier's partition {}",
+                snap.partition_id, self.partition_id.0
+            ));
+        }
+        // Apply nodes + edges via the storage layer. PutNode /
+        // PutEdge are idempotent overwrites — a previously-stale
+        // replica that's catching up sees its old data replaced.
+        let mut muts: Vec<GraphMutation> = Vec::new();
+        for n in snap.nodes {
+            muts.push(GraphMutation::PutNode(n));
+        }
+        for e in snap.edges {
+            muts.push(GraphMutation::PutEdge(e));
+        }
+        if !muts.is_empty() {
+            self.store.apply_batch(&muts).map_err(|e| e.to_string())?;
+        }
+        // Replace pending_tx_meta rows for this partition. The
+        // snapshot captures the leader's view at snapshot time;
+        // anything stale on disk gets overwritten via put.
+        for (key, value) in snap.pending_rows {
+            self.store
+                .put_pending_tx(&key, &value)
+                .map_err(|e| e.to_string())?;
+        }
+        // Rebuild the in-memory pending_txs from the freshly-
+        // restored on-disk rows. Same logic as `new` after a
+        // restart — list_pending_txs filtered by partition.
+        let mut pending = self.pending_txs.lock().expect("pending_txs mutex poisoned");
+        pending.clear();
+        for (key, value) in self.store.list_pending_txs().map_err(|e| e.to_string())? {
+            if let Some((p, txid)) = decode_pending_tx_key(&key) {
+                if p == self.partition_id {
+                    if let Ok(cmds) = serde_json::from_slice::<Vec<GraphCommand>>(&value) {
+                        pending.insert(txid, cmds);
+                    }
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// On-the-wire shape for [`PartitionGraphApplier`] snapshots.
+/// JSON-encoded — fields are ordered to keep the serialized form
+/// stable for cross-version replay during a rolling upgrade.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PartitionSnapshot {
+    /// Partition this snapshot belongs to. Restore rejects a
+    /// mismatch — defensive against a misrouted InstallSnapshot.
+    partition_id: u32,
+    nodes: Vec<meshdb_core::Node>,
+    edges: Vec<meshdb_core::Edge>,
+    /// Raw `(key, value)` pairs from `pending_tx_meta`, restored
+    /// via `put_pending_tx` so the in-memory `pending_txs` map
+    /// reconstructs from disk on the next applier read.
+    pending_rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// State-machine applier for the multi-raft metadata group. Handles
@@ -617,6 +699,81 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.contains("tx-coordination"), "got: {err}");
+    }
+
+    #[test]
+    fn partition_snapshot_round_trips_only_owned_data() {
+        // Source store has 50 nodes split across 4 partitions plus
+        // some edges. The partition-1 applier's snapshot should
+        // contain ~25% of the nodes (those owned by partition 1)
+        // plus edges with at least one endpoint on partition 1.
+        // Restoring into a fresh store on a different "peer" via
+        // a partition-1 applier reproduces only that subset.
+        let (_d, src) = store();
+        let p = Partitioner::new(4);
+        let mut node_ids = Vec::new();
+        for _ in 0..50 {
+            let n = Node::new();
+            node_ids.push(n.id);
+            src.put_node(&n).unwrap();
+        }
+        // Edges across consecutive ids — covers same-partition and
+        // cross-partition cases.
+        for w in node_ids.windows(2).take(25) {
+            src.put_edge(&Edge::new("LINK", w[0], w[1])).unwrap();
+        }
+
+        let applier = PartitionGraphApplier::new(PartitionId(1), src.clone(), p.clone());
+        let snap = applier.snapshot().expect("snapshot");
+        // Decode and verify it only carries partition-1's data.
+        let parsed: PartitionSnapshot = serde_json::from_slice(&snap).unwrap();
+        assert_eq!(parsed.partition_id, 1);
+        assert!(
+            parsed
+                .nodes
+                .iter()
+                .all(|n| p.partition_for(n.id) == PartitionId(1)),
+            "snapshot leaked non-partition-1 nodes"
+        );
+        assert!(
+            parsed.edges.iter().all(|e| {
+                p.partition_for(e.source) == PartitionId(1)
+                    || p.partition_for(e.target) == PartitionId(1)
+            }),
+            "snapshot leaked non-partition-1 edges"
+        );
+
+        // Restore into a fresh "destination peer". The dst applier
+        // applies whatever the snapshot contains.
+        let (_d2, dst) = store();
+        let dst_applier = PartitionGraphApplier::new(PartitionId(1), dst.clone(), p.clone());
+        dst_applier.restore(&snap).expect("restore");
+
+        // Every partition-1 node from src should now be on dst.
+        for id in node_ids {
+            if p.partition_for(id) == PartitionId(1) {
+                assert!(
+                    dst.get_node(id).unwrap().is_some(),
+                    "partition-1 node {id:?} missing from restored store"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partition_snapshot_rejects_mismatched_partition_id() {
+        let (_d, src) = store();
+        let p = Partitioner::new(4);
+        let applier = PartitionGraphApplier::new(PartitionId(1), src, p);
+        let snap = applier.snapshot().unwrap();
+
+        let (_d2, dst) = store();
+        let dst_applier = PartitionGraphApplier::new(PartitionId(2), dst, Partitioner::new(4));
+        let err = dst_applier.restore(&snap).unwrap_err();
+        assert!(
+            err.contains("does not match"),
+            "expected partition-id mismatch error, got {err}"
+        );
     }
 
     #[test]
