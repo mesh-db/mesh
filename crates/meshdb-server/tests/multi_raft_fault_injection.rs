@@ -432,7 +432,7 @@ async fn multi_raft_reject_forward_write_retries_after_cache_refresh() {
     // rejection on the leader, expect the caller's leader cache to
     // be invalidated, and verify a fresh write succeeds against the
     // actually-current leader.
-    let mut peers = spawn_three_peer_multi_raft(2).await;
+    let peers = spawn_three_peer_multi_raft(2).await;
 
     // Pick a partition's leader and inject the rejection on it.
     let p0 = PartitionId(0);
