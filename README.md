@@ -615,11 +615,19 @@ Multi-peer configs pick one of three modes via the top-level `mode` field:
   follow-up write lands. **Per-partition snapshots:** each partition's
   applier packs only its own nodes + edges (~1/N of cluster data),
   so a new replica catching up via `InstallSnapshot` doesn't download
-  the full graph. **Dynamic rebalancing scaffolding:**
-  `add_partition_replica` / `remove_partition_replica` wrap openraft's
-  per-partition `change_membership` for voter set changes; full
-  orchestration (runtime group spin-up on new peers, hot data
-  migration) is a follow-up. Combines the durability of `raft` with
+  the full graph. **Dynamic rebalancing:** `add_partition_replica` /
+  `remove_partition_replica` wrap openraft's per-partition
+  `change_membership` for voter changes; the cluster's persisted
+  view of placement (the `PartitionReplicaMap` in `ClusterState`)
+  updates atomically via `ClusterCommand::SetPartitionReplicas` so
+  a restart picks up the new replica set. **Runtime partition group
+  spin-up:** `instantiate_partition_group(...)` creates a partition
+  Raft + rocksdb dir + applier on a peer that didn't bootstrap
+  with that partition, registering it in both the live
+  `MultiRaftCluster` and the dispatch table without restart.
+  Combined with `add_partition_replica`, this is the foundation
+  for online rebalancing — openraft's InstallSnapshot handles
+  data catchup for the new replica. Combines the durability of `raft` with
   the capacity scaling of `routing`. Never inferred — opting in
   changes data placement, so the operator must request it explicitly.
 
