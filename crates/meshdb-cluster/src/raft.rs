@@ -879,11 +879,17 @@ impl RaftCluster {
     /// address in that case, which yields `ForwardToLeader` redirects
     /// via the normal write path once elections settle.
     pub fn current_leader(&self) -> Option<crate::PeerId> {
-        self.raft
-            .metrics()
-            .borrow()
-            .current_leader
-            .map(crate::PeerId)
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        // After `shutdown_in_place`, openraft's metrics watcher is
+        // closed but `borrow()` still returns the last published
+        // value — including a stale `current_leader` pointing at a
+        // dead replica. Treat any non-running state as no-leader so
+        // routing falls through to the forward path.
+        if m.state == openraft::ServerState::Shutdown || m.running_state.is_err() {
+            return None;
+        }
+        m.current_leader.map(crate::PeerId)
     }
 
     /// Propose a [`ClusterCommand`] entry. Wraps internally as

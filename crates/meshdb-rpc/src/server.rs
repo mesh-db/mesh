@@ -2188,26 +2188,45 @@ impl MeshService {
             GraphCommand::Batch(commands.clone())
         };
 
+        let mut entry_for_forward = Some(entry);
         if multi_raft.is_local_leader(partition) {
             if let Some(raft) = multi_raft.partition(partition) {
-                return match raft.propose_graph(entry).await {
-                    Ok(_) => Ok(()),
+                let local_entry = entry_for_forward.take().expect("entry present");
+                match raft.propose_graph(local_entry.clone()).await {
+                    Ok(_) => return Ok(()),
                     Err(meshdb_cluster::Error::ForwardToLeader { leader_id, .. }) => {
-                        // Lost leadership between cache check and propose —
-                        // refresh and surface a retryable error.
+                        // Lost leadership between cache check and
+                        // propose. Refresh the cache and fall
+                        // through to the forward path so a single
+                        // leader change doesn't surface as
+                        // Unavailable.
                         if let Some(l) = leader_id {
                             multi_raft.leader_cache.set(partition, l.0);
                         } else {
                             multi_raft.leader_cache.invalidate(partition);
                         }
-                        Err(Status::unavailable(
-                            "partition leadership changed mid-propose; retry",
-                        ))
+                        entry_for_forward = Some(local_entry);
                     }
-                    Err(e) => Err(raft_propose_failed(e)),
-                };
+                    Err(e) => {
+                        // Local raft is unhealthy (e.g., shut down,
+                        // storage error). Invalidate the cache so
+                        // `leader_of` re-polls openraft metrics and
+                        // fall through to forwarding. If the cluster
+                        // can elect a new leader on a survivor, the
+                        // forward path will land there.
+                        let msg = e.to_string();
+                        if msg.contains("stopped") || msg.contains("shutting down") {
+                            multi_raft.leader_cache.invalidate(partition);
+                            entry_for_forward = Some(local_entry);
+                        } else {
+                            return Err(raft_propose_failed(e));
+                        }
+                    }
+                }
             }
         }
+        let entry = entry_for_forward
+            .expect("entry must be retained for forward path when local propose fell through");
 
         // Encode the commands once. Both attempts of the forward
         // path reuse this buffer.

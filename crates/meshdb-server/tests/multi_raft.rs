@@ -1323,6 +1323,170 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_explicit_tx_session_affinity_survives_leader_change() {
+    // Bolt explicit transactions accumulate commands in-memory on
+    // the session peer (single TCP connection). At COMMIT, the peer
+    // dispatches the full batch through `commit_buffered_commands`,
+    // which forwards single-partition writes to the partition leader
+    // and runs Spanner-style 2PC for cross-partition writes.
+    //
+    // This test pins down that the path survives a partition leader
+    // change mid-transaction:
+    //   1. Open a multi-statement tx on the session peer.
+    //   2. RUN #1 — first write, accumulate command.
+    //   3. Force a leader change on the touched partition.
+    //   4. RUN #2 — read with read-your-writes overlay; must still
+    //      see RUN #1's write (the overlay is local, doesn't depend
+    //      on cluster routing).
+    //   5. RUN #3 — another write, accumulate.
+    //   6. COMMIT — the forward-write retry + idempotency logic must
+    //      land the batch on the new leader without double-applying.
+    //   7. Verify every write applied on every survivor.
+    let peers = spawn_multi_raft_cluster(3, 1, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+
+    // Pin the session to a peer that is NOT the partition leader.
+    // The realistic Bolt scenario: a client connects to a follower
+    // (load balancer chose it), opens an explicit tx, and we lose
+    // the leader mid-tx. The follower's local replica stays alive
+    // through the leader change, so it can route writes to the new
+    // leader at COMMIT time.
+    let original_leader = peers[0].multi_raft.leader_of(p0).expect("leader known");
+    let session_idx = (0..peers.len())
+        .find(|i| peers[*i].config.self_id != original_leader)
+        .expect("at least one follower");
+
+    let mut buffered: Vec<meshdb_cluster::GraphCommand> = Vec::new();
+
+    // RUN #1.
+    let (rows1, new_cmds1) = peers[session_idx]
+        .service
+        .execute_cypher_in_tx(
+            "CREATE (a:Affinity {seq: 1}) RETURN a".to_string(),
+            std::collections::HashMap::new(),
+            buffered.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(!rows1.is_empty());
+    buffered.extend(new_cmds1);
+
+    // Mid-tx leader change. We resolved `original_leader` above
+    // via `peers[0]`'s cache, which was warm at that point.
+    let leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == original_leader)
+        .unwrap();
+    peers[leader_idx]
+        .multi_raft
+        .shutdown_partition(p0)
+        .await
+        .unwrap();
+    let force_idx = (0..peers.len()).find(|i| *i != leader_idx).unwrap();
+    peers[force_idx]
+        .multi_raft
+        .force_partition_election(p0)
+        .await
+        .unwrap();
+
+    // Wait for survivors to converge on the new leader.
+    let survivor_idxs: Vec<usize> = (0..peers.len()).filter(|i| *i != leader_idx).collect();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut leaders = Vec::new();
+        for idx in &survivor_idxs {
+            leaders.push(peers[*idx].multi_raft.partition_current_leader(p0));
+        }
+        let agreed = leaders
+            .iter()
+            .copied()
+            .reduce(|a, b| if a == b { a } else { None })
+            .flatten();
+        if matches!(agreed, Some(l) if l != original_leader) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("survivors did not converge on a new leader within 15s: {leaders:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // RUN #2 — read-your-writes overlay must surface RUN #1.
+    let (rows2, new_cmds2) = peers[session_idx]
+        .service
+        .execute_cypher_in_tx(
+            "MATCH (n:Affinity) RETURN count(n) AS c".to_string(),
+            std::collections::HashMap::new(),
+            buffered.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+    let count = match rows2.first().and_then(|r| r.get("c")) {
+        Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    assert_eq!(
+        count, 1,
+        "read-your-writes inside the tx must see the first CREATE despite leader change"
+    );
+    buffered.extend(new_cmds2);
+
+    // RUN #3 — another write inside the tx.
+    let (_, new_cmds3) = peers[session_idx]
+        .service
+        .execute_cypher_in_tx(
+            "CREATE (b:Affinity {seq: 2})".to_string(),
+            std::collections::HashMap::new(),
+            buffered.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+    buffered.extend(new_cmds3);
+
+    // COMMIT.
+    peers[session_idx]
+        .service
+        .commit_buffered_commands(buffered)
+        .await
+        .expect("explicit-tx commit must succeed across mid-tx leader change");
+
+    // Verify both Affinity nodes are visible on every survivor.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for idx in &survivor_idxs {
+            let rows = peers[*idx]
+                .service
+                .execute_cypher_local(
+                    "MATCH (n:Affinity) RETURN count(n) AS c".to_string(),
+                    std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let count = match rows.first().and_then(|r| r.get("c")) {
+                Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+                other => panic!("expected Int64, got {other:?}"),
+            };
+            if count != 2 {
+                if Instant::now() > deadline {
+                    panic!(
+                        "survivor peer {} sees count(:Affinity) = {count}, expected 2",
+                        peers[*idx].config.self_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_force_partition_election_lands_leadership() {
     // Operator-pattern leader transfer: shut down the current
     // leader's partition Raft, force-elect on a chosen survivor,
