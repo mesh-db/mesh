@@ -238,6 +238,43 @@ pub static MULTI_RAFT_PENDING_TX_STAGED: Lazy<IntGauge> = Lazy::new(|| {
     )
 });
 
+/// `mesh_multiraft_apply_lag{group}` — number of log entries this
+/// peer has committed but not yet applied for `group` ∈
+/// `meta` / `p-<id>`. Healthy steady state is near zero; persistent
+/// drift means the applier has fallen behind Raft commit (slow
+/// disk, blocked on a long apply, deadlock in the state machine).
+/// Distinct from openraft's internal "replication lag" — this is
+/// the *local* applier-side gap.
+pub static MULTI_RAFT_APPLY_LAG: Lazy<prometheus::IntGaugeVec> = Lazy::new(|| {
+    register(
+        prometheus::IntGaugeVec::new(
+            Opts::new(
+                "mesh_multiraft_apply_lag",
+                "Per-group commit-vs-applied lag (entries not yet applied) on this peer",
+            ),
+            &["group"],
+        )
+        .expect("gauge spec"),
+    )
+});
+
+/// `mesh_multiraft_last_applied{group}` — most recent `last_applied`
+/// log index per group. Useful to confirm the applier is making
+/// progress — a flat gauge under traffic is the canonical
+/// stuck-applier signal.
+pub static MULTI_RAFT_LAST_APPLIED: Lazy<prometheus::IntGaugeVec> = Lazy::new(|| {
+    register(
+        prometheus::IntGaugeVec::new(
+            Opts::new(
+                "mesh_multiraft_last_applied",
+                "Per-group last_applied log index on this peer",
+            ),
+            &["group"],
+        )
+        .expect("gauge spec"),
+    )
+});
+
 /// Mode label values for [`CYPHER_QUERIES_TOTAL`] /
 /// [`CYPHER_QUERY_DURATION_SECONDS`]. Stringly so call sites can
 /// just pass the same value to both.

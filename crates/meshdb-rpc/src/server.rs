@@ -511,6 +511,28 @@ impl MeshService {
         self.pending_batches.clone().spawn_sweeper(interval)
     }
 
+    /// Spawn a periodic apply-lag metrics poller for multi-raft
+    /// mode. Reads each partition Raft's metrics watcher and the
+    /// metadata Raft's metrics, and updates the
+    /// `mesh_multiraft_apply_lag` and `mesh_multiraft_last_applied`
+    /// gauges. Runs on a tight cadence (default 10s) — cheap because
+    /// metrics access is just a `watch::Receiver::borrow()`.
+    /// Returns `None` when the service isn't running multi-raft.
+    pub fn spawn_multi_raft_metrics_poller(
+        &self,
+        interval: std::time::Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let multi_raft = self.multi_raft.clone()?;
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                update_multi_raft_apply_metrics(&multi_raft);
+            }
+        }))
+    }
+
     /// Spawn a periodic in-doubt-recovery loop for multi-raft mode.
     /// Calls [`Self::recover_multi_raft_in_doubt`] every `interval`
     /// so a coordinator that crashes after fsyncing CommitDecision —
@@ -4559,6 +4581,39 @@ fn apply_ddl_commands(
         }
     }
     Ok(())
+}
+
+/// Sample `last_applied` and `last_log_index` from the meta Raft
+/// and every locally-hosted partition Raft, updating the
+/// `mesh_multiraft_apply_lag` and `mesh_multiraft_last_applied`
+/// gauges. Called from the periodic poller task spawned by
+/// [`MeshService::spawn_multi_raft_metrics_poller`]. Pure-read on
+/// openraft's metrics watcher — no Raft round-trip, no propose.
+fn update_multi_raft_apply_metrics(multi_raft: &Arc<crate::MultiRaftCluster>) {
+    fn sample(raft: &meshdb_cluster::raft::RaftCluster) -> (u64, i64) {
+        let m = raft.raft.metrics().borrow().clone();
+        let last_applied = m.last_applied.as_ref().map(|id| id.index).unwrap_or(0);
+        let last_log = m.last_log_index.unwrap_or(0);
+        let lag = (last_log as i64 - last_applied as i64).max(0);
+        (last_applied, lag)
+    }
+    let (meta_applied, meta_lag) = sample(&multi_raft.meta);
+    crate::metrics::MULTI_RAFT_LAST_APPLIED
+        .with_label_values(&["meta"])
+        .set(meta_applied as i64);
+    crate::metrics::MULTI_RAFT_APPLY_LAG
+        .with_label_values(&["meta"])
+        .set(meta_lag);
+    for (partition, raft) in multi_raft.partitions_snapshot() {
+        let (last_applied, lag) = sample(&raft);
+        let label = format!("p-{}", partition.0);
+        crate::metrics::MULTI_RAFT_LAST_APPLIED
+            .with_label_values(&[&label])
+            .set(last_applied as i64);
+        crate::metrics::MULTI_RAFT_APPLY_LAG
+            .with_label_values(&[&label])
+            .set(lag);
+    }
 }
 
 fn raft_propose_failed<E: std::fmt::Display>(e: E) -> Status {

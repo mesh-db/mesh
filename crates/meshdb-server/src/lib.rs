@@ -845,6 +845,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let multi_raft_recovery_loop =
         service.spawn_multi_raft_recovery_loop(meshdb_rpc::DEFAULT_RECOVERY_INTERVAL);
 
+    // Periodic apply-lag metrics poller for multi-raft mode. Reads
+    // openraft's metrics watcher every 10s and updates the per-group
+    // `mesh_multiraft_apply_lag` and `mesh_multiraft_last_applied`
+    // gauges. Returns None in every other mode.
+    let multi_raft_metrics_poller =
+        service.spawn_multi_raft_metrics_poller(std::time::Duration::from_secs(10));
+
     // Optional Bolt listener. Binds before we start the gRPC server so
     // that a port-in-use error at startup is immediately fatal rather
     // than surfacing only on the first Bolt client connection.
@@ -1049,6 +1056,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     }
 
     if let Some(handle) = multi_raft_recovery_loop {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    if let Some(handle) = multi_raft_metrics_poller {
         handle.abort();
         let _ = handle.await;
     }

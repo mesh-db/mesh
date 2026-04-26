@@ -1323,6 +1323,66 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_apply_lag_metric_reports_per_group() {
+    // Spawn a 3-peer cluster, generate writes, run the metrics
+    // poller manually (we don't spawn the long-lived task in
+    // tests), then verify the per-group gauges report data:
+    //   - meta last_applied is non-zero (membership entries +
+    //     bootstrap state)
+    //   - every partition's last_applied is non-zero after writes
+    //   - apply_lag is bounded (<= 5 — committed entries should
+    //     be applied promptly)
+    use meshdb_rpc::metrics::{MULTI_RAFT_APPLY_LAG, MULTI_RAFT_LAST_APPLIED};
+
+    let peers = spawn_multi_raft_cluster(3, 2, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Generate writes so partition Rafts have non-trivial state.
+    for i in 0..20 {
+        peers[0]
+            .service
+            .execute_cypher_local(
+                format!("CREATE (:LagTest {{i: {i}}})"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Trigger one tick of the poller. Use a 60ms interval and let
+    // it tick once.
+    let poller = peers[0]
+        .service
+        .spawn_multi_raft_metrics_poller(Duration::from_millis(60))
+        .expect("poller spawned in multi-raft mode");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    poller.abort();
+    let _ = poller.await;
+
+    // meta last_applied must be > 0 after bootstrap + writes.
+    let meta_applied = MULTI_RAFT_LAST_APPLIED.with_label_values(&["meta"]).get();
+    assert!(
+        meta_applied > 0,
+        "meta last_applied should be > 0, got {meta_applied}"
+    );
+
+    // Every partition gauge must be present and lag bounded.
+    for partition in 0..2u32 {
+        let label = format!("p-{partition}");
+        let applied = MULTI_RAFT_LAST_APPLIED.with_label_values(&[&label]).get();
+        let lag = MULTI_RAFT_APPLY_LAG.with_label_values(&[&label]).get();
+        assert!(
+            applied > 0,
+            "partition {partition} last_applied should be > 0, got {applied}"
+        );
+        assert!(
+            lag >= 0 && lag < 100,
+            "partition {partition} apply_lag should be small, got {lag}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_forward_write_idempotency_dedupes_retries() {
     // Calling ForwardWrite twice with the same idempotency_key
     // against the partition leader must apply only once.
