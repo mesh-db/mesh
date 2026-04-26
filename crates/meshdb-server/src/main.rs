@@ -99,6 +99,7 @@ impl Cli {
             grpc_tls: None,
             mode: self.mode,
             replication_factor: None,
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         })
@@ -250,6 +251,7 @@ mod tests {
             grpc_tls: None,
             mode: None,
             replication_factor: None,
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         };
@@ -276,6 +278,7 @@ mod tests {
             grpc_tls: None,
             mode: None,
             replication_factor: None,
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         };

@@ -373,6 +373,68 @@ impl MultiRaftCluster {
             .map_err(|e| format!("meta shutdown: {e}"))
     }
 
+    /// Linearizable-read primitive for `partition`. Calls openraft's
+    /// `ensure_linearizable` on the local partition Raft replica,
+    /// which:
+    ///   1. Verifies this peer is still the leader of `partition`
+    ///      (sends heartbeats to a quorum of followers).
+    ///   2. Waits for the local state machine's last_applied to
+    ///      catch up to the read_log_id implied by step 1.
+    ///
+    /// After this returns Ok, a subsequent read of the local store
+    /// for keys owned by this partition observes every write that
+    /// committed before the call — the canonical Raft linearizability
+    /// guarantee.
+    ///
+    /// Errors:
+    ///   * `Err("partition not hosted")` — this peer doesn't replicate
+    ///     `partition`. Caller should route the read to a peer that
+    ///     does (look up `replica_map`).
+    ///   * `Err("not leader: …")` — this peer's replica isn't the
+    ///     current leader. Caller should retry against the leader
+    ///     (look up `leader_of(partition)`). The error string carries
+    ///     the leader hint when openraft surfaces one.
+    ///   * `Err("…")` — any other openraft error (election in flight,
+    ///     shutting down, etc.).
+    ///
+    /// Production sites that want linearizable reads should:
+    ///   1. Identify the partition for the keys they're reading.
+    ///   2. Resolve the partition leader via `leader_of`.
+    ///   3. Issue the read RPC to that leader; the leader calls
+    ///      this method before serving from its local store.
+    ///
+    /// The full read-path rewire that does this transparently across
+    /// the executor is future work — for now this primitive is
+    /// exposed so callers that opt in (a config knob, a Bolt-level
+    /// consistency hint, etc.) can build on it.
+    pub async fn ensure_partition_linearizable(
+        &self,
+        partition: PartitionId,
+    ) -> Result<(), String> {
+        let raft = self
+            .partition(partition)
+            .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
+        raft.raft
+            .ensure_linearizable()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("ensure_linearizable on partition {}: {e}", partition.0))
+    }
+
+    /// Linearizable-read primitive for the metadata Raft group.
+    /// Same shape as [`Self::ensure_partition_linearizable`] — must
+    /// be called on the meta leader. Useful before reads against
+    /// the meta-replicated `ClusterState` (replica map, partition
+    /// leader gossip) when stale views aren't acceptable.
+    pub async fn ensure_meta_linearizable(&self) -> Result<(), String> {
+        self.meta
+            .raft
+            .ensure_linearizable()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("ensure_linearizable on meta: {e}"))
+    }
+
     /// Add a peer as a voter of `partition`'s Raft group. Wraps
     /// openraft's `change_membership` with `ChangeMembers::AddVoters`.
     /// The new peer's address is looked up from the cluster's meta

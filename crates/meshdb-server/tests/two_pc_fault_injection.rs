@@ -104,6 +104,7 @@ fn make_server_config(
         grpc_tls: None,
         mode: Some(ClusterMode::Routing),
         replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     }

@@ -1,6 +1,26 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Read-consistency policy for multi-raft mode. Defaults to
+/// [`ReadConsistency::Local`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum ReadConsistency {
+    /// Read from the closest replica's local store, no Raft round-trip.
+    /// Default. Eventually consistent — a read may miss a very
+    /// recently committed write that hasn't yet applied to this
+    /// peer's replica.
+    #[default]
+    Local,
+    /// Linearizable reads via openraft's read-index protocol. Every
+    /// partition read goes through the partition leader's
+    /// `ensure_linearizable` quorum check before the local store
+    /// is consulted, so the read observes every write that
+    /// committed before the call.
+    Linearizable,
+}
+
 /// How a multi-peer server operates on top of its peer list. See
 /// [`ServerConfig::resolved_mode`] for the defaulting rules that apply
 /// when the TOML config omits `mode` entirely.
@@ -167,6 +187,25 @@ pub struct ServerConfig {
     /// Must be in `[1, peers.len()]`.
     #[serde(default)]
     pub replication_factor: Option<usize>,
+
+    /// Read-consistency policy for `mode = "multi-raft"`. Omitted →
+    /// `Local`, which lets any peer that holds a partition replica
+    /// serve reads from its local rocksdb (cheap, fast, no Raft
+    /// round-trip). Setting `Linearizable` opts callers into
+    /// stricter semantics: a partition read goes through the
+    /// partition leader's `ensure_linearizable` quorum check before
+    /// the local store is consulted, so the read observes every
+    /// write that committed before the call.
+    ///
+    /// **Status:** the primitive is exposed via
+    /// `MultiRaftCluster::ensure_partition_linearizable`; the full
+    /// executor-side rewrite that automatically routes reads
+    /// through partition leaders is future work. For now this knob
+    /// records the operator's intent and is consulted by call
+    /// sites that opt in (Bolt-level consistency hints, gRPC
+    /// extensions, etc.).
+    #[serde(default)]
+    pub read_consistency: Option<ReadConsistency>,
 
     /// Configuration for `apoc.load.*` (and, in the future,
     /// `apoc.export.*`). Omitted → every load call fails with a
@@ -443,6 +482,7 @@ mod tests {
             grpc_tls: None,
             mode,
             replication_factor: None,
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         }

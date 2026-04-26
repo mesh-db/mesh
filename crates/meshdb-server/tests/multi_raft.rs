@@ -72,6 +72,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             grpc_tls: None,
             mode: Some(ClusterMode::MultiRaft),
             replication_factor: Some(rf),
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         };
@@ -1322,6 +1323,75 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_linearizable_read_primitive() {
+    // Verifies the `ensure_partition_linearizable` primitive that
+    // future linearizable read paths build on:
+    //   - Calling it on the partition leader succeeds.
+    //   - Calling it on a non-leader replica fails with a hint
+    //     pointing at the leader.
+    //   - Calling it on a peer that doesn't host the partition
+    //     fails with "not hosted".
+    //
+    // 3 peers × 4 partitions × rf=2 → not every peer hosts every
+    // partition, so we can exercise all three branches.
+    let peers = spawn_multi_raft_cluster(3, 4, 2).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let hosted: Option<PartitionId> = (0..4u32)
+        .map(PartitionId)
+        .find(|p| peers[0].multi_raft.hosts_partition(*p));
+    let not_hosted: Option<PartitionId> = (0..4u32)
+        .map(PartitionId)
+        .find(|p| !peers[0].multi_raft.hosts_partition(*p));
+    let Some(hosted) = hosted else {
+        eprintln!("skipping: peer 1 hosts every partition");
+        return;
+    };
+
+    // Leader path — must succeed against the partition's leader.
+    let leader_idx = (0..peers.len())
+        .find(|i| peers[*i].multi_raft.is_local_leader(hosted))
+        .expect("hosted partition must have a leader somewhere");
+    peers[leader_idx]
+        .multi_raft
+        .ensure_partition_linearizable(hosted)
+        .await
+        .expect("ensure_linearizable on the leader replica must succeed");
+
+    // Non-leader path — must fail with a leader-hint error.
+    if let Some(non_leader_idx) = (0..peers.len()).find(|i| {
+        *i != leader_idx
+            && peers[*i].multi_raft.hosts_partition(hosted)
+            && !peers[*i].multi_raft.is_local_leader(hosted)
+    }) {
+        let err = peers[non_leader_idx]
+            .multi_raft
+            .ensure_partition_linearizable(hosted)
+            .await
+            .expect_err("non-leader call must fail");
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("leader") || lower.contains("forward"),
+            "expected leader hint in error, got: {err}"
+        );
+    }
+
+    // Not-hosted path — must fail with "not hosted" if such a
+    // partition exists for this peer.
+    if let Some(p) = not_hosted {
+        let err = peers[0]
+            .multi_raft
+            .ensure_partition_linearizable(p)
+            .await
+            .expect_err("call against not-hosted partition must fail");
+        assert!(
+            err.contains("not hosted"),
+            "expected 'not hosted' error, got: {err}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_weighted_placement_skews_replica_distribution() {
     // 3 peers with weights [1.0, 1.0, 4.0]. 6 partitions × rf=2 →
     // 12 placements. Weighted greedy hands peer 3 the lion's
@@ -1369,6 +1439,7 @@ async fn multi_raft_weighted_placement_skews_replica_distribution() {
             grpc_tls: None,
             mode: Some(ClusterMode::MultiRaft),
             replication_factor: Some(2),
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         };

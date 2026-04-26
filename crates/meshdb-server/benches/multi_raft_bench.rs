@@ -91,6 +91,7 @@ async fn spawn_three_peer_cluster(num_partitions: u32, rf: usize) -> Cluster {
             grpc_tls: None,
             mode: Some(ClusterMode::MultiRaft),
             replication_factor: Some(rf),
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         };
