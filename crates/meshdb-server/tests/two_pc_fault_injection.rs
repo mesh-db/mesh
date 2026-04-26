@@ -71,11 +71,13 @@ fn make_peer_configs(addr_a: SocketAddr, addr_b: SocketAddr) -> Vec<PeerConfig> 
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ]
 }

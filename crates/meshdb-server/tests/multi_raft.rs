@@ -45,6 +45,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             id: (i + 1) as u64,
             address: a.to_string(),
             bolt_address: None,
+            weight: None,
         })
         .collect();
 
@@ -1318,6 +1319,116 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
         count, 50,
         "all SnapshotData nodes should survive the snapshot+purge cycle"
     );
+}
+
+#[tokio::test]
+async fn multi_raft_weighted_placement_skews_replica_distribution() {
+    // 3 peers with weights [1.0, 1.0, 4.0]. 6 partitions × rf=2 →
+    // 12 placements. Weighted greedy hands peer 3 the lion's
+    // share. Verify the resolved replica map's totals follow the
+    // weights, end-to-end through ServerConfig.
+    use meshdb_cluster::PartitionReplicaMap;
+
+    // Pre-bind ports so the spawn function knows them.
+    let mut listeners: Vec<TcpListener> = Vec::with_capacity(3);
+    let mut addrs: Vec<SocketAddr> = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(l.local_addr().unwrap());
+        listeners.push(l);
+    }
+
+    let weighted_peer_configs: Vec<PeerConfig> = addrs
+        .iter()
+        .enumerate()
+        .map(|(i, a)| PeerConfig {
+            id: (i + 1) as u64,
+            address: a.to_string(),
+            bolt_address: None,
+            weight: Some(if i == 2 { 4.0 } else { 1.0 }),
+        })
+        .collect();
+
+    let mut peers = Vec::with_capacity(3);
+    for (i, listener) in listeners.into_iter().enumerate() {
+        let dir = TempDir::new().unwrap();
+        let addr = addrs[i];
+        let config = ServerConfig {
+            self_id: (i + 1) as u64,
+            listen_address: addr.to_string(),
+            data_dir: dir.path().to_path_buf(),
+            num_partitions: 6,
+            peers: weighted_peer_configs.clone(),
+            bootstrap: i == 0,
+            bolt_address: None,
+            metrics_address: None,
+            bolt_auth: None,
+            bolt_tls: None,
+            bolt_advertised_versions: None,
+            bolt_advertised_address: None,
+            grpc_tls: None,
+            mode: Some(ClusterMode::MultiRaft),
+            replication_factor: Some(2),
+            #[cfg(feature = "apoc-load")]
+            apoc_import: None,
+        };
+        let components = build_components(&config).await.unwrap();
+        let multi_raft = components.multi_raft.clone().expect("multi-raft built");
+        let service = components.service.clone();
+        let registry = multi_raft.build_registry();
+        let raft_service = meshdb_rpc::MeshRaftService::with_registry(registry);
+        let service_for_server = service.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(raft_service.into_server())
+                .add_service(service_for_server.clone().into_query_server())
+                .add_service(service_for_server.clone().into_write_server())
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        peers.push(Peer {
+            config,
+            multi_raft,
+            service,
+            _dir: dir,
+            server_task,
+        });
+    }
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    for peer in &peers {
+        initialize_multi_raft_if_seed(&peer.config, &peer.multi_raft)
+            .await
+            .unwrap();
+    }
+
+    // Inspect any peer's replica map — they all share the same
+    // initial placement deterministically.
+    let map: &PartitionReplicaMap = &peers[0].multi_raft.replica_map;
+    let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for p in 0..6u32 {
+        for replica in map.replicas(PartitionId(p)) {
+            *counts.entry(replica.0).or_insert(0) += 1;
+        }
+    }
+    let p1 = *counts.get(&1).unwrap_or(&0);
+    let p2 = *counts.get(&2).unwrap_or(&0);
+    let p3 = *counts.get(&3).unwrap_or(&0);
+    assert_eq!(
+        p1 + p2 + p3,
+        12,
+        "every placement must be assigned: ({p1}, {p2}, {p3})"
+    );
+    assert!(
+        p3 > p1 && p3 > p2,
+        "weight-4 peer 3 must dominate placement: ({p1}, {p2}, {p3})"
+    );
+
+    // Drop server tasks before TempDir goes out of scope to avoid
+    // a rocksdb LOCK race during cleanup.
+    for peer in peers {
+        peer.server_task.abort();
+    }
 }
 
 #[tokio::test]

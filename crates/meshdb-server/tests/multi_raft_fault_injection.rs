@@ -188,6 +188,7 @@ async fn spawn_three_peer_multi_raft(num_partitions: u32) -> Vec<McPeer> {
             id: (i + 1) as u64,
             address: a.to_string(),
             bolt_address: None,
+            weight: None,
         })
         .collect();
 

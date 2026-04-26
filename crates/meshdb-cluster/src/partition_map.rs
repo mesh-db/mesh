@@ -106,6 +106,82 @@ impl PartitionReplicaMap {
         Ok(Self { replicas })
     }
 
+    /// Weighted replica placement: each peer carries a positive
+    /// weight; partition slots are distributed so each peer ends
+    /// up with approximately `weight_i / sum(weights) * num_partitions
+    /// * replication_factor` placements. Useful for heterogeneous
+    /// clusters (peers with different cores / disk capacity).
+    ///
+    /// Algorithm: greedy lowest-score, where `score(peer) = (count
+    /// + 1) / weight`. For each partition, pick `replication_factor`
+    /// distinct peers in ascending score order, breaking ties by
+    /// peer id for determinism. The same `weighted_peers` slice
+    /// always yields the same map.
+    ///
+    /// When every weight is equal this produces a placement that
+    /// matches `round_robin_replicas` modulo tie-breaks; the round-
+    /// robin path is still preferred at config-resolve time when
+    /// no peer has a non-default weight, to keep wire-compatible
+    /// with v1 clusters.
+    ///
+    /// Errors:
+    ///   * `NoPeers` — `weighted_peers` is empty.
+    ///   * `ZeroPartitions` — `num_partitions == 0`.
+    ///   * `InvalidReplicationFactor` — out of `[1, weighted_peers.len()]`.
+    ///   * `InvalidWeight` — any weight ≤ 0 or non-finite.
+    pub fn weighted_replicas(
+        weighted_peers: &[(PeerId, f64)],
+        num_partitions: u32,
+        replication_factor: usize,
+    ) -> Result<Self> {
+        if weighted_peers.is_empty() {
+            return Err(Error::NoPeers);
+        }
+        if num_partitions == 0 {
+            return Err(Error::ZeroPartitions);
+        }
+        if replication_factor == 0 || replication_factor > weighted_peers.len() {
+            return Err(Error::InvalidReplicationFactor {
+                replication_factor,
+                peer_count: weighted_peers.len(),
+            });
+        }
+        for (peer, w) in weighted_peers {
+            if !w.is_finite() || *w <= 0.0 {
+                return Err(Error::InvalidWeight {
+                    peer: *peer,
+                    weight: *w,
+                });
+            }
+        }
+        let n = weighted_peers.len();
+        let mut counts: Vec<f64> = vec![0.0; n];
+        let mut replicas: Vec<Vec<PeerId>> = Vec::with_capacity(num_partitions as usize);
+        for _p in 0..num_partitions {
+            let mut chosen: Vec<PeerId> = Vec::with_capacity(replication_factor);
+            let mut used: Vec<bool> = vec![false; n];
+            for _r in 0..replication_factor {
+                // Find unused peer with lowest (count + 1) / weight.
+                // Tie-break by peer id for determinism.
+                let best = (0..n)
+                    .filter(|i| !used[*i])
+                    .min_by(|a, b| {
+                        let sa = (counts[*a] + 1.0) / weighted_peers[*a].1;
+                        let sb = (counts[*b] + 1.0) / weighted_peers[*b].1;
+                        sa.partial_cmp(&sb)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| weighted_peers[*a].0.cmp(&weighted_peers[*b].0))
+                    })
+                    .expect("rf <= n means at least one peer is unused");
+                counts[best] += 1.0;
+                used[best] = true;
+                chosen.push(weighted_peers[best].0);
+            }
+            replicas.push(chosen);
+        }
+        Ok(Self { replicas })
+    }
+
     pub fn num_partitions(&self) -> u32 {
         self.replicas.len() as u32
     }
@@ -202,5 +278,106 @@ mod tests {
     fn replica_map_rejects_zero_partitions() {
         let err = PartitionReplicaMap::round_robin_replicas(&peers(&[1]), 0, 1).unwrap_err();
         assert!(matches!(err, Error::ZeroPartitions));
+    }
+
+    fn weighted(pairs: &[(u64, f64)]) -> Vec<(PeerId, f64)> {
+        pairs.iter().map(|(id, w)| (PeerId(*id), *w)).collect()
+    }
+
+    #[test]
+    fn weighted_replicas_uniform_weights_balances_evenly() {
+        // 6 partitions × rf=2 = 12 placements; 3 peers each weight 1.0
+        // → 4 placements per peer. Greedy lowest-score lays them down
+        // evenly.
+        let map = PartitionReplicaMap::weighted_replicas(
+            &weighted(&[(1, 1.0), (2, 1.0), (3, 1.0)]),
+            6,
+            2,
+        )
+        .unwrap();
+        let mut counts = std::collections::HashMap::new();
+        for p in 0..6 {
+            for peer in map.replicas(PartitionId(p)) {
+                *counts.entry(peer.0).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(counts.get(&1), Some(&4));
+        assert_eq!(counts.get(&2), Some(&4));
+        assert_eq!(counts.get(&3), Some(&4));
+    }
+
+    #[test]
+    fn weighted_replicas_skewed_weights_skews_load() {
+        // Peer 1 has weight 4, peers 2 & 3 weight 1. 6 partitions × rf=2
+        // = 12 placements; expected ratio 4:1:1 → ~8:2:2. Allow ±1
+        // slack since greedy isn't perfectly continuous.
+        let map = PartitionReplicaMap::weighted_replicas(
+            &weighted(&[(1, 4.0), (2, 1.0), (3, 1.0)]),
+            6,
+            2,
+        )
+        .unwrap();
+        let mut counts = std::collections::HashMap::new();
+        for p in 0..6 {
+            for peer in map.replicas(PartitionId(p)) {
+                *counts.entry(peer.0).or_insert(0) += 1;
+            }
+        }
+        let p1 = *counts.get(&1).unwrap_or(&0);
+        let p2 = *counts.get(&2).unwrap_or(&0);
+        let p3 = *counts.get(&3).unwrap_or(&0);
+        assert!(
+            p1 > p2 && p1 > p3,
+            "peer 1 should dominate: counts = ({p1}, {p2}, {p3})"
+        );
+        assert_eq!(p1 + p2 + p3, 12, "every placement must be assigned");
+    }
+
+    #[test]
+    fn weighted_replicas_each_partition_has_distinct_replicas() {
+        let map =
+            PartitionReplicaMap::weighted_replicas(&weighted(&[(1, 2.0), (2, 1.0)]), 3, 2).unwrap();
+        for p in 0..3 {
+            let r = map.replicas(PartitionId(p));
+            let mut sorted = r.to_vec();
+            sorted.sort_by_key(|p| p.0);
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                r.len(),
+                "duplicates in partition {p}'s replicas"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_replicas_is_deterministic() {
+        let a = PartitionReplicaMap::weighted_replicas(
+            &weighted(&[(1, 2.5), (2, 1.0), (3, 1.5)]),
+            8,
+            2,
+        )
+        .unwrap();
+        let b = PartitionReplicaMap::weighted_replicas(
+            &weighted(&[(1, 2.5), (2, 1.0), (3, 1.5)]),
+            8,
+            2,
+        )
+        .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn weighted_replicas_rejects_non_positive_weight() {
+        let err = PartitionReplicaMap::weighted_replicas(&weighted(&[(1, 0.0), (2, 1.0)]), 4, 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidWeight { .. }));
+        let err = PartitionReplicaMap::weighted_replicas(&weighted(&[(1, -1.0), (2, 1.0)]), 4, 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidWeight { .. }));
+        let err =
+            PartitionReplicaMap::weighted_replicas(&weighted(&[(1, f64::NAN), (2, 1.0)]), 4, 1)
+                .unwrap_err();
+        assert!(matches!(err, Error::InvalidWeight { .. }));
     }
 }

@@ -372,9 +372,24 @@ async fn build_multi_raft_components(
         .collect();
     let membership = Membership::new(peers);
     let peer_ids: Vec<PeerId> = membership.peer_ids().collect();
-    let initial_replica_map =
+    // Choose between round-robin and weighted placement. Weighted
+    // is selected only when at least one peer specifies an explicit
+    // `weight` in the TOML config — otherwise we use round-robin so
+    // existing clusters (and existing snapshots / persisted replica
+    // maps) stay bit-identical.
+    let any_weighted = config.peers.iter().any(|p| p.weight.is_some());
+    let initial_replica_map = if any_weighted {
+        let weighted: Vec<(PeerId, f64)> = config
+            .peers
+            .iter()
+            .map(|p| (PeerId(p.id), p.weight.unwrap_or(1.0)))
+            .collect();
+        PartitionReplicaMap::weighted_replicas(&weighted, config.num_partitions, rf)
+            .context("building weighted partition replica map")?
+    } else {
         PartitionReplicaMap::round_robin_replicas(&peer_ids, config.num_partitions, rf)
-            .context("building partition replica map")?;
+            .context("building partition replica map")?
+    };
     // The legacy PartitionMap (single owner per partition) still
     // populates ClusterState — multi-raft routing reads from
     // replica_map, but ClusterState's structure stays unchanged so

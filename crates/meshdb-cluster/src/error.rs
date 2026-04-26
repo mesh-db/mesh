@@ -16,6 +16,9 @@ pub enum Error {
         peer_count: usize,
     },
 
+    #[error("invalid placement weight {weight} for peer {peer:?}: must be > 0 and finite")]
+    InvalidWeight { peer: PeerId, weight: f64 },
+
     #[error("unknown peer: {0:?}")]
     UnknownPeer(PeerId),
 

@@ -68,6 +68,7 @@ async fn spawn_three_peer_cluster(num_partitions: u32, rf: usize) -> Cluster {
             id: (i + 1) as u64,
             address: a.to_string(),
             bolt_address: None,
+            weight: None,
         })
         .collect();
     let mut peers = Vec::with_capacity(3);

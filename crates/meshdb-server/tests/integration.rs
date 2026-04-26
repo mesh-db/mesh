@@ -146,11 +146,13 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
 
@@ -589,11 +591,13 @@ async fn build_components_multi_peer_builds_raft() {
                 id: 1,
                 address: "127.0.0.1:7001".into(),
                 bolt_address: None,
+                weight: None,
             },
             PeerConfig {
                 id: 2,
                 address: "127.0.0.1:7002".into(),
                 bolt_address: None,
+                weight: None,
             },
         ],
         bootstrap: false,
@@ -630,11 +634,13 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
                 id: 1,
                 address: "127.0.0.1:7001".into(),
                 bolt_address: None,
+                weight: None,
             },
             PeerConfig {
                 id: 2,
                 address: "127.0.0.1:7002".into(),
                 bolt_address: None,
+                weight: None,
             },
         ],
         bootstrap: false,
@@ -685,11 +691,13 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -864,11 +872,13 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1091,11 +1101,13 @@ async fn peer_restart_recovers_persistent_raft_state() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1275,11 +1287,13 @@ async fn cypher_create_replicates_through_raft_to_follower() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1441,11 +1455,13 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1703,11 +1719,13 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1986,11 +2004,13 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2175,11 +2195,13 @@ async fn cypher_merge_replicates_through_raft() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2345,11 +2367,13 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2518,11 +2542,13 @@ async fn two_peer_raft_replicates_via_server_components() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2807,11 +2833,13 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
             id: 1,
             address: grpc_addr_a.clone(),
             bolt_address: Some(bolt_addr_a.clone()),
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: grpc_addr_b.clone(),
             bolt_address: Some(bolt_addr_b.clone()),
+            weight: None,
         },
     ];
     let mk_config = |self_id: u64, data_dir: PathBuf, grpc: &str, bootstrap: bool| ServerConfig {
@@ -3001,6 +3029,7 @@ async fn route_write_role_tracks_raft_leader_across_handoff() {
             id: (i + 1) as u64,
             address: grpc_addrs[i].clone(),
             bolt_address: Some(bolt_addrs[i].clone()),
+            weight: None,
         })
         .collect::<Vec<_>>();
 

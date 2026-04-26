@@ -201,6 +201,19 @@ pub struct PeerConfig {
     /// listener, so drivers can't derive one from the other.
     #[serde(default)]
     pub bolt_address: Option<String>,
+    /// Optional placement weight for this peer in `mode = "multi-raft"`.
+    /// Larger weights attract more partition replicas — useful when
+    /// peers have heterogeneous CPU / disk capacity. The default
+    /// (`None`, treated as 1.0) gives every peer the same weight,
+    /// in which case placement is bit-identical to the v1 round-
+    /// robin algorithm. As soon as any peer specifies an explicit
+    /// weight, multi-raft falls back to weighted placement for the
+    /// whole cluster.
+    ///
+    /// Must be > 0 and finite. Validation rejects 0, negative,
+    /// NaN, and infinity.
+    #[serde(default)]
+    pub weight: Option<f64>,
 }
 
 /// Authentication table for the Bolt listener. Enabled by adding a
@@ -417,6 +430,7 @@ mod tests {
                     id,
                     address: format!("127.0.0.1:700{id}"),
                     bolt_address: None,
+                    weight: None,
                 })
                 .collect(),
             bootstrap: false,
