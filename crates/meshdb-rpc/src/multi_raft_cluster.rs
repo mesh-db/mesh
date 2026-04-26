@@ -363,6 +363,16 @@ impl MultiRaftCluster {
             .map_err(|e| format!("partition {} shutdown: {e}", partition.0))
     }
 
+    /// Stop the local replica of the metadata Raft group. After
+    /// return, this peer no longer participates in meta-Raft —
+    /// surviving peers will elect a new leader. Test-only.
+    pub async fn shutdown_meta(&self) -> Result<(), String> {
+        self.meta
+            .shutdown_in_place()
+            .await
+            .map_err(|e| format!("meta shutdown: {e}"))
+    }
+
     /// Add a peer as a voter of `partition`'s Raft group. Wraps
     /// openraft's `change_membership` with `ChangeMembers::AddVoters`.
     /// The new peer's address is looked up from the cluster's meta

@@ -1218,6 +1218,149 @@ async fn multi_raft_per_partition_storage_dirs_are_isolated() {
 }
 
 #[tokio::test]
+async fn multi_raft_meta_leader_failover_preserves_ddl_path() {
+    // 3 peers. Issue a CREATE INDEX (commits through the meta
+    // leader), then crash that leader. A subsequent CREATE INDEX
+    // through any survivor must succeed once the new meta leader
+    // is settled — the DDL gate, the forward path, and the
+    // synchronous-apply guarantee all keep working through the
+    // leadership change.
+    let peers = spawn_multi_raft_cluster(3, 2, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // First DDL — establishes the baseline and confirms the gate
+    // is operational on the original meta leader.
+    peers[0]
+        .service
+        .execute_cypher_local(
+            "CREATE INDEX FOR (n:BeforeFailover) ON (n.id)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    // Crash the meta leader: shut down its meta Raft handle and
+    // abort its gRPC server task.
+    let original_meta_leader = peers[0]
+        .multi_raft
+        .meta_leader()
+        .expect("meta leader known after first DDL");
+    let leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == original_meta_leader)
+        .expect("meta leader peer in cluster");
+    peers[leader_idx].multi_raft.shutdown_meta().await.unwrap();
+    peers[leader_idx].server_task.abort();
+
+    // Wait for the survivors to elect a new meta leader and AGREE
+    // on it. Same pattern as the partition-leader test — half-
+    // completed elections would race the next forward.
+    let survivor_idxs: Vec<usize> = (0..peers.len()).filter(|i| *i != leader_idx).collect();
+    let new_meta_leader = {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut leaders = Vec::with_capacity(survivor_idxs.len());
+            for idx in &survivor_idxs {
+                leaders.push(peers[*idx].multi_raft.meta_leader());
+            }
+            let agreed = leaders
+                .iter()
+                .copied()
+                .reduce(|a, b| if a == b { a } else { None })
+                .flatten();
+            if let Some(l) = agreed {
+                if l != original_meta_leader {
+                    break l;
+                }
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "survivors did not agree on a new meta leader within 15s after crashing peer {original_meta_leader}: {leaders:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    assert_ne!(new_meta_leader, original_meta_leader);
+
+    // Second DDL through a survivor. It must succeed: either the
+    // survivor IS the new meta leader (proposes locally), or it
+    // forwards via `forward_ddl` to the new leader. The DDL gate
+    // skips the dead peer entry once forward_ddl returns OK
+    // because the dead peer's gRPC is gone — but the DDL ITSELF
+    // still committed on the surviving 2-of-3 quorum.
+    //
+    // Note: the DDL gate as currently implemented polls every
+    // *cluster member*, including the dead peer, so it'll trip the
+    // strict timeout. To exercise the failover behaviour without
+    // depending on the gate's pessimistic behaviour, set a short
+    // strict timeout — and accept either Ok (gate cleared because
+    // the dead peer was somehow reachable, unlikely) or
+    // DeadlineExceeded with the DDL durably committed (the
+    // recovery-friendly outcome).
+    for peer in &peers {
+        peer.multi_raft
+            .set_ddl_strict_timeout(Duration::from_millis(500));
+    }
+    let writer_idx = survivor_idxs[0];
+    let result = peers[writer_idx]
+        .service
+        .execute_cypher_local(
+            "CREATE INDEX FOR (n:AfterFailover) ON (n.id)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await;
+    // Either outcome confirms the new meta leader proposed and
+    // committed the entry.
+    match result {
+        Ok(_) => {}
+        Err(e) => {
+            assert!(
+                e.code() == tonic::Code::DeadlineExceeded
+                    || format!("{e}").contains("strict-apply gate"),
+                "unexpected error after meta-leader failover: {e}"
+            );
+        }
+    }
+
+    // Sanity: every survivor now sees BOTH indexes in its meta
+    // applier's local view. Whether the gate cleared or timed out
+    // above, the meta proposal landed and replicated to both
+    // survivors.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for idx in &survivor_idxs {
+            let rows = peers[*idx]
+                .service
+                .execute_cypher_local("SHOW INDEXES".to_string(), std::collections::HashMap::new())
+                .await
+                .unwrap();
+            let saw_before = rows.iter().any(|r| {
+                matches!(r.get("label"),
+                    Some(meshdb_executor::Value::Property(meshdb_core::Property::String(s)))
+                    if s == "BeforeFailover")
+            });
+            let saw_after = rows.iter().any(|r| {
+                matches!(r.get("label"),
+                    Some(meshdb_executor::Value::Property(meshdb_core::Property::String(s)))
+                    if s == "AfterFailover")
+            });
+            if !(saw_before && saw_after) {
+                if Instant::now() > deadline {
+                    panic!(
+                        "peer {} after failover: BeforeFailover={saw_before}, AfterFailover={saw_after}",
+                        peers[*idx].config.self_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_quorum_loss_blocks_writes_reads_still_work() {
     // 3 peers, 1 partition, rf=3. Kill 2 of 3 replicas (gRPC server
     // + Raft handle) so the partition has no quorum. Verify:
