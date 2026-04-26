@@ -1580,12 +1580,14 @@ impl MeshService {
             return Ok(());
         };
         for (partition, applier) in &multi_raft.partition_appliers {
-            // Skip partitions where this peer doesn't lead — only the
-            // leader can propose entries through the Raft. Followers
-            // pick up the recovery once they win an election.
-            if !multi_raft.is_local_leader(*partition) {
-                continue;
-            }
+            // Run recovery on every replica that hosts this partition.
+            // Non-leader proposals route through `forward_write` to
+            // the current leader; the first successful CommitTx /
+            // AbortTx wins, the rest are idempotent no-ops because
+            // the applier's pending_txs entry is already gone.
+            // Without this fan-out, a coordinator crash that re-
+            // started on a non-leader peer would never converge —
+            // followers don't run recovery on their own.
             let pending = applier.pending_tx_ids();
             for txid in pending {
                 let decision = self.resolve_decision_across_peers(&multi_raft, &txid).await;
@@ -1715,7 +1717,26 @@ impl MeshService {
                 .propose_partition_command(multi_raft, *partition, entry)
                 .await
             {
-                Ok(()) => prepared.push(*partition),
+                Ok(()) => {
+                    prepared.push(*partition);
+                    // Fault injection: simulate a coordinator crash
+                    // mid-PREPARE-fanout — return without sending the
+                    // next PREPARE so recovery sees `Prepared` with
+                    // no decision in the coordinator log.
+                    #[cfg(any(test, feature = "fault-inject"))]
+                    if let Some(fp) = &self.fault_points {
+                        if fp
+                            .multi_raft_crash_after_first_prepared_tx
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            && prepared.len() == 1
+                            && touched.len() > 1
+                        {
+                            return Err(Status::internal(
+                                "injected fault: multi_raft_crash_after_first_prepared_tx",
+                            ));
+                        }
+                    }
+                }
                 Err(e) => {
                     prepare_err = Some(e);
                     break;
@@ -1759,6 +1780,22 @@ impl MeshService {
                 return Err(Status::internal(format!(
                     "coordinator log CommitDecision: {e}"
                 )));
+            }
+        }
+
+        // Fault injection: simulate a coordinator crash after the
+        // commit decision is durable but before any CommitTx ships.
+        // Recovery resolves every prepared partition forward to
+        // committed via `ResolveTransaction` polling.
+        #[cfg(any(test, feature = "fault-inject"))]
+        if let Some(fp) = &self.fault_points {
+            if fp
+                .multi_raft_crash_after_commit_decision
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Status::internal(
+                    "injected fault: multi_raft_crash_after_commit_decision",
+                ));
             }
         }
 
@@ -5243,6 +5280,20 @@ impl MeshWrite for MeshService {
     ) -> Result<Response<crate::proto::ForwardWriteResponse>, Status> {
         let req = request.into_inner();
         tracing::Span::current().record("partition", req.partition);
+
+        #[cfg(any(test, feature = "fault-inject"))]
+        if let Some(fp) = &self.fault_points {
+            fp.forward_write_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if fp
+                .multi_raft_reject_forward_write
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Status::internal(
+                    "injected fault: multi_raft_reject_forward_write",
+                ));
+            }
+        }
 
         let Some(multi_raft) = self.multi_raft.as_ref() else {
             return Err(Status::failed_precondition(

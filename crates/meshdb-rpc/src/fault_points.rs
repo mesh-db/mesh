@@ -54,6 +54,34 @@ pub struct FaultPoints {
     /// RPC served. Tests read this to assert that recovery actually
     /// polled peers, not just rehydrated staging from the log.
     pub resolve_transaction_call_count: AtomicU32,
+
+    /// Multi-raft coordinator: after the first `PreparedTx` entry
+    /// commits through a partition Raft, return the injected error
+    /// instead of issuing the next partition's PREPARE. Simulates a
+    /// coordinator crash mid-PREPARE-fanout. On restart, the
+    /// coordinator log shows `Prepared` with no decision, so
+    /// recovery's abort path drives every prepared partition to
+    /// `AbortTx`.
+    pub multi_raft_crash_after_first_prepared_tx: AtomicBool,
+
+    /// Multi-raft coordinator: after the `CommitDecision` log entry
+    /// fsyncs (post-PREPARE-quorum), return the injected error
+    /// instead of issuing the first CommitTx. Simulates a
+    /// coordinator crash post-decision, pre-fanout. Recovery
+    /// resolves every PREPAREd partition forward to `CommitTx` via
+    /// `ResolveTransaction` polling.
+    pub multi_raft_crash_after_commit_decision: AtomicBool,
+
+    /// Multi-raft participant: in `MeshWrite::ForwardWrite`, return
+    /// `Status::internal("injected fault")` before proposing through
+    /// the partition Raft. Used to exercise the forward-retry path
+    /// where the caller refreshes its leader cache and retries.
+    pub multi_raft_reject_forward_write: AtomicBool,
+
+    /// Observability counter: bumped once per `ForwardWrite` RPC
+    /// served. Tests read this to confirm the forwarding path
+    /// actually fired, not just an in-process direct propose.
+    pub forward_write_call_count: AtomicU32,
 }
 
 impl FaultPoints {
@@ -65,6 +93,10 @@ impl FaultPoints {
             reject_prepare: AtomicBool::new(false),
             reject_commit_before_apply: AtomicBool::new(false),
             resolve_transaction_call_count: AtomicU32::new(0),
+            multi_raft_crash_after_first_prepared_tx: AtomicBool::new(false),
+            multi_raft_crash_after_commit_decision: AtomicBool::new(false),
+            multi_raft_reject_forward_write: AtomicBool::new(false),
+            forward_write_call_count: AtomicU32::new(0),
         }
     }
 }

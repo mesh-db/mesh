@@ -59,6 +59,13 @@ const CF_EDGE_POINT_INDEX_META: &str = "edge_point_index_meta";
 /// this release — the trigger registry doesn't replicate
 /// across cluster peers, so each node holds its own set.
 const CF_TRIGGER_META: &str = "trigger_meta";
+/// Persisted multi-raft pending-tx staging. Keyed by partition-
+/// namespaced txid (4-byte LE partition + txid bytes), valued by
+/// the serde-encoded `Vec<GraphMutation>` to apply on `CommitTx`.
+/// Lets the partition applier reconstruct `pending_txs` after a
+/// restart instead of relying on openraft to re-replay entries
+/// past `last_applied` (which it doesn't).
+const CF_PENDING_TX_META: &str = "pending_tx_meta";
 
 const ALL_CFS: &[&str] = &[
     CF_NODES,
@@ -77,6 +84,7 @@ const ALL_CFS: &[&str] = &[
     CF_EDGE_POINT_INDEX,
     CF_EDGE_POINT_INDEX_META,
     CF_TRIGGER_META,
+    CF_PENDING_TX_META,
 ];
 
 const EMPTY: &[u8] = &[];
@@ -2908,6 +2916,27 @@ impl StorageEngine for RocksDbStorageEngine {
             // accepts `&str`. Lossy decode is defensive.
             let name = String::from_utf8_lossy(&k).into_owned();
             out.push((name, v.to_vec()));
+        }
+        Ok(out)
+    }
+
+    fn put_pending_tx(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let cf = self.cf(CF_PENDING_TX_META)?;
+        self.db.put_cf(cf, key, value).map_err(Error::from)
+    }
+
+    fn delete_pending_tx(&self, key: &[u8]) -> Result<()> {
+        let cf = self.cf(CF_PENDING_TX_META)?;
+        self.db.delete_cf(cf, key).map_err(Error::from)
+    }
+
+    fn list_pending_txs(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.cf(CF_PENDING_TX_META)?;
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        for entry in iter {
+            let (k, v) = entry.map_err(Error::from)?;
+            out.push((k.to_vec(), v.to_vec()));
         }
         Ok(out)
     }

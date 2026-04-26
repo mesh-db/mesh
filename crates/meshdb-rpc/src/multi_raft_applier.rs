@@ -26,6 +26,31 @@ use meshdb_storage::{GraphMutation, StorageEngine};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Encode `(partition, txid)` as a `pending_tx_meta` rocksdb key.
+/// Layout: 4 LE bytes of partition id, then the txid string bytes.
+/// Partition prefix lets a single CF host every partition's
+/// staging on a peer that hosts multiple partitions, while
+/// `list_pending_txs` lookups on each applier filter by partition.
+fn encode_pending_tx_key(partition: PartitionId, txid: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + txid.len());
+    out.extend_from_slice(&partition.0.to_le_bytes());
+    out.extend_from_slice(txid.as_bytes());
+    out
+}
+
+/// Inverse of [`encode_pending_tx_key`]. Returns `None` for keys
+/// shorter than the 4-byte partition prefix or whose txid bytes
+/// aren't valid UTF-8 — corrupted entries are skipped silently
+/// rather than aborting recovery.
+fn decode_pending_tx_key(key: &[u8]) -> Option<(PartitionId, TxId)> {
+    if key.len() < 4 {
+        return None;
+    }
+    let partition = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+    let txid = std::str::from_utf8(&key[4..]).ok()?.to_string();
+    Some((PartitionId(partition), txid))
+}
+
 /// State-machine applier for a multi-raft partition group. Lives on
 /// every replica of partition `partition_id`; applies the partition-
 /// scoped subset of `GraphCommand`s and stages cross-partition
@@ -42,7 +67,15 @@ pub struct PartitionGraphApplier {
     /// the same `PreparedTx` entries on startup, so the map
     /// reconstructs deterministically without any additional
     /// fsync.
-    pending_txs: Mutex<HashMap<TxId, Vec<GraphMutation>>>,
+    /// Cross-partition transactions staged via `PreparedTx`,
+    /// keyed by the coordinator-issued txid. Stored as the
+    /// original `Vec<GraphCommand>` (which is serializable;
+    /// `GraphMutation` isn't) — the partition-filtering pass
+    /// re-runs on `CommitTx` to derive the materialized
+    /// mutations. The on-disk row in `pending_tx_meta` mirrors
+    /// this map exactly so a restart reconstructs in-memory state
+    /// from storage.
+    pending_txs: Mutex<HashMap<TxId, Vec<GraphCommand>>>,
 }
 
 impl std::fmt::Debug for PartitionGraphApplier {
@@ -59,11 +92,29 @@ impl PartitionGraphApplier {
         store: Arc<dyn StorageEngine>,
         partitioner: Partitioner,
     ) -> Self {
+        // Rebuild the pending_txs map from durable storage. Without
+        // this, an applied `PreparedTx` would be invisible to
+        // post-restart recovery — openraft replays only entries past
+        // `last_applied`, so the in-memory staging set wouldn't
+        // reconstruct from the partition Raft log alone.
+        let mut pending: HashMap<TxId, Vec<GraphCommand>> = HashMap::new();
+        if let Ok(entries) = store.list_pending_txs() {
+            for (key, value) in entries {
+                if let Some((p, txid)) = decode_pending_tx_key(&key) {
+                    if p != partition_id {
+                        continue;
+                    }
+                    if let Ok(cmds) = serde_json::from_slice::<Vec<GraphCommand>>(&value) {
+                        pending.insert(txid, cmds);
+                    }
+                }
+            }
+        }
         Self {
             partition_id,
             store,
             partitioner,
-            pending_txs: Mutex::new(HashMap::new()),
+            pending_txs: Mutex::new(pending),
         }
     }
 
@@ -142,28 +193,47 @@ impl GraphStateMachine for PartitionGraphApplier {
             | GraphCommand::Batch(_) => self.apply_immediate(command),
 
             GraphCommand::PreparedTx { txid, commands } => {
-                let mut mutations = Vec::new();
-                self.collect_partition_mutations(commands, &mut mutations);
+                // Durable copy first — the in-memory entry lasts only
+                // until the next restart; the on-disk row survives.
+                let key = encode_pending_tx_key(self.partition_id, txid);
+                let value = serde_json::to_vec(commands)
+                    .map_err(|e| format!("encoding pending tx: {e}"))?;
+                self.store
+                    .put_pending_tx(&key, &value)
+                    .map_err(|e| e.to_string())?;
                 self.pending_txs
                     .lock()
                     .expect("pending_txs mutex poisoned")
-                    .insert(txid.clone(), mutations);
+                    .insert(txid.clone(), commands.clone());
                 Ok(())
             }
             GraphCommand::CommitTx { txid } => {
-                let mutations = self
+                let staged = self
                     .pending_txs
                     .lock()
                     .expect("pending_txs mutex poisoned")
                     .remove(txid);
-                match mutations {
-                    Some(m) if !m.is_empty() => {
-                        self.store.apply_batch(&m).map_err(|e| e.to_string())
+                let key = encode_pending_tx_key(self.partition_id, txid);
+                // Always clear the durable row, even when the in-
+                // memory entry is missing — a CommitTx after restart
+                // looks at storage as the source of truth.
+                let _ = self.store.delete_pending_tx(&key);
+                match staged {
+                    Some(cmds) if !cmds.is_empty() => {
+                        // Re-derive partition-filtered mutations from
+                        // the staged commands list. Equivalent to
+                        // applying the immediate-commit single-
+                        // partition path with the same source data.
+                        let mut mutations = Vec::new();
+                        self.collect_partition_mutations(&cmds, &mut mutations);
+                        if mutations.is_empty() {
+                            return Ok(());
+                        }
+                        self.store
+                            .apply_batch(&mutations)
+                            .map_err(|e| e.to_string())
                     }
                     // Unknown txid or empty staging → idempotent no-op.
-                    // A replay of an already-committed tx, or a
-                    // tx that PREPARed before this peer had any data
-                    // commands targeting our partition, both land here.
                     _ => Ok(()),
                 }
             }
@@ -172,6 +242,8 @@ impl GraphStateMachine for PartitionGraphApplier {
                     .lock()
                     .expect("pending_txs mutex poisoned")
                     .remove(txid);
+                let key = encode_pending_tx_key(self.partition_id, txid);
+                let _ = self.store.delete_pending_tx(&key);
                 Ok(())
             }
 
