@@ -938,4 +938,16 @@ impl RaftCluster {
             .await
             .map_err(|e| Error::Raft(e.to_string()))
     }
+
+    /// Stop this Raft replica without consuming the wrapper. Useful
+    /// for tests that simulate a crash on a peer reachable through
+    /// an `Arc`. Once shut down, the openraft handle stops sending
+    /// heartbeats and rejects further proposals — followers will
+    /// elect a new leader.
+    pub async fn shutdown_in_place(&self) -> Result<()> {
+        self.raft
+            .shutdown()
+            .await
+            .map_err(|e| Error::Raft(e.to_string()))
+    }
 }

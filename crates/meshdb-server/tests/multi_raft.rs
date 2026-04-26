@@ -21,6 +21,10 @@ struct Peer {
     multi_raft: Arc<meshdb_rpc::MultiRaftCluster>,
     service: MeshService,
     _dir: TempDir,
+    /// Handle for the spawned gRPC server task. Tests that
+    /// simulate a peer crash abort this so the other peers see
+    /// the listener stop responding.
+    server_task: tokio::task::JoinHandle<()>,
 }
 
 async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usize) -> Vec<Peer> {
@@ -81,14 +85,16 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
         let raft_service = meshdb_rpc::MeshRaftService::with_registry(registry);
 
         let service_for_server = service.clone();
-        tokio::spawn(async move {
-            Server::builder()
+        let server_task = tokio::spawn(async move {
+            // Ignore errors from a forced abort — tests that
+            // simulate a peer crash abort this task and the
+            // resulting JoinError is expected, not a test failure.
+            let _ = Server::builder()
                 .add_service(raft_service.into_server())
                 .add_service(service_for_server.clone().into_query_server())
                 .add_service(service_for_server.clone().into_write_server())
                 .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-                .unwrap();
+                .await;
         });
 
         peers.push(Peer {
@@ -96,6 +102,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             multi_raft,
             service,
             _dir: dir,
+            server_task,
         });
     }
 
@@ -487,15 +494,21 @@ async fn multi_raft_create_index_synchronous_ddl_gate() {
 
 #[tokio::test]
 async fn multi_raft_survives_partition_leader_shutdown() {
-    // 3 peers, 1 partition, rf=3. Pick the partition's leader and
-    // shut down its Raft handle so the other two replicas have to
-    // re-elect. A subsequent write through any peer should still
-    // succeed once the new leader is settled — this is the basic
-    // "ride the wave" durability case.
+    // 3 peers, 1 partition, rf=3. Identify the partition leader,
+    // simulate a peer crash by aborting its gRPC server task (so
+    // the other two replicas can no longer reach it), then verify
+    // a write through a surviving peer succeeds after re-election.
+    //
+    // This is the "lose the leader during normal traffic" scenario.
+    // The server-task abort is functionally equivalent to a SIGKILL
+    // from the perspective of the surviving peers — AppendEntries
+    // and Vote RPCs to the dead peer time out, the followers' Raft
+    // election timer fires, and one of them wins the next term.
     let peers = spawn_multi_raft_cluster(3, 1, 3).await;
     wait_for_leaders(&peers, Duration::from_secs(10)).await;
 
-    // Initial write through peer 0; verify all three see it.
+    // Initial write through peer 0; verifies the cluster is healthy
+    // before we start cutting things.
     peers[0]
         .service
         .execute_cypher_local(
@@ -505,52 +518,85 @@ async fn multi_raft_survives_partition_leader_shutdown() {
         .await
         .unwrap();
 
-    // Identify the partition leader.
     let p0 = PartitionId(0);
-    let leader = peers[0].multi_raft.leader_of(p0).expect("leader known");
-
-    // Find which Peer struct corresponds to the leader id.
+    let original_leader = peers[0].multi_raft.leader_of(p0).expect("leader known");
     let leader_idx = peers
         .iter()
-        .position(|p| p.config.self_id == leader)
+        .position(|p| p.config.self_id == original_leader)
         .expect("leader peer in cluster");
 
-    // Force the leader's partition Raft into stepdown by shutting
-    // down its handle. The other two replicas form a new quorum.
-    // We can't actually drop the Arc<RaftCluster> mid-flight without
-    // racing with the listener thread, so we use the cluster's
-    // current_leader() to wait for re-election after a long enough
-    // pause that openraft notices the silence.
-    //
-    // Instead of true shutdown, we issue many writes through a
-    // *different* peer to exercise the leader-change machinery
-    // even with the original leader still present. The real
-    // shutdown-recovery scenario lands in Phase 11's fault-injection
-    // test suite.
-    let _ = leader_idx;
-
-    // Issue a follow-up write through a non-leader peer to exercise
-    // the server-side forwarding path under live leadership.
-    let alternate_idx = (0..peers.len())
-        .find(|i| peers[*i].config.self_id != leader)
+    // Crash the leader: shut down its partition Raft handle (so
+    // it stops sending heartbeats) AND abort its gRPC server task
+    // (so the survivors can no longer reach it for any RPC). The
+    // combination is a clean SIGKILL simulation — followers see
+    // no more AppendEntries, election timer fires, new leader
+    // emerges.
+    peers[leader_idx]
+        .multi_raft
+        .shutdown_partition(p0)
+        .await
         .unwrap();
-    peers[alternate_idx]
+    peers[leader_idx].server_task.abort();
+
+    // Wait for the surviving peers to elect a new leader and AGREE
+    // on who it is. Without heartbeats from the dead leader,
+    // openraft's election timer (default ~150–300ms) fires; one of
+    // the survivors wins. We require both survivors to report the
+    // same leader id (and that id to not be the crashed peer)
+    // before we proceed — otherwise the write path may race a
+    // half-completed election and bounce off a stale cache entry.
+    let survivor_idxs: Vec<usize> = (0..peers.len()).filter(|i| *i != leader_idx).collect();
+    let new_leader = {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut leaders = Vec::with_capacity(survivor_idxs.len());
+            for idx in &survivor_idxs {
+                leaders.push(peers[*idx].multi_raft.partition_current_leader(p0));
+            }
+            let agreed = leaders
+                .iter()
+                .copied()
+                .reduce(|a, b| if a == b { a } else { None })
+                .flatten();
+            if let Some(l) = agreed {
+                if l != original_leader {
+                    break l;
+                }
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "survivors did not agree on a new leader within 15s after crashing peer {original_leader}: {leaders:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    assert_ne!(
+        new_leader, original_leader,
+        "new leader should not be the crashed peer"
+    );
+
+    // Issue a write through a survivor. The target peer either
+    // leads (proposes locally) or proxies via forward_write to the
+    // newly-elected leader. Either path must succeed.
+    let writer_idx = survivor_idxs[0];
+    peers[writer_idx]
         .service
         .execute_cypher_local(
             "CREATE (:After)".to_string(),
             std::collections::HashMap::new(),
         )
         .await
-        .unwrap();
+        .expect("write through survivor must succeed after re-election");
 
-    // Verify both nodes are visible on every replica after a brief
-    // settle.
+    // Both labels must be visible on every survivor (the dead peer
+    // can't serve queries because its server is aborted).
     let deadline = Instant::now() + Duration::from_secs(5);
     'outer: loop {
-        for peer in &peers {
+        for idx in &survivor_idxs {
             for label in ["Before", "After"] {
                 let q = format!("MATCH (n:{label}) RETURN count(n) AS c");
-                let rows = peer
+                let rows = peers[*idx]
                     .service
                     .execute_cypher_local(q, std::collections::HashMap::new())
                     .await
@@ -562,8 +608,8 @@ async fn multi_raft_survives_partition_leader_shutdown() {
                 if count != 1 {
                     if Instant::now() > deadline {
                         panic!(
-                            "peer {} sees count(:{label}) = {count}, expected 1",
-                            peer.config.self_id
+                            "survivor peer {} sees count(:{label}) = {count}, expected 1",
+                            peers[*idx].config.self_id
                         );
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;

@@ -2151,68 +2151,100 @@ impl MeshService {
             }
         }
 
-        // Non-leader path: forward to the partition leader's peer.
-        let leader_id = match multi_raft.leader_of(partition) {
-            Some(l) => l,
-            None => {
-                return Err(Status::unavailable(format!(
-                    "no known leader for partition {} yet; retry shortly",
-                    partition.0
-                )))
-            }
-        };
-        // Encode the commands once.
+        // Encode the commands once. Both attempts of the forward
+        // path reuse this buffer.
         let commands_json = serde_json::to_vec(&entry_to_vec(entry))
             .map_err(|e| Status::internal(format!("encoding commands: {e}")))?;
 
-        // Resolve the leader's peer address from cluster membership.
-        // We rely on the meta cluster state's membership list (every
-        // peer is in the meta group, so it's the right place to look).
-        let state = multi_raft.meta.current_state().await;
-        let leader_addr = state
-            .membership
-            .iter()
-            .find_map(|(id, addr)| {
+        // Non-leader path: forward to the partition leader's peer.
+        // We make up to 2 attempts: if the first lands on a stale
+        // cache entry (the proxy peer rejects with a leader_hint),
+        // we refresh and retry once. A single leader change should
+        // not surface as `Unavailable` to the caller.
+        let mut last_err: Option<Status> = None;
+        for attempt in 0..2 {
+            let leader_id = match multi_raft.leader_of(partition) {
+                Some(l) => l,
+                None => {
+                    last_err = Some(Status::unavailable(format!(
+                        "no known leader for partition {} yet; retry shortly",
+                        partition.0
+                    )));
+                    // Brief settle before retrying — election may be
+                    // mid-flight.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+
+            // Resolve the leader's peer address from cluster
+            // membership. We rely on the meta cluster state's
+            // membership list (every peer is in the meta group).
+            let state = multi_raft.meta.current_state().await;
+            let leader_addr = state.membership.iter().find_map(|(id, addr)| {
                 if id.0 == leader_id {
                     Some(addr.to_string())
                 } else {
                     None
                 }
-            })
-            .ok_or_else(|| {
-                Status::internal(format!("leader {leader_id} not in cluster membership"))
-            })?;
-        drop(state);
+            });
+            drop(state);
+            let leader_addr = match leader_addr {
+                Some(a) => a,
+                None => {
+                    return Err(Status::internal(format!(
+                        "leader {leader_id} not in cluster membership"
+                    )))
+                }
+            };
 
-        let mut client = self
-            .leader_write_client(&leader_addr)
-            .map_err(|e| Status::unavailable(format!("connecting to partition leader: {e}")))?;
-        let resp = client
-            .forward_write(crate::proto::ForwardWriteRequest {
-                partition: partition.0,
-                commands_json,
-                idempotency_key: Vec::new(),
-                min_meta_index: multi_raft
-                    .min_meta_index
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            })
-            .await
-            .map_err(|s| s)?
-            .into_inner();
-        if resp.ok {
-            return Ok(());
+            let mut client = match self.leader_write_client(&leader_addr) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = Some(Status::unavailable(format!(
+                        "connecting to partition leader: {e}"
+                    )));
+                    continue;
+                }
+            };
+            let resp = match client
+                .forward_write(crate::proto::ForwardWriteRequest {
+                    partition: partition.0,
+                    commands_json: commands_json.clone(),
+                    idempotency_key: Vec::new(),
+                    min_meta_index: multi_raft
+                        .min_meta_index
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                })
+                .await
+            {
+                Ok(r) => r.into_inner(),
+                Err(e) => {
+                    last_err = Some(e);
+                    multi_raft.leader_cache.invalidate(partition);
+                    continue;
+                }
+            };
+            if resp.ok {
+                return Ok(());
+            }
+            // Refresh the leader cache from the hint so the next
+            // attempt (or the next request from the caller) routes
+            // correctly.
+            if resp.leader_hint != 0 {
+                multi_raft.leader_cache.set(partition, resp.leader_hint);
+            } else {
+                multi_raft.leader_cache.invalidate(partition);
+            }
+            last_err = Some(Status::unavailable(format!(
+                "forwarded write rejected by peer {leader_id}: {}",
+                resp.error_message
+            )));
+            // Only loop again on the first attempt — second rejection
+            // is surfaced to the caller.
+            let _ = attempt;
         }
-        // Refresh the leader cache from the hint so the next request
-        // routes correctly.
-        if resp.leader_hint != 0 {
-            multi_raft.leader_cache.set(partition, resp.leader_hint);
-        } else {
-            multi_raft.leader_cache.invalidate(partition);
-        }
-        Err(Status::unavailable(format!(
-            "forwarded write rejected by peer {leader_id}: {}",
-            resp.error_message
-        )))
+        Err(last_err.unwrap_or_else(|| Status::unavailable("forward_write retry exhausted")))
     }
 
     /// suppresses further trigger evaluation so a trigger's own

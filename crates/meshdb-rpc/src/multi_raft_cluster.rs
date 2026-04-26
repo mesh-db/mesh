@@ -310,6 +310,31 @@ impl MultiRaftCluster {
         self.meta.current_leader().map(|id| id.0)
     }
 
+    /// Like [`Self::leader_of`] but bypasses the leader cache and
+    /// asks the local Raft replica directly. Useful when callers
+    /// know the cached entry may be stale (e.g. just observed the
+    /// previous leader crash). Returns `None` if this peer doesn't
+    /// host the partition or its replica doesn't yet know who leads.
+    pub fn partition_current_leader(&self, partition: PartitionId) -> Option<NodeId> {
+        let raft = self.partition(partition)?;
+        let leader = raft.current_leader()?.0;
+        self.leader_cache.set(partition, leader);
+        Some(leader)
+    }
+
+    /// Stop the local replica of `partition`. After return, this
+    /// peer's openraft handle for that partition is shut down — it
+    /// stops sending heartbeats and rejects proposals. Other
+    /// replicas will time out and elect a new leader. Test-only.
+    pub async fn shutdown_partition(&self, partition: PartitionId) -> Result<(), String> {
+        let raft = self
+            .partition(partition)
+            .ok_or_else(|| format!("partition {} not hosted on this peer", partition.0))?;
+        raft.shutdown_in_place()
+            .await
+            .map_err(|e| format!("partition {} shutdown: {e}", partition.0))
+    }
+
     /// Add a peer as a voter of `partition`'s Raft group. Wraps
     /// openraft's `change_membership` with `ChangeMembers::AddVoters`.
     /// The new peer's address is looked up from the cluster's meta
