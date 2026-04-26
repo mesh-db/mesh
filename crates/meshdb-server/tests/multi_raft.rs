@@ -1323,6 +1323,103 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_forward_write_idempotency_dedupes_retries() {
+    // Calling ForwardWrite twice with the same idempotency_key
+    // against the partition leader must apply only once.
+    // Demonstrates the "response lost after commit, caller retries"
+    // recovery path doesn't double-apply.
+    use meshdb_rpc::proto::mesh_write_client::MeshWriteClient;
+    use meshdb_rpc::proto::ForwardWriteRequest;
+
+    let peers = spawn_multi_raft_cluster(3, 1, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+    let leader_id = peers[0].multi_raft.leader_of(p0).expect("leader known");
+    let leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == leader_id)
+        .unwrap();
+    let leader_addr = peers[leader_idx].config.listen_address.clone();
+
+    // gRPC straight to the leader so we control the request
+    // payload — the in-process `commit_multi_raft_*` paths generate
+    // a fresh idempotency_key per call, which is the wrong shape
+    // for the dedupe test.
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{leader_addr}")).unwrap();
+    let mut client = MeshWriteClient::new(endpoint.connect().await.unwrap());
+
+    let cmds = vec![meshdb_cluster::GraphCommand::PutNode(meshdb_core::Node {
+        id: meshdb_core::NodeId::new(),
+        labels: vec!["IdempTest".to_string()],
+        properties: std::collections::HashMap::new(),
+    })];
+    let commands_json = serde_json::to_vec(&cmds).unwrap();
+    // Random 16-byte idempotency key (no uuid crate dep on the
+    // test-binary side; bytes are opaque to the server).
+    let key = (0u8..16).collect::<Vec<u8>>();
+
+    // First call — must succeed and apply.
+    let resp1 = client
+        .forward_write(ForwardWriteRequest {
+            partition: p0.0,
+            commands_json: commands_json.clone(),
+            idempotency_key: key.clone(),
+            min_meta_index: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp1.ok, "first forward_write must succeed: {resp1:?}");
+
+    // Second call with the same key — must return the cached
+    // response and NOT re-propose. Observable proof: node count is
+    // still 1 on every replica, not 2.
+    let resp2 = client
+        .forward_write(ForwardWriteRequest {
+            partition: p0.0,
+            commands_json: commands_json.clone(),
+            idempotency_key: key.clone(),
+            min_meta_index: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp2.ok, "second forward_write must also succeed");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for peer in &peers {
+            let rows = peer
+                .service
+                .execute_cypher_local(
+                    "MATCH (n:IdempTest) RETURN count(n) AS c".to_string(),
+                    std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let count = match rows.first().and_then(|r| r.get("c")) {
+                Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+                other => panic!("expected Int64, got {other:?}"),
+            };
+            if count != 1 {
+                if Instant::now() > deadline {
+                    panic!(
+                        "peer {} sees count(:IdempTest) = {count}, expected 1 — \
+                         idempotency dedupe failed (the retry double-applied)",
+                        peer.config.self_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_num_partitions_marker_blocks_silent_resharding() {
     // Spawn a 3-peer cluster with num_partitions=4. After it's
     // running, confirm the marker file exists. Then attempt to

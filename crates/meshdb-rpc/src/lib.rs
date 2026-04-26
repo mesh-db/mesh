@@ -21,6 +21,7 @@ mod error;
 mod executor_writer;
 #[cfg(any(test, feature = "fault-inject"))]
 pub mod fault_points;
+mod idempotency;
 pub mod metrics;
 mod multi_raft_applier;
 mod multi_raft_cluster;

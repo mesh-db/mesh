@@ -290,6 +290,13 @@ pub struct MeshService {
     /// `resolve_transaction` handlers.
     #[cfg(any(test, feature = "fault-inject"))]
     fault_points: Option<Arc<crate::FaultPoints>>,
+    /// Idempotency cache for `MeshWrite::ForwardWrite`. Each entry
+    /// is keyed by a client-generated UUID and stores the leader's
+    /// most recent response. A retry with the same key returns the
+    /// cached response unchanged so a write that landed and ack'd
+    /// but lost its response on the way back is not double-applied.
+    /// See [`crate::idempotency`] for the contract.
+    idempotency: Arc<crate::idempotency::IdempotencyCache>,
 }
 
 impl MeshService {
@@ -308,6 +315,7 @@ impl MeshService {
             procedure_registry_factory: default_registry_factory(),
             #[cfg(any(test, feature = "fault-inject"))]
             fault_points: None,
+            idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
         }
     }
 
@@ -339,6 +347,7 @@ impl MeshService {
             procedure_registry_factory: default_registry_factory(),
             #[cfg(any(test, feature = "fault-inject"))]
             fault_points: None,
+            idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
         }
     }
 
@@ -378,6 +387,7 @@ impl MeshService {
             procedure_registry_factory: default_registry_factory(),
             #[cfg(any(test, feature = "fault-inject"))]
             fault_points: None,
+            idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
         }
     }
 
@@ -404,6 +414,7 @@ impl MeshService {
             procedure_registry_factory: default_registry_factory(),
             #[cfg(any(test, feature = "fault-inject"))]
             fault_points: None,
+            idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
         }
     }
 
@@ -2107,11 +2118,17 @@ impl MeshService {
         let mut client = self
             .leader_write_client(&leader_addr)
             .map_err(|e| Status::unavailable(format!("connecting to partition leader: {e}")))?;
+        // Fresh idempotency key per propose. Even though
+        // propose_partition_command does not retry internally, the
+        // higher-level cross-partition tx orchestration may re-call
+        // it (e.g., recovery loop re-issuing CommitTx); the cache
+        // makes those re-calls free.
+        let idempotency_key = uuid::Uuid::new_v4().as_bytes().to_vec();
         let resp = client
             .forward_write(crate::proto::ForwardWriteRequest {
                 partition: partition.0,
                 commands_json,
-                idempotency_key: Vec::new(),
+                idempotency_key,
                 min_meta_index: multi_raft
                     .min_meta_index
                     .load(std::sync::atomic::Ordering::SeqCst),
@@ -2175,6 +2192,13 @@ impl MeshService {
         let commands_json = serde_json::to_vec(&entry_to_vec(entry))
             .map_err(|e| Status::internal(format!("encoding commands: {e}")))?;
 
+        // One idempotency key per logical write. Both attempts of
+        // the retry loop carry the same key, so a leader that
+        // already applied the commands but lost its response on the
+        // way back returns the cached OK on the second attempt
+        // instead of double-applying.
+        let idempotency_key = uuid::Uuid::new_v4().as_bytes().to_vec();
+
         // Non-leader path: forward to the partition leader's peer.
         // We make up to 2 attempts: if the first lands on a stale
         // cache entry (the proxy peer rejects with a leader_hint),
@@ -2230,7 +2254,7 @@ impl MeshService {
                 .forward_write(crate::proto::ForwardWriteRequest {
                     partition: partition.0,
                     commands_json: commands_json.clone(),
-                    idempotency_key: Vec::new(),
+                    idempotency_key: idempotency_key.clone(),
                     min_meta_index: multi_raft
                         .min_meta_index
                         .load(std::sync::atomic::Ordering::SeqCst),
@@ -5599,6 +5623,17 @@ impl MeshWrite for MeshService {
             ));
         };
 
+        // Idempotency: if the caller already saw this `idempotency_key`
+        // succeed (response lost on the way back, leader stepdown
+        // post-commit, etc.), return the cached response rather than
+        // re-proposing. Empty keys opt out — old callers that don't
+        // set a key fall through to the existing not-deduped behaviour.
+        if !req.idempotency_key.is_empty() {
+            if let Some(cached) = self.idempotency.get(&req.idempotency_key) {
+                return Ok(Response::new(cached));
+            }
+        }
+
         // Absorb the caller's DDL barrier into our cluster's
         // `min_meta_index`. The propose path's `await_meta_barrier`
         // will block until our meta replica has applied at least
@@ -5614,7 +5649,9 @@ impl MeshWrite for MeshService {
             Some(r) => r,
             None => {
                 // We don't host this partition's Raft replica; the
-                // caller's leader cache is stale.
+                // caller's leader cache is stale. Don't cache —
+                // refusal-style responses are themselves idempotent
+                // (the caller refreshes and retries elsewhere).
                 return Ok(Response::new(crate::proto::ForwardWriteResponse {
                     ok: false,
                     leader_hint: 0,
@@ -5650,11 +5687,20 @@ impl MeshWrite for MeshService {
             meshdb_cluster::GraphCommand::Batch(commands)
         };
         match partition_raft.propose_graph(entry).await {
-            Ok(_) => Ok(Response::new(crate::proto::ForwardWriteResponse {
-                ok: true,
-                leader_hint: 0,
-                error_message: String::new(),
-            })),
+            Ok(_) => {
+                let resp = crate::proto::ForwardWriteResponse {
+                    ok: true,
+                    leader_hint: 0,
+                    error_message: String::new(),
+                };
+                // Cache the success so a retry with the same key
+                // returns the same response without re-proposing.
+                if !req.idempotency_key.is_empty() {
+                    self.idempotency
+                        .put(req.idempotency_key.clone(), resp.clone());
+                }
+                Ok(Response::new(resp))
+            }
             Err(meshdb_cluster::Error::ForwardToLeader { leader_id, .. }) => {
                 // Lost leadership between is_local_leader check and
                 // propose. Surface the new hint so the caller retries.
