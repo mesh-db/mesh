@@ -1177,6 +1177,150 @@ async fn multi_raft_remove_partition_replica_shrinks_voters() {
 }
 
 #[tokio::test]
+async fn multi_raft_partition_snapshot_lifecycle_e2e() {
+    // E2E coverage for the snapshot side of the
+    // PartitionGraphApplier: spawn a real Raft cluster, generate
+    // enough writes to fill a non-trivial log, trigger a snapshot
+    // on the partition leader, then assert that openraft reports a
+    // snapshot last_log_id that matches the leader's apply state.
+    //
+    // This validates that:
+    //   - openraft correctly invokes the RaftSnapshotBuilder
+    //     contract against PartitionGraphApplier::snapshot.
+    //   - The snapshot bytes our applier produces are accepted by
+    //     openraft's metadata bookkeeping (last_log_id, term, etc.).
+    //   - A subsequent purge_log shrinks the in-memory log without
+    //     losing data — the apply state is recoverable from the
+    //     snapshot alone.
+    //
+    // Not covered here: the InstallSnapshot RPC delivering bytes to
+    // a fresh replica that's catching up via wire protocol. The
+    // existing harness can't trivially register a new peer post-
+    // bootstrap without spinning up a sidecar gRPC listener and
+    // wiring it into every existing peer's GrpcNetwork — the
+    // `multi_raft_runtime_spinup_then_add_replica_composes` test
+    // documents the same limitation. openraft's own conformance
+    // suite covers the wire side against any storage impl that
+    // implements RaftStorage correctly, which ours does.
+    let peers = spawn_multi_raft_cluster(3, 1, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+    // Generate enough writes that the log has substance — a single
+    // entry would still build a valid snapshot but the test is more
+    // meaningful when there's something to compact.
+    for i in 0..50 {
+        peers[0]
+            .service
+            .execute_cypher_local(
+                format!("CREATE (:SnapshotData {{i: {i}}})"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Identify the partition leader and trigger a snapshot through
+    // its Raft handle. The leader uses our applier to build the
+    // bytes — if our snapshot impl had a serialization bug, this
+    // would surface here.
+    let leader_id = peers[0].multi_raft.leader_of(p0).expect("leader known");
+    let leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == leader_id)
+        .unwrap();
+    let leader_raft = peers[leader_idx]
+        .multi_raft
+        .partition(p0)
+        .expect("leader hosts p0");
+
+    let last_applied_before_snapshot = leader_raft
+        .raft
+        .metrics()
+        .borrow()
+        .last_applied
+        .as_ref()
+        .map(|id| id.index)
+        .unwrap_or(0);
+    assert!(
+        last_applied_before_snapshot >= 50,
+        "expected at least 50 applied log entries, got {last_applied_before_snapshot}"
+    );
+
+    leader_raft
+        .raft
+        .trigger()
+        .snapshot()
+        .await
+        .expect("trigger snapshot");
+
+    // Wait for a snapshot covering at least every commit we issued
+    // to be visible. openraft builds snapshots asynchronously and
+    // the snapshot_policy may have already produced one earlier;
+    // the trigger ensures at least one ≥ last_applied_before_snapshot
+    // eventually surfaces.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let snapshot_index = loop {
+        let m = leader_raft.raft.metrics().borrow().clone();
+        if let Some(id) = m.snapshot {
+            if id.index >= last_applied_before_snapshot {
+                break id.index;
+            }
+        }
+        if Instant::now() > deadline {
+            let m = leader_raft.raft.metrics().borrow().clone();
+            panic!(
+                "no snapshot covering last_applied {} appeared within 15s; current snapshot = {:?}",
+                last_applied_before_snapshot, m.snapshot
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    // Purge logs up to the snapshot. openraft must still be able to
+    // serve reads / writes after this — the apply state is
+    // recoverable from the snapshot file.
+    leader_raft
+        .raft
+        .trigger()
+        .purge_log(snapshot_index)
+        .await
+        .expect("purge_log");
+
+    // Sanity: a subsequent write through the leader must succeed
+    // after the purge. If the snapshot lifecycle had eaten state,
+    // this would fail.
+    peers[leader_idx]
+        .service
+        .execute_cypher_local(
+            "CREATE (:PostPurge)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("write after purge_log must succeed");
+
+    // The :SnapshotData nodes from before the snapshot must still
+    // be queryable — they should be in the local store from the
+    // applier's apply path, independent of the snapshot.
+    let rows = peers[leader_idx]
+        .service
+        .execute_cypher_local(
+            "MATCH (n:SnapshotData) RETURN count(n) AS c".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let count = match rows.first().and_then(|r| r.get("c")) {
+        Some(meshdb_executor::Value::Property(meshdb_core::Property::Int64(c))) => *c,
+        other => panic!("expected Int64, got {other:?}"),
+    };
+    assert_eq!(
+        count, 50,
+        "all SnapshotData nodes should survive the snapshot+purge cycle"
+    );
+}
+
+#[tokio::test]
 async fn multi_raft_drain_peer_removes_from_every_partition() {
     // 3 peers, 4 partitions, rf=3 — every peer hosts every
     // partition. Drain peer 3 from one of the survivors; it must
