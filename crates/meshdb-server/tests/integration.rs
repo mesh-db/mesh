@@ -110,6 +110,7 @@ async fn spawn_single_node_server() -> Harness {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let service = meshdb_server::build_service(&config).unwrap();
@@ -176,6 +177,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -196,6 +198,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let service_a = meshdb_server::build_service(&config_a).unwrap();
@@ -576,6 +579,7 @@ async fn build_components_single_node_has_no_raft() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_none());
@@ -617,6 +621,7 @@ async fn build_components_multi_peer_builds_raft() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_some());
@@ -661,6 +666,7 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_none());
@@ -725,6 +731,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -745,6 +752,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -908,6 +916,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -928,6 +937,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1139,6 +1149,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1159,6 +1170,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1327,6 +1339,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1347,6 +1360,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1497,6 +1511,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1517,6 +1532,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1763,6 +1779,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b1 = ServerConfig {
         self_id: 2,
@@ -1783,6 +1800,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1886,6 +1904,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let listener_b2 = TcpListener::bind(addr_b).await.unwrap();
@@ -2051,6 +2070,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2071,6 +2091,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -2244,6 +2265,7 @@ async fn cypher_merge_replicates_through_raft() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2264,6 +2286,7 @@ async fn cypher_merge_replicates_through_raft() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -2418,6 +2441,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2438,6 +2462,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -2595,6 +2620,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2615,6 +2641,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     // Build components for both peers.
@@ -2888,6 +2915,7 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let config_a = mk_config(1, dir_a.path().to_path_buf(), &grpc_addr_a, true);
     let config_b = mk_config(2, dir_b.path().to_path_buf(), &grpc_addr_b, false);
@@ -3080,6 +3108,7 @@ async fn route_write_role_tracks_raft_leader_across_handoff() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
     let configs = [
         mk_config(1, dirs[0].path().to_path_buf(), &grpc_addrs[0], true),
@@ -3260,6 +3289,7 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
         read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
     };
 
     let service = meshdb_server::build_service(&config).unwrap();

@@ -94,6 +94,7 @@ async fn spawn_three_peer_cluster(num_partitions: u32, rf: usize) -> Cluster {
             read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
+            cluster_auth: None,
         };
         let components = build_components(&config).await.unwrap();
         let multi_raft = components.multi_raft.clone().expect("multi-raft built");

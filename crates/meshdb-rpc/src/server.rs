@@ -297,6 +297,13 @@ pub struct MeshService {
     /// but lost its response on the way back is not double-applied.
     /// See [`crate::idempotency`] for the contract.
     idempotency: Arc<crate::idempotency::IdempotencyCache>,
+    /// Cluster-shared-secret authentication for inter-peer + admin
+    /// gRPC. `None` (default) disables both inbound validation and
+    /// outbound injection — appropriate for trusted-network dev
+    /// setups; production should set a token via
+    /// [`Self::with_cluster_auth`]. See
+    /// [`crate::cluster_auth`].
+    cluster_auth: crate::cluster_auth::ClusterAuth,
 }
 
 impl MeshService {
@@ -316,6 +323,7 @@ impl MeshService {
             #[cfg(any(test, feature = "fault-inject"))]
             fault_points: None,
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
+            cluster_auth: crate::cluster_auth::ClusterAuth::default(),
         }
     }
 
@@ -348,6 +356,7 @@ impl MeshService {
             #[cfg(any(test, feature = "fault-inject"))]
             fault_points: None,
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
+            cluster_auth: crate::cluster_auth::ClusterAuth::default(),
         }
     }
 
@@ -388,6 +397,7 @@ impl MeshService {
             #[cfg(any(test, feature = "fault-inject"))]
             fault_points: None,
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
+            cluster_auth: crate::cluster_auth::ClusterAuth::default(),
         }
     }
 
@@ -415,6 +425,7 @@ impl MeshService {
             #[cfg(any(test, feature = "fault-inject"))]
             fault_points: None,
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
+            cluster_auth: crate::cluster_auth::ClusterAuth::default(),
         }
     }
 
@@ -584,6 +595,54 @@ impl MeshService {
 
     pub fn into_write_server(self) -> MeshWriteServer<Self> {
         MeshWriteServer::new(self)
+    }
+
+    /// Set the cluster-shared-secret token for both inbound
+    /// validation and outbound injection. `None` disables auth;
+    /// existing test harnesses leave it unset.
+    pub fn with_cluster_auth(mut self, token: Option<String>) -> Self {
+        self.cluster_auth = crate::cluster_auth::ClusterAuth::new(token);
+        self
+    }
+
+    /// Returns the [`crate::cluster_auth::ClusterAuth`] handle this
+    /// service was configured with. Callers use this to obtain
+    /// matching client-side interceptors when constructing peer
+    /// channels.
+    pub fn cluster_auth(&self) -> crate::cluster_auth::ClusterAuth {
+        self.cluster_auth.clone()
+    }
+
+    /// Like [`Self::into_query_server`] but wraps the server in
+    /// tonic's `InterceptedService` so every inbound request is
+    /// validated against the configured cluster auth token.
+    pub fn into_intercepted_query_server(
+        self,
+    ) -> tonic::service::interceptor::InterceptedService<
+        MeshQueryServer<Self>,
+        impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + Sync + 'static,
+    > {
+        let interceptor = self.cluster_auth.server_interceptor();
+        tonic::service::interceptor::InterceptedService::new(
+            MeshQueryServer::new(self),
+            interceptor,
+        )
+    }
+
+    /// Like [`Self::into_write_server`] but wraps the server in
+    /// tonic's `InterceptedService` so every inbound request is
+    /// validated against the configured cluster auth token.
+    pub fn into_intercepted_write_server(
+        self,
+    ) -> tonic::service::interceptor::InterceptedService<
+        MeshWriteServer<Self>,
+        impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + Sync + 'static,
+    > {
+        let interceptor = self.cluster_auth.server_interceptor();
+        tonic::service::interceptor::InterceptedService::new(
+            MeshWriteServer::new(self),
+            interceptor,
+        )
     }
 
     /// Run a Cypher query end-to-end against this service and return the

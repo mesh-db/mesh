@@ -75,6 +75,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
+            cluster_auth: None,
         };
 
         let components = build_components(&config).await.unwrap();
@@ -1323,6 +1324,70 @@ async fn multi_raft_partition_snapshot_lifecycle_e2e() {
 }
 
 #[tokio::test]
+async fn multi_raft_cluster_auth_rejects_unauthorized_grpc() {
+    // Spin up a single MeshService with a cluster auth token and
+    // verify the intercepted gRPC server:
+    //   * accepts requests carrying the matching token
+    //   * rejects requests with no/bad/wrong token (Unauthenticated)
+    use meshdb_rpc::cluster_auth::ClusterAuth;
+    use meshdb_rpc::proto::mesh_write_client::MeshWriteClient;
+    use meshdb_rpc::proto::PartitionLeaderRequest;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = TempDir::new().unwrap();
+    let store: std::sync::Arc<dyn meshdb_storage::StorageEngine> =
+        std::sync::Arc::new(meshdb_storage::RocksDbStorageEngine::open(dir.path()).unwrap());
+    let token = "supersecret".to_string();
+    let svc = MeshService::new(store).with_cluster_auth(Some(token.clone()));
+
+    let server_task = tokio::spawn(async move {
+        let _ = Server::builder()
+            .add_service(svc.into_intercepted_write_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Client #1 — no token → rejected.
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    let mut bare = MeshWriteClient::new(endpoint.connect().await.unwrap());
+    let err = bare
+        .partition_leader(PartitionLeaderRequest { partition: 0 })
+        .await
+        .expect_err("no-token request must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Client #2 — wrong token → rejected.
+    let wrong_auth = ClusterAuth::new(Some("nope".into()));
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    let mut wrong = MeshWriteClient::with_interceptor(
+        endpoint.connect().await.unwrap(),
+        wrong_auth.client_interceptor(),
+    );
+    let err = wrong
+        .partition_leader(PartitionLeaderRequest { partition: 0 })
+        .await
+        .expect_err("wrong-token request must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Client #3 — correct token → accepted.
+    let good_auth = ClusterAuth::new(Some(token));
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    let mut good = MeshWriteClient::with_interceptor(
+        endpoint.connect().await.unwrap(),
+        good_auth.client_interceptor(),
+    );
+    let resp = good
+        .partition_leader(PartitionLeaderRequest { partition: 0 })
+        .await
+        .expect("authorized request must succeed");
+    assert_eq!(resp.into_inner().leader_id, 0);
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn multi_raft_drain_leadership_transfers_every_led_partition() {
     // Graceful-shutdown contract: after `drain_leadership`, the
     // peer leads no partitions, so a binary that exits afterwards
@@ -2047,6 +2112,7 @@ async fn multi_raft_weighted_placement_skews_replica_distribution() {
             read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
+            cluster_auth: None,
         };
         let components = build_components(&config).await.unwrap();
         let multi_raft = components.multi_raft.clone().expect("multi-raft built");

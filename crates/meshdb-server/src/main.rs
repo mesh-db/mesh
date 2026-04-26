@@ -102,6 +102,7 @@ impl Cli {
             read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
+            cluster_auth: None,
         })
     }
 
@@ -254,6 +255,7 @@ mod tests {
             read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
+            cluster_auth: None,
         };
         cli.apply_to(&mut cfg);
         assert!(!cfg.bootstrap);
@@ -281,6 +283,7 @@ mod tests {
             read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
+            cluster_auth: None,
         };
         cli.apply_to(&mut cfg);
         assert_eq!(cfg.listen_address, "0.0.0.0:9000"); // overridden

@@ -1,6 +1,16 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Shared-secret cluster authentication. Set in `[cluster_auth]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAuthConfig {
+    /// Bearer token every inbound gRPC RPC must present in
+    /// `authorization: Bearer <token>` metadata. Outgoing RPCs to
+    /// peers carry the same token automatically.
+    pub token: String,
+}
+
 /// Read-consistency policy for multi-raft mode. Defaults to
 /// [`ReadConsistency::Local`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
@@ -187,6 +197,22 @@ pub struct ServerConfig {
     /// Must be in `[1, peers.len()]`.
     #[serde(default)]
     pub replication_factor: Option<usize>,
+
+    /// Optional shared cluster auth token. When set, every inbound
+    /// gRPC RPC (MeshWrite, MeshQuery, MeshRaftService) must carry
+    /// `authorization: Bearer <token>` metadata; mismatches are
+    /// rejected with `Unauthenticated`. Outgoing RPCs to peers
+    /// inject the same token automatically.
+    ///
+    /// Bolt traffic is not affected — Bolt has its own
+    /// authentication (`bolt_auth`).
+    ///
+    /// Omitted → no auth check (current default behaviour, suitable
+    /// only for trusted-network deployments). Production clusters
+    /// should set this to a high-entropy secret distributed via the
+    /// operator's secret-management tooling.
+    #[serde(default)]
+    pub cluster_auth: Option<ClusterAuthConfig>,
 
     /// Read-consistency policy for `mode = "multi-raft"`. Omitted →
     /// `Local`, which lets any peer that holds a partition replica
@@ -483,6 +509,7 @@ mod tests {
             mode,
             replication_factor: None,
             read_consistency: None,
+            cluster_auth: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         }

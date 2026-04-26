@@ -15,6 +15,7 @@ pub mod proto {
     tonic::include_proto!("mesh");
 }
 
+pub mod cluster_auth;
 pub mod convert;
 mod coordinator_log;
 mod error;

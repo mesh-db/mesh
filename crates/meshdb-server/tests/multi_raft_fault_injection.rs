@@ -257,6 +257,7 @@ fn make_config(
         mode: Some(ClusterMode::MultiRaft),
         replication_factor: Some(3),
         read_consistency: None,
+        cluster_auth: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     }
