@@ -392,6 +392,7 @@ async fn build_multi_raft_components(
     // contains this peer.
     let partitioner = Partitioner::new(config.num_partitions);
     let mut partitions: HashMap<PartitionId, Arc<RaftCluster>> = HashMap::new();
+    let mut partition_appliers: HashMap<PartitionId, Arc<PartitionGraphApplier>> = HashMap::new();
     for p in 0..config.num_partitions {
         let partition_id = PartitionId(p);
         if !replica_map.contains(partition_id, PeerId(config.self_id)) {
@@ -400,11 +401,12 @@ async fn build_multi_raft_components(
         let dir = config.data_dir.join("raft").join(format!("p-{p}"));
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating partition raft dir {}", dir.display()))?;
-        let applier: Arc<dyn GraphStateMachine> = Arc::new(PartitionGraphApplier::new(
+        let applier_concrete = Arc::new(PartitionGraphApplier::new(
             partition_id,
             store.clone(),
             partitioner.clone(),
         ));
+        let applier: Arc<dyn GraphStateMachine> = applier_concrete.clone();
         let raft = RaftCluster::open_persistent(
             config.self_id,
             &dir,
@@ -416,12 +418,14 @@ async fn build_multi_raft_components(
         .with_context(|| format!("building partition {p} raft cluster"))?
         .with_label(format!("p-{p}"));
         partitions.insert(partition_id, Arc::new(raft));
+        partition_appliers.insert(partition_id, applier_concrete);
     }
 
     let multi_raft = Arc::new(MultiRaftCluster::new(
         config.self_id,
         Arc::new(meta_raft),
         partitions,
+        partition_appliers,
         replica_map,
     ));
 
@@ -429,14 +433,25 @@ async fn build_multi_raft_components(
     let registry = multi_raft.build_registry();
     let raft_service = MeshRaftService::with_registry(registry);
 
+    // Open the coordinator log so cross-partition decisions are
+    // durable across a coordinator crash. The participant log isn't
+    // opened in multi-raft mode — partition Raft logs are the
+    // durable participant record for staged commands.
+    let coordinator_log = Arc::new(
+        crate::CoordinatorLog::open(coordinator_log_path(&config.data_dir))
+            .context("opening coordinator log for multi-raft")?,
+    );
+
     // Wire writes through the multi-raft path: single-partition
     // writes propose through the partition Raft (server-side
-    // forwarded to the leader peer when this isn't it); reads still
-    // hit the local store directly. Multi-partition writes ship in
-    // a follow-up commit (Phase 7: PREPARE-Raft).
+    // forwarded to the leader peer when this isn't it); cross-
+    // partition writes ride a Spanner-style 2PC. Reads still hit
+    // the local store directly.
     let store_for_triggers = store.clone();
     let service = apply_apoc_import(
-        MeshService::with_multi_raft(store, multi_raft.clone()).with_client_tls(client_tls),
+        MeshService::with_multi_raft(store, multi_raft.clone())
+            .with_coordinator_log(Some(coordinator_log))
+            .with_client_tls(client_tls),
         config,
         &store_for_triggers,
     );
@@ -542,6 +557,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         raft_service,
         multi_raft: _,
     } = components;
+    // Cheap clones (every field is Arc-wrapped). Lets the recovery
+    // call below reuse the service after the server task has taken
+    // ownership of the original.
+    let service_for_recovery = service.clone();
 
     // Rehydrate 2PC participant-side state from the on-disk log
     // BEFORE the gRPC server accepts new traffic. Without this step,
@@ -771,6 +790,16 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 partitions = mr.partitions.len(),
                 "multi-raft groups bootstrapped on this peer"
             );
+        }
+        // In-doubt recovery: any PreparedTx left behind by a prior
+        // coordinator crash gets resolved via ResolveTransaction
+        // polling across peers. Runs once at startup; the
+        // coordinator-log + partition-Raft pair drives it forward.
+        // Failures here are logged but don't block the listener —
+        // periodic re-runs (future addition) cover transient
+        // peer-unreachable cases.
+        if let Err(e) = service_for_recovery.recover_multi_raft_in_doubt().await {
+            tracing::warn!("multi-raft in-doubt recovery failed: {e:#}");
         }
     }
 

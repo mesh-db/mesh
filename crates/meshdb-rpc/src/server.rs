@@ -407,6 +407,16 @@ impl MeshService {
         }
     }
 
+    /// Attach a coordinator log to a multi-raft service so cross-
+    /// partition decisions are durable. The log records `Prepared` /
+    /// `CommitDecision` / `AbortDecision` / `Completed` entries; new
+    /// partition leaders use `ResolveTransaction` to read each peer's
+    /// log when resolving in-doubt PREPAREs after a leader change.
+    pub fn with_coordinator_log(mut self, log: Option<Arc<crate::CoordinatorLog>>) -> Self {
+        self.coordinator_log = log;
+        self
+    }
+
     /// Override the per-request [`ProcedureRegistry`] factory. The
     /// closure is called every time a Cypher query needs a
     /// registry; meshdb-server uses this to bake the operator-
@@ -1552,6 +1562,100 @@ impl MeshService {
             .await
     }
 
+    /// Resolve any in-doubt PREPAREd transactions left behind by a
+    /// coordinator crash mid-2PC. For each partition this peer leads,
+    /// poll `pending_tx_ids()` from the local applier, then ask every
+    /// peer's `ResolveTransaction` RPC for the coordinator's recorded
+    /// decision. Propose `CommitTx` / `AbortTx` through the partition
+    /// Raft to converge; tolerate `Unknown` responses (the
+    /// coordinator may not yet have written its decision; recovery
+    /// runs on a loop and will pick it up later).
+    ///
+    /// Idempotent — re-running drives any new in-doubt PREPAREs to
+    /// resolution and leaves resolved txes untouched. Callers
+    /// typically schedule this once at startup post-leader-election
+    /// plus periodically as a safety net.
+    pub async fn recover_multi_raft_in_doubt(&self) -> std::result::Result<(), Status> {
+        let Some(multi_raft) = self.multi_raft.clone() else {
+            return Ok(());
+        };
+        for (partition, applier) in &multi_raft.partition_appliers {
+            // Skip partitions where this peer doesn't lead — only the
+            // leader can propose entries through the Raft. Followers
+            // pick up the recovery once they win an election.
+            if !multi_raft.is_local_leader(*partition) {
+                continue;
+            }
+            let pending = applier.pending_tx_ids();
+            for txid in pending {
+                let decision = self.resolve_decision_across_peers(&multi_raft, &txid).await;
+                let resolution = match decision {
+                    Some(crate::TxDecision::Commit) => {
+                        GraphCommand::CommitTx { txid: txid.clone() }
+                    }
+                    Some(crate::TxDecision::Abort) => GraphCommand::AbortTx { txid: txid.clone() },
+                    None => continue, // unknown — try again later
+                };
+                if let Err(e) = self
+                    .propose_partition_command(&multi_raft, *partition, resolution)
+                    .await
+                {
+                    tracing::warn!(
+                        partition = ?partition,
+                        txid = %txid,
+                        error = %e,
+                        "in-doubt resolution propose failed; will retry"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Poll every cluster peer's `ResolveTransaction` RPC for `txid`
+    /// and return the coordinator's recorded decision. The first
+    /// `Committed` / `Aborted` response wins (decisions are
+    /// monotonic — once written, every other peer either agrees or
+    /// returns `Unknown` because it isn't a coordinator). `None`
+    /// when no peer has a recorded decision yet.
+    async fn resolve_decision_across_peers(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+        txid: &str,
+    ) -> Option<crate::TxDecision> {
+        let state = multi_raft.meta.current_state().await;
+        let addrs: Vec<String> = state
+            .membership
+            .iter()
+            .map(|(_, a)| a.to_string())
+            .collect();
+        drop(state);
+        for addr in addrs {
+            let mut client = match self.leader_write_client(&addr) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let req = ResolveTransactionRequest {
+                txid: txid.to_string(),
+            };
+            let resp = match client.resolve_transaction(req).await {
+                Ok(r) => r.into_inner(),
+                Err(_) => continue,
+            };
+            match resp.status() {
+                crate::proto::TxResolutionStatus::Committed => {
+                    return Some(crate::TxDecision::Commit);
+                }
+                crate::proto::TxResolutionStatus::Aborted => {
+                    return Some(crate::TxDecision::Abort);
+                }
+                crate::proto::TxResolutionStatus::Unknown => {}
+                crate::proto::TxResolutionStatus::Unspecified => {}
+            }
+        }
+        None
+    }
+
     /// Spanner-style 2PC over partition leaders. Each touched
     /// partition's leader proposes a `PreparedTx` entry through its
     /// Raft group; once all PREPAREs ACK, the coordinator proposes
@@ -1576,6 +1680,28 @@ impl MeshService {
         }
         flatten_commands_by_partition(&commands, &partitioner, &mut by_partition);
 
+        // Coordinator log: record the intent before we touch any
+        // partition. The log entry stores the per-partition command
+        // groups keyed by partition leader's NodeId — sufficient for
+        // recovery to identify which partitions need a follow-up
+        // CommitTx / AbortTx after a coordinator crash.
+        if let Some(log) = &self.coordinator_log {
+            let groups: Vec<(PeerId, Vec<GraphCommand>)> = touched
+                .iter()
+                .map(|p| {
+                    let leader = multi_raft.leader_of(*p).unwrap_or(0);
+                    let cmds = by_partition.get(p).cloned().unwrap_or_default();
+                    (PeerId(leader), cmds)
+                })
+                .collect();
+            if let Err(e) = log.append(&crate::TxLogEntry::Prepared {
+                txid: txid.clone(),
+                groups,
+            }) {
+                return Err(Status::internal(format!("coordinator log Prepared: {e}")));
+            }
+        }
+
         // PREPARE phase. Each propose goes through the partition Raft;
         // ACKs only return after Raft quorum.
         let mut prepared: Vec<meshdb_cluster::PartitionId> = Vec::new();
@@ -1598,6 +1724,11 @@ impl MeshService {
         }
 
         if let Some(err) = prepare_err {
+            // Record the abort decision before fanning out so a
+            // coordinator crash mid-rollback recovers correctly.
+            if let Some(log) = &self.coordinator_log {
+                let _ = log.append(&crate::TxLogEntry::AbortDecision { txid: txid.clone() });
+            }
             // Best-effort abort on partitions that prepared.
             for partition in &prepared {
                 let abort = GraphCommand::AbortTx { txid: txid.clone() };
@@ -1613,7 +1744,22 @@ impl MeshService {
                     );
                 }
             }
+            if let Some(log) = &self.coordinator_log {
+                let _ = log.append(&crate::TxLogEntry::Completed { txid: txid.clone() });
+            }
             return Err(err);
+        }
+
+        // Record the commit decision before sending COMMITs — this is
+        // the point of no return. A coordinator crash after this entry
+        // means recovery rolls every prepared partition forward to
+        // committed.
+        if let Some(log) = &self.coordinator_log {
+            if let Err(e) = log.append(&crate::TxLogEntry::CommitDecision { txid: txid.clone() }) {
+                return Err(Status::internal(format!(
+                    "coordinator log CommitDecision: {e}"
+                )));
+            }
         }
 
         // COMMIT phase.
@@ -1629,6 +1775,9 @@ impl MeshService {
         }
         if !commit_errs.is_empty() {
             return Err(commit_errs.into_iter().next().unwrap());
+        }
+        if let Some(log) = &self.coordinator_log {
+            let _ = log.append(&crate::TxLogEntry::Completed { txid });
         }
         Ok(())
     }

@@ -13,6 +13,7 @@
 //! those handles together plus a [`PartitionLeaderCache`] used by the
 //! write-routing path to find the right peer for a partition.
 
+use crate::multi_raft_applier::PartitionGraphApplier;
 use crate::raft_service::RaftGroupRegistry;
 use meshdb_cluster::raft::{NodeId, RaftCluster};
 use meshdb_cluster::{PartitionId, PartitionReplicaMap};
@@ -32,6 +33,11 @@ pub struct MultiRaftCluster {
     /// every partition appears here — only the ones whose replica
     /// set includes `self_id`.
     pub partitions: HashMap<PartitionId, Arc<RaftCluster>>,
+    /// Concrete applier handles for the partitions hosted on this
+    /// peer. Stored separately from the `Arc<dyn GraphStateMachine>`
+    /// the `RaftCluster` holds so the recovery path can call
+    /// `PartitionGraphApplier::pending_tx_ids` without downcasting.
+    pub partition_appliers: HashMap<PartitionId, Arc<PartitionGraphApplier>>,
     /// The deterministic placement map shared by every peer.
     /// Lookup-only — multi-raft v1 does not rebalance at runtime.
     pub replica_map: Arc<PartitionReplicaMap>,
@@ -55,6 +61,7 @@ impl MultiRaftCluster {
         self_id: NodeId,
         meta: Arc<RaftCluster>,
         partitions: HashMap<PartitionId, Arc<RaftCluster>>,
+        partition_appliers: HashMap<PartitionId, Arc<PartitionGraphApplier>>,
         replica_map: Arc<PartitionReplicaMap>,
     ) -> Self {
         let leader_cache = PartitionLeaderCache::new(replica_map.num_partitions());
@@ -62,6 +69,7 @@ impl MultiRaftCluster {
             self_id,
             meta,
             partitions,
+            partition_appliers,
             replica_map,
             leader_cache,
         }

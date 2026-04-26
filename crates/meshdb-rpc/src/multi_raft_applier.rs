@@ -67,6 +67,21 @@ impl PartitionGraphApplier {
         }
     }
 
+    /// All in-doubt transaction ids — those whose `PreparedTx` entry
+    /// has been applied but whose matching `CommitTx` / `AbortTx` has
+    /// not yet been replicated. The recovery loop on a partition's
+    /// new leader uses this to drive `ResolveTransaction` against
+    /// the coordinator's log and propose the resolution into this
+    /// partition's Raft.
+    pub fn pending_tx_ids(&self) -> Vec<TxId> {
+        self.pending_txs
+            .lock()
+            .expect("pending_txs mutex poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// True when `node_id` is in this applier's partition. Used to
     /// drop misrouted commands silently — under correct routing the
     /// caller never sends a non-target command to us, but a

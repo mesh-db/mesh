@@ -333,6 +333,63 @@ async fn multi_raft_cross_partition_write_commits_atomically() {
 }
 
 #[tokio::test]
+async fn multi_raft_create_index_replicates_through_meta_group() {
+    // CREATE INDEX is DDL — it goes through the metadata Raft group,
+    // not partition groups. After the proposal commits, every peer
+    // should see the index in its local store regardless of which
+    // peer the user issued it through.
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Issue CREATE INDEX on the bootstrap peer.
+    peers[0]
+        .service
+        .execute_cypher_local(
+            "CREATE INDEX FOR (n:Person) ON (n.email)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    // Every peer's local store should reflect the index.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for peer in &peers {
+            let store = peer.multi_raft.meta.clone();
+            // Check via the Cypher SHOW INDEXES surface — round-trips
+            // through the executor against each peer's local store.
+            let rows = peer
+                .service
+                .execute_cypher_local("SHOW INDEXES".to_string(), std::collections::HashMap::new())
+                .await
+                .unwrap();
+            let saw_it = rows.iter().any(|row| {
+                let label = row.get("label").and_then(|v| match v {
+                    meshdb_executor::Value::Property(meshdb_core::Property::String(s)) => {
+                        Some(s.clone())
+                    }
+                    _ => None,
+                });
+                label.as_deref() == Some("Person")
+            });
+            if !saw_it {
+                if Instant::now() > deadline {
+                    panic!(
+                        "peer {} doesn't see Person index after 5s",
+                        peer.config.self_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue 'outer;
+            }
+            // Avoid clippy "unused" on the meta handle in this test.
+            let _ = store;
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_per_partition_storage_dirs_are_isolated() {
     // 3 peers, 4 partitions, rf=2 → not every peer hosts every
     // partition. Verifies storage-layout isolation per group and
