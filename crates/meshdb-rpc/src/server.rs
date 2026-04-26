@@ -1549,13 +1549,14 @@ impl MeshService {
         // meta group via the same routing once Phase 9 ships.
         let (ddl, graph) = split_ddl(commands);
         if !ddl.is_empty() {
-            // Forward DDL through the meta-raft group. This handles
-            // both the DDL-only and the DDL-mixed-with-data cases —
-            // Cypher in practice doesn't mix the two, but we apply
-            // DDL first so a follow-up data write sees the new index.
+            // DDL goes through the meta Raft group. Local-leader
+            // path proposes directly; non-leader proxies via
+            // `MeshWrite::ForwardDdl` to the meta leader so the
+            // user sees a transparent commit regardless of which
+            // peer they hit.
             for entry in ddl {
-                if let Err(e) = multi_raft.meta.propose_graph(entry).await {
-                    return Err(raft_propose_failed(e));
+                if let Err(e) = self.propose_meta_command(multi_raft, entry).await {
+                    return Err(e);
                 }
             }
             if graph.is_empty() {
@@ -1872,6 +1873,46 @@ impl MeshService {
             let _ = log.append(&crate::TxLogEntry::Completed { txid });
         }
         Ok(())
+    }
+
+    /// Propose a DDL `GraphCommand` through the metadata Raft group.
+    /// Local-leader proposes directly; non-leader forwards via
+    /// `MeshWrite::ForwardDdl` to the meta leader's peer. Mirrors
+    /// `propose_partition_command` for the per-partition case.
+    async fn propose_meta_command(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+        entry: GraphCommand,
+    ) -> std::result::Result<(), Status> {
+        // Try local propose first. If we're the meta leader the
+        // entry commits immediately; if not, openraft returns
+        // ForwardToLeader and we proxy.
+        match multi_raft.meta.propose_graph(entry.clone()).await {
+            Ok(_) => Ok(()),
+            Err(meshdb_cluster::Error::ForwardToLeader { leader_address, .. }) => {
+                let leader_addr = leader_address.ok_or_else(|| {
+                    Status::unavailable("meta-raft leader unknown; retry after election")
+                })?;
+                let mut client = self
+                    .leader_write_client(&leader_addr)
+                    .map_err(|e| Status::unavailable(format!("connecting to meta leader: {e}")))?;
+                let commands_json = serde_json::to_vec(&vec![entry])
+                    .map_err(|e| Status::internal(format!("encoding ddl: {e}")))?;
+                let resp = client
+                    .forward_ddl(crate::proto::ForwardDdlRequest { commands_json })
+                    .await?
+                    .into_inner();
+                if resp.ok {
+                    Ok(())
+                } else {
+                    Err(Status::unavailable(format!(
+                        "forwarded ddl rejected: {}",
+                        resp.error_message
+                    )))
+                }
+            }
+            Err(e) => Err(raft_propose_failed(e)),
+        }
     }
 
     /// Propose a single `GraphCommand` through `partition`'s Raft
@@ -5418,5 +5459,45 @@ impl MeshWrite for MeshService {
             }
             Err(e) => Err(Status::internal(format!("propose_graph: {e}"))),
         }
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "forward_ddl"))]
+    async fn forward_ddl(
+        &self,
+        request: Request<crate::proto::ForwardDdlRequest>,
+    ) -> Result<Response<crate::proto::ForwardDdlResponse>, Status> {
+        let req = request.into_inner();
+        let Some(multi_raft) = self.multi_raft.as_ref() else {
+            return Err(Status::failed_precondition(
+                "ForwardDdl called on a peer not running mode = \"multi-raft\"",
+            ));
+        };
+        let commands: Vec<GraphCommand> = serde_json::from_slice(&req.commands_json)
+            .map_err(|e| Status::invalid_argument(format!("decoding ddl commands: {e}")))?;
+        for entry in commands {
+            match multi_raft.meta.propose_graph(entry).await {
+                Ok(_) => {}
+                Err(meshdb_cluster::Error::ForwardToLeader { leader_id, .. }) => {
+                    let hint = leader_id.map(|id| id.0).unwrap_or(0);
+                    return Ok(Response::new(crate::proto::ForwardDdlResponse {
+                        ok: false,
+                        leader_hint: hint,
+                        error_message: "this peer is not the meta leader".into(),
+                    }));
+                }
+                Err(e) => {
+                    return Ok(Response::new(crate::proto::ForwardDdlResponse {
+                        ok: false,
+                        leader_hint: 0,
+                        error_message: format!("meta propose failed: {e}"),
+                    }));
+                }
+            }
+        }
+        Ok(Response::new(crate::proto::ForwardDdlResponse {
+            ok: true,
+            leader_hint: 0,
+            error_message: String::new(),
+        }))
     }
 }

@@ -480,6 +480,77 @@ async fn multi_raft_survives_partition_leader_shutdown() {
 }
 
 #[tokio::test]
+async fn multi_raft_concurrent_create_index_is_idempotent() {
+    // Three peers issue `CREATE INDEX` for the same `(label, prop)`
+    // simultaneously. The metadata Raft serializes the proposes;
+    // exactly one CreateIndex applies (the rest are no-ops because
+    // the storage layer's `create_property_index_composite` is
+    // idempotent). Every peer ends up with exactly one Person
+    // index and no errors propagate to the user.
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let cypher = "CREATE INDEX FOR (n:Person) ON (n.email)".to_string();
+
+    // Concurrent fan-out — every peer issues the same statement.
+    let (r0, r1, r2) = tokio::join!(
+        peers[0]
+            .service
+            .execute_cypher_local(cypher.clone(), std::collections::HashMap::new()),
+        peers[1]
+            .service
+            .execute_cypher_local(cypher.clone(), std::collections::HashMap::new()),
+        peers[2]
+            .service
+            .execute_cypher_local(cypher, std::collections::HashMap::new()),
+    );
+
+    // None of the three should error — the index either creates or
+    // is idempotent-no-op on each peer.
+    r0.expect("peer 0 CREATE INDEX");
+    r1.expect("peer 1 CREATE INDEX");
+    r2.expect("peer 2 CREATE INDEX");
+
+    // Every peer's local store should hold exactly one Person index
+    // — never two from the concurrent attempts.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for peer in &peers {
+            let rows = peer
+                .service
+                .execute_cypher_local("SHOW INDEXES".to_string(), std::collections::HashMap::new())
+                .await
+                .unwrap();
+            let person_count = rows
+                .iter()
+                .filter(|row| {
+                    row.get("label")
+                        .and_then(|v| match v {
+                            meshdb_executor::Value::Property(meshdb_core::Property::String(s)) => {
+                                Some(s.as_str())
+                            }
+                            _ => None,
+                        })
+                        .map(|s| s == "Person")
+                        .unwrap_or(false)
+                })
+                .count();
+            if person_count != 1 {
+                if Instant::now() > deadline {
+                    panic!(
+                        "peer {} sees {person_count} Person indexes; expected 1",
+                        peer.config.self_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_per_partition_storage_dirs_are_isolated() {
     // 3 peers, 4 partitions, rf=2 → not every peer hosts every
     // partition. Verifies storage-layout isolation per group and

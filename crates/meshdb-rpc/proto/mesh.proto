@@ -341,6 +341,13 @@ service MeshWrite {
   // internally and the client sees one consistent gRPC endpoint for
   // its session.
   rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+  // Multi-raft mode only: forward a DDL command (CreateIndex,
+  // CreateConstraint, InstallTrigger, etc.) to the metadata Raft
+  // group's leader for proposal. Same shape as ForwardWrite but
+  // targets `meta` instead of a partition. Lets DDL issued from
+  // any peer transparently reach the meta leader without surfacing
+  // a ForwardToLeader to the client.
+  rpc ForwardDdl(ForwardDdlRequest) returns (ForwardDdlResponse);
 }
 
 enum BatchPhase {
@@ -388,6 +395,24 @@ message ForwardWriteResponse {
   uint64 leader_hint = 2;
   // Human-readable error message when `ok = false`. Empty on
   // success.
+  string error_message = 3;
+}
+
+message ForwardDdlRequest {
+  // serde-json-serialized Vec<meshdb_cluster::GraphCommand>. Every
+  // command must be a DDL variant — the receiver proposes them
+  // through the metadata Raft group one by one. Mixed batches
+  // are accepted and proposed in order.
+  bytes commands_json = 1;
+}
+
+message ForwardDdlResponse {
+  // True iff every DDL command committed through the meta Raft.
+  bool ok = 1;
+  // When `ok = false`, the NodeId the receiver believes is the
+  // current meta leader. Caller refreshes its hint and retries.
+  // `0` means "leader unknown".
+  uint64 leader_hint = 2;
   string error_message = 3;
 }
 

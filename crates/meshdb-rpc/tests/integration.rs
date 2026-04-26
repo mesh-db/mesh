@@ -1,3 +1,7 @@
+// Same recursion_limit bump as the lib — async stack depth from
+// `MeshService::execute_cypher_local` exceeds rustc's default 128.
+#![recursion_limit = "256"]
+
 use meshdb_cluster::{Cluster, Peer, PeerId};
 use meshdb_core::{Edge, Node, Property};
 use meshdb_executor::{ParamMap, Value};
@@ -2409,6 +2413,12 @@ impl meshdb_rpc::proto::mesh_write_server::MeshWrite for StallingMeshWrite {
         &self,
         _req: tonic::Request<meshdb_rpc::proto::ForwardWriteRequest>,
     ) -> Result<tonic::Response<meshdb_rpc::proto::ForwardWriteResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn forward_ddl(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::ForwardDdlRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::ForwardDdlResponse>, tonic::Status> {
         std::future::pending().await
     }
 }
