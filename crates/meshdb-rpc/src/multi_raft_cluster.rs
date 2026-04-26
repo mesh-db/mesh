@@ -239,7 +239,9 @@ impl MultiRaftCluster {
             .change_membership(openraft::ChangeMembers::AddVoters(members), false)
             .await
             .map(|_| ())
-            .map_err(|e| format!("partition {} AddVoters: {e}", partition.0))
+            .map_err(|e| format!("partition {} AddVoters: {e}", partition.0))?;
+        self.publish_partition_voters(partition).await;
+        Ok(())
     }
 
     /// Remove a peer as a voter of `partition`'s Raft group. Wraps
@@ -266,7 +268,58 @@ impl MultiRaftCluster {
             .change_membership(openraft::ChangeMembers::RemoveVoters(to_remove), false)
             .await
             .map(|_| ())
-            .map_err(|e| format!("partition {} RemoveVoters: {e}", partition.0))
+            .map_err(|e| format!("partition {} RemoveVoters: {e}", partition.0))?;
+        self.publish_partition_voters(partition).await;
+        Ok(())
+    }
+
+    /// Publish the partition's current voter set through the meta
+    /// Raft as a `ClusterCommand::SetPartitionReplicas` so the
+    /// cluster's persisted view of placement matches the partition
+    /// Raft's actual membership. Called after a successful
+    /// `change_membership` on the partition.
+    ///
+    /// Failures here are logged but not propagated — the rebalance
+    /// itself succeeded; only the meta-side bookkeeping fell behind.
+    /// An operator can re-run the rebalance API to reconcile, or
+    /// the periodic recovery loop will eventually surface the gap
+    /// (future work; for v1 the operator handles it).
+    async fn publish_partition_voters(&self, partition: PartitionId) {
+        let voters = self.current_partition_voters(partition).await;
+        if let Err(e) = self
+            .meta
+            .propose(meshdb_cluster::ClusterCommand::SetPartitionReplicas {
+                partition: partition.0,
+                replicas: voters.iter().map(|p| p.0).collect(),
+            })
+            .await
+        {
+            tracing::warn!(
+                partition = ?partition,
+                error = %e,
+                "post-rebalance SetPartitionReplicas propose failed; \
+                 partition Raft membership advanced but cluster view did not — \
+                 operator should re-run the rebalance API to reconcile"
+            );
+        }
+    }
+
+    /// Snapshot the partition Raft's current voter set as observed
+    /// by this peer's local replica.
+    async fn current_partition_voters(
+        &self,
+        partition: PartitionId,
+    ) -> Vec<meshdb_cluster::PeerId> {
+        let Some(raft) = self.partitions.get(&partition) else {
+            return Vec::new();
+        };
+        let metrics = raft.raft.metrics().borrow().clone();
+        metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .map(meshdb_cluster::PeerId)
+            .collect()
     }
 }
 

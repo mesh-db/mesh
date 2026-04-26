@@ -772,6 +772,61 @@ async fn multi_raft_trigger_install_and_fire() {
 }
 
 #[tokio::test]
+async fn multi_raft_replica_map_persisted_through_meta_after_rebalance() {
+    // After remove_partition_replica succeeds, the meta-replicated
+    // ClusterState's `partition_replica_map` should reflect the new
+    // voter set. Every peer's local view of the cluster (read via
+    // multi_raft.meta.current_state()) eventually shows the change.
+    let peers = spawn_multi_raft_cluster(3, 2, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let p0 = PartitionId(0);
+    let leader_id = peers[0].multi_raft.leader_of(p0).expect("p0 leader");
+    let leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == leader_id)
+        .unwrap();
+    let evict_id = peers
+        .iter()
+        .map(|p| p.config.self_id)
+        .find(|id| *id != leader_id)
+        .unwrap();
+
+    peers[leader_idx]
+        .multi_raft
+        .remove_partition_replica(p0, evict_id)
+        .await
+        .expect("remove_partition_replica");
+
+    // Wait for SetPartitionReplicas to propagate through meta. Every
+    // peer's persisted state should drop the evicted id from
+    // partition 0's replica set.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: loop {
+        for peer in &peers {
+            let state = peer.multi_raft.meta.current_state().await;
+            let replicas: Vec<u64> = state
+                .partition_replica_map
+                .as_ref()
+                .map(|m| m.replicas(p0).iter().map(|p| p.0).collect())
+                .unwrap_or_default();
+            if replicas.contains(&evict_id) || replicas.is_empty() {
+                if Instant::now() > deadline {
+                    panic!(
+                        "peer {} partition 0 replicas = {replicas:?} still \
+                         contains {evict_id} (or is empty)",
+                        peer.config.self_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+}
+
+#[tokio::test]
 async fn multi_raft_remove_partition_replica_shrinks_voters() {
     // 3 peers, 2 partitions, rf=3 → every peer is a voter of every
     // partition. Find partition 0's leader, call

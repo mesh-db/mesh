@@ -372,17 +372,23 @@ async fn build_multi_raft_components(
         .collect();
     let membership = Membership::new(peers);
     let peer_ids: Vec<PeerId> = membership.peer_ids().collect();
-    let replica_map = Arc::new(
+    let initial_replica_map =
         PartitionReplicaMap::round_robin_replicas(&peer_ids, config.num_partitions, rf)
-            .context("building partition replica map")?,
-    );
+            .context("building partition replica map")?;
     // The legacy PartitionMap (single owner per partition) still
     // populates ClusterState — multi-raft routing reads from
     // replica_map, but ClusterState's structure stays unchanged so
     // the meta group's snapshot/restore is shared with single-Raft.
     let partition_map = PartitionMap::round_robin(&peer_ids, config.num_partitions)
         .context("building partition map")?;
-    let initial_state = ClusterState::new(membership, partition_map);
+    // Seed the meta-replicated ClusterState with the initial
+    // replica map so a cold start has the placement durable from
+    // the first applied entry. On a warm restart, openraft loads
+    // the persisted ClusterState which carries any
+    // `SetPartitionReplicas` updates applied since bootstrap.
+    let initial_state =
+        ClusterState::with_replica_map(membership, partition_map, initial_replica_map.clone());
+    let replica_map = Arc::new(initial_replica_map);
 
     // One channel pool, shared across every group via for_group().
     let peer_map: Vec<(u64, String)> = config
@@ -435,6 +441,17 @@ async fn build_multi_raft_components(
     .await
     .context("building meta raft cluster")?
     .with_label("meta");
+
+    // Read the persisted ClusterState — on a warm restart this
+    // contains any `SetPartitionReplicas` entries applied since
+    // bootstrap, so the partition-spin-up loop below sees the
+    // current placement, not the original round-robin assignment.
+    let persisted_state = meta_raft.current_state().await;
+    let effective_replica_map = persisted_state
+        .partition_replica_map
+        .clone()
+        .unwrap_or_else(|| (*replica_map).clone());
+    let replica_map = Arc::new(effective_replica_map);
 
     // Per-partition groups — only the ones whose replica set
     // contains this peer.
