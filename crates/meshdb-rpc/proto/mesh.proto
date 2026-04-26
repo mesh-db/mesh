@@ -537,6 +537,16 @@ service MeshRaft {
 
 message RaftRpcRequest {
   bytes payload = 1;
+
+  // Which Raft group this RPC targets. Unset = the legacy single-Raft
+  // group, preserving the wire shape every pre-multi-raft peer expects.
+  // `meta = true` targets the multi-raft metadata group; `partition = N`
+  // targets per-partition Raft group N. Mutually exclusive — at most
+  // one is set.
+  oneof target {
+    bool meta = 2;
+    uint32 partition = 3;
+  }
 }
 
 message RaftRpcResponse {

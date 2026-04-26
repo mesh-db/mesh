@@ -49,8 +49,8 @@ pub use participant_log::{
 };
 pub use partitioned_reader::PartitionedGraphReader;
 pub use raft_applier::StoreGraphApplier;
-pub use raft_network::{GrpcNetwork, GrpcNetworkError};
-pub use raft_service::MeshRaftService;
+pub use raft_network::{GrpcNetwork, GrpcNetworkError, RaftGroupTarget};
+pub use raft_service::{MeshRaftService, RaftGroupRegistry};
 pub use routing::{Routing, RoutingError};
 pub use routing_writer::RoutingGraphWriter;
 pub use server::MeshService;

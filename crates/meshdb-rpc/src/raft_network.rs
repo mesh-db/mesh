@@ -6,8 +6,10 @@
 //! openraft's internal types evolve.
 
 use crate::proto::mesh_raft_client::MeshRaftClient;
+use crate::proto::raft_rpc_request::Target;
 use crate::proto::{RaftRpcRequest, RaftRpcResponse};
 use meshdb_cluster::raft::{MeshRaftConfig, NodeId};
+use meshdb_cluster::PartitionId;
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -19,11 +21,40 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+/// Which Raft group an outbound RPC targets on the remote peer.
+/// Mirrors [`crate::proto::raft_rpc_request::Target`] but typed for
+/// internal callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaftGroupTarget {
+    /// Single-Raft group — sends with no `target` field set, matching
+    /// the wire shape every pre-multi-raft peer expects.
+    Legacy,
+    /// Multi-raft metadata group.
+    Meta,
+    /// Multi-raft partition group `N`.
+    Partition(PartitionId),
+}
+
+impl RaftGroupTarget {
+    fn to_proto(self) -> Option<Target> {
+        match self {
+            RaftGroupTarget::Legacy => None,
+            RaftGroupTarget::Meta => Some(Target::Meta(true)),
+            RaftGroupTarget::Partition(p) => Some(Target::Partition(p.0)),
+        }
+    }
+}
+
 /// Maps peer ids to their gRPC addresses. The factory holds lazy channels so
 /// `new_client` is cheap to call from openraft.
 #[derive(Debug, Clone)]
 pub struct GrpcNetwork {
     channels: Arc<HashMap<NodeId, Channel>>,
+    /// Which Raft group `new_client` should tag outbound RPCs with.
+    /// Single-Raft mode leaves it at `Legacy` so the wire shape is
+    /// identical to the pre-multi-raft binary; multi-raft per-group
+    /// network factories override this via [`GrpcNetwork::for_group`].
+    target: RaftGroupTarget,
 }
 
 impl GrpcNetwork {
@@ -70,7 +101,20 @@ impl GrpcNetwork {
         }
         Ok(Self {
             channels: Arc::new(channels),
+            target: RaftGroupTarget::Legacy,
         })
+    }
+
+    /// Reuse this network's channel map but tag outbound RPCs with a
+    /// specific multi-raft group. Used when each Raft instance gets
+    /// its own [`RaftNetworkFactory`] (one for the metadata group,
+    /// one per partition group) but they all share the same channel
+    /// pool to avoid duplicating connections.
+    pub fn for_group(&self, target: RaftGroupTarget) -> Self {
+        Self {
+            channels: self.channels.clone(),
+            target,
+        }
     }
 }
 
@@ -90,13 +134,21 @@ impl RaftNetworkFactory<MeshRaftConfig> for GrpcNetwork {
         // (shouldn't happen in a correctly-configured cluster) the client
         // will surface the error on its first RPC as an Unreachable error.
         let channel = self.channels.get(&target).cloned();
-        GrpcNetworkClient { target, channel }
+        GrpcNetworkClient {
+            target,
+            channel,
+            group: self.target,
+        }
     }
 }
 
 pub struct GrpcNetworkClient {
     target: NodeId,
     channel: Option<Channel>,
+    /// Which multi-raft group this client tags outbound RPCs with.
+    /// `Legacy` keeps the wire shape identical to single-Raft mode
+    /// (no `target` field set on the proto).
+    group: RaftGroupTarget,
 }
 
 impl GrpcNetworkClient {
@@ -121,7 +173,10 @@ impl RaftNetwork<MeshRaftConfig> for GrpcNetworkClient {
             serde_json::to_vec(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let mut client = self.client().map_err(RPCError::Network)?;
         let resp = client
-            .append_entries(RaftRpcRequest { payload })
+            .append_entries(RaftRpcRequest {
+                payload,
+                target: self.group.to_proto(),
+            })
             .await
             .map_err(|s| {
                 RPCError::Network(NetworkError::new(&std::io::Error::new(
@@ -147,7 +202,10 @@ impl RaftNetwork<MeshRaftConfig> for GrpcNetworkClient {
             serde_json::to_vec(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let mut client = self.client().map_err(RPCError::Network)?;
         let resp = client
-            .install_snapshot(RaftRpcRequest { payload })
+            .install_snapshot(RaftRpcRequest {
+                payload,
+                target: self.group.to_proto(),
+            })
             .await
             .map_err(|s| {
                 RPCError::Network(NetworkError::new(&std::io::Error::new(
@@ -171,12 +229,18 @@ impl RaftNetwork<MeshRaftConfig> for GrpcNetworkClient {
         let payload =
             serde_json::to_vec(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let mut client = self.client().map_err(RPCError::Network)?;
-        let resp = client.vote(RaftRpcRequest { payload }).await.map_err(|s| {
-            RPCError::Network(NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::Other,
-                s.message().to_string(),
-            )))
-        })?;
+        let resp = client
+            .vote(RaftRpcRequest {
+                payload,
+                target: self.group.to_proto(),
+            })
+            .await
+            .map_err(|s| {
+                RPCError::Network(NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    s.message().to_string(),
+                )))
+            })?;
         let result: Result<VoteResponse<NodeId>, RaftError<NodeId>> =
             serde_json::from_slice(&resp.into_inner().payload)
                 .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
