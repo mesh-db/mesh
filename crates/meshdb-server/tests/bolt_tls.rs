@@ -67,6 +67,8 @@ async fn spawn_tls_bolt_server() -> (String, TempDir) {
                 local_advertised: addr.to_string(),
                 peers: Arc::new(meshdb_cluster::Membership::new(std::iter::empty())),
                 raft: None,
+                multi_raft: None,
+                routing_ttl_seconds: None,
             }),
         )
         .await;

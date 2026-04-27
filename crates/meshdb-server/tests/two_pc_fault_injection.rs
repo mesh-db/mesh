@@ -106,6 +106,7 @@ fn make_server_config(
         replication_factor: None,
         read_consistency: None,
         cluster_auth: None,
+        routing_ttl_seconds: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     }

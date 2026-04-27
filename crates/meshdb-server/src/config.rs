@@ -242,6 +242,20 @@ pub struct ServerConfig {
     #[cfg(feature = "apoc-load")]
     #[serde(default)]
     pub apoc_import: Option<meshdb_executor::ImportConfig>,
+
+    /// TTL (in seconds) advertised on every Bolt ROUTE response.
+    /// Drivers cache the routing table for this long before
+    /// re-fetching. Tradeoff is staleness vs. ROUTE-handler load:
+    /// shorter TTL means drivers pick up topology changes (peer
+    /// join, leader transfer) faster but issue more ROUTE traffic.
+    ///
+    /// `None` keeps the historical effectively-infinite TTL
+    /// (~292 years) for single-node and routing modes. Multi-raft
+    /// mode defaults to 30 seconds via `serve()` so drivers
+    /// observe partition rebalancing without operator intervention.
+    /// Set explicitly to override.
+    #[serde(default)]
+    pub routing_ttl_seconds: Option<u64>,
 }
 
 fn default_num_partitions() -> u32 {
@@ -510,6 +524,7 @@ mod tests {
             replication_factor: None,
             read_consistency: None,
             cluster_auth: None,
+            routing_ttl_seconds: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         }

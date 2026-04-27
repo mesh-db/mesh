@@ -935,6 +935,22 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             local_advertised,
             peers: Arc::new(Membership::new(peers_for_route)),
             raft: raft_handle.clone(),
+            multi_raft: components.multi_raft.clone(),
+            // Multi-raft has dynamic partition leadership and
+            // membership churn, so default to a 30-second TTL —
+            // drivers re-fetch the routing table fast enough to
+            // observe leader transfers and node-join events without
+            // hammering the ROUTE handler. Other modes inherit the
+            // historical effectively-infinite TTL unless the
+            // operator opts in. The override knob is
+            // [`ServerConfig::routing_ttl_seconds`].
+            routing_ttl_seconds: config.routing_ttl_seconds.or_else(|| {
+                if components.multi_raft.is_some() {
+                    Some(30)
+                } else {
+                    None
+                }
+            }),
         });
         Some(tokio::spawn(async move {
             if let Err(e) = bolt::run_listener(

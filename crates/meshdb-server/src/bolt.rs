@@ -91,6 +91,21 @@ pub struct RouteContext {
     pub local_advertised: String,
     pub peers: Arc<Membership>,
     pub raft: Option<Arc<RaftCluster>>,
+    /// Multi-raft cluster handle when `mode = "multi-raft"`. Drives
+    /// the ROUTE response: WRITE / READ / ROUTE all list every
+    /// peer's Bolt address (multi-raft does server-side leader
+    /// forwarding so any peer can accept writes), and the TTL drops
+    /// to `routing_ttl_seconds` so drivers re-fetch as topology
+    /// drifts (membership changes, partition leader churn).
+    pub multi_raft: Option<Arc<meshdb_rpc::MultiRaftCluster>>,
+    /// TTL in seconds advertised on every ROUTE response. Bolt
+    /// drivers cache the routing table for this long before
+    /// re-fetching. `None` keeps the historical effectively-infinite
+    /// TTL (~292y); a finite value is recommended for any
+    /// multi-peer deployment so drivers pick up topology changes
+    /// without a manual session bounce. Defaults are wired through
+    /// [`ServerConfig::routing_ttl_seconds`].
+    pub routing_ttl_seconds: Option<u64>,
 }
 
 /// Current connection phase used by the message-dispatch loop.
@@ -829,10 +844,11 @@ fn route_success(ctx: &RouteContext) -> BoltMessage {
         }
     }
 
-    // WRITE list. Raft mode wants just the leader; routing and
-    // single-node accept the full advertised list. Any fallback path
-    // lands on `local_advertised` so the table always has at least
-    // one WRITE entry.
+    // WRITE list. Raft mode wants just the leader; routing,
+    // multi-raft, and single-node accept the full advertised list
+    // (multi-raft does server-side leader forwarding so any peer
+    // accepts writes). Any fallback lands on `local_advertised` so
+    // the table always has at least one WRITE entry.
     let write_addrs: Vec<String> = match ctx.raft.as_ref() {
         Some(raft) => {
             let leader_bolt = raft
@@ -855,8 +871,15 @@ fn route_success(ctx: &RouteContext) -> BoltMessage {
             ("role", BoltValue::String(role.to_string())),
         ])
     };
+    // TTL: long-cache historical default (~292y) when unset, finite
+    // value when configured. Multi-raft mode defaults to a finite
+    // TTL via `serve()` so drivers re-fetch as partitions reshuffle.
+    let ttl_seconds = ctx
+        .routing_ttl_seconds
+        .map(|t| t as i64)
+        .unwrap_or(9_223_372_036);
     let rt = BoltValue::map([
-        ("ttl", BoltValue::Int(9_223_372_036)),
+        ("ttl", BoltValue::Int(ttl_seconds)),
         (
             "servers",
             BoltValue::List(vec![
