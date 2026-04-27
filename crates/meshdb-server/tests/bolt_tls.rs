@@ -210,8 +210,8 @@ async fn build_tls_acceptor_rejects_missing_cert_file() {
     let missing = dir.path().join("does-not-exist.pem");
     let err = acceptor_err(build_tls_acceptor(&missing, &key));
     assert!(
-        err.contains("reading bolt tls cert"),
-        "expected a `reading bolt tls cert` error, got: {err}"
+        err.contains("reading tls cert"),
+        "expected a `reading tls cert` error, got: {err}"
     );
 }
 

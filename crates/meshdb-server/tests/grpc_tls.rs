@@ -178,3 +178,157 @@ async fn grpc_tls_rejects_plaintext_client() {
         }
     }
 }
+
+/// Capturing verifier for the gRPC hot-reload test below — bypasses
+/// peer-cert validation (the cert is self-signed, intentionally) and
+/// records the leaf cert DER for comparison across reloads.
+#[derive(Debug)]
+struct CapturingGrpcVerifier {
+    captured: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl CapturingGrpcVerifier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            captured: std::sync::Mutex::new(None),
+        })
+    }
+    fn captured(&self) -> Option<Vec<u8>> {
+        self.captured.lock().unwrap().clone()
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for CapturingGrpcVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        *self.captured.lock().unwrap() = Some(end_entity.as_ref().to_vec());
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _msg: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _msg: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+        ]
+    }
+}
+
+/// Connect to `addr` over TLS, send one Health RPC, and return
+/// the leaf cert the server presented.
+async fn fetch_grpc_presented_cert(addr: &str) -> Vec<u8> {
+    let verifier = CapturingGrpcVerifier::new();
+    let client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier.clone())
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    // Just complete the TLS handshake — no need to drive an actual
+    // gRPC RPC, the cert verifier captures during handshake.
+    let _tls_stream = connector.connect(server_name, stream).await.unwrap();
+    verifier.captured().expect("verifier captured a cert")
+}
+
+/// gRPC TLS hot-reload swaps the server cert without dropping
+/// the listener. Connect once → see cert A. Replace cert files
+/// in place. Wait past the reload interval. Connect again → see
+/// cert B.
+#[tokio::test]
+async fn grpc_tls_hot_reload_picks_up_replaced_cert() {
+    use meshdb_server::tls_reload::build_hot_reloading_tls_acceptor;
+
+    install_default_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let fixture = write_self_signed(&dir);
+
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    let service = MeshService::new(store);
+
+    let (acceptor, _reload_handle) = build_hot_reloading_tls_acceptor(
+        &fixture.cert_path,
+        &fixture.key_path,
+        Duration::from_millis(50),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Custom incoming: TLS handshake per-connection, plaintext
+    // streams forwarded to tonic. Mirrors the lib.rs serve() path.
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        std::result::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, std::io::Error>,
+    >(32);
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let acceptor = acceptor.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Ok(s) = acceptor.accept(tcp).await {
+                    let _ = tx.send(Ok(s)).await;
+                }
+            });
+        }
+    });
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service.clone().into_query_server())
+            .add_service(service.into_write_server())
+            .serve_with_incoming(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let cert_a = fetch_grpc_presented_cert(&addr.to_string()).await;
+
+    // Sleep past mtime resolution, swap cert files.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let params2 =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap();
+    let key_pair2 = rcgen::KeyPair::generate().unwrap();
+    let cert2 = params2.self_signed(&key_pair2).unwrap();
+    std::fs::write(&fixture.cert_path, cert2.pem()).unwrap();
+    std::fs::write(&fixture.key_path, key_pair2.serialize_pem()).unwrap();
+
+    // Wait for at least one reload tick to land.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let cert_b = fetch_grpc_presented_cert(&addr.to_string()).await;
+
+    assert_ne!(
+        cert_a, cert_b,
+        "after hot-reload the gRPC listener should present the new cert"
+    );
+}

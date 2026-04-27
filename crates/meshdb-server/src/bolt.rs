@@ -54,7 +54,6 @@
 //! `meshdb-rpc/src/tx_overlay.rs` for the exact semantics.
 
 use crate::value_conv::{bolt_params_to_param_map, field_names_from_rows, row_to_bolt_fields};
-use anyhow::Context;
 use meshdb_bolt::{
     perform_server_handshake_with, read_message, write_message, BoltError, BoltMessage, BoltValue,
     BOLT_4_4, BOLT_5_0, BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4, SUPPORTED,
@@ -202,181 +201,26 @@ pub async fn run_listener(
     }
 }
 
-/// Load and parse a cert + key pair into rustls's wire types.
-/// Used by the initial `build_tls_acceptor` call and by every
-/// reload tick on the hot-reload path.
-fn load_certified_key(
-    cert_path: &Path,
-    key_path: &Path,
-) -> anyhow::Result<Arc<rustls::sign::CertifiedKey>> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-    let cert_bytes = std::fs::read(cert_path)
-        .with_context(|| format!("reading bolt tls cert {}", cert_path.display()))?;
-    let key_bytes = std::fs::read(key_path)
-        .with_context(|| format!("reading bolt tls key {}", key_path.display()))?;
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_bytes.as_slice())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("parsing bolt tls cert {}", cert_path.display()))?;
-    if certs.is_empty() {
-        anyhow::bail!(
-            "bolt tls cert {} contained no CERTIFICATE PEM blocks",
-            cert_path.display()
-        );
-    }
-
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_bytes.as_slice())
-        .with_context(|| format!("parsing bolt tls key {}", key_path.display()))?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "bolt tls key {} contained no PRIVATE KEY PEM block",
-                key_path.display()
-            )
-        })?;
-
-    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
-        .context("building signing key from private key")?;
-
-    Ok(Arc::new(rustls::sign::CertifiedKey::new(
-        certs,
-        signing_key,
-    )))
-}
-
-/// `ResolvesServerCert` impl that returns the cert held in a
-/// shared `Mutex`. The TLS handshake hits this on every accept;
-/// the background reload task swaps the inner Arc on each
-/// successful reload, so new connections immediately use the
-/// rotated cert without restarting the listener. In-flight
-/// connections retain whichever cert their handshake completed
-/// against — rustls clones the Arc into the per-connection state.
-#[derive(Debug)]
-struct HotReloadingCertResolver {
-    current: std::sync::Mutex<Arc<rustls::sign::CertifiedKey>>,
-}
-
-impl HotReloadingCertResolver {
-    fn new(initial: Arc<rustls::sign::CertifiedKey>) -> Self {
-        Self {
-            current: std::sync::Mutex::new(initial),
-        }
-    }
-
-    fn replace(&self, next: Arc<rustls::sign::CertifiedKey>) {
-        *self.current.lock().expect("cert mutex poisoned") = next;
-    }
-}
-
-impl rustls::server::ResolvesServerCert for HotReloadingCertResolver {
-    fn resolve(
-        &self,
-        _hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        Some(self.current.lock().expect("cert mutex poisoned").clone())
-    }
-}
-
-/// Build a [`TlsAcceptor`] from PEM-encoded certificate + private key
-/// files. The certificate file may contain one or more X.509
-/// certificates (leaf first, then any intermediates); the private key
-/// file may hold a PKCS#8, SEC1 (EC), or RSA-format key — the first
-/// key found wins.
+/// Build a static [`TlsAcceptor`] from PEM-encoded cert + key
+/// files. Wraps [`crate::tls_reload::build_static_tls_acceptor`];
+/// this thin wrapper exists so existing callers in the test
+/// harness keep working with the older `bolt::` module path.
 ///
 /// The caller is responsible for installing a rustls crypto provider
 /// before calling this (see [`install_default_crypto_provider`]).
-///
-/// Static — the cert is loaded once and never rotated. For
-/// zero-downtime cert rotation use
-/// [`build_tls_acceptor_with_reload`].
 pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAcceptor> {
-    use rustls::ServerConfig;
-
-    let certified = load_certified_key(cert_path, key_path)?;
-    let resolver = Arc::new(HotReloadingCertResolver::new(certified));
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    crate::tls_reload::build_static_tls_acceptor(cert_path, key_path)
 }
 
-/// Same as [`build_tls_acceptor`] but spawns a background task
-/// that polls the cert + key files every `reload_interval` and
-/// hot-swaps the certificate when either file's mtime changes.
-/// New TLS handshakes use the rotated cert immediately; in-flight
-/// handshakes retain the old cert. Reload errors (file missing,
-/// PEM parse failure) are logged at WARN and the previous cert
-/// stays in place — the listener never goes down.
-///
-/// Returns the acceptor + the `JoinHandle` of the reload task so
-/// the caller can abort it at shutdown.
+/// Hot-reloading variant of [`build_tls_acceptor`]. Wraps
+/// [`crate::tls_reload::build_hot_reloading_tls_acceptor`]; see
+/// that module for the cadence + error semantics.
 pub fn build_tls_acceptor_with_reload(
     cert_path: &Path,
     key_path: &Path,
     reload_interval: std::time::Duration,
 ) -> anyhow::Result<(TlsAcceptor, tokio::task::JoinHandle<()>)> {
-    use rustls::ServerConfig;
-
-    let certified = load_certified_key(cert_path, key_path)?;
-    let resolver = Arc::new(HotReloadingCertResolver::new(certified));
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver.clone());
-    let acceptor = TlsAcceptor::from(Arc::new(config));
-
-    // Reload task. Polls mtime on both files; rebuilds the
-    // CertifiedKey when either changes. Doesn't crash on missing /
-    // unreadable files — operators replace files atomically, but a
-    // brief read race during the swap would otherwise cause a
-    // listener panic.
-    let cert_path = cert_path.to_path_buf();
-    let key_path = key_path.to_path_buf();
-    let initial_mtime = std::fs::metadata(&cert_path)
-        .and_then(|m| m.modified())
-        .ok();
-    let initial_mtime_key = std::fs::metadata(&key_path).and_then(|m| m.modified()).ok();
-    let mut last_cert_mtime = initial_mtime;
-    let mut last_key_mtime = initial_mtime_key;
-    let handle = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(reload_interval);
-        // Skip the first immediate tick (we just loaded the certs
-        // synchronously above).
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            let cert_mtime = std::fs::metadata(&cert_path)
-                .and_then(|m| m.modified())
-                .ok();
-            let key_mtime = std::fs::metadata(&key_path).and_then(|m| m.modified()).ok();
-            if cert_mtime == last_cert_mtime && key_mtime == last_key_mtime {
-                continue;
-            }
-            match load_certified_key(&cert_path, &key_path) {
-                Ok(next) => {
-                    resolver.replace(next);
-                    last_cert_mtime = cert_mtime;
-                    last_key_mtime = key_mtime;
-                    tracing::info!(
-                        cert_path = %cert_path.display(),
-                        key_path = %key_path.display(),
-                        "bolt tls cert reloaded"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        cert_path = %cert_path.display(),
-                        error = %e,
-                        "bolt tls cert reload failed; keeping previous cert"
-                    );
-                    // Don't update last_*_mtime — try again on the
-                    // next tick when the operator finishes their
-                    // atomic swap.
-                }
-            }
-        }
-    });
-
-    Ok((acceptor, handle))
+    crate::tls_reload::build_hot_reloading_tls_acceptor(cert_path, key_path, reload_interval)
 }
 
 /// Install the default rustls crypto provider (aws-lc-rs). Delegates

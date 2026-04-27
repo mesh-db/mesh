@@ -418,6 +418,21 @@ pub struct GrpcTlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub ca_path: PathBuf,
+
+    /// When set, the gRPC listener spawns a background reload task
+    /// that polls the cert + key files at the given interval (in
+    /// seconds) and hot-swaps the certificate when either file's
+    /// mtime changes. New TLS handshakes pick up the rotated cert
+    /// immediately; in-flight handshakes keep the old cert.
+    /// Recommended for any deployment where certs are auto-rotated
+    /// (cert-manager, ACME, etc.). Omit for static certs.
+    ///
+    /// When this is set, the gRPC server bypasses tonic's built-in
+    /// `ServerTlsConfig` (which doesn't expose a cert resolver) and
+    /// terminates TLS in a custom `tokio_rustls::TlsAcceptor` in
+    /// front of `serve_with_incoming_shutdown`.
+    #[serde(default)]
+    pub reload_interval_seconds: Option<u64>,
 }
 
 impl BoltAuthConfig {

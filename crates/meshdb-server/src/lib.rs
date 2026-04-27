@@ -9,6 +9,7 @@
 pub mod bolt;
 pub mod config;
 pub mod metrics;
+pub mod tls_reload;
 pub mod value_conv;
 
 use anyhow::{anyhow, Context, Result};
@@ -1000,44 +1001,124 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         None
     };
 
-    // Server-side TLS identity for the gRPC listener. Built up-front
-    // so a bad cert path fails before we spawn the server task.
-    let grpc_server_tls = if let Some(tls_cfg) = config.grpc_tls.as_ref() {
+    // Server-side TLS identity for the gRPC listener. Either:
+    //   * Static (`reload_interval_seconds` unset): tonic's
+    //     `ServerTlsConfig` loads the cert once at startup.
+    //   * Hot-reload (`reload_interval_seconds = N`): we build a
+    //     `tokio_rustls::TlsAcceptor` with a `ResolvesServerCert`
+    //     hook and terminate TLS ourselves; tonic gets plaintext
+    //     streams via `serve_with_incoming_shutdown`. This is
+    //     necessary because tonic 0.12's `ServerTlsConfig` doesn't
+    //     expose the cert resolver, so a static-tonic-tls listener
+    //     can't rotate without a restart.
+    enum GrpcTls {
+        Static(tonic::transport::ServerTlsConfig),
+        HotReload(tokio_rustls::TlsAcceptor, tokio::task::JoinHandle<()>),
+    }
+    let grpc_tls = if let Some(tls_cfg) = config.grpc_tls.as_ref() {
         meshdb_rpc::tls::install_default_crypto_provider();
-        Some(
-            meshdb_rpc::tls::build_server_tls_config(&tls_cfg.cert_path, &tls_cfg.key_path)
-                .context("building grpc server tls config")?,
-        )
+        match tls_cfg.reload_interval_seconds {
+            Some(secs) => {
+                let (acceptor, handle) = tls_reload::build_hot_reloading_tls_acceptor(
+                    &tls_cfg.cert_path,
+                    &tls_cfg.key_path,
+                    Duration::from_secs(secs),
+                )
+                .context("building grpc tls hot-reloading acceptor")?;
+                Some(GrpcTls::HotReload(acceptor, handle))
+            }
+            None => Some(GrpcTls::Static(
+                meshdb_rpc::tls::build_server_tls_config(&tls_cfg.cert_path, &tls_cfg.key_path)
+                    .context("building grpc server tls config")?,
+            )),
+        }
     } else {
         None
     };
-    if grpc_server_tls.is_some() {
-        tracing::info!(addr = %local_addr, "meshdb-server grpc tls enabled");
+    let grpc_tls_state = match &grpc_tls {
+        Some(GrpcTls::Static(_)) => "static",
+        Some(GrpcTls::HotReload(_, _)) => "hot-reload",
+        None => "disabled",
+    };
+    if grpc_tls.is_some() {
+        tracing::info!(addr = %local_addr, mode = grpc_tls_state, "meshdb-server grpc tls enabled");
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let server_task = tokio::spawn(async move {
+        let services = (
+            service.clone().into_query_server(),
+            service.clone().into_write_server(),
+            raft_service.map(|rs| rs.into_server()),
+        );
+
         let mut builder = Server::builder();
-        if let Some(tls) = grpc_server_tls {
+        if let Some(GrpcTls::Static(tls)) = &grpc_tls {
             builder = builder
-                .tls_config(tls)
+                .tls_config(tls.clone())
                 .context("applying grpc tls config")?;
         }
-        let mut router = builder
-            .add_service(service.clone().into_query_server())
-            .add_service(service.into_write_server());
-        if let Some(rs) = raft_service {
-            router = router.add_service(rs.into_server());
+        let mut router = builder.add_service(services.0).add_service(services.1);
+        if let Some(rs) = services.2 {
+            router = router.add_service(rs);
         }
         let shutdown = async {
             let _ = shutdown_rx.await;
             tracing::info!("received shutdown signal");
         };
-        router
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
-            .await
-            .context("gRPC server error")
+
+        match grpc_tls {
+            Some(GrpcTls::HotReload(acceptor, _reload_handle)) => {
+                // Custom incoming: TCP accept + TLS handshake +
+                // forward as `TlsStream<TcpStream>`. tonic 0.12's
+                // `Connected` impl for `TlsStream<T: Connected>`
+                // gives us connection metadata for free. Per-handshake
+                // failures log + drop without killing the listener.
+                let (tx, rx) = tokio::sync::mpsc::channel::<
+                    std::result::Result<
+                        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                        std::io::Error,
+                    >,
+                >(32);
+                tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((tcp, _peer)) => {
+                                let acceptor = acceptor.clone();
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    match acceptor.accept(tcp).await {
+                                        Ok(s) => {
+                                            let _ = tx.send(Ok(s)).await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "grpc tls handshake failed; dropping connection"
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "grpc tcp accept failed; retrying");
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                });
+                let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                router
+                    .serve_with_incoming_shutdown(stream, shutdown)
+                    .await
+                    .context("gRPC server error (hot-reload tls)")
+            }
+            _ => router
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+                .await
+                .context("gRPC server error"),
+        }
     });
 
     // Give the server a moment to bind before we start trying to send Raft
