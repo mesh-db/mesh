@@ -1016,14 +1016,25 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // Optional Prometheus metrics endpoint. Same fail-fast bind
     // model as Bolt — port-in-use is fatal at startup rather than
     // a confusing 500 the first time something scrapes.
+    // Readiness state shared between the /readyz handler and the
+    // shutdown drain path. `mark_draining()` flips the bit when
+    // SIGTERM/SIGINT fires; the kubelet sees the next probe
+    // return 503 and stops sending traffic before drain_leadership
+    // begins.
+    let readiness = metrics::ReadinessState {
+        is_draining: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        multi_raft: multi_raft_handle.clone(),
+    };
+
     let metrics_task = if let Some(metrics_addr) = config.metrics_address.as_ref() {
         let metrics_listener = TcpListener::bind(metrics_addr)
             .await
             .with_context(|| format!("binding metrics {}", metrics_addr))?;
         let metrics_local = metrics_listener.local_addr()?;
         tracing::info!(addr = %metrics_local, "meshdb-server metrics listening");
+        let readiness_for_listener = readiness.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = metrics::run_listener(metrics_listener).await {
+            if let Err(e) = metrics::run_listener(metrics_listener, readiness_for_listener).await {
                 tracing::error!(error = %e, "metrics listener exited");
             }
         }))
@@ -1208,6 +1219,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // Wait for SIGINT (Ctrl-C in interactive shells) or SIGTERM
     // (k8s / systemd graceful-stop). Whichever fires first wins.
     wait_for_shutdown_signal().await;
+
+    // Flip readiness immediately so the kubelet sees /readyz
+    // return 503 on the next probe and stops sending traffic.
+    // This happens *before* the drain so the kubelet has time to
+    // pull the peer out of its Service endpoints; otherwise
+    // requests would still arrive mid-drain and time out.
+    readiness.mark_draining();
 
     // Multi-raft mode: drain leadership before tearing down the
     // listener so partition followers take over in-place rather

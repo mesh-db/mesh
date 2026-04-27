@@ -3441,9 +3441,12 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
             .unwrap();
     });
     tokio::spawn(async move {
-        meshdb_server::metrics::run_listener(metrics_listener)
-            .await
-            .unwrap();
+        meshdb_server::metrics::run_listener(
+            metrics_listener,
+            meshdb_server::metrics::ReadinessState::new(),
+        )
+        .await
+        .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -3509,4 +3512,61 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
         body.contains("meshdb_cypher_query_duration_seconds"),
         "metrics body missing query duration histogram"
     );
+}
+
+/// /livez always returns 200 — the kubelet's TCP probe alone
+/// would catch a process crash; this endpoint exists so an
+/// HTTP-level liveness probe (which kubelet supports for richer
+/// signals) is also wired up.
+#[tokio::test]
+async fn livez_endpoint_returns_ok() {
+    let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_addr = metrics_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        meshdb_server::metrics::run_listener(
+            metrics_listener,
+            meshdb_server::metrics::ReadinessState::new(),
+        )
+        .await
+        .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp = reqwest::get(format!("http://{}/livez", metrics_addr))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(resp.text().await.unwrap().trim() == "ok");
+}
+
+/// /readyz returns 200 by default and 503 once draining is
+/// flagged. The shutdown path flips the bit before draining so
+/// the kubelet stops sending traffic before the in-flight drain
+/// completes.
+#[tokio::test]
+async fn readyz_endpoint_flips_to_unavailable_during_drain() {
+    let readiness = meshdb_server::metrics::ReadinessState::new();
+    let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_addr = metrics_listener.local_addr().unwrap();
+    let readiness_for_listener = readiness.clone();
+    tokio::spawn(async move {
+        meshdb_server::metrics::run_listener(metrics_listener, readiness_for_listener)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Default — ready.
+    let resp = reqwest::get(format!("http://{}/readyz", metrics_addr))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Flip the drain bit; next probe must report unavailable.
+    readiness.mark_draining();
+    let resp = reqwest::get(format!("http://{}/readyz", metrics_addr))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    assert!(resp.text().await.unwrap().contains("draining"));
 }
