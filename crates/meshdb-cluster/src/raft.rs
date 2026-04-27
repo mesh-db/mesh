@@ -878,6 +878,19 @@ impl RaftCluster {
     /// now"; the Bolt ROUTE handler falls back to the local advertised
     /// address in that case, which yields `ForwardToLeader` redirects
     /// via the normal write path once elections settle.
+    /// Borrow this replica's most recently-applied log id, as
+    /// known to the in-memory metrics watcher. Returns `(index,
+    /// term)` of the highest applied entry, or `None` when the
+    /// replica is fresh / has applied nothing yet. Used by the
+    /// backup orchestrator to record "snapshot taken at log index
+    /// X" so an operator can match restored snapshots against the
+    /// manifest.
+    pub fn last_applied_log(&self) -> Option<(u64, u64)> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        m.last_applied.map(|id| (id.index, id.leader_id.term))
+    }
+
     pub fn current_leader(&self) -> Option<crate::PeerId> {
         let metrics = self.raft.metrics();
         let m = metrics.borrow();

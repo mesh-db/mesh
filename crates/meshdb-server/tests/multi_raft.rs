@@ -2836,7 +2836,7 @@ async fn multi_raft_take_cluster_backup_covers_every_group_on_every_peer() {
         for p in 0..2 {
             let hit = manifest.entries.iter().any(|e| {
                 e.peer_id == peer.config.self_id
-                    && matches!(e.group, meshdb_rpc::MultiRaftBackupGroup::Partition(q) if q == p)
+                    && matches!(e.group, meshdb_rpc::MultiRaftBackupGroup::Partition { id: q } if q == p)
             });
             assert!(
                 hit,
@@ -2991,6 +2991,69 @@ async fn multi_raft_linearizable_label_scan_unions_partition_leaders() {
         }
     }
     assert_eq!(seen_idx.len(), 12, "all idx values must be distinct");
+}
+
+/// Backup manifest serializes to JSON, captures per-group
+/// last-applied log indexes, and round-trips back through serde
+/// without losing any field. Operators archive this manifest
+/// alongside the data_dirs so the validate-backup CLI can match
+/// each restored peer's snapshot against it.
+#[tokio::test]
+async fn multi_raft_backup_manifest_round_trips_through_json_with_log_index() {
+    let peers = spawn_multi_raft_cluster(3, 2, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Drive at least one apply so last_applied_log isn't zero on
+    // any group. CREATE INDEX commits to meta; CREATE node commits
+    // to a partition.
+    peers[0]
+        .service
+        .execute_cypher_local(
+            "CREATE INDEX FOR (n:BackupProbe) ON (n.x)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("ddl through peer 0");
+    for i in 0..6 {
+        peers[0]
+            .service
+            .execute_cypher_local(
+                format!("CREATE (:BackupProbe {{x: {i}}})"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("write through peer 0");
+    }
+
+    let manifest = peers[0]
+        .service
+        .take_cluster_backup()
+        .await
+        .expect("cluster backup");
+    assert!(manifest.is_clean(), "errors: {:?}", manifest.errors);
+
+    // Every entry has a non-None last_log_index because every
+    // group received at least one apply above.
+    for entry in &manifest.entries {
+        assert!(
+            entry.last_log_index.is_some(),
+            "entry {:?} missing last_log_index — backup is supposed to capture it",
+            entry
+        );
+    }
+
+    // Round-trip through serde_json so the on-disk manifest format
+    // is locked in.
+    let json = serde_json::to_string_pretty(&manifest).expect("serialize");
+    let parsed: meshdb_rpc::MultiRaftBackupManifest =
+        serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(parsed.entries.len(), manifest.entries.len());
+    assert_eq!(parsed.errors.len(), manifest.errors.len());
+    for (a, b) in parsed.entries.iter().zip(manifest.entries.iter()) {
+        assert_eq!(a.peer_id, b.peer_id);
+        assert_eq!(a.last_log_index, b.last_log_index);
+        assert_eq!(a.last_log_term, b.last_log_term);
+    }
 }
 
 /// Per-query timeout fires when the configured deadline is too

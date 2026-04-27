@@ -25,24 +25,47 @@ use std::time::{Duration, Instant};
 /// Identifier of a Raft group within a backup manifest. The
 /// metadata group spans every peer; partition groups are scoped
 /// to the replica set of a specific partition id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BackupGroup {
     Meta,
-    Partition(u32),
+    Partition { id: u32 },
+}
+
+impl BackupGroup {
+    /// Stable directory name under `data_dir/raft/` matching the
+    /// on-disk layout used by [`raft_group_dir`] in the server
+    /// crate. Used by the validate-backup CLI to locate the
+    /// rocksdb subdir for each group.
+    pub fn dir_name(&self) -> String {
+        match self {
+            BackupGroup::Meta => "meta".to_string(),
+            BackupGroup::Partition { id } => format!("p-{id}"),
+        }
+    }
 }
 
 /// One row of a backup manifest — a snapshot built on a specific
-/// peer for a specific Raft group.
-#[derive(Debug, Clone)]
+/// peer for a specific Raft group, identified by the log id at
+/// which the snapshot was built.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackupEntry {
     pub group: BackupGroup,
     pub peer_id: NodeId,
+    /// Index of the highest log entry applied at the moment the
+    /// snapshot was built. The snapshot bytes on disk reflect
+    /// state at this index. `None` only when the metrics watcher
+    /// returned no applied entry (a fresh-and-empty replica).
+    pub last_log_index: Option<u64>,
+    /// Term of the same log id. Pairs with `last_log_index` for
+    /// strict matching during validate.
+    pub last_log_term: Option<u64>,
 }
 
 /// Per-group failure surfaced during backup. The other groups
 /// still snapshot; this entry tells the operator which ones to
 /// retry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackupError {
     pub group: BackupGroup,
     pub peer_id: NodeId,
@@ -54,7 +77,11 @@ pub struct BackupError {
 /// archive (the snapshot itself lives in the peer's
 /// `data_dir/raft/<group>/` rocksdb under a stable key, written
 /// synchronously when the trigger returns).
-#[derive(Debug, Clone, Default)]
+///
+/// Serializes to / from JSON so the file produced at backup time
+/// can be re-read by the validate-backup CLI before a restore
+/// is brought up.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BackupManifest {
     pub entries: Vec<BackupEntry>,
     pub errors: Vec<BackupError>,
@@ -804,10 +831,18 @@ impl MultiRaftCluster {
         let mut errors = Vec::new();
 
         match self.meta.trigger_snapshot().await {
-            Ok(()) => entries.push(BackupEntry {
-                group: BackupGroup::Meta,
-                peer_id: self.self_id,
-            }),
+            Ok(()) => {
+                let (idx, term) = match self.meta.last_applied_log() {
+                    Some((i, t)) => (Some(i), Some(t)),
+                    None => (None, None),
+                };
+                entries.push(BackupEntry {
+                    group: BackupGroup::Meta,
+                    peer_id: self.self_id,
+                    last_log_index: idx,
+                    last_log_term: term,
+                });
+            }
             Err(e) => errors.push(BackupError {
                 group: BackupGroup::Meta,
                 peer_id: self.self_id,
@@ -821,12 +856,20 @@ impl MultiRaftCluster {
         };
         for (p, raft) in partitions {
             match raft.trigger_snapshot().await {
-                Ok(()) => entries.push(BackupEntry {
-                    group: BackupGroup::Partition(p.0),
-                    peer_id: self.self_id,
-                }),
+                Ok(()) => {
+                    let (idx, term) = match raft.last_applied_log() {
+                        Some((i, t)) => (Some(i), Some(t)),
+                        None => (None, None),
+                    };
+                    entries.push(BackupEntry {
+                        group: BackupGroup::Partition { id: p.0 },
+                        peer_id: self.self_id,
+                        last_log_index: idx,
+                        last_log_term: term,
+                    });
+                }
                 Err(e) => errors.push(BackupError {
-                    group: BackupGroup::Partition(p.0),
+                    group: BackupGroup::Partition { id: p.0 },
                     peer_id: self.self_id,
                     message: e.to_string(),
                 }),

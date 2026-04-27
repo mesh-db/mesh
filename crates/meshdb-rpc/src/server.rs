@@ -2179,6 +2179,16 @@ impl MeshService {
                             combined.entries.push(crate::MultiRaftBackupEntry {
                                 group,
                                 peer_id: e.peer_id,
+                                last_log_index: if e.last_log_index == 0 {
+                                    None
+                                } else {
+                                    Some(e.last_log_index)
+                                },
+                                last_log_term: if e.last_log_term == 0 {
+                                    None
+                                } else {
+                                    Some(e.last_log_term)
+                                },
                             });
                         }
                     }
@@ -6618,7 +6628,7 @@ impl MeshWrite for MeshService {
 fn backup_group_label(g: crate::MultiRaftBackupGroup) -> String {
     match g {
         crate::MultiRaftBackupGroup::Meta => "meta".to_string(),
-        crate::MultiRaftBackupGroup::Partition(p) => format!("partition:{p}"),
+        crate::MultiRaftBackupGroup::Partition { id } => format!("partition:{id}"),
     }
 }
 
@@ -6628,7 +6638,7 @@ fn parse_backup_group(s: &str) -> Option<crate::MultiRaftBackupGroup> {
     } else if let Some(rest) = s.strip_prefix("partition:") {
         rest.parse::<u32>()
             .ok()
-            .map(crate::MultiRaftBackupGroup::Partition)
+            .map(|id| crate::MultiRaftBackupGroup::Partition { id })
     } else {
         None
     }
@@ -6644,6 +6654,8 @@ fn backup_manifest_to_proto(
             .map(|e| crate::proto::BackupEntryProto {
                 group: backup_group_label(e.group),
                 peer_id: e.peer_id,
+                last_log_index: e.last_log_index.unwrap_or(0),
+                last_log_term: e.last_log_term.unwrap_or(0),
             })
             .collect(),
         errors: m

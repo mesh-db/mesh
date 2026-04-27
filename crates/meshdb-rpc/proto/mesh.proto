@@ -160,6 +160,12 @@ message BackupEntryProto {
   // "meta" or "partition:<id>".
   string group = 1;
   uint64 peer_id = 2;
+  // Index + term of the highest log entry applied at the moment
+  // the snapshot was built. Lets a validate-backup CLI confirm
+  // each replica's on-disk SNAPSHOT_META_KEY matches the
+  // manifest entry. Both 0 if the replica had applied nothing.
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
 }
 message BackupErrorProto {
   string group = 1;
