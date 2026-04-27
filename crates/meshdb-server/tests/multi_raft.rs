@@ -80,6 +80,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
             query_max_rows: None,
+            max_concurrent_queries: None,
             tracing: None,
         };
 
@@ -2216,6 +2217,7 @@ async fn multi_raft_weighted_placement_skews_replica_distribution() {
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
             query_max_rows: None,
+            max_concurrent_queries: None,
             tracing: None,
         };
         let components = build_components(&config).await.unwrap();
@@ -3102,6 +3104,48 @@ async fn multi_raft_query_timeout_fires_with_deadline_exceeded() {
         )
         .await
         .expect("default-timeout service still serves writes");
+}
+
+/// Concurrency cap fails fast with `ResourceExhausted` instead
+/// of queueing under load. Configure cap = 0 so the very first
+/// call surfaces the cap deterministically — saturating a real
+/// semaphore with concurrent calls would be timing-flaky.
+#[tokio::test]
+async fn multi_raft_max_concurrent_queries_caps_in_flight_runs() {
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let saturated = peers[0]
+        .service
+        .clone()
+        .with_max_concurrent_queries(Some(0));
+    let result = saturated
+        .execute_cypher_local(
+            "CREATE (:ConcProbe)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await;
+    let status = result.expect_err("zero-permit cap must surface as Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::ResourceExhausted,
+        "expected ResourceExhausted, got {:?}: {}",
+        status.code(),
+        status.message()
+    );
+
+    // Sanity: cap = 4 lets the same call through.
+    let allowed = peers[0]
+        .service
+        .clone()
+        .with_max_concurrent_queries(Some(4));
+    allowed
+        .execute_cypher_local(
+            "CREATE (:ConcProbe)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("under-cap query succeeds");
 }
 
 /// Result-set max-rows cap surfaces as `ResourceExhausted` when

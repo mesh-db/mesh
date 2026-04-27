@@ -142,6 +142,7 @@ impl Cli {
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
             query_max_rows: None,
+            max_concurrent_queries: None,
             tracing: None,
         })
     }
@@ -452,6 +453,7 @@ mod tests {
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
             query_max_rows: None,
+            max_concurrent_queries: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);
@@ -485,6 +487,7 @@ mod tests {
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
             query_max_rows: None,
+            max_concurrent_queries: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);

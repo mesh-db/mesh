@@ -327,6 +327,16 @@ pub struct MeshService {
     /// `ResourceExhausted` once the buffer crosses the limit.
     /// Set via [`Self::with_query_max_rows`].
     query_max_rows: Option<usize>,
+    /// Concurrency cap on `execute_cypher_local`. A
+    /// [`tokio::sync::Semaphore`] with `max_concurrent_queries`
+    /// permits guards every Cypher run; once N permits are taken
+    /// further calls fail fast with `ResourceExhausted` rather
+    /// than queue and contend on the executor / Raft propose
+    /// path. `None` (default) leaves the gates open. Bolt
+    /// sessions and gRPC `ExecuteCypher` callers all share the
+    /// same semaphore — the cap is per-peer, not per-connection.
+    /// Set via [`Self::with_max_concurrent_queries`].
+    query_concurrency: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl MeshService {
@@ -350,6 +360,7 @@ impl MeshService {
             linearizable_reads: false,
             query_timeout: None,
             query_max_rows: None,
+            query_concurrency: None,
         }
     }
 
@@ -386,6 +397,7 @@ impl MeshService {
             linearizable_reads: false,
             query_timeout: None,
             query_max_rows: None,
+            query_concurrency: None,
         }
     }
 
@@ -430,6 +442,7 @@ impl MeshService {
             linearizable_reads: false,
             query_timeout: None,
             query_max_rows: None,
+            query_concurrency: None,
         }
     }
 
@@ -461,6 +474,7 @@ impl MeshService {
             linearizable_reads: false,
             query_timeout: None,
             query_max_rows: None,
+            query_concurrency: None,
         }
     }
 
@@ -545,6 +559,23 @@ impl MeshService {
     /// See [`Self::with_read_consistency`].
     pub fn linearizable_reads(&self) -> bool {
         self.linearizable_reads
+    }
+
+    /// Configure a per-peer concurrency cap on Cypher execution.
+    /// A bounded [`tokio::sync::Semaphore`] guards every
+    /// `execute_cypher_local`; once `max` permits are taken the
+    /// next call fails fast with `ResourceExhausted` rather than
+    /// queue and contend on the executor / Raft propose path.
+    ///
+    /// Bolt sessions and gRPC `ExecuteCypher` callers all share
+    /// the same semaphore so a single misbehaving client can't
+    /// monopolise the peer.
+    ///
+    /// `None` (default) leaves the gates open — no cap, every
+    /// call gets a permit immediately.
+    pub fn with_max_concurrent_queries(mut self, max: Option<usize>) -> Self {
+        self.query_concurrency = max.map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+        self
     }
 
     /// Configure a maximum row count returned from any one
@@ -843,6 +874,21 @@ impl MeshService {
         query: String,
         params: meshdb_executor::ParamMap,
     ) -> std::result::Result<Vec<meshdb_executor::Row>, Status> {
+        // Concurrency cap: try_acquire (non-blocking) so a saturated
+        // peer fails fast with `ResourceExhausted` rather than
+        // queueing under load. The permit is dropped when this future
+        // returns / is cancelled, releasing the slot.
+        let _permit = match &self.query_concurrency {
+            Some(sem) => match sem.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    return Err(Status::resource_exhausted(
+                        "peer at concurrent-query cap; retry later".to_string(),
+                    ));
+                }
+            },
+            None => None,
+        };
         // Wrap the entire pipeline in the configured per-query
         // timeout — covers parse, plan, execute, and commit. On
         // expiry the inner future is dropped, which cancels the

@@ -198,7 +198,8 @@ fn build_routing_service(
             .with_participant_log(Some(participant_log))
             .with_client_tls(client_tls)
             .with_query_timeout(query_timeout)
-            .with_query_max_rows(config.query_max_rows),
+            .with_query_max_rows(config.query_max_rows)
+            .with_max_concurrent_queries(config.max_concurrent_queries),
         config,
         &store_for_triggers,
     ))
@@ -340,7 +341,8 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
                 service: apply_apoc_import(
                     MeshService::new(store)
                         .with_query_timeout(query_timeout)
-                        .with_query_max_rows(config.query_max_rows),
+                        .with_query_max_rows(config.query_max_rows)
+                        .with_max_concurrent_queries(config.max_concurrent_queries),
                     config,
                     &store_for_triggers,
                 ),
@@ -423,7 +425,8 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
         MeshService::with_raft(store, raft.clone())
             .with_client_tls(client_tls)
             .with_query_timeout(query_timeout)
-            .with_query_max_rows(config.query_max_rows),
+            .with_query_max_rows(config.query_max_rows)
+            .with_max_concurrent_queries(config.max_concurrent_queries),
         config,
         &store_for_triggers,
     );
@@ -645,7 +648,8 @@ async fn build_multi_raft_components(
             .with_client_tls(client_tls)
             .with_read_consistency(linearizable)
             .with_query_timeout(query_timeout)
-            .with_query_max_rows(config.query_max_rows),
+            .with_query_max_rows(config.query_max_rows)
+            .with_max_concurrent_queries(config.max_concurrent_queries),
         config,
         &store_for_triggers,
         #[cfg(feature = "apoc-trigger")]

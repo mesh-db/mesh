@@ -276,6 +276,17 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tracing: Option<TracingConfig>,
 
+    /// Per-peer concurrency cap on Cypher execution. Bolt
+    /// sessions and gRPC `ExecuteCypher` callers all share one
+    /// semaphore — once `max_concurrent_queries` runs are in
+    /// flight the next call fails fast with `ResourceExhausted`
+    /// rather than queue and contend on the executor / Raft
+    /// propose path. `None` (default) leaves no cap.
+    /// Recommended for any production deploy that exposes Bolt
+    /// to untrusted clients.
+    #[serde(default)]
+    pub max_concurrent_queries: Option<usize>,
+
     /// Maximum row count returned from any one Cypher run.
     /// Today the gRPC / Bolt layer accumulates rows in memory
     /// before responding, so an unbounded `MATCH` over a huge
@@ -637,6 +648,7 @@ mod tests {
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
             query_max_rows: None,
+            max_concurrent_queries: None,
             tracing: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
