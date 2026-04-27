@@ -1,6 +1,30 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// OpenTelemetry / OTLP tracing exporter configuration. Set in
+/// `[tracing]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracingConfig {
+    /// OTLP-over-gRPC endpoint of the collector (e.g.
+    /// `http://otel-collector:4317`). Required — the only knob
+    /// that gates the exporter on.
+    pub otlp_endpoint: String,
+
+    /// Logical service name attached to every span. Surfaces in the
+    /// collector's `service.name` resource attribute. Defaults to
+    /// `"meshdb-server"`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+
+    /// Head-based sampler ratio in [0.0, 1.0]. `1.0` (default)
+    /// exports every trace; `0.1` exports a random 10%. Use a
+    /// fraction for high-throughput production clusters where the
+    /// collector budget can't absorb every span.
+    #[serde(default)]
+    pub sample_rate: Option<f64>,
+}
+
 /// Shared-secret cluster authentication. Set in `[cluster_auth]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -242,6 +266,15 @@ pub struct ServerConfig {
     #[cfg(feature = "apoc-load")]
     #[serde(default)]
     pub apoc_import: Option<meshdb_executor::ImportConfig>,
+
+    /// OpenTelemetry / OTLP tracing exporter configuration. When
+    /// set, every `tracing::span` from the server (and from
+    /// `#[tracing::instrument]` annotations on the gRPC handlers,
+    /// Raft applies, and the Cypher executor) is exported to the
+    /// configured collector via gRPC-OTLP. Omitted → only the
+    /// existing fmt layer (stdout logs) is active.
+    #[serde(default)]
+    pub tracing: Option<TracingConfig>,
 
     /// TTL (in seconds) advertised on every Bolt ROUTE response.
     /// Drivers cache the routing table for this long before
@@ -525,6 +558,7 @@ mod tests {
             read_consistency: None,
             cluster_auth: None,
             routing_ttl_seconds: None,
+            tracing: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
         }
@@ -614,6 +648,56 @@ address = "127.0.0.1:7003"
         assert!(!is_bcrypt_hash("plaintext"));
         assert!(!is_bcrypt_hash("$1$md5-ish"));
         assert!(!is_bcrypt_hash(""));
+    }
+
+    #[test]
+    fn tracing_config_parses_from_toml() {
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+
+[tracing]
+otlp_endpoint = "http://otel-collector:4317"
+service_name = "mesh-prod"
+sample_rate = 0.25
+"#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        let t = cfg.tracing.expect("tracing section parsed");
+        assert_eq!(t.otlp_endpoint, "http://otel-collector:4317");
+        assert_eq!(t.service_name.as_deref(), Some("mesh-prod"));
+        assert_eq!(t.sample_rate, Some(0.25));
+    }
+
+    #[test]
+    fn tracing_config_omitted_is_none() {
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+"#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.tracing.is_none());
+    }
+
+    #[test]
+    fn tracing_config_endpoint_required() {
+        // No `otlp_endpoint` in `[tracing]` → parse error. Catches the
+        // common operator mistake of writing the section header but
+        // forgetting to fill in the URL.
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+
+[tracing]
+service_name = "mesh-prod"
+"#;
+        let err = ServerConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("otlp_endpoint"),
+            "expected missing-field error to mention otlp_endpoint, got: {err}"
+        );
     }
 }
 

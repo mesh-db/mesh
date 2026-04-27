@@ -104,6 +104,7 @@ impl Cli {
             apoc_import: None,
             cluster_auth: None,
             routing_ttl_seconds: None,
+            tracing: None,
         })
     }
 
@@ -150,10 +151,9 @@ fn build_config(cli: Cli) -> Result<ServerConfig> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
     let config = build_config(cli)?;
+    init_tracing(config.tracing.as_ref())?;
     tracing::info!(
         self_id = config.self_id,
         listen_address = %config.listen_address,
@@ -165,10 +165,71 @@ async fn main() -> Result<()> {
     meshdb_server::serve(config).await
 }
 
-fn init_tracing() {
+/// Set up the global tracing subscriber. Always installs the
+/// fmt-to-stdout layer (gated by `RUST_LOG` / fallback `info`).
+/// When `[tracing] otlp_endpoint = "..."` is configured, also
+/// installs an OpenTelemetry layer that exports spans to the
+/// collector via OTLP/gRPC.
+///
+/// The OTel pipeline uses a tokio-runtime batch span processor
+/// (`opentelemetry_sdk::runtime::Tokio`), so a tokio runtime must
+/// be active before this runs — that's why `main()` parses CLI
+/// inside `#[tokio::main]` first and only then calls this.
+fn init_tracing(tracing_cfg: Option<&meshdb_server::config::TracingConfig>) -> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    match tracing_cfg {
+        Some(cfg) => {
+            use opentelemetry::trace::TracerProvider as _;
+            use opentelemetry_otlp::WithExportConfig;
+
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(cfg.otlp_endpoint.clone())
+                .build()
+                .map_err(|e| {
+                    anyhow!("building OTLP span exporter for {}: {e}", cfg.otlp_endpoint)
+                })?;
+            let service_name = cfg
+                .service_name
+                .clone()
+                .unwrap_or_else(|| "meshdb-server".to_string());
+            let resource = opentelemetry_sdk::Resource::new([opentelemetry::KeyValue::new(
+                "service.name",
+                service_name,
+            )]);
+            let sampler = match cfg.sample_rate {
+                Some(r) if (0.0..=1.0).contains(&r) => {
+                    opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(r)
+                }
+                Some(r) => {
+                    return Err(anyhow!(
+                        "tracing.sample_rate must be in [0.0, 1.0], got {r}"
+                    ));
+                }
+                None => opentelemetry_sdk::trace::Sampler::AlwaysOn,
+            };
+            let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_resource(resource)
+                .with_sampler(sampler)
+                .build();
+            let tracer = provider.tracer("meshdb");
+            opentelemetry::global::set_tracer_provider(provider);
+            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+            registry.with(otel_layer).init();
+        }
+        None => registry.init(),
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -258,6 +319,7 @@ mod tests {
             apoc_import: None,
             cluster_auth: None,
             routing_ttl_seconds: None,
+            tracing: None,
         };
         cli.apply_to(&mut cfg);
         assert!(!cfg.bootstrap);
@@ -287,6 +349,7 @@ mod tests {
             apoc_import: None,
             cluster_auth: None,
             routing_ttl_seconds: None,
+            tracing: None,
         };
         cli.apply_to(&mut cfg);
         assert_eq!(cfg.listen_address, "0.0.0.0:9000"); // overridden
