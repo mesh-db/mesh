@@ -104,6 +104,7 @@ impl Cli {
             apoc_import: None,
             cluster_auth: None,
             routing_ttl_seconds: None,
+            shutdown_drain_timeout_seconds: None,
             tracing: None,
         })
     }
@@ -319,6 +320,7 @@ mod tests {
             apoc_import: None,
             cluster_auth: None,
             routing_ttl_seconds: None,
+            shutdown_drain_timeout_seconds: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);
@@ -349,6 +351,7 @@ mod tests {
             apoc_import: None,
             cluster_auth: None,
             routing_ttl_seconds: None,
+            shutdown_drain_timeout_seconds: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);

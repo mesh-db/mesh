@@ -1158,7 +1158,45 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         }
     }
 
-    tokio::signal::ctrl_c().await.ok();
+    // Wait for SIGINT (Ctrl-C in interactive shells) or SIGTERM
+    // (k8s / systemd graceful-stop). Whichever fires first wins.
+    wait_for_shutdown_signal().await;
+
+    // Multi-raft mode: drain leadership before tearing down the
+    // listener so partition followers take over in-place rather
+    // than electing from cold after we vanish. Bounded by
+    // `shutdown_drain_timeout_seconds` (default 30) so a stuck
+    // partition can't make the process hang during a planned
+    // restart.
+    if let Some(_mr) = service_for_recovery.multi_raft_handle() {
+        let timeout = config.shutdown_drain_timeout_seconds.unwrap_or(30);
+        let drain_deadline = Duration::from_secs(timeout);
+        tracing::info!(
+            timeout_seconds = timeout,
+            "draining partition leadership before shutdown"
+        );
+        let drain = tokio::time::timeout(
+            drain_deadline,
+            service_for_recovery.drain_leadership(drain_deadline),
+        )
+        .await;
+        match drain {
+            Ok((stepped_down, errors)) => {
+                tracing::info!(
+                    partitions_drained = stepped_down.len(),
+                    errors = errors.len(),
+                    "leadership drain complete"
+                );
+                for (p, e) in &errors {
+                    tracing::warn!(partition = ?p, error = %e, "drain error");
+                }
+            }
+            Err(_) => tracing::warn!(
+                "leadership drain timed out; some partitions will re-elect from cold"
+            ),
+        }
+    }
+
     let _ = shutdown_tx.send(());
 
     staging_sweeper.abort();
@@ -1194,4 +1232,31 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         Err(e) => return Err(anyhow!("server task panicked: {e}")),
     }
     Ok(())
+}
+
+/// Wait for either a SIGINT (Ctrl-C) or a SIGTERM (the
+/// kubelet/systemd graceful-stop signal) and return as soon as
+/// either fires. On non-unix platforms only SIGINT is wired.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler; falling back to SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received SIGINT");
+    }
 }

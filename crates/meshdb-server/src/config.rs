@@ -276,6 +276,17 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tracing: Option<TracingConfig>,
 
+    /// Total deadline (in seconds) the server gives a shutdown
+    /// drain — every partition this peer leads is asked to step
+    /// down before the gRPC listener exits. Default 30 seconds.
+    /// Operators with very high partition counts may want a
+    /// higher value; CI/dev setups can drop it to 1 to make the
+    /// teardown fast.
+    ///
+    /// Has no effect outside multi-raft mode.
+    #[serde(default)]
+    pub shutdown_drain_timeout_seconds: Option<u64>,
+
     /// TTL (in seconds) advertised on every Bolt ROUTE response.
     /// Drivers cache the routing table for this long before
     /// re-fetching. Tradeoff is staleness vs. ROUTE-handler load:
@@ -583,6 +594,7 @@ mod tests {
             read_consistency: None,
             cluster_auth: None,
             routing_ttl_seconds: None,
+            shutdown_drain_timeout_seconds: None,
             tracing: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,

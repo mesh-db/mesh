@@ -2035,6 +2035,14 @@ impl MeshService {
     /// move is to shut it down outright. Returns `(stepped_down,
     /// errors)` — `errors` records partitions where shutdown
     /// failed.
+    /// Borrow the configured multi-raft cluster handle, if any.
+    /// `None` in single-node, single-Raft, and routing modes.
+    /// Used by `meshdb-server::serve` to decide whether to drain
+    /// partition leadership before shutdown.
+    pub fn multi_raft_handle(&self) -> Option<&Arc<crate::MultiRaftCluster>> {
+        self.multi_raft.as_ref()
+    }
+
     pub async fn drain_leadership(
         &self,
         _per_partition_timeout: std::time::Duration,

@@ -112,6 +112,7 @@ async fn spawn_single_node_server() -> Harness {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -181,6 +182,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -204,6 +206,7 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -589,6 +592,7 @@ async fn build_components_single_node_has_no_raft() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
@@ -633,6 +637,7 @@ async fn build_components_multi_peer_builds_raft() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
@@ -680,6 +685,7 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
@@ -747,6 +753,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -770,6 +777,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -938,6 +946,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -961,6 +970,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -1178,6 +1188,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -1201,6 +1212,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -1372,6 +1384,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -1395,6 +1408,7 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -1548,6 +1562,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -1571,6 +1586,7 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -1820,6 +1836,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b1 = ServerConfig {
@@ -1843,6 +1860,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -1949,6 +1967,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -2118,6 +2137,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -2141,6 +2161,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -2317,6 +2338,7 @@ async fn cypher_merge_replicates_through_raft() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -2340,6 +2362,7 @@ async fn cypher_merge_replicates_through_raft() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -2497,6 +2520,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -2520,6 +2544,7 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -2680,6 +2705,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_b = ServerConfig {
@@ -2703,6 +2729,7 @@ async fn two_peer_raft_replicates_via_server_components() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
@@ -2979,6 +3006,7 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let config_a = mk_config(1, dir_a.path().to_path_buf(), &grpc_addr_a, true);
@@ -3178,6 +3206,7 @@ async fn route_write_role_tracks_raft_leader_across_handoff() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
     let configs = [
@@ -3363,6 +3392,7 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
         apoc_import: None,
         cluster_auth: None,
         routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
         tracing: None,
     };
 
