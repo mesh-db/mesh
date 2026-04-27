@@ -30,6 +30,7 @@ mod multi_raft_cluster;
 mod multi_raft_reader;
 mod participant_log;
 mod partitioned_reader;
+pub mod plan_cache;
 mod raft_applier;
 mod raft_network;
 mod raft_service;
@@ -62,6 +63,7 @@ pub use participant_log::{
     ParticipantOutcome, PARTICIPANT_LOG_MIN_TERMINAL, PARTICIPANT_LOG_ROTATION_INTERVAL,
 };
 pub use partitioned_reader::PartitionedGraphReader;
+pub use plan_cache::{fingerprint_schema, PlanCache, DEFAULT_PLAN_CACHE_CAPACITY};
 pub use raft_applier::StoreGraphApplier;
 pub use raft_network::{GrpcNetwork, GrpcNetworkError, RaftGroupTarget};
 pub use raft_service::{MeshRaftService, RaftGroupRegistry};

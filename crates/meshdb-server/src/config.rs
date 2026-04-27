@@ -276,6 +276,17 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tracing: Option<TracingConfig>,
 
+    /// Cypher plan cache size. When set to `Some(n)` the
+    /// service caches up to `n` parsed + planned Cypher
+    /// queries; subsequent runs of the same query (with any
+    /// parameters) skip parse + plan and go straight to
+    /// execution. Bolt session patterns ("run the same
+    /// parametrised MATCH thousands of times") win the most.
+    /// `Some(0)` is a config error; use `None` to disable.
+    /// Default — disabled.
+    #[serde(default)]
+    pub plan_cache_size: Option<usize>,
+
     /// Path to a durable, append-only audit log of admin
     /// operations. When set, every `drain_leadership` /
     /// `take_cluster_backup` (and future cluster-level admin
@@ -664,6 +675,7 @@ mod tests {
             query_max_rows: None,
             max_concurrent_queries: None,
             audit_log_path: None,
+            plan_cache_size: None,
             tracing: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,

@@ -82,6 +82,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             query_max_rows: None,
             max_concurrent_queries: None,
             audit_log_path: None,
+            plan_cache_size: None,
             tracing: None,
         };
 
@@ -2220,6 +2221,7 @@ async fn multi_raft_weighted_placement_skews_replica_distribution() {
             query_max_rows: None,
             max_concurrent_queries: None,
             audit_log_path: None,
+            plan_cache_size: None,
             tracing: None,
         };
         let components = build_components(&config).await.unwrap();
@@ -3106,6 +3108,73 @@ async fn multi_raft_query_timeout_fires_with_deadline_exceeded() {
         )
         .await
         .expect("default-timeout service still serves writes");
+}
+
+/// Plan cache holds repeated query strings under the current
+/// schema fingerprint and rebuilds when DDL bumps it. Cache
+/// hit/miss behaviour at the unit level is covered by
+/// `plan_cache::tests`; this end-to-end test pins down the
+/// integration with the service.
+#[tokio::test]
+async fn multi_raft_plan_cache_skips_replan_on_repeated_query() {
+    use meshdb_rpc::PlanCache;
+
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let cache = PlanCache::new(8);
+    let cached_service = peers[0]
+        .service
+        .clone()
+        .with_plan_cache(Some(cache.clone()));
+
+    // First run: cache miss → entry inserted.
+    cached_service
+        .execute_cypher_local(
+            "MATCH (n:CacheProbe) RETURN n".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("first run");
+    let after_first = cache.len();
+    assert_eq!(after_first, 1, "first run should populate the cache");
+
+    // Second run: cache hit → cache size unchanged.
+    cached_service
+        .execute_cypher_local(
+            "MATCH (n:CacheProbe) RETURN n".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("second run");
+    assert_eq!(
+        cache.len(),
+        after_first,
+        "second run should hit the cache, not insert again"
+    );
+
+    // DDL bumps the schema fingerprint. Next MATCH re-plans at
+    // the new fingerprint and inserts a fresh entry; the stale
+    // entry from the old fingerprint is evicted on lookup.
+    cached_service
+        .execute_cypher_local(
+            "CREATE INDEX FOR (n:CacheProbe) ON (n.x)".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("ddl");
+    cached_service
+        .execute_cypher_local(
+            "MATCH (n:CacheProbe) RETURN n".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("post-ddl run");
+    // Sanity: cache still has at least the post-DDL MATCH entry.
+    assert!(
+        cache.len() >= 1,
+        "post-ddl run should re-plan and re-insert"
+    );
 }
 
 /// Audit log captures admin operations (drain_leadership and

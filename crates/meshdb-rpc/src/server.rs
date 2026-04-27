@@ -343,6 +343,15 @@ pub struct MeshService {
     /// `None` (default) disables — operations still succeed,
     /// they just don't leave a compliance trail.
     audit_log: Option<Arc<crate::AuditLog>>,
+    /// Optional Cypher plan cache. When set, every `RUN` first
+    /// looks the query up in the cache against the current
+    /// schema fingerprint; on hit it skips parse + plan and
+    /// goes straight to execution. The fingerprint is derived
+    /// from the local store's index registry, so a cached plan
+    /// becomes invalid the moment a DDL apply changes the
+    /// catalog — no explicit invalidation hook required.
+    /// `None` (default) disables the cache.
+    plan_cache: Option<crate::PlanCache>,
 }
 
 impl MeshService {
@@ -368,6 +377,7 @@ impl MeshService {
             query_max_rows: None,
             query_concurrency: None,
             audit_log: None,
+            plan_cache: None,
         }
     }
 
@@ -406,6 +416,7 @@ impl MeshService {
             query_max_rows: None,
             query_concurrency: None,
             audit_log: None,
+            plan_cache: None,
         }
     }
 
@@ -452,6 +463,7 @@ impl MeshService {
             query_max_rows: None,
             query_concurrency: None,
             audit_log: None,
+            plan_cache: None,
         }
     }
 
@@ -485,6 +497,7 @@ impl MeshService {
             query_max_rows: None,
             query_concurrency: None,
             audit_log: None,
+            plan_cache: None,
         }
     }
 
@@ -569,6 +582,16 @@ impl MeshService {
     /// See [`Self::with_read_consistency`].
     pub fn linearizable_reads(&self) -> bool {
         self.linearizable_reads
+    }
+
+    /// Attach a Cypher plan cache. Every `RUN` looks the query
+    /// up against the current schema fingerprint before
+    /// parsing; cache hits skip parse + plan. `None` (default)
+    /// disables — repeated parametrised queries pay the parse
+    /// + plan cost on every call.
+    pub fn with_plan_cache(mut self, cache: Option<crate::PlanCache>) -> Self {
+        self.plan_cache = cache;
+        self
     }
 
     /// Attach an audit log. Every admin operation invoked
@@ -1031,50 +1054,68 @@ impl MeshService {
         prev_commands: Vec<GraphCommand>,
         in_explicit_tx: bool,
     ) -> std::result::Result<(Vec<meshdb_executor::Row>, Vec<GraphCommand>), Status> {
-        let statement = meshdb_cypher::parse(&query).map_err(bad_request)?;
+        // Plan cache lookup. Same indexes pulled out of the
+        // store every call go into the planner context and into
+        // the fingerprint, so a DDL that changes any of them
+        // invalidates cached plans on every peer (initiator or
+        // replica) the next time the cache is consulted.
+        let property_indexes: Vec<(String, Vec<String>)> = self
+            .store
+            .list_property_indexes()
+            .into_iter()
+            .map(|s| (s.label, s.properties))
+            .collect();
+        let edge_property_indexes: Vec<(String, Vec<String>)> = self
+            .store
+            .list_edge_property_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.properties))
+            .collect();
+        let point_indexes: Vec<(String, String)> = self
+            .store
+            .list_point_indexes()
+            .into_iter()
+            .map(|s| (s.label, s.property))
+            .collect();
+        let edge_point_indexes: Vec<(String, String)> = self
+            .store
+            .list_edge_point_indexes()
+            .into_iter()
+            .map(|s| (s.edge_type, s.property))
+            .collect();
+        let schema_fp = crate::plan_cache::fingerprint_schema(
+            &property_indexes,
+            &edge_property_indexes,
+            &point_indexes,
+            &edge_point_indexes,
+        );
 
-        // Schema DDL replication is wired up across every mode now:
-        // - Single-node: applied directly through the store.
-        // - Raft: replicated via `propose_graph(GraphCommand::CreateIndex)`,
-        //   each peer's `StoreGraphApplier` runs the local create.
-        // - Routing: parallel fan-out with rollback in
-        //   `replicate_index_ddl_routing`, called from
-        //   `commit_buffered_commands`.
-
-        // Populate the planner context with the registered indexes so
-        // `MATCH (n:Label {prop: ...})` can rewrite to `IndexSeek`
-        // when a matching index exists. In Raft/routing modes this is
-        // currently always empty because DDL is rejected above; once
-        // phases B/C land the same call will surface the full set.
-        let planner_ctx = meshdb_cypher::PlannerContext {
-            outer_bindings: Vec::new(),
-            indexes: self
-                .store
-                .list_property_indexes()
-                .into_iter()
-                .map(|s| (s.label, s.properties))
-                .collect(),
-            edge_indexes: self
-                .store
-                .list_edge_property_indexes()
-                .into_iter()
-                .map(|s| (s.edge_type, s.properties))
-                .collect(),
-            point_indexes: self
-                .store
-                .list_point_indexes()
-                .into_iter()
-                .map(|s| (s.label, s.property))
-                .collect(),
-            edge_point_indexes: self
-                .store
-                .list_edge_point_indexes()
-                .into_iter()
-                .map(|s| (s.edge_type, s.property))
-                .collect(),
+        // Cache hit short-circuits parse + plan entirely.
+        let cached_plan = self
+            .plan_cache
+            .as_ref()
+            .and_then(|c| c.get(&query, schema_fp));
+        let plan: meshdb_cypher::LogicalPlan = if let Some(arc) = cached_plan {
+            (*arc).clone()
+        } else {
+            let statement = meshdb_cypher::parse(&query).map_err(bad_request)?;
+            // Populate the planner context with the registered indexes so
+            // `MATCH (n:Label {prop: ...})` can rewrite to `IndexSeek`
+            // when a matching index exists.
+            let planner_ctx = meshdb_cypher::PlannerContext {
+                outer_bindings: Vec::new(),
+                indexes: property_indexes,
+                edge_indexes: edge_property_indexes,
+                point_indexes,
+                edge_point_indexes,
+            };
+            let plan =
+                meshdb_cypher::plan_with_context(&statement, &planner_ctx).map_err(bad_request)?;
+            if let Some(c) = self.plan_cache.as_ref() {
+                c.insert(query.clone(), Arc::new(plan.clone()), schema_fp);
+            }
+            plan
         };
-        let plan =
-            meshdb_cypher::plan_with_context(&statement, &planner_ctx).map_err(bad_request)?;
 
         // CALL { ... } IN TRANSACTIONS commits each batch
         // independently, which conflicts with an enclosing

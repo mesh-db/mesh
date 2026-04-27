@@ -218,7 +218,8 @@ fn build_routing_service(
             .with_query_timeout(query_timeout)
             .with_query_max_rows(config.query_max_rows)
             .with_max_concurrent_queries(config.max_concurrent_queries)
-            .with_audit_log(open_audit_log(config)?),
+            .with_audit_log(open_audit_log(config)?)
+            .with_plan_cache(config.plan_cache_size.map(meshdb_rpc::PlanCache::new)),
         config,
         &store_for_triggers,
     ))
@@ -447,7 +448,8 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
             .with_query_timeout(query_timeout)
             .with_query_max_rows(config.query_max_rows)
             .with_max_concurrent_queries(config.max_concurrent_queries)
-            .with_audit_log(open_audit_log(config)?),
+            .with_audit_log(open_audit_log(config)?)
+            .with_plan_cache(config.plan_cache_size.map(meshdb_rpc::PlanCache::new)),
         config,
         &store_for_triggers,
     );
@@ -671,7 +673,8 @@ async fn build_multi_raft_components(
             .with_query_timeout(query_timeout)
             .with_query_max_rows(config.query_max_rows)
             .with_max_concurrent_queries(config.max_concurrent_queries)
-            .with_audit_log(open_audit_log(config)?),
+            .with_audit_log(open_audit_log(config)?)
+            .with_plan_cache(config.plan_cache_size.map(meshdb_rpc::PlanCache::new)),
         config,
         &store_for_triggers,
         #[cfg(feature = "apoc-trigger")]
