@@ -872,14 +872,26 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         } else {
             "disabled"
         };
-        let tls_acceptor = if let Some(tls_cfg) = config.bolt_tls.as_ref() {
+        let (tls_acceptor, _tls_reload_task) = if let Some(tls_cfg) = config.bolt_tls.as_ref() {
             bolt::install_default_crypto_provider();
-            Some(
-                bolt::build_tls_acceptor(&tls_cfg.cert_path, &tls_cfg.key_path)
-                    .context("building bolt tls acceptor")?,
-            )
+            match tls_cfg.reload_interval_seconds {
+                Some(interval_secs) => {
+                    let (acceptor, handle) = bolt::build_tls_acceptor_with_reload(
+                        &tls_cfg.cert_path,
+                        &tls_cfg.key_path,
+                        std::time::Duration::from_secs(interval_secs),
+                    )
+                    .context("building bolt tls acceptor with hot-reload")?;
+                    (Some(acceptor), Some(handle))
+                }
+                None => {
+                    let acceptor = bolt::build_tls_acceptor(&tls_cfg.cert_path, &tls_cfg.key_path)
+                        .context("building bolt tls acceptor")?;
+                    (Some(acceptor), None)
+                }
+            }
         } else {
-            None
+            (None, None)
         };
         let tls_state = if tls_acceptor.is_some() {
             "enabled"

@@ -379,6 +379,16 @@ pub struct BoltUser {
 pub struct BoltTlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+
+    /// When set, the listener spawns a background reload task that
+    /// polls the cert + key files at the given interval (in
+    /// seconds) and hot-swaps the certificate when either file's
+    /// mtime changes. New TLS handshakes pick up the rotated cert
+    /// immediately; in-flight handshakes keep the old cert.
+    /// Recommended for any deployment where certs are auto-rotated
+    /// (cert-manager, ACME, etc.). Omit for static certs.
+    #[serde(default)]
+    pub reload_interval_seconds: Option<u64>,
 }
 
 /// TLS material for the gRPC listener and outbound peer channels.
