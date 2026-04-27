@@ -109,6 +109,7 @@ fn make_server_config(
         routing_ttl_seconds: None,
         shutdown_drain_timeout_seconds: None,
         query_timeout_seconds: None,
+        query_max_rows: None,
         tracing: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,

@@ -276,6 +276,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tracing: Option<TracingConfig>,
 
+    /// Maximum row count returned from any one Cypher run.
+    /// Today the gRPC / Bolt layer accumulates rows in memory
+    /// before responding, so an unbounded `MATCH` over a huge
+    /// graph OOMs the peer. Caller gets `ResourceExhausted`
+    /// when this cap trips. `None` (default) keeps the
+    /// historical unbounded behaviour. Recommended for any
+    /// production deploy that exposes Bolt to untrusted clients.
+    #[serde(default)]
+    pub query_max_rows: Option<usize>,
+
     /// Per-query budget (in seconds). Every Cypher execution
     /// path — gRPC `ExecuteCypher`, Bolt `RUN`, and the in-process
     /// `MeshService::execute_cypher_local` — wraps its future in
@@ -626,6 +636,7 @@ mod tests {
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
+            query_max_rows: None,
             tracing: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,

@@ -141,6 +141,7 @@ impl Cli {
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
+            query_max_rows: None,
             tracing: None,
         })
     }
@@ -450,6 +451,7 @@ mod tests {
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
+            query_max_rows: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);
@@ -482,6 +484,7 @@ mod tests {
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
+            query_max_rows: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);

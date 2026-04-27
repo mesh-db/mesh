@@ -318,6 +318,15 @@ pub struct MeshService {
     /// no server-side cap — runaway queries hang their session.
     /// Set via [`Self::with_query_timeout`].
     query_timeout: Option<std::time::Duration>,
+    /// Maximum row count returned by any single Cypher run. The
+    /// executor still iterates lazily via the Volcano model, but
+    /// the gRPC / Bolt layer accumulates rows in `Vec<Row>` before
+    /// responding — without this cap a `MATCH (n) RETURN n` over
+    /// a 100M-node graph OOMs the peer. `None` keeps the
+    /// historical unbounded behaviour. Caller gets
+    /// `ResourceExhausted` once the buffer crosses the limit.
+    /// Set via [`Self::with_query_max_rows`].
+    query_max_rows: Option<usize>,
 }
 
 impl MeshService {
@@ -340,6 +349,7 @@ impl MeshService {
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
             linearizable_reads: false,
             query_timeout: None,
+            query_max_rows: None,
         }
     }
 
@@ -375,6 +385,7 @@ impl MeshService {
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
             linearizable_reads: false,
             query_timeout: None,
+            query_max_rows: None,
         }
     }
 
@@ -418,6 +429,7 @@ impl MeshService {
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
             linearizable_reads: false,
             query_timeout: None,
+            query_max_rows: None,
         }
     }
 
@@ -448,6 +460,7 @@ impl MeshService {
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
             linearizable_reads: false,
             query_timeout: None,
+            query_max_rows: None,
         }
     }
 
@@ -532,6 +545,24 @@ impl MeshService {
     /// See [`Self::with_read_consistency`].
     pub fn linearizable_reads(&self) -> bool {
         self.linearizable_reads
+    }
+
+    /// Configure a maximum row count returned from any one
+    /// Cypher run. `None` (default) keeps the historical
+    /// unbounded behaviour. When the executor produces more
+    /// than `n` rows, the caller gets `ResourceExhausted` instead
+    /// of an OOM.
+    ///
+    /// The cap is enforced after the executor returns its full
+    /// `Vec<Row>` — proper PULL-driven streaming (where the
+    /// executor returns an iterator and the gRPC/Bolt layer pulls
+    /// one batch at a time) is a v3 follow-up that requires
+    /// changing `meshdb_executor`'s public surface. For now this
+    /// gives operators a hard ceiling so unbounded queries fail
+    /// loudly rather than hanging the peer.
+    pub fn with_query_max_rows(mut self, max_rows: Option<usize>) -> Self {
+        self.query_max_rows = max_rows;
+        self
     }
 
     /// Configure the per-query timeout. Every Cypher execution
@@ -825,6 +856,20 @@ impl MeshService {
             let (rows, commands) = self
                 .execute_cypher_buffered(query.clone(), params.clone())
                 .await?;
+            // Cap on result-set size. Today the executor returns a
+            // fully-materialised Vec<Row>; without a cap a runaway
+            // MATCH OOMs the peer. Once meshdb_executor exposes a
+            // streaming row iterator this check moves into the
+            // pull loop.
+            if let Some(max) = self.query_max_rows {
+                if rows.len() > max {
+                    return Err(Status::resource_exhausted(format!(
+                        "query produced {} rows, exceeding configured max of {}",
+                        rows.len(),
+                        max
+                    )));
+                }
+            }
             if !commands.is_empty() {
                 // Raft mode needs to forward the *original query string* to
                 // the leader on a ForwardToLeader error, not the buffered

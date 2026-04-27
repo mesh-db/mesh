@@ -79,6 +79,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
+            query_max_rows: None,
             tracing: None,
         };
 
@@ -2214,6 +2215,7 @@ async fn multi_raft_weighted_placement_skews_replica_distribution() {
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
             query_timeout_seconds: None,
+            query_max_rows: None,
             tracing: None,
         };
         let components = build_components(&config).await.unwrap();
@@ -3100,4 +3102,55 @@ async fn multi_raft_query_timeout_fires_with_deadline_exceeded() {
         )
         .await
         .expect("default-timeout service still serves writes");
+}
+
+/// Result-set max-rows cap surfaces as `ResourceExhausted` when
+/// the executor produces more rows than configured. Without the
+/// cap, an unbounded `MATCH` over a large graph would
+/// accumulate every row in `Vec<Row>` and OOM the peer.
+#[tokio::test]
+async fn multi_raft_query_max_rows_caps_unbounded_results() {
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Seed enough rows to exceed the cap we'll configure below.
+    for i in 0..6 {
+        peers[0]
+            .service
+            .execute_cypher_local(
+                format!("CREATE (:CapProbe {{idx: {i}}})"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("seed write");
+    }
+
+    // Cap at 3 rows; the MATCH below will produce 6.
+    let capped = peers[0].service.clone().with_query_max_rows(Some(3));
+    let result = capped
+        .execute_cypher_local(
+            "MATCH (n:CapProbe) RETURN n.idx".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await;
+    let status = result.expect_err("cap must surface as Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::ResourceExhausted,
+        "expected ResourceExhausted, got {:?}: {}",
+        status.code(),
+        status.message()
+    );
+
+    // Sanity: a service without the cap still serves the same
+    // query.
+    let rows = peers[0]
+        .service
+        .execute_cypher_local(
+            "MATCH (n:CapProbe) RETURN n.idx".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("uncapped query succeeds");
+    assert_eq!(rows.len(), 6, "uncapped query returns all seeded rows");
 }
