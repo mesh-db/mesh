@@ -8,4 +8,4 @@ pub use engine::{
     PropertyConstraintKind, PropertyConstraintSpec, PropertyIndexSpec, PropertyType, StorageEngine,
 };
 pub use error::{Error, Result};
-pub use rocksdb_engine::RocksDbStorageEngine;
+pub use rocksdb_engine::{RocksDbStorageEngine, StorageOptions};

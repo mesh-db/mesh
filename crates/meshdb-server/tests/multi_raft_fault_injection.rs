@@ -265,6 +265,7 @@ fn make_config(
         max_concurrent_queries: None,
         audit_log_path: None,
         plan_cache_size: None,
+        storage: None,
         tracing: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,

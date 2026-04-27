@@ -1,6 +1,57 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// RocksDB tuning knobs. Set in `[storage]`. Every field is
+/// optional — leave them unset to inherit the
+/// [`meshdb_storage::StorageOptions`] defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Cap on open SST files. RocksDB's default is -1 which
+    /// retains every SST forever.
+    #[serde(default)]
+    pub max_open_files: Option<i32>,
+    /// Maximum historical INFO log files retained on disk.
+    #[serde(default)]
+    pub keep_log_file_num: Option<usize>,
+    /// Per-CF write-buffer (memtable) size in bytes.
+    #[serde(default)]
+    pub write_buffer_size_bytes: Option<usize>,
+    /// Maximum number of memtables before writes stall.
+    #[serde(default)]
+    pub max_write_buffer_number: Option<i32>,
+    /// Bloom filter bits per key on the block-based table
+    /// format. ~10 gives ~1% false-positive rate; set on
+    /// point-read-heavy workloads.
+    #[serde(default)]
+    pub bloom_filter_bits_per_key: Option<i32>,
+}
+
+impl StorageConfig {
+    /// Apply this config on top of the storage crate's
+    /// defaults, returning a [`meshdb_storage::StorageOptions`]
+    /// suitable for `RocksDbStorageEngine::open_with_options`.
+    pub fn resolved(&self) -> meshdb_storage::StorageOptions {
+        let mut opts = meshdb_storage::StorageOptions::default();
+        if let Some(v) = self.max_open_files {
+            opts.max_open_files = v;
+        }
+        if let Some(v) = self.keep_log_file_num {
+            opts.keep_log_file_num = v;
+        }
+        if let Some(v) = self.write_buffer_size_bytes {
+            opts.write_buffer_size_bytes = Some(v);
+        }
+        if let Some(v) = self.max_write_buffer_number {
+            opts.max_write_buffer_number = Some(v);
+        }
+        if let Some(v) = self.bloom_filter_bits_per_key {
+            opts.bloom_filter_bits_per_key = Some(v);
+        }
+        opts
+    }
+}
+
 /// OpenTelemetry / OTLP tracing exporter configuration. Set in
 /// `[tracing]`.
 #[derive(Debug, Clone, Deserialize)]
@@ -275,6 +326,12 @@ pub struct ServerConfig {
     /// existing fmt layer (stdout logs) is active.
     #[serde(default)]
     pub tracing: Option<TracingConfig>,
+
+    /// RocksDB tuning knobs. Defaults are conservative and
+    /// match the historical hand-applied values; production
+    /// deployments tune via the `[storage]` TOML section.
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
 
     /// Cypher plan cache size. When set to `Some(n)` the
     /// service caches up to `n` parsed + planned Cypher
@@ -676,6 +733,7 @@ mod tests {
             max_concurrent_queries: None,
             audit_log_path: None,
             plan_cache_size: None,
+            storage: None,
             tracing: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
@@ -766,6 +824,37 @@ address = "127.0.0.1:7003"
         assert!(!is_bcrypt_hash("plaintext"));
         assert!(!is_bcrypt_hash("$1$md5-ish"));
         assert!(!is_bcrypt_hash(""));
+    }
+
+    #[test]
+    fn storage_config_parses_from_toml_and_resolves_defaults() {
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+
+[storage]
+max_open_files = 256
+write_buffer_size_bytes = 67108864
+bloom_filter_bits_per_key = 10
+"#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        let s = cfg.storage.expect("storage section parsed");
+        assert_eq!(s.max_open_files, Some(256));
+        assert_eq!(s.write_buffer_size_bytes, Some(67_108_864));
+        assert_eq!(s.bloom_filter_bits_per_key, Some(10));
+        // Unset fields fall through.
+        assert_eq!(s.keep_log_file_num, None);
+        assert_eq!(s.max_write_buffer_number, None);
+
+        // Resolved options apply set fields, leave the rest at defaults.
+        let resolved = s.resolved();
+        assert_eq!(resolved.max_open_files, 256);
+        assert_eq!(resolved.write_buffer_size_bytes, Some(67_108_864));
+        assert_eq!(resolved.bloom_filter_bits_per_key, Some(10));
+        // Defaults preserved on un-set fields.
+        let default = meshdb_storage::StorageOptions::default();
+        assert_eq!(resolved.keep_log_file_num, default.keep_log_file_num);
     }
 
     #[test]

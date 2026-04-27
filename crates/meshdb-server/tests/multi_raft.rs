@@ -83,6 +83,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             max_concurrent_queries: None,
             audit_log_path: None,
             plan_cache_size: None,
+            storage: None,
             tracing: None,
         };
 
@@ -2222,6 +2223,7 @@ async fn multi_raft_weighted_placement_skews_replica_distribution() {
             max_concurrent_queries: None,
             audit_log_path: None,
             plan_cache_size: None,
+            storage: None,
             tracing: None,
         };
         let components = build_components(&config).await.unwrap();

@@ -58,8 +58,15 @@ pub fn build_service(config: &ServerConfig) -> Result<MeshService> {
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
     let store: Arc<dyn StorageEngine> = Arc::new(
-        RocksDbStorageEngine::open(&config.data_dir)
-            .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
+        RocksDbStorageEngine::open_with_options(
+            &config.data_dir,
+            config
+                .storage
+                .as_ref()
+                .map(|s| s.resolved())
+                .unwrap_or_default(),
+        )
+        .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
     );
 
     match config.resolved_mode() {
@@ -347,8 +354,15 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
     // documented in CLAUDE.md ("Partition count change").
     check_num_partitions_marker(&config.data_dir, config.num_partitions)?;
     let store: Arc<dyn StorageEngine> = Arc::new(
-        RocksDbStorageEngine::open(&config.data_dir)
-            .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
+        RocksDbStorageEngine::open_with_options(
+            &config.data_dir,
+            config
+                .storage
+                .as_ref()
+                .map(|s| s.resolved())
+                .unwrap_or_default(),
+        )
+        .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
     );
 
     let query_timeout = config

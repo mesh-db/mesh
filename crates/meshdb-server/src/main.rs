@@ -145,6 +145,7 @@ impl Cli {
             max_concurrent_queries: None,
             audit_log_path: None,
             plan_cache_size: None,
+            storage: None,
             tracing: None,
         })
     }
@@ -458,6 +459,7 @@ mod tests {
             max_concurrent_queries: None,
             audit_log_path: None,
             plan_cache_size: None,
+            storage: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);
@@ -494,6 +496,7 @@ mod tests {
             max_concurrent_queries: None,
             audit_log_path: None,
             plan_cache_size: None,
+            storage: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);
