@@ -153,6 +153,24 @@ fn apply_apoc_import_with_registry(
     })
 }
 
+/// Open the configured admin-operation audit log, if any. Each
+/// peer maintains its own file so a multi-peer cluster's audit
+/// trail is the union of every peer's local file. `None` when
+/// `audit_log_path` is unset — admin operations still succeed
+/// without leaving a record.
+fn open_audit_log(config: &ServerConfig) -> Result<Option<Arc<meshdb_rpc::AuditLog>>> {
+    let Some(path) = config.audit_log_path.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating audit-log parent dir {}", parent.display()))?;
+    }
+    let log = meshdb_rpc::AuditLog::open(path.clone())
+        .with_context(|| format!("opening audit log {}", path.display()))?;
+    Ok(Some(Arc::new(log)))
+}
+
 /// Shared routing-mode assembly used by both `build_service` (sync)
 /// and `build_components` (async). Opens the durable 2PC coordinator
 /// log under `data_dir` so recovery and rotation are wired up
@@ -199,7 +217,8 @@ fn build_routing_service(
             .with_client_tls(client_tls)
             .with_query_timeout(query_timeout)
             .with_query_max_rows(config.query_max_rows)
-            .with_max_concurrent_queries(config.max_concurrent_queries),
+            .with_max_concurrent_queries(config.max_concurrent_queries)
+            .with_audit_log(open_audit_log(config)?),
         config,
         &store_for_triggers,
     ))
@@ -342,7 +361,8 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
                     MeshService::new(store)
                         .with_query_timeout(query_timeout)
                         .with_query_max_rows(config.query_max_rows)
-                        .with_max_concurrent_queries(config.max_concurrent_queries),
+                        .with_max_concurrent_queries(config.max_concurrent_queries)
+                        .with_audit_log(open_audit_log(config)?),
                     config,
                     &store_for_triggers,
                 ),
@@ -426,7 +446,8 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
             .with_client_tls(client_tls)
             .with_query_timeout(query_timeout)
             .with_query_max_rows(config.query_max_rows)
-            .with_max_concurrent_queries(config.max_concurrent_queries),
+            .with_max_concurrent_queries(config.max_concurrent_queries)
+            .with_audit_log(open_audit_log(config)?),
         config,
         &store_for_triggers,
     );
@@ -649,7 +670,8 @@ async fn build_multi_raft_components(
             .with_read_consistency(linearizable)
             .with_query_timeout(query_timeout)
             .with_query_max_rows(config.query_max_rows)
-            .with_max_concurrent_queries(config.max_concurrent_queries),
+            .with_max_concurrent_queries(config.max_concurrent_queries)
+            .with_audit_log(open_audit_log(config)?),
         config,
         &store_for_triggers,
         #[cfg(feature = "apoc-trigger")]

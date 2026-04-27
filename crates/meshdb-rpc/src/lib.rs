@@ -15,6 +15,7 @@ pub mod proto {
     tonic::include_proto!("mesh");
 }
 
+pub mod audit_log;
 pub mod cluster_auth;
 pub mod convert;
 mod coordinator_log;
@@ -40,6 +41,7 @@ pub mod tls;
 mod tx_coordinator;
 mod tx_overlay;
 
+pub use audit_log::{AuditEntry, AuditLog};
 pub use coordinator_log::{
     CoordinatorLog, TxDecision, TxLogEntry, TxState, DEFAULT_MIN_COMPLETED,
     DEFAULT_ROTATION_INTERVAL,

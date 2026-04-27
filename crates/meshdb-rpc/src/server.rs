@@ -337,6 +337,12 @@ pub struct MeshService {
     /// same semaphore — the cap is per-peer, not per-connection.
     /// Set via [`Self::with_max_concurrent_queries`].
     query_concurrency: Option<Arc<tokio::sync::Semaphore>>,
+    /// Optional durable audit log for admin operations
+    /// (drain_leadership, take_cluster_backup, …). When set,
+    /// each call appends one JSONL record before returning.
+    /// `None` (default) disables — operations still succeed,
+    /// they just don't leave a compliance trail.
+    audit_log: Option<Arc<crate::AuditLog>>,
 }
 
 impl MeshService {
@@ -361,6 +367,7 @@ impl MeshService {
             query_timeout: None,
             query_max_rows: None,
             query_concurrency: None,
+            audit_log: None,
         }
     }
 
@@ -398,6 +405,7 @@ impl MeshService {
             query_timeout: None,
             query_max_rows: None,
             query_concurrency: None,
+            audit_log: None,
         }
     }
 
@@ -443,6 +451,7 @@ impl MeshService {
             query_timeout: None,
             query_max_rows: None,
             query_concurrency: None,
+            audit_log: None,
         }
     }
 
@@ -475,6 +484,7 @@ impl MeshService {
             query_timeout: None,
             query_max_rows: None,
             query_concurrency: None,
+            audit_log: None,
         }
     }
 
@@ -559,6 +569,45 @@ impl MeshService {
     /// See [`Self::with_read_consistency`].
     pub fn linearizable_reads(&self) -> bool {
         self.linearizable_reads
+    }
+
+    /// Attach an audit log. Every admin operation invoked
+    /// through this service (`drain_leadership`,
+    /// `take_cluster_backup`) appends one JSONL record before
+    /// returning. `None` (default) disables — operations still
+    /// succeed without leaving a trail. The same `Arc<AuditLog>`
+    /// can be threaded into a `MultiRaftCluster` so cluster-level
+    /// admin calls share one audit file.
+    pub fn with_audit_log(mut self, log: Option<Arc<crate::AuditLog>>) -> Self {
+        self.audit_log = log;
+        self
+    }
+
+    /// Best-effort audit-log append. Logs at WARN if the write
+    /// fails (compliance is the audit log's job, correctness is
+    /// the caller's; we don't want a disk-full audit log to
+    /// fail the operation it was supposed to trail).
+    fn audit(
+        &self,
+        peer_id: u64,
+        op: &str,
+        args: serde_json::Value,
+        success: bool,
+        error: Option<&str>,
+    ) {
+        let Some(log) = &self.audit_log else { return };
+        let result = if success {
+            log.record_success(peer_id, op, args)
+        } else {
+            log.record_failure(peer_id, op, args, error.unwrap_or(""))
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                operation = op,
+                error = %e,
+                "audit log append failed; operation succeeded but record was not durable"
+            );
+        }
     }
 
     /// Configure a per-peer concurrency cap on Cypher execution.
@@ -2194,15 +2243,28 @@ impl MeshService {
         let Some(multi_raft) = self.multi_raft.clone() else {
             return (Vec::new(), Vec::new());
         };
+        let self_id = multi_raft.self_id;
         let mut stepped_down = Vec::new();
         let mut errors = Vec::new();
         let leads = multi_raft.partitions_led_locally();
+        let leads_count = leads.len();
         for partition in leads {
             match multi_raft.shutdown_partition(partition).await {
                 Ok(()) => stepped_down.push(partition),
                 Err(e) => errors.push((partition, e)),
             }
         }
+        self.audit(
+            self_id,
+            "drain_leadership",
+            serde_json::json!({
+                "partitions_led": leads_count,
+                "partitions_stepped_down": stepped_down.len(),
+                "errors": errors.len(),
+            }),
+            errors.is_empty(),
+            errors.first().map(|(_, e)| e.as_str()),
+        );
         (stepped_down, errors)
     }
 
@@ -2302,6 +2364,17 @@ impl MeshService {
                 }
             }
         }
+
+        self.audit(
+            multi_raft.self_id,
+            "take_cluster_backup",
+            serde_json::json!({
+                "entries": combined.entries.len(),
+                "errors": combined.errors.len(),
+            }),
+            combined.is_clean(),
+            combined.errors.first().map(|e| e.message.as_str()),
+        );
 
         Ok(combined)
     }

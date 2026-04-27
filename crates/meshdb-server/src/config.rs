@@ -276,6 +276,20 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tracing: Option<TracingConfig>,
 
+    /// Path to a durable, append-only audit log of admin
+    /// operations. When set, every `drain_leadership` /
+    /// `take_cluster_backup` (and future cluster-level admin
+    /// calls) appends one JSONL record before returning. Each
+    /// record carries timestamp + peer id + structured args +
+    /// success/error. Compliance regimes that mandate an audit
+    /// trail of privileged operations want this on; for
+    /// dev/test setups it's safe to leave omitted.
+    ///
+    /// Default — no audit log. Operations succeed normally and
+    /// emit `tracing::info` only.
+    #[serde(default)]
+    pub audit_log_path: Option<PathBuf>,
+
     /// Per-peer concurrency cap on Cypher execution. Bolt
     /// sessions and gRPC `ExecuteCypher` callers all share one
     /// semaphore — once `max_concurrent_queries` runs are in
@@ -649,6 +663,7 @@ mod tests {
             query_timeout_seconds: None,
             query_max_rows: None,
             max_concurrent_queries: None,
+            audit_log_path: None,
             tracing: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,

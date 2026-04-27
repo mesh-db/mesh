@@ -143,6 +143,7 @@ impl Cli {
             query_timeout_seconds: None,
             query_max_rows: None,
             max_concurrent_queries: None,
+            audit_log_path: None,
             tracing: None,
         })
     }
@@ -454,6 +455,7 @@ mod tests {
             query_timeout_seconds: None,
             query_max_rows: None,
             max_concurrent_queries: None,
+            audit_log_path: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);
@@ -488,6 +490,7 @@ mod tests {
             query_timeout_seconds: None,
             query_max_rows: None,
             max_concurrent_queries: None,
+            audit_log_path: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);

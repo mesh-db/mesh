@@ -2008,6 +2008,7 @@ dependencies = [
 name = "meshdb-rpc"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "criterion",
  "meshdb-cluster",
  "meshdb-core",

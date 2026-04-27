@@ -81,6 +81,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             query_timeout_seconds: None,
             query_max_rows: None,
             max_concurrent_queries: None,
+            audit_log_path: None,
             tracing: None,
         };
 
@@ -2218,6 +2219,7 @@ async fn multi_raft_weighted_placement_skews_replica_distribution() {
             query_timeout_seconds: None,
             query_max_rows: None,
             max_concurrent_queries: None,
+            audit_log_path: None,
             tracing: None,
         };
         let components = build_components(&config).await.unwrap();
@@ -3104,6 +3106,53 @@ async fn multi_raft_query_timeout_fires_with_deadline_exceeded() {
         )
         .await
         .expect("default-timeout service still serves writes");
+}
+
+/// Audit log captures admin operations (drain_leadership and
+/// take_cluster_backup) as JSONL records. Each entry carries
+/// timestamp + initiator peer id + structured args + success
+/// flag, fsync'd before the call returns.
+#[tokio::test]
+async fn multi_raft_audit_log_records_admin_operations() {
+    use meshdb_rpc::{AuditEntry, AuditLog};
+
+    let peers = spawn_multi_raft_cluster(3, 2, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let log_path = dir.path().join("audit.jsonl");
+    let log = std::sync::Arc::new(AuditLog::open(log_path.clone()).unwrap());
+
+    // Attach the audit log to peer 0's service. Service is
+    // cheap-to-clone; the new clone shares the Arc<AuditLog>.
+    let audited = peers[0].service.clone().with_audit_log(Some(log.clone()));
+
+    // Trigger one cluster-wide backup — should record one
+    // success entry.
+    let manifest = audited
+        .take_cluster_backup()
+        .await
+        .expect("backup succeeds");
+    assert!(manifest.is_clean(), "errors: {:?}", manifest.errors);
+
+    // Read the audit log back.
+    let raw = std::fs::read_to_string(&log_path).unwrap();
+    let lines: Vec<_> = raw.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one audit entry expected, got: {raw}"
+    );
+    let entry: AuditEntry = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(entry.peer_id, peers[0].config.self_id);
+    assert_eq!(entry.operation, "take_cluster_backup");
+    assert!(entry.success);
+    assert!(entry.error.is_none());
+    assert!(
+        entry.args.get("entries").and_then(|v| v.as_u64()).unwrap() > 0,
+        "args should record entry count: {}",
+        entry.args
+    );
 }
 
 /// Concurrency cap fails fast with `ResourceExhausted` instead

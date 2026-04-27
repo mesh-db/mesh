@@ -100,6 +100,7 @@ async fn spawn_three_peer_cluster(num_partitions: u32, rf: usize) -> Cluster {
             query_timeout_seconds: None,
             query_max_rows: None,
             max_concurrent_queries: None,
+            audit_log_path: None,
             tracing: None,
         };
         let components = build_components(&config).await.unwrap();
