@@ -135,6 +135,7 @@ async fn count_probes_local(addr: String) -> usize {
         .nodes_by_label(NodesByLabelRequest {
             label: "Probe".into(),
             local_only: true,
+            linearizable: false,
         })
         .await
         .unwrap();

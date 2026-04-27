@@ -139,6 +139,7 @@ async fn nodes_by_label_returns_all_ids_for_label() {
         .nodes_by_label(NodesByLabelRequest {
             label: "Person".into(),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -211,6 +212,7 @@ async fn get_edge_roundtrip() {
         .get_edge(GetEdgeRequest {
             id: Some(uuid_to_proto(edge_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -455,6 +457,7 @@ async fn nodes_by_label_scatter_gathers_across_peers() {
         .nodes_by_label(NodesByLabelRequest {
             label: "Worker".into(),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -483,6 +486,7 @@ async fn nodes_by_label_local_only_skips_remote() {
         .nodes_by_label(NodesByLabelRequest {
             label: "Flag".into(),
             local_only: true,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -547,6 +551,7 @@ async fn edges_by_property_scatter_gathers_across_peers() {
             property: "k".into(),
             value_json: value_json.clone(),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -561,6 +566,7 @@ async fn edges_by_property_scatter_gathers_across_peers() {
             property: "k".into(),
             value_json,
             local_only: true,
+            linearizable: false,
         })
         .await
         .unwrap();

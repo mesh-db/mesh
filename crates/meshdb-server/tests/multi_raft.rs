@@ -2848,14 +2848,10 @@ async fn multi_raft_take_cluster_backup_covers_every_group_on_every_peer() {
 /// `ensure_linearizable`, and observes a write that committed on
 /// the leader before the local follower had a chance to apply.
 ///
-/// Builds the test on top of the `MeshQuery::GetNode` gRPC handler
-/// rather than `MATCH … RETURN` because executor scatter-gather
-/// reads (label scan, property scan) currently fall back to the
-/// local store even under `linearizable=true` — that's a documented
-/// v3 follow-up. Point reads (which are what most production
-/// workloads do via `id(n)` / merge / hop traversal) get the full
-/// leader-forwarding fence end-to-end and that's what this test
-/// pins down.
+/// Pinned down at the gRPC layer via `MeshQuery::GetNode`. The
+/// executor-side scatter-gather counterpart (`MATCH (n:Label)`
+/// across partition leaders) is exercised by
+/// `multi_raft_linearizable_label_scan_unions_partition_leaders`.
 #[tokio::test]
 async fn multi_raft_linearizable_read_sees_recent_write() {
     use meshdb_rpc::proto::mesh_query_server::MeshQuery;
@@ -2933,4 +2929,62 @@ async fn multi_raft_linearizable_read_sees_recent_write() {
         returned.labels.iter().any(|l| l == "LinProbe"),
         "returned node should carry the LinProbe label"
     );
+}
+
+/// Linearizable scatter-gather (`MATCH (n:Label) RETURN ...`)
+/// fences on every partition leader and unions their results.
+/// Each leader filters its local-store reply to the partitions it
+/// leads, so the union covers every partition exactly once with
+/// no duplicates and no stale follower data.
+#[tokio::test]
+async fn multi_raft_linearizable_label_scan_unions_partition_leaders() {
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Write 12 probe nodes through peer 0. With 4 partitions and a
+    // uniform partitioner, each partition receives ~3 nodes.
+    for i in 0..12 {
+        peers[0]
+            .service
+            .execute_cypher_local(
+                format!("CREATE (:LabelProbe {{idx: {i}}})"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("CREATE through peer 0");
+    }
+
+    // Pick a follower for at least one partition — with rf=3 / 3
+    // peers everyone replicates everything, so any peer works as
+    // the read entry-point. We use peer 1 to make the scatter
+    // exercise a real cross-peer fan-out.
+    let reader = peers[1].service.clone().with_read_consistency(true);
+    let rows = reader
+        .execute_cypher_local(
+            "MATCH (n:LabelProbe) RETURN n.idx AS idx".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("linearizable label scan succeeds");
+
+    assert_eq!(
+        rows.len(),
+        12,
+        "linearizable label scan must union every partition leader's contribution \
+         exactly once; got {} rows",
+        rows.len()
+    );
+
+    // Distinct values cover 0..12 — no duplicates from a partition
+    // leader and a follower both returning the same id.
+    let mut seen_idx: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for row in rows {
+        match row.get("idx").expect("idx") {
+            meshdb_executor::Value::Property(meshdb_core::Property::Int64(n)) => {
+                seen_idx.insert(*n);
+            }
+            other => panic!("unexpected idx value: {other:?}"),
+        }
+    }
+    assert_eq!(seen_idx.len(), 12, "all idx values must be distinct");
 }

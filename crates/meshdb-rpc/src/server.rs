@@ -523,6 +523,36 @@ impl MeshService {
         self.linearizable_reads
     }
 
+    /// Identify every partition this peer currently leads and fence
+    /// each via `Raft::ensure_linearizable`. Returns the set of led
+    /// partition ids — receivers of scatter linearizable reads use
+    /// this to filter their local-store result down to "data this
+    /// peer is the leader of, with the read index quorum-checked".
+    /// Together with the caller fanning out to every peer, the
+    /// union covers every partition exactly once.
+    async fn fence_locally_led_partitions(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+    ) -> Result<std::collections::BTreeSet<meshdb_cluster::PartitionId>, Status> {
+        let led: Vec<meshdb_cluster::PartitionId> = multi_raft
+            .partitions_snapshot()
+            .into_iter()
+            .filter(
+                |(_, raft)| matches!(raft.current_leader(), Some(l) if l.0 == multi_raft.self_id),
+            )
+            .map(|(p, _)| p)
+            .collect();
+        for p in &led {
+            multi_raft
+                .ensure_partition_linearizable(*p)
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!("ensure_linearizable on partition {}: {e}", p.0))
+                })?;
+        }
+        Ok(led.into_iter().collect())
+    }
+
     /// Forward a point-read RPC to the leader of `partition`. Builds
     /// a `MeshQueryClient` for the leader's address (looking it up in
     /// the meta cluster's membership), injects cluster auth, and
@@ -5107,7 +5137,37 @@ impl MeshQuery for MeshService {
             .id
             .ok_or_else(|| Status::invalid_argument("missing id"))?;
         let local_only = req.local_only;
+        let linearizable = req.linearizable;
         let id = edge_id_from_proto(&id_proto).map_err(bad_request)?;
+
+        // Multi-raft + linearizable: only return the edge if its
+        // source partition is one we lead, and only after fencing
+        // on every locally-led partition. Caller fans out to every
+        // peer; the leader of the edge's source partition is the
+        // single one that returns `found=true`. Non-leaders return
+        // not-found instead of stale local data.
+        if linearizable {
+            if let Some(multi_raft) = &self.multi_raft {
+                let led = self.fence_locally_led_partitions(multi_raft).await?;
+                let partitioner =
+                    meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions());
+                let edge = self.store.get_edge(id).map_err(internal)?;
+                let response = match edge {
+                    Some(edge) if led.contains(&partitioner.partition_for(edge.source)) => {
+                        let proto_edge = edge_to_proto(&edge).map_err(internal)?;
+                        GetEdgeResponse {
+                            found: true,
+                            edge: Some(proto_edge),
+                        }
+                    }
+                    _ => GetEdgeResponse {
+                        found: false,
+                        edge: None,
+                    },
+                };
+                return Ok(Response::new(response));
+            }
+        }
 
         // Always check local first — if the edge lives here, we're done.
         if let Some(edge) = self.store.get_edge(id).map_err(internal)? {
@@ -5134,6 +5194,7 @@ impl MeshQuery for MeshService {
                         .get_edge(GetEdgeRequest {
                             id: Some(id_proto.clone()),
                             local_only: true,
+                            linearizable: false,
                         })
                         .await?;
                     let inner = resp.into_inner();
@@ -5158,14 +5219,37 @@ impl MeshQuery for MeshService {
         let req = request.into_inner();
         let label = req.label;
         let local_only = req.local_only;
+        let linearizable = req.linearizable;
 
-        let mut ids: Vec<_> = self
-            .store
-            .nodes_by_label(&label)
-            .map_err(internal)?
-            .into_iter()
-            .map(|id| uuid_to_proto(id.as_uuid()))
-            .collect();
+        // Multi-raft + linearizable: fence on every locally-led
+        // partition, then filter the local-store result down to
+        // ids whose partition is led by this peer. Caller fans out
+        // to every peer; their unions cover every partition exactly
+        // once.
+        let led = if linearizable {
+            if let Some(multi_raft) = &self.multi_raft {
+                Some((
+                    self.fence_locally_led_partitions(multi_raft).await?,
+                    meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions()),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let raw = self.store.nodes_by_label(&label).map_err(internal)?;
+        let mut ids: Vec<_> = if let Some((led, partitioner)) = &led {
+            raw.into_iter()
+                .filter(|id| led.contains(&partitioner.partition_for(*id)))
+                .map(|id| uuid_to_proto(id.as_uuid()))
+                .collect()
+        } else {
+            raw.into_iter()
+                .map(|id| uuid_to_proto(id.as_uuid()))
+                .collect()
+        };
 
         if !local_only {
             if let Some(routing) = &self.routing {
@@ -5181,6 +5265,7 @@ impl MeshQuery for MeshService {
                         .nodes_by_label(NodesByLabelRequest {
                             label: label.clone(),
                             local_only: true,
+                            linearizable: false,
                         })
                         .await?;
                     ids.extend(resp.into_inner().ids);
@@ -5200,18 +5285,39 @@ impl MeshQuery for MeshService {
         let label = req.label;
         let property = req.property;
         let local_only = req.local_only;
+        let linearizable = req.linearizable;
         // Decode the JSON-carried Property value. A malformed blob
         // is a client bug, surface as InvalidArgument.
         let value: meshdb_core::Property = serde_json::from_slice(&req.value_json)
             .map_err(|e| Status::invalid_argument(format!("value_json: {e}")))?;
 
-        let mut ids: Vec<_> = self
+        let led = if linearizable {
+            if let Some(multi_raft) = &self.multi_raft {
+                Some((
+                    self.fence_locally_led_partitions(multi_raft).await?,
+                    meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions()),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let raw = self
             .store
             .nodes_by_property(&label, &property, &value)
-            .map_err(internal)?
-            .into_iter()
-            .map(|id| uuid_to_proto(id.as_uuid()))
-            .collect();
+            .map_err(internal)?;
+        let mut ids: Vec<_> = if let Some((led, partitioner)) = &led {
+            raw.into_iter()
+                .filter(|id| led.contains(&partitioner.partition_for(*id)))
+                .map(|id| uuid_to_proto(id.as_uuid()))
+                .collect()
+        } else {
+            raw.into_iter()
+                .map(|id| uuid_to_proto(id.as_uuid()))
+                .collect()
+        };
 
         if !local_only {
             if let Some(routing) = &self.routing {
@@ -5229,6 +5335,7 @@ impl MeshQuery for MeshService {
                             property: property.clone(),
                             value_json: req.value_json.clone(),
                             local_only: true,
+                            linearizable: false,
                         })
                         .await?;
                     ids.extend(resp.into_inner().ids);
@@ -5248,16 +5355,48 @@ impl MeshQuery for MeshService {
         let edge_type = req.edge_type;
         let property = req.property;
         let local_only = req.local_only;
+        let linearizable = req.linearizable;
         let value: meshdb_core::Property = serde_json::from_slice(&req.value_json)
             .map_err(|e| Status::invalid_argument(format!("value_json: {e}")))?;
 
-        let mut ids: Vec<_> = self
+        let led = if linearizable {
+            if let Some(multi_raft) = &self.multi_raft {
+                Some((
+                    self.fence_locally_led_partitions(multi_raft).await?,
+                    meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions()),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let raw_ids = self
             .store
             .edges_by_property(&edge_type, &property, &value)
-            .map_err(internal)?
-            .into_iter()
-            .map(|id| uuid_to_proto(id.as_uuid()))
-            .collect();
+            .map_err(internal)?;
+
+        // Edges live on the source-owner's partition; filter by
+        // partition_for(edge.source). Need to look up each edge to
+        // find its source node — extra reads but guarantees the
+        // caller's union over peers covers each edge exactly once.
+        let mut ids: Vec<_> = if let Some((led, partitioner)) = &led {
+            let mut filtered = Vec::with_capacity(raw_ids.len());
+            for eid in raw_ids {
+                if let Some(edge) = self.store.get_edge(eid).map_err(internal)? {
+                    if led.contains(&partitioner.partition_for(edge.source)) {
+                        filtered.push(uuid_to_proto(eid.as_uuid()));
+                    }
+                }
+            }
+            filtered
+        } else {
+            raw_ids
+                .into_iter()
+                .map(|id| uuid_to_proto(id.as_uuid()))
+                .collect()
+        };
 
         if !local_only {
             if let Some(routing) = &self.routing {
@@ -5275,6 +5414,7 @@ impl MeshQuery for MeshService {
                             property: property.clone(),
                             value_json: req.value_json.clone(),
                             local_only: true,
+                            linearizable: false,
                         })
                         .await?;
                     ids.extend(resp.into_inner().ids);
@@ -5438,15 +5578,34 @@ impl MeshQuery for MeshService {
         &self,
         request: Request<AllNodeIdsRequest>,
     ) -> Result<Response<AllNodeIdsResponse>, Status> {
-        let local_only = request.into_inner().local_only;
+        let req = request.into_inner();
+        let local_only = req.local_only;
+        let linearizable = req.linearizable;
 
-        let mut ids: Vec<_> = self
-            .store
-            .all_node_ids()
-            .map_err(internal)?
-            .into_iter()
-            .map(|id| uuid_to_proto(id.as_uuid()))
-            .collect();
+        let led = if linearizable {
+            if let Some(multi_raft) = &self.multi_raft {
+                Some((
+                    self.fence_locally_led_partitions(multi_raft).await?,
+                    meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions()),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let raw = self.store.all_node_ids().map_err(internal)?;
+        let mut ids: Vec<_> = if let Some((led, partitioner)) = &led {
+            raw.into_iter()
+                .filter(|id| led.contains(&partitioner.partition_for(*id)))
+                .map(|id| uuid_to_proto(id.as_uuid()))
+                .collect()
+        } else {
+            raw.into_iter()
+                .map(|id| uuid_to_proto(id.as_uuid()))
+                .collect()
+        };
 
         if !local_only {
             if let Some(routing) = &self.routing {
@@ -5459,7 +5618,10 @@ impl MeshQuery for MeshService {
                         .query_client(peer_id)
                         .ok_or_else(|| no_client(peer_id))?;
                     let resp = client
-                        .all_node_ids(AllNodeIdsRequest { local_only: true })
+                        .all_node_ids(AllNodeIdsRequest {
+                            local_only: true,
+                            linearizable: false,
+                        })
                         .await?;
                     ids.extend(resp.into_inner().ids);
                 }

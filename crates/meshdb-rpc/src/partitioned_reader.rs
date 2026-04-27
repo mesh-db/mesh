@@ -111,6 +111,7 @@ impl GraphReader for PartitionedGraphReader {
                     .get_edge(GetEdgeRequest {
                         id: Some(uuid_to_proto(id.as_uuid())),
                         local_only: true,
+                        linearizable: false,
                     })
                     .await
                     .map_err(Self::remote)?;
@@ -143,7 +144,10 @@ impl GraphReader for PartitionedGraphReader {
                     ExecError::Remote(format!("no client registered for peer {}", peer_id))
                 })?;
                 let resp = client
-                    .all_node_ids(AllNodeIdsRequest { local_only: true })
+                    .all_node_ids(AllNodeIdsRequest {
+                        local_only: true,
+                        linearizable: false,
+                    })
                     .await
                     .map_err(Self::remote)?;
                 for id_proto in resp.into_inner().ids {
@@ -177,6 +181,7 @@ impl GraphReader for PartitionedGraphReader {
                     .nodes_by_label(NodesByLabelRequest {
                         label: label.clone(),
                         local_only: true,
+                        linearizable: false,
                     })
                     .await
                     .map_err(Self::remote)?;
@@ -329,6 +334,7 @@ impl GraphReader for PartitionedGraphReader {
                         property: property.clone(),
                         value_json: value_json.clone(),
                         local_only: true,
+                        linearizable: false,
                     })
                     .await
                     .map_err(Self::remote)?;
@@ -382,6 +388,7 @@ impl GraphReader for PartitionedGraphReader {
                         property: property.clone(),
                         value_json: value_json.clone(),
                         local_only: true,
+                        linearizable: false,
                     })
                     .await
                     .map_err(Self::remote)?;

@@ -14,24 +14,34 @@
 //!   and one extra gRPC hop when the local peer isn't the leader.
 //!
 //! Scatter-gather reads (`all_node_ids`, `nodes_by_label`,
-//! `nodes_by_property`, `edges_by_property`, `get_edge`) fall back to
-//! the local store in both modes. Linearizable scatter-gather
-//! requires fanning out to every partition leader and unioning the
-//! results — that's a v3 follow-up and is gated behind a comment in
-//! the trait impl below. The point-read path is what actually
-//! matters for the typical workloads (Bolt sessions, MERGE,
-//! property-by-id traversals) so end-to-end linearizability ships
-//! with the v2 surface and the gap is documented.
+//! `nodes_by_property`, `edges_by_property`, `get_edge`) under
+//! linearizable mode fence on every partition this peer leads,
+//! filter the local-store result to ids whose partition is led
+//! locally, and fan out to every other peer to union their
+//! filtered contributions. Each partition leader's local store
+//! is the authoritative source for its partition (after the
+//! `ensure_linearizable` quorum check), so the union covers
+//! every partition exactly once with no duplicates and no stale
+//! follower data. Default (relaxed) reads still hit the local
+//! store directly without the scatter, matching pre-v2.5
+//! behaviour.
 
 use crate::cluster_auth::ClusterAuth;
-use crate::convert::{node_from_proto, uuid_from_proto, uuid_to_proto};
+use crate::convert::{
+    edge_from_proto, edge_id_from_proto, node_from_proto, node_id_from_proto, uuid_from_proto,
+    uuid_to_proto,
+};
 use crate::proto::mesh_query_client::MeshQueryClient;
-use crate::proto::{GetNodeRequest, NeighborRequest};
+use crate::proto::{
+    AllNodeIdsRequest, EdgesByPropertyRequest, GetEdgeRequest, GetNodeRequest, NeighborRequest,
+    NodesByLabelRequest, NodesByPropertyRequest,
+};
 use crate::MultiRaftCluster;
 use meshdb_cluster::{PartitionId, Partitioner, PeerId};
 use meshdb_core::{Edge, EdgeId, Node, NodeId, Property};
 use meshdb_executor::{Error as ExecError, GraphReader, Result as ExecResult};
 use meshdb_storage::StorageEngine;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
@@ -98,24 +108,12 @@ impl MultiRaftGraphReader {
             })
     }
 
-    /// Build a fresh leader-bound `MeshQueryClient`. Channels are
-    /// not pooled here because partition leadership can shift between
-    /// reads; pooling would require leader-cache invalidation hooks
-    /// and rebuilding on miss anyway. The cost is one `connect_lazy`
-    /// per linearizable forward — connect_lazy returns immediately,
-    /// the actual TCP / TLS handshake amortises across subsequent
-    /// requests on the same channel.
-    async fn leader_client(&self, partition: PartitionId) -> ExecResult<MeshQueryClient<Channel>> {
-        let leader_id = self.multi_raft.leader_of(partition).ok_or_else(|| {
-            ExecError::Remote(format!("no known leader for partition {}", partition.0))
-        })?;
-        let state = self.multi_raft.meta.current_state().await;
-        let addr = state
-            .membership
-            .address(PeerId(leader_id))
-            .ok_or_else(|| ExecError::Remote(format!("no address for leader peer {}", leader_id)))?
-            .to_string();
-        drop(state);
+    /// Build a `MeshQueryClient` for a peer at `addr`. Used by both
+    /// the leader-forwarding path (point reads) and the scatter
+    /// path (label scans, etc.) — neither pools channels because
+    /// partition leadership shifts between reads, but `connect_lazy`
+    /// returns immediately so the cost is just per-call.
+    async fn peer_client(&self, addr: &str) -> ExecResult<MeshQueryClient<Channel>> {
         let scheme = if self.client_tls.is_some() {
             "https"
         } else {
@@ -130,6 +128,57 @@ impl MultiRaftGraphReader {
                 .map_err(|e| ExecError::Remote(format!("tls config: {e}")))?;
         }
         Ok(MeshQueryClient::new(endpoint.connect_lazy()))
+    }
+
+    /// Resolve the partition leader's address and build a query
+    /// client for it.
+    async fn leader_client(&self, partition: PartitionId) -> ExecResult<MeshQueryClient<Channel>> {
+        let leader_id = self.multi_raft.leader_of(partition).ok_or_else(|| {
+            ExecError::Remote(format!("no known leader for partition {}", partition.0))
+        })?;
+        let state = self.multi_raft.meta.current_state().await;
+        let addr = state
+            .membership
+            .address(PeerId(leader_id))
+            .ok_or_else(|| ExecError::Remote(format!("no address for leader peer {}", leader_id)))?
+            .to_string();
+        drop(state);
+        self.peer_client(&addr).await
+    }
+
+    /// Identify every partition this peer leads, fence each via
+    /// `Raft::ensure_linearizable`, and return the set. Used by
+    /// the scatter-gather methods to filter their local-store
+    /// result to "data this peer is the leader of, with the read
+    /// index quorum-checked". Together with the fan-out below,
+    /// the union covers every partition exactly once.
+    async fn led_partitions_with_fence(&self) -> ExecResult<BTreeSet<PartitionId>> {
+        let led: Vec<PartitionId> = self
+            .multi_raft
+            .partitions_snapshot()
+            .into_iter()
+            .filter(|(_, raft)| {
+                matches!(raft.current_leader(), Some(l) if l.0 == self.multi_raft.self_id)
+            })
+            .map(|(p, _)| p)
+            .collect();
+        for p in &led {
+            self.fence_local(*p).await?;
+        }
+        Ok(led.into_iter().collect())
+    }
+
+    /// Build the list of (peer_id, addr) pairs for every peer
+    /// other than self, looked up from the meta cluster's
+    /// membership.
+    async fn other_peer_addrs(&self) -> Vec<(u64, String)> {
+        let state = self.multi_raft.meta.current_state().await;
+        state
+            .membership
+            .iter()
+            .filter(|(id, _)| id.0 != self.multi_raft.self_id)
+            .map(|(id, addr)| (id.0, addr.to_string()))
+            .collect()
     }
 
     /// Build a `tonic::Request` with cluster-auth bearer token
@@ -192,19 +241,113 @@ impl GraphReader for MultiRaftGraphReader {
     }
 
     fn get_edge(&self, id: EdgeId) -> ExecResult<Option<Edge>> {
-        // Edges may live on two partitions (source-owner + target-
-        // owner). Linearizable scatter-gather across both is v3 work
-        // (would require fencing on each partition's leader and
-        // fanning out the request); for now we read locally.
-        Ok(self.local.get_edge(id)?)
+        if !self.linearizable {
+            return Ok(self.local.get_edge(id)?);
+        }
+        self.block(async {
+            // Local fence + check.
+            let led = self.led_partitions_with_fence().await?;
+            let partitioner = Partitioner::new(self.multi_raft.replica_map.num_partitions());
+            if let Some(edge) = self.local.get_edge(id)? {
+                if led.contains(&partitioner.partition_for(edge.source)) {
+                    return Ok(Some(edge));
+                }
+            }
+            // Scatter: every other peer; whichever leads the edge's
+            // source partition returns `found=true`.
+            let id_proto = uuid_to_proto(id.as_uuid());
+            for (_peer_id, addr) in self.other_peer_addrs().await {
+                let mut client = self.peer_client(&addr).await?;
+                let req = self.auth_request(GetEdgeRequest {
+                    id: Some(id_proto.clone()),
+                    local_only: true,
+                    linearizable: true,
+                })?;
+                let resp = client
+                    .get_edge(req)
+                    .await
+                    .map_err(|e| ExecError::Remote(format!("forward get_edge: {e}")))?;
+                let inner = resp.into_inner();
+                if inner.found {
+                    let edge = edge_from_proto(
+                        inner
+                            .edge
+                            .ok_or_else(|| ExecError::Remote("missing edge in response".into()))?,
+                    )
+                    .map_err(|e| ExecError::Remote(e.to_string()))?;
+                    return Ok(Some(edge));
+                }
+            }
+            Ok(None)
+        })
     }
 
     fn all_node_ids(&self) -> ExecResult<Vec<NodeId>> {
-        Ok(self.local.all_node_ids()?)
+        if !self.linearizable {
+            return Ok(self.local.all_node_ids()?);
+        }
+        self.block(async {
+            let partitioner = Partitioner::new(self.multi_raft.replica_map.num_partitions());
+            let led = self.led_partitions_with_fence().await?;
+            let mut seen: HashSet<NodeId> = self
+                .local
+                .all_node_ids()?
+                .into_iter()
+                .filter(|id| led.contains(&partitioner.partition_for(*id)))
+                .collect();
+            for (_peer_id, addr) in self.other_peer_addrs().await {
+                let mut client = self.peer_client(&addr).await?;
+                let req = self.auth_request(AllNodeIdsRequest {
+                    local_only: true,
+                    linearizable: true,
+                })?;
+                let resp = client
+                    .all_node_ids(req)
+                    .await
+                    .map_err(|e| ExecError::Remote(format!("forward all_node_ids: {e}")))?;
+                for id_proto in resp.into_inner().ids {
+                    let id = node_id_from_proto(&id_proto)
+                        .map_err(|e| ExecError::Remote(e.to_string()))?;
+                    seen.insert(id);
+                }
+            }
+            Ok(seen.into_iter().collect())
+        })
     }
 
     fn nodes_by_label(&self, label: &str) -> ExecResult<Vec<NodeId>> {
-        Ok(self.local.nodes_by_label(label)?)
+        if !self.linearizable {
+            return Ok(self.local.nodes_by_label(label)?);
+        }
+        let label = label.to_string();
+        self.block(async {
+            let partitioner = Partitioner::new(self.multi_raft.replica_map.num_partitions());
+            let led = self.led_partitions_with_fence().await?;
+            let mut seen: HashSet<NodeId> = self
+                .local
+                .nodes_by_label(&label)?
+                .into_iter()
+                .filter(|id| led.contains(&partitioner.partition_for(*id)))
+                .collect();
+            for (_peer_id, addr) in self.other_peer_addrs().await {
+                let mut client = self.peer_client(&addr).await?;
+                let req = self.auth_request(NodesByLabelRequest {
+                    label: label.clone(),
+                    local_only: true,
+                    linearizable: true,
+                })?;
+                let resp = client
+                    .nodes_by_label(req)
+                    .await
+                    .map_err(|e| ExecError::Remote(format!("forward nodes_by_label: {e}")))?;
+                for id_proto in resp.into_inner().ids {
+                    let id = node_id_from_proto(&id_proto)
+                        .map_err(|e| ExecError::Remote(e.to_string()))?;
+                    seen.insert(id);
+                }
+            }
+            Ok(seen.into_iter().collect())
+        })
     }
 
     fn outgoing(&self, id: NodeId) -> ExecResult<Vec<(EdgeId, NodeId)>> {
@@ -303,8 +446,44 @@ impl GraphReader for MultiRaftGraphReader {
         property: &str,
         value: &Property,
     ) -> ExecResult<Vec<NodeId>> {
-        // See `get_edge` — scatter-gather linearizable is v3.
-        Ok(self.local.nodes_by_property(label, property, value)?)
+        if !self.linearizable {
+            return Ok(self.local.nodes_by_property(label, property, value)?);
+        }
+        let label = label.to_string();
+        let property = property.to_string();
+        let value_json = serde_json::to_vec(value)
+            .map_err(|e| ExecError::Remote(format!("encoding property value: {e}")))?;
+        let local_value = value.clone();
+        self.block(async {
+            let partitioner = Partitioner::new(self.multi_raft.replica_map.num_partitions());
+            let led = self.led_partitions_with_fence().await?;
+            let mut seen: HashSet<NodeId> = self
+                .local
+                .nodes_by_property(&label, &property, &local_value)?
+                .into_iter()
+                .filter(|id| led.contains(&partitioner.partition_for(*id)))
+                .collect();
+            for (_peer_id, addr) in self.other_peer_addrs().await {
+                let mut client = self.peer_client(&addr).await?;
+                let req = self.auth_request(NodesByPropertyRequest {
+                    label: label.clone(),
+                    property: property.clone(),
+                    value_json: value_json.clone(),
+                    local_only: true,
+                    linearizable: true,
+                })?;
+                let resp = client
+                    .nodes_by_property(req)
+                    .await
+                    .map_err(|e| ExecError::Remote(format!("forward nodes_by_property: {e}")))?;
+                for id_proto in resp.into_inner().ids {
+                    let id = node_id_from_proto(&id_proto)
+                        .map_err(|e| ExecError::Remote(e.to_string()))?;
+                    seen.insert(id);
+                }
+            }
+            Ok(seen.into_iter().collect())
+        })
     }
 
     fn edges_by_property(
@@ -313,7 +492,50 @@ impl GraphReader for MultiRaftGraphReader {
         property: &str,
         value: &Property,
     ) -> ExecResult<Vec<EdgeId>> {
-        Ok(self.local.edges_by_property(edge_type, property, value)?)
+        if !self.linearizable {
+            return Ok(self.local.edges_by_property(edge_type, property, value)?);
+        }
+        let edge_type = edge_type.to_string();
+        let property = property.to_string();
+        let value_json = serde_json::to_vec(value)
+            .map_err(|e| ExecError::Remote(format!("encoding property value: {e}")))?;
+        let local_value = value.clone();
+        self.block(async {
+            let partitioner = Partitioner::new(self.multi_raft.replica_map.num_partitions());
+            let led = self.led_partitions_with_fence().await?;
+            // Local: filter edge ids by source partition.
+            let mut seen: HashSet<EdgeId> = HashSet::new();
+            for eid in self
+                .local
+                .edges_by_property(&edge_type, &property, &local_value)?
+            {
+                if let Some(edge) = self.local.get_edge(eid)? {
+                    if led.contains(&partitioner.partition_for(edge.source)) {
+                        seen.insert(eid);
+                    }
+                }
+            }
+            for (_peer_id, addr) in self.other_peer_addrs().await {
+                let mut client = self.peer_client(&addr).await?;
+                let req = self.auth_request(EdgesByPropertyRequest {
+                    edge_type: edge_type.clone(),
+                    property: property.clone(),
+                    value_json: value_json.clone(),
+                    local_only: true,
+                    linearizable: true,
+                })?;
+                let resp = client
+                    .edges_by_property(req)
+                    .await
+                    .map_err(|e| ExecError::Remote(format!("forward edges_by_property: {e}")))?;
+                for id_proto in resp.into_inner().ids {
+                    let id = edge_id_from_proto(&id_proto)
+                        .map_err(|e| ExecError::Remote(e.to_string()))?;
+                    seen.insert(id);
+                }
+            }
+            Ok(seen.into_iter().collect())
+        })
     }
 }
 
