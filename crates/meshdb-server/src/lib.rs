@@ -189,11 +189,15 @@ fn build_routing_service(
         ParticipantLog::open(participant_log_path(&config.data_dir))
             .context("opening participant log")?,
     );
+    let query_timeout = config
+        .query_timeout_seconds
+        .map(std::time::Duration::from_secs);
     let store_for_triggers = store.clone();
     Ok(apply_apoc_import(
         MeshService::with_routing_and_log(store, routing, Some(log))
             .with_participant_log(Some(participant_log))
-            .with_client_tls(client_tls),
+            .with_client_tls(client_tls)
+            .with_query_timeout(query_timeout),
         config,
         &store_for_triggers,
     ))
@@ -312,11 +316,18 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
             .with_context(|| format!("opening store at {}", config.data_dir.display()))?,
     );
 
+    let query_timeout = config
+        .query_timeout_seconds
+        .map(std::time::Duration::from_secs);
     match config.resolved_mode() {
         ClusterMode::Single => {
             let store_for_triggers = store.clone();
             return Ok(ServerComponents {
-                service: apply_apoc_import(MeshService::new(store), config, &store_for_triggers),
+                service: apply_apoc_import(
+                    MeshService::new(store).with_query_timeout(query_timeout),
+                    config,
+                    &store_for_triggers,
+                ),
                 raft: None,
                 raft_service: None,
                 multi_raft: None,
@@ -393,7 +404,9 @@ pub async fn build_components(config: &ServerConfig) -> Result<ServerComponents>
     // store ends up consistent.
     let store_for_triggers = store.clone();
     let service = apply_apoc_import(
-        MeshService::with_raft(store, raft.clone()).with_client_tls(client_tls),
+        MeshService::with_raft(store, raft.clone())
+            .with_client_tls(client_tls)
+            .with_query_timeout(query_timeout),
         config,
         &store_for_triggers,
     );
@@ -606,11 +619,15 @@ async fn build_multi_raft_components(
         config.read_consistency,
         Some(crate::config::ReadConsistency::Linearizable)
     );
+    let query_timeout = config
+        .query_timeout_seconds
+        .map(std::time::Duration::from_secs);
     let service = apply_apoc_import_with_registry(
         MeshService::with_multi_raft(store, multi_raft.clone())
             .with_coordinator_log(Some(coordinator_log))
             .with_client_tls(client_tls)
-            .with_read_consistency(linearizable),
+            .with_read_consistency(linearizable)
+            .with_query_timeout(query_timeout),
         config,
         &store_for_triggers,
         #[cfg(feature = "apoc-trigger")]

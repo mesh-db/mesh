@@ -78,6 +78,7 @@ async fn spawn_multi_raft_cluster(num_peers: usize, num_partitions: u32, rf: usi
             cluster_auth: None,
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
             tracing: None,
         };
 
@@ -2212,6 +2213,7 @@ async fn multi_raft_weighted_placement_skews_replica_distribution() {
             cluster_auth: None,
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
             tracing: None,
         };
         let components = build_components(&config).await.unwrap();
@@ -2989,4 +2991,50 @@ async fn multi_raft_linearizable_label_scan_unions_partition_leaders() {
         }
     }
     assert_eq!(seen_idx.len(), 12, "all idx values must be distinct");
+}
+
+/// Per-query timeout fires when the configured deadline is too
+/// short for the pipeline to complete. Checks both that the
+/// caller gets a `DeadlineExceeded` and that the in-flight
+/// future is dropped (the fast-path with no timeout still
+/// succeeds on a fresh service clone).
+#[tokio::test]
+async fn multi_raft_query_timeout_fires_with_deadline_exceeded() {
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // 1ns is shorter than any realistic parse + plan + propose +
+    // apply path — guarantees the timeout fires before the
+    // pipeline returns. We use the same tracing/timeout type the
+    // server side uses so a future infrastructure regression
+    // (skipping the wrap, etc.) makes this test fail.
+    let with_timeout = peers[0]
+        .service
+        .clone()
+        .with_query_timeout(Some(Duration::from_nanos(1)));
+    let result = with_timeout
+        .execute_cypher_local(
+            "CREATE (:TimeoutProbe {x: 1})".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await;
+    let status = result.expect_err("query timeout must surface as Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::DeadlineExceeded,
+        "expected DeadlineExceeded, got {:?}: {}",
+        status.code(),
+        status.message()
+    );
+
+    // Sanity: the unmodified service (no timeout) handles the same
+    // query fine. Confirms the timeout is the only thing differing.
+    peers[0]
+        .service
+        .execute_cypher_local(
+            "CREATE (:TimeoutProbe {x: 2})".to_string(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("default-timeout service still serves writes");
 }

@@ -311,6 +311,13 @@ pub struct MeshService {
     /// (eventually-consistent local-replica reads, the cheap path).
     /// Set via [`Self::with_read_consistency`].
     linearizable_reads: bool,
+    /// Per-query budget. When set, every `execute_cypher_local`
+    /// (and every gRPC `ExecuteCypher` / Bolt `RUN`) is wrapped in
+    /// `tokio::time::timeout`; on expiry the future is dropped and
+    /// the caller gets `DeadlineExceeded`. `None` (default) means
+    /// no server-side cap — runaway queries hang their session.
+    /// Set via [`Self::with_query_timeout`].
+    query_timeout: Option<std::time::Duration>,
 }
 
 impl MeshService {
@@ -332,6 +339,7 @@ impl MeshService {
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
             linearizable_reads: false,
+            query_timeout: None,
         }
     }
 
@@ -366,6 +374,7 @@ impl MeshService {
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
             linearizable_reads: false,
+            query_timeout: None,
         }
     }
 
@@ -408,6 +417,7 @@ impl MeshService {
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
             linearizable_reads: false,
+            query_timeout: None,
         }
     }
 
@@ -437,6 +447,7 @@ impl MeshService {
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
             linearizable_reads: false,
+            query_timeout: None,
         }
     }
 
@@ -521,6 +532,38 @@ impl MeshService {
     /// See [`Self::with_read_consistency`].
     pub fn linearizable_reads(&self) -> bool {
         self.linearizable_reads
+    }
+
+    /// Configure the per-query timeout. Every Cypher execution
+    /// path — gRPC `ExecuteCypher`, Bolt `RUN`, and the in-process
+    /// [`Self::execute_cypher_local`] — wraps its future in
+    /// `tokio::time::timeout` and returns `DeadlineExceeded` on
+    /// expiry. `None` disables the cap (runaway queries hang the
+    /// session, the historical behaviour).
+    pub fn with_query_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.query_timeout = timeout;
+        self
+    }
+
+    /// Apply the configured per-query timeout to a future. When
+    /// no timeout is set, returns the future result directly. On
+    /// expiry the future is dropped (cancelling the executor task,
+    /// the in-flight Raft propose, etc.) and the caller gets
+    /// `DeadlineExceeded`.
+    async fn with_timeout<F, T>(&self, fut: F) -> std::result::Result<T, Status>
+    where
+        F: std::future::Future<Output = std::result::Result<T, Status>>,
+    {
+        match self.query_timeout {
+            Some(d) => match tokio::time::timeout(d, fut).await {
+                Ok(r) => r,
+                Err(_) => Err(Status::deadline_exceeded(format!(
+                    "query exceeded the configured timeout of {}ms",
+                    d.as_millis()
+                ))),
+            },
+            None => fut.await,
+        }
     }
 
     /// Identify every partition this peer currently leads and fence
@@ -769,34 +812,41 @@ impl MeshService {
         query: String,
         params: meshdb_executor::ParamMap,
     ) -> std::result::Result<Vec<meshdb_executor::Row>, Status> {
-        // Two-step auto-commit: run the executor against a buffer,
-        // then dispatch the buffered writes through the active
-        // backend. The two halves are public on their own so the Bolt
-        // explicit-transaction handler can interleave multiple buffered
-        // RUNs and commit them as one batch.
-        let (rows, commands) = self
-            .execute_cypher_buffered(query.clone(), params.clone())
-            .await?;
-        if !commands.is_empty() {
-            // Raft mode needs to forward the *original query string* to
-            // the leader on a ForwardToLeader error, not the buffered
-            // commands (whose ids would clash with anything the leader
-            // already minted). Detect that case here and re-issue the
-            // gRPC call with params; the leader runs the whole pipeline
-            // on its end and returns the resulting rows.
-            match self.commit_buffered_commands(commands).await {
-                Ok(()) => {}
-                Err(status) => {
-                    if let Some(addr) = leader_redirect_address(&status) {
-                        return self
-                            .forward_execute_cypher_to_leader(&addr, query, params)
-                            .await;
+        // Wrap the entire pipeline in the configured per-query
+        // timeout — covers parse, plan, execute, and commit. On
+        // expiry the inner future is dropped, which cancels the
+        // executor task and any in-flight Raft propose.
+        self.with_timeout(async {
+            // Two-step auto-commit: run the executor against a buffer,
+            // then dispatch the buffered writes through the active
+            // backend. The two halves are public on their own so the Bolt
+            // explicit-transaction handler can interleave multiple buffered
+            // RUNs and commit them as one batch.
+            let (rows, commands) = self
+                .execute_cypher_buffered(query.clone(), params.clone())
+                .await?;
+            if !commands.is_empty() {
+                // Raft mode needs to forward the *original query string* to
+                // the leader on a ForwardToLeader error, not the buffered
+                // commands (whose ids would clash with anything the leader
+                // already minted). Detect that case here and re-issue the
+                // gRPC call with params; the leader runs the whole pipeline
+                // on its end and returns the resulting rows.
+                match self.commit_buffered_commands(commands).await {
+                    Ok(()) => {}
+                    Err(status) => {
+                        if let Some(addr) = leader_redirect_address(&status) {
+                            return self
+                                .forward_execute_cypher_to_leader(&addr, query, params)
+                                .await;
+                        }
+                        return Err(status);
                     }
-                    return Err(status);
                 }
             }
-        }
-        Ok(rows)
+            Ok(rows)
+        })
+        .await
     }
 
     /// Run a Cypher query end-to-end without committing — returns the

@@ -276,6 +276,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tracing: Option<TracingConfig>,
 
+    /// Per-query budget (in seconds). Every Cypher execution
+    /// path — gRPC `ExecuteCypher`, Bolt `RUN`, and the in-process
+    /// `MeshService::execute_cypher_local` — wraps its future in
+    /// `tokio::time::timeout` and returns `DeadlineExceeded` on
+    /// expiry. `None` (default) leaves the historical "runaway
+    /// queries hang their session" behaviour. Recommended for any
+    /// production deploy that exposes Bolt to untrusted clients.
+    #[serde(default)]
+    pub query_timeout_seconds: Option<u64>,
+
     /// Total deadline (in seconds) the server gives a shutdown
     /// drain — every partition this peer leads is asked to step
     /// down before the gRPC listener exits. Default 30 seconds.
@@ -595,6 +605,7 @@ mod tests {
             cluster_auth: None,
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
             tracing: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,

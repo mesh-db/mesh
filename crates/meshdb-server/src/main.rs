@@ -105,6 +105,7 @@ impl Cli {
             cluster_auth: None,
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
             tracing: None,
         })
     }
@@ -321,6 +322,7 @@ mod tests {
             cluster_auth: None,
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);
@@ -352,6 +354,7 @@ mod tests {
             cluster_auth: None,
             routing_ttl_seconds: None,
             shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
             tracing: None,
         };
         cli.apply_to(&mut cfg);
