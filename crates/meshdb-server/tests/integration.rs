@@ -267,6 +267,7 @@ async fn server_write_then_read_single_node() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -304,6 +305,7 @@ async fn two_peer_cluster_via_config_routes_writes_and_reads() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();
@@ -830,6 +832,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -849,6 +852,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(node_id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();
@@ -1019,6 +1023,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1035,6 +1040,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(node_id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();
@@ -1099,6 +1105,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
                 .get_node(GetNodeRequest {
                     id: Some(uuid_to_proto(id.as_uuid())),
                     local_only: false,
+                    linearizable: false,
                 })
                 .await
                 .unwrap();
@@ -1943,6 +1950,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(pinned_id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();

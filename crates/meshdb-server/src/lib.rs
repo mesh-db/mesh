@@ -601,10 +601,15 @@ async fn build_multi_raft_components(
     // to the procedure factory so `apoc.trigger.list()` reads
     // from the same instance the applier refreshes.
     let store_for_triggers = store.clone();
+    let linearizable = matches!(
+        config.read_consistency,
+        Some(crate::config::ReadConsistency::Linearizable)
+    );
     let service = apply_apoc_import_with_registry(
         MeshService::with_multi_raft(store, multi_raft.clone())
             .with_coordinator_log(Some(coordinator_log))
-            .with_client_tls(client_tls),
+            .with_client_tls(client_tls)
+            .with_read_consistency(linearizable),
         config,
         &store_for_triggers,
         #[cfg(feature = "apoc-trigger")]

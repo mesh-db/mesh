@@ -304,6 +304,13 @@ pub struct MeshService {
     /// [`Self::with_cluster_auth`]. See
     /// [`crate::cluster_auth`].
     cluster_auth: crate::cluster_auth::ClusterAuth,
+    /// Linearizable-read flag for multi-raft mode. When true, point
+    /// read RPCs (`GetNode`, `Outgoing`, `Incoming`) and the
+    /// executor's read path forward to the partition leader and gate
+    /// on `Raft::ensure_linearizable` before answering. Default false
+    /// (eventually-consistent local-replica reads, the cheap path).
+    /// Set via [`Self::with_read_consistency`].
+    linearizable_reads: bool,
 }
 
 impl MeshService {
@@ -324,6 +331,7 @@ impl MeshService {
             fault_points: None,
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
+            linearizable_reads: false,
         }
     }
 
@@ -357,6 +365,7 @@ impl MeshService {
             fault_points: None,
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
+            linearizable_reads: false,
         }
     }
 
@@ -398,6 +407,7 @@ impl MeshService {
             fault_points: None,
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
+            linearizable_reads: false,
         }
     }
 
@@ -426,6 +436,7 @@ impl MeshService {
             fault_points: None,
             idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
             cluster_auth: crate::cluster_auth::ClusterAuth::default(),
+            linearizable_reads: false,
         }
     }
 
@@ -489,6 +500,74 @@ impl MeshService {
     pub fn with_staging(mut self, staging: Arc<crate::ParticipantStaging>) -> Self {
         self.pending_batches = staging;
         self
+    }
+
+    /// Configure the read-consistency policy for multi-raft mode.
+    /// `linearizable=true` makes point reads (`get_node`,
+    /// `outgoing`, `incoming`, and the executor's per-row reads when
+    /// running multi-raft with linearizable mode) forward to the
+    /// partition leader, fence on `Raft::ensure_linearizable`, and
+    /// only then read from the local store. `linearizable=false`
+    /// (the default) reads directly from the local replica with no
+    /// quorum check — cheaper but eventually consistent.
+    ///
+    /// Has no effect in single-node, single-Raft, or routing modes.
+    pub fn with_read_consistency(mut self, linearizable: bool) -> Self {
+        self.linearizable_reads = linearizable;
+        self
+    }
+
+    /// True if this service is configured to do linearizable reads.
+    /// See [`Self::with_read_consistency`].
+    pub fn linearizable_reads(&self) -> bool {
+        self.linearizable_reads
+    }
+
+    /// Forward a point-read RPC to the leader of `partition`. Builds
+    /// a `MeshQueryClient` for the leader's address (looking it up in
+    /// the meta cluster's membership), injects cluster auth, and
+    /// returns the channel-backed client. Caller invokes the desired
+    /// RPC method (`get_node`, `outgoing`, `incoming`) with
+    /// `local_only=true` and `linearizable=true` so the leader fences
+    /// and answers from its local store without re-forwarding.
+    async fn leader_query_client(
+        &self,
+        multi_raft: &Arc<crate::MultiRaftCluster>,
+        partition: meshdb_cluster::PartitionId,
+    ) -> Result<crate::proto::mesh_query_client::MeshQueryClient<Channel>, Status> {
+        let leader_id = match multi_raft.leader_of(partition) {
+            Some(id) => id,
+            None => match self
+                .resolve_partition_leader_remote(multi_raft, partition)
+                .await
+            {
+                Some(id) => id,
+                None => {
+                    return Err(Status::unavailable(format!(
+                        "no known leader for partition {}",
+                        partition.0
+                    )));
+                }
+            },
+        };
+        if leader_id == multi_raft.self_id {
+            return Err(Status::failed_precondition(
+                "leader_query_client called when local peer is the leader",
+            ));
+        }
+        let state = multi_raft.meta.current_state().await;
+        let addr = state
+            .membership
+            .address(meshdb_cluster::PeerId(leader_id))
+            .ok_or_else(|| {
+                Status::unavailable(format!("no address for leader peer {}", leader_id))
+            })?
+            .to_string();
+        drop(state);
+        let endpoint = self.peer_endpoint(&addr)?;
+        Ok(crate::proto::mesh_query_client::MeshQueryClient::new(
+            endpoint.connect_lazy(),
+        ))
     }
 
     /// Attach a shared [`FaultPoints`](crate::FaultPoints) handle so
@@ -840,6 +919,10 @@ impl MeshService {
 
         let store = self.store.clone();
         let routing = self.routing.clone();
+        let multi_raft = self.multi_raft.clone();
+        let linearizable_reads = self.linearizable_reads;
+        let client_tls = self.client_tls.clone();
+        let cluster_auth = self.cluster_auth.clone();
         let exec_params = params;
         let registry_factory = self.procedure_registry_factory.clone();
 
@@ -859,8 +942,7 @@ impl MeshService {
                 let procs = registry_factory();
                 let rows = if let Some(r) = routing.as_ref() {
                     // Routing mode: reads go through a partitioned
-                    // reader. Single-node and Raft modes use the local
-                    // store directly (Raft replicates the full graph).
+                    // reader.
                     let partitioned =
                         PartitionedGraphReader::new(store.clone(), r.clone());
                     let base: &dyn GraphReader = &partitioned;
@@ -872,7 +954,31 @@ impl MeshService {
                         &exec_params,
                         &procs,
                     )?
+                } else if let Some(mr) = multi_raft.as_ref() {
+                    // Multi-raft mode: reads go through a
+                    // leader-routing reader. When linearizable is on
+                    // it forwards point reads to partition leaders
+                    // and fences on `ensure_linearizable`; otherwise
+                    // it just reads the local replica.
+                    let mr_reader = crate::MultiRaftGraphReader::new(
+                        store.clone(),
+                        mr.clone(),
+                        linearizable_reads,
+                        client_tls.clone(),
+                        cluster_auth.clone(),
+                    );
+                    let base: &dyn GraphReader = &mr_reader;
+                    let reader = crate::OverlayGraphReader::new(base, &overlay);
+                    execute_with_reader_and_procs(
+                        &plan,
+                        &reader as &dyn GraphReader,
+                        &writer as &dyn GraphWriter,
+                        &exec_params,
+                        &procs,
+                    )?
                 } else {
+                    // Single-node or single-Raft. Local store is
+                    // authoritative.
                     let base: &dyn GraphReader = &storage_reader;
                     let reader = crate::OverlayGraphReader::new(base, &overlay);
                     execute_with_reader_and_procs(
@@ -4828,15 +4934,54 @@ impl MeshQuery for MeshService {
     ) -> Result<Response<GetNodeResponse>, Status> {
         let req = request.into_inner();
         let local_only = req.local_only;
+        let linearizable = req.linearizable;
         let id_proto = req
             .id
             .ok_or_else(|| Status::invalid_argument("missing id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
 
-        // Forward to the partition owner if this node doesn't live locally.
-        // `local_only` short-circuits forwarding so the partitioned reader
-        // can issue direct point reads against a specific peer.
-        if !local_only {
+        // Multi-raft + linearizable: forward to the partition leader if
+        // we're not it; otherwise fence on `ensure_linearizable` before
+        // touching the local store. `local_only=true` on a forwarded
+        // request is a contract violation (the caller is responsible for
+        // routing to the leader) — we still fence locally so the read is
+        // strictly linearizable for the partition leader's view.
+        if let Some(multi_raft) = &self.multi_raft {
+            let partitioner =
+                meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions());
+            let partition = partitioner.partition_for(id);
+            if linearizable {
+                let is_leader =
+                    matches!(multi_raft.leader_of(partition), Some(l) if l == multi_raft.self_id);
+                if !is_leader {
+                    if local_only {
+                        return Err(Status::failed_precondition(
+                            "linearizable read landed on non-leader with local_only=true; \
+                             caller must route to the partition leader",
+                        ));
+                    }
+                    let mut client = self.leader_query_client(multi_raft, partition).await?;
+                    return client
+                        .get_node(GetNodeRequest {
+                            id: Some(id_proto),
+                            local_only: true,
+                            linearizable: true,
+                        })
+                        .await;
+                }
+                multi_raft
+                    .ensure_partition_linearizable(partition)
+                    .await
+                    .map_err(|e| {
+                        Status::unavailable(format!(
+                            "ensure_linearizable on partition {}: {e}",
+                            partition.0
+                        ))
+                    })?;
+            }
+        } else if !local_only {
+            // Routing-mode (single-owner) forwarding to the partition
+            // owner if this node doesn't live locally.
             if let Some(routing) = &self.routing {
                 if !routing.cluster().is_local(id) {
                     let owner = routing.cluster().owner_of(id);
@@ -4847,6 +4992,7 @@ impl MeshQuery for MeshService {
                         .get_node(GetNodeRequest {
                             id: Some(id_proto),
                             local_only: false,
+                            linearizable: false,
                         })
                         .await;
                 }
@@ -5056,12 +5202,45 @@ impl MeshQuery for MeshService {
     ) -> Result<Response<NeighborResponse>, Status> {
         let req = request.into_inner();
         let local_only = req.local_only;
+        let linearizable = req.linearizable;
         let id_proto = req
             .node_id
             .ok_or_else(|| Status::invalid_argument("missing node_id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
 
-        if !local_only {
+        if let Some(multi_raft) = &self.multi_raft {
+            let partitioner =
+                meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions());
+            let partition = partitioner.partition_for(id);
+            if linearizable {
+                let is_leader =
+                    matches!(multi_raft.leader_of(partition), Some(l) if l == multi_raft.self_id);
+                if !is_leader {
+                    if local_only {
+                        return Err(Status::failed_precondition(
+                            "linearizable outgoing on non-leader with local_only=true",
+                        ));
+                    }
+                    let mut client = self.leader_query_client(multi_raft, partition).await?;
+                    return client
+                        .outgoing(NeighborRequest {
+                            node_id: Some(id_proto),
+                            local_only: true,
+                            linearizable: true,
+                        })
+                        .await;
+                }
+                multi_raft
+                    .ensure_partition_linearizable(partition)
+                    .await
+                    .map_err(|e| {
+                        Status::unavailable(format!(
+                            "ensure_linearizable on partition {}: {e}",
+                            partition.0
+                        ))
+                    })?;
+            }
+        } else if !local_only {
             if let Some(routing) = &self.routing {
                 if !routing.cluster().is_local(id) {
                     let owner = routing.cluster().owner_of(id);
@@ -5072,6 +5251,7 @@ impl MeshQuery for MeshService {
                         .outgoing(NeighborRequest {
                             node_id: Some(id_proto),
                             local_only: false,
+                            linearizable: false,
                         })
                         .await;
                 }
@@ -5096,12 +5276,45 @@ impl MeshQuery for MeshService {
     ) -> Result<Response<NeighborResponse>, Status> {
         let req = request.into_inner();
         let local_only = req.local_only;
+        let linearizable = req.linearizable;
         let id_proto = req
             .node_id
             .ok_or_else(|| Status::invalid_argument("missing node_id"))?;
         let id = node_id_from_proto(&id_proto).map_err(bad_request)?;
 
-        if !local_only {
+        if let Some(multi_raft) = &self.multi_raft {
+            let partitioner =
+                meshdb_cluster::Partitioner::new(multi_raft.replica_map.num_partitions());
+            let partition = partitioner.partition_for(id);
+            if linearizable {
+                let is_leader =
+                    matches!(multi_raft.leader_of(partition), Some(l) if l == multi_raft.self_id);
+                if !is_leader {
+                    if local_only {
+                        return Err(Status::failed_precondition(
+                            "linearizable incoming on non-leader with local_only=true",
+                        ));
+                    }
+                    let mut client = self.leader_query_client(multi_raft, partition).await?;
+                    return client
+                        .incoming(NeighborRequest {
+                            node_id: Some(id_proto),
+                            local_only: true,
+                            linearizable: true,
+                        })
+                        .await;
+                }
+                multi_raft
+                    .ensure_partition_linearizable(partition)
+                    .await
+                    .map_err(|e| {
+                        Status::unavailable(format!(
+                            "ensure_linearizable on partition {}: {e}",
+                            partition.0
+                        ))
+                    })?;
+            }
+        } else if !local_only {
             if let Some(routing) = &self.routing {
                 if !routing.cluster().is_local(id) {
                     let owner = routing.cluster().owner_of(id);
@@ -5112,6 +5325,7 @@ impl MeshQuery for MeshService {
                         .incoming(NeighborRequest {
                             node_id: Some(id_proto),
                             local_only: false,
+                            linearizable: false,
                         })
                         .await;
                 }

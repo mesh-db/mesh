@@ -26,6 +26,7 @@ mod idempotency;
 pub mod metrics;
 mod multi_raft_applier;
 mod multi_raft_cluster;
+mod multi_raft_reader;
 mod participant_log;
 mod partitioned_reader;
 mod raft_applier;
@@ -51,6 +52,7 @@ pub use multi_raft_applier::{MetaGraphApplier, PartitionGraphApplier};
 pub use multi_raft_cluster::{
     MultiRaftCluster, PartitionLeaderCache, DEFAULT_DDL_STRICT_TIMEOUT, DEFAULT_RECOVERY_INTERVAL,
 };
+pub use multi_raft_reader::MultiRaftGraphReader;
 pub use participant_log::{
     replay_in_doubt_commands, replay_outcomes, ParticipantLog, ParticipantLogEntry,
     ParticipantOutcome, PARTICIPANT_LOG_MIN_TERMINAL, PARTICIPANT_LOG_ROTATION_INTERVAL,

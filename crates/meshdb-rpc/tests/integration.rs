@@ -86,6 +86,7 @@ async fn get_node_roundtrips_labels_and_properties() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -108,6 +109,7 @@ async fn get_node_missing_returns_not_found() {
         .get_node(GetNodeRequest {
             id: Some(fake),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -159,6 +161,7 @@ async fn outgoing_returns_edge_and_neighbor() {
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(a.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -184,6 +187,7 @@ async fn incoming_mirrors_outgoing() {
         .incoming(NeighborRequest {
             node_id: Some(uuid_to_proto(b.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -411,6 +415,7 @@ async fn routed_get_node_crosses_peers() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(node.id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();
@@ -589,6 +594,7 @@ async fn routed_outgoing_forwards_to_source_owner() {
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(src.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1249,6 +1255,7 @@ async fn routed_get_node_missing_returns_not_found_on_either_peer() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(meshdb_core::NodeId::new().as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1518,6 +1525,7 @@ async fn write_then_routed_read_full_cycle() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(src.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1527,6 +1535,7 @@ async fn write_then_routed_read_full_cycle() {
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(src.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1536,6 +1545,7 @@ async fn write_then_routed_read_full_cycle() {
         .incoming(NeighborRequest {
             node_id: Some(uuid_to_proto(dst.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1553,6 +1563,7 @@ async fn invalid_uuid_length_returns_invalid_argument() {
         .get_node(GetNodeRequest {
             id: Some(bad),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap_err();

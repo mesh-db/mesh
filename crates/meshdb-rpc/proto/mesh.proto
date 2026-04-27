@@ -150,6 +150,12 @@ message GetNodeRequest {
   // forward to the partition owner. Used by the partitioned reader to issue
   // direct point reads against a specific peer.
   bool local_only = 2;
+  // When true *and* the server is in multi-raft mode, the receiving peer
+  // ensures it is the leader of the relevant partition and gates the read
+  // on `Raft::ensure_linearizable` before answering. Ignored in other
+  // cluster modes (linearizability is implicit in single / single-Raft, and
+  // routing mode lacks the per-partition consensus to fence on).
+  bool linearizable = 3;
 }
 message GetNodeResponse {
   bool found = 1;
@@ -208,6 +214,10 @@ message NeighborRequest {
   // When true, the server answers only from its local store and does not
   // forward to the partition owner.
   bool local_only = 2;
+  // See `GetNodeRequest.linearizable`. Same semantics for adjacency reads:
+  // multi-raft + linearizable forces the receiving peer to fence on the
+  // partition leader's read index before answering.
+  bool linearizable = 3;
 }
 message NeighborResponse { repeated NeighborInfo neighbors = 1; }
 

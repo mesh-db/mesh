@@ -89,6 +89,7 @@ async fn put_node_handler_emits_instrumented_span() {
     svc.get_node(Request::new(GetNodeRequest {
         id: Some(meshdb_rpc::convert::uuid_to_proto(id.as_uuid())),
         local_only: false,
+        linearizable: false,
     }))
     .await
     .unwrap();

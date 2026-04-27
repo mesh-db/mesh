@@ -70,6 +70,7 @@ impl GraphReader for PartitionedGraphReader {
                 .get_node(GetNodeRequest {
                     id: Some(uuid_to_proto(id.as_uuid())),
                     local_only: true,
+                    linearizable: false,
                 })
                 .await
                 .map_err(Self::remote)?;
@@ -206,6 +207,7 @@ impl GraphReader for PartitionedGraphReader {
                 .outgoing(NeighborRequest {
                     node_id: Some(uuid_to_proto(id.as_uuid())),
                     local_only: true,
+                    linearizable: false,
                 })
                 .await
                 .map_err(Self::remote)?;
@@ -227,6 +229,7 @@ impl GraphReader for PartitionedGraphReader {
                 .incoming(NeighborRequest {
                     node_id: Some(uuid_to_proto(id.as_uuid())),
                     local_only: true,
+                    linearizable: false,
                 })
                 .await
                 .map_err(Self::remote)?;

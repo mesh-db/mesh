@@ -2776,3 +2776,95 @@ async fn multi_raft_metrics_increment_on_forward_write_and_ddl_gate() {
         "ddl_gate_total{{ok}} should increment on a successful CREATE INDEX: {ddl_before} -> {ddl_after}"
     );
 }
+
+/// Linearizable point-read on a non-leader peer transparently
+/// forwards to the partition leader, fences on
+/// `ensure_linearizable`, and observes a write that committed on
+/// the leader before the local follower had a chance to apply.
+///
+/// Builds the test on top of the `MeshQuery::GetNode` gRPC handler
+/// rather than `MATCH … RETURN` because executor scatter-gather
+/// reads (label scan, property scan) currently fall back to the
+/// local store even under `linearizable=true` — that's a documented
+/// v3 follow-up. Point reads (which are what most production
+/// workloads do via `id(n)` / merge / hop traversal) get the full
+/// leader-forwarding fence end-to-end and that's what this test
+/// pins down.
+#[tokio::test]
+async fn multi_raft_linearizable_read_sees_recent_write() {
+    use meshdb_rpc::proto::mesh_query_server::MeshQuery;
+    use meshdb_rpc::proto::GetNodeRequest;
+
+    let peers = spawn_multi_raft_cluster(3, 4, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    // Pick partition 0's leader; do the write through it (so the
+    // commit is on its log immediately).
+    let p0 = PartitionId(0);
+    let leader_id = peers[0].multi_raft.leader_of(p0).expect("p0 leader");
+    let leader_idx = peers
+        .iter()
+        .position(|p| p.config.self_id == leader_id)
+        .expect("leader is in cluster");
+    let follower_idx = peers
+        .iter()
+        .position(|p| p.config.self_id != leader_id)
+        .expect("at least one non-leader peer");
+
+    // Write a probe node + capture its id via `RETURN id(n)`. Loop
+    // until the partitioner places the new id on partition 0 so the
+    // follower's GetNode forwards to the partition-0 leader (the one
+    // we just wrote through). Re-roll on collision because the
+    // hash distribution is uniform-random over partitions.
+    let mut node_id: Option<meshdb_core::NodeId> = None;
+    for _ in 0..32 {
+        let rows = peers[leader_idx]
+            .service
+            .execute_cypher_local(
+                "CREATE (n:LinProbe {marker: 1}) RETURN id(n) AS id".to_string(),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("write through leader");
+        let row = rows.first().expect("RETURN id(n) row");
+        let id_str = match row.get("id").expect("id column") {
+            meshdb_executor::Value::Property(meshdb_core::Property::String(s)) => s.clone(),
+            other => panic!("unexpected id value: {other:?}"),
+        };
+        let candidate = meshdb_core::NodeId::from_uuid(uuid::Uuid::parse_str(&id_str).unwrap());
+        let partitioner = meshdb_cluster::Partitioner::new(
+            peers[leader_idx].multi_raft.replica_map.num_partitions(),
+        );
+        if partitioner.partition_for(candidate) == p0 {
+            node_id = Some(candidate);
+            break;
+        }
+    }
+    let node_id = node_id.expect("at least one of 32 probes hashes to partition 0");
+
+    // Cluster auth, etc. left default. Issue a linearizable GetNode
+    // through the follower's gRPC handler. The handler detects
+    // `linearizable=true`, sees this peer is not the partition-0
+    // leader, builds a leader-bound MeshQueryClient, forwards with
+    // `local_only=true`, and returns the leader's fenced answer.
+    let follower = &peers[follower_idx].service;
+    let req = tonic::Request::new(GetNodeRequest {
+        id: Some(meshdb_rpc::convert::uuid_to_proto(node_id.as_uuid())),
+        local_only: false,
+        linearizable: true,
+    });
+    let resp = follower
+        .get_node(req)
+        .await
+        .expect("linearizable get_node forwards and succeeds")
+        .into_inner();
+    assert!(
+        resp.found,
+        "linearizable read on follower must observe the leader's commit"
+    );
+    let returned = resp.node.expect("response carries node payload");
+    assert!(
+        returned.labels.iter().any(|l| l == "LinProbe"),
+        "returned node should carry the LinProbe label"
+    );
+}
