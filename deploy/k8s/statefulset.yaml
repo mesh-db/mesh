@@ -84,7 +84,12 @@ spec:
               mountPath: /etc/meshdb-rendered
       containers:
         - name: meshdb
-          image: ghcr.io/mesh-db/meshdb-server:latest  # set to your registry
+          # TODO: set to your registry / version. The MeshDB
+          # project does not publish container images; build from
+          # the Dockerfile at the repo root and push to your own
+          # registry, then patch this reference. The example
+          # below is illustrative only.
+          image: REGISTRY.EXAMPLE/meshdb-server:0.2.0
           imagePullPolicy: IfNotPresent
           args:
             - --config
