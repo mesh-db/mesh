@@ -214,8 +214,21 @@ fn build_grpc_client_tls(
         return Ok(None);
     };
     meshdb_rpc::tls::install_default_crypto_provider();
-    let client = meshdb_rpc::tls::build_client_tls_config(&tls_cfg.ca_path)
-        .context("building grpc client tls config")?;
+    // mTLS: when the listener requires client certs, every
+    // outgoing peer endpoint must present its own identity. Reuse
+    // `cert_path` / `key_path` so a single per-peer cert covers
+    // both directions (server identity + client identity).
+    let client = if tls_cfg.client_ca_path.is_some() {
+        meshdb_rpc::tls::build_client_tls_config_mtls(
+            &tls_cfg.ca_path,
+            &tls_cfg.cert_path,
+            &tls_cfg.key_path,
+        )
+        .context("building grpc client tls config (mtls)")?
+    } else {
+        meshdb_rpc::tls::build_client_tls_config(&tls_cfg.ca_path)
+            .context("building grpc client tls config")?
+    };
     Ok(Some(client))
 }
 
@@ -1036,18 +1049,35 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         meshdb_rpc::tls::install_default_crypto_provider();
         match tls_cfg.reload_interval_seconds {
             Some(secs) => {
-                let (acceptor, handle) = tls_reload::build_hot_reloading_tls_acceptor(
-                    &tls_cfg.cert_path,
-                    &tls_cfg.key_path,
-                    Duration::from_secs(secs),
-                )
-                .context("building grpc tls hot-reloading acceptor")?;
+                let (acceptor, handle) = match &tls_cfg.client_ca_path {
+                    Some(client_ca) => tls_reload::build_hot_reloading_tls_acceptor_mtls(
+                        &tls_cfg.cert_path,
+                        &tls_cfg.key_path,
+                        client_ca,
+                        Duration::from_secs(secs),
+                    )
+                    .context("building grpc tls hot-reloading acceptor (mtls)")?,
+                    None => tls_reload::build_hot_reloading_tls_acceptor(
+                        &tls_cfg.cert_path,
+                        &tls_cfg.key_path,
+                        Duration::from_secs(secs),
+                    )
+                    .context("building grpc tls hot-reloading acceptor")?,
+                };
                 Some(GrpcTls::HotReload(acceptor, handle))
             }
-            None => Some(GrpcTls::Static(
-                meshdb_rpc::tls::build_server_tls_config(&tls_cfg.cert_path, &tls_cfg.key_path)
-                    .context("building grpc server tls config")?,
-            )),
+            None => Some(GrpcTls::Static(match &tls_cfg.client_ca_path {
+                Some(client_ca) => meshdb_rpc::tls::build_server_tls_config_mtls(
+                    &tls_cfg.cert_path,
+                    &tls_cfg.key_path,
+                    client_ca,
+                )
+                .context("building grpc server tls config (mtls)")?,
+                None => {
+                    meshdb_rpc::tls::build_server_tls_config(&tls_cfg.cert_path, &tls_cfg.key_path)
+                        .context("building grpc server tls config")?
+                }
+            })),
         }
     } else {
         None

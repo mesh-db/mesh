@@ -255,6 +255,118 @@ async fn fetch_grpc_presented_cert(addr: &str) -> Vec<u8> {
     verifier.captured().expect("verifier captured a cert")
 }
 
+/// gRPC mTLS rejects clients that don't present a cert, and
+/// accepts clients whose cert validates against the configured
+/// client-CA bundle. Exercises the static-tonic codepath via
+/// `build_server_tls_config_mtls`.
+#[tokio::test]
+async fn grpc_mtls_rejects_anonymous_clients_and_accepts_ca_signed_clients() {
+    install_default_crypto_provider();
+    let dir = TempDir::new().unwrap();
+
+    // Build a CA, then issue a server cert + a client cert
+    // signed by it. Both directions trust the same CA so an
+    // mTLS handshake can complete.
+    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "mesh test ca");
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    let mut server_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap();
+    server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "mesh test server");
+    let server_key = rcgen::KeyPair::generate().unwrap();
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let mut client_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "mesh test client");
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let ca_path = dir.path().join("ca.pem");
+    let server_cert_path = dir.path().join("server.pem");
+    let server_key_path = dir.path().join("server.key");
+    let client_cert_path = dir.path().join("client.pem");
+    let client_key_path = dir.path().join("client.key");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    std::fs::write(&server_cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
+    std::fs::write(&client_cert_path, client_cert.pem()).unwrap();
+    std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
+
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    let service = MeshService::new(store);
+
+    let server_tls = meshdb_rpc::tls::build_server_tls_config_mtls(
+        &server_cert_path,
+        &server_key_path,
+        &ca_path,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = Server::builder()
+            .tls_config(server_tls)
+            .unwrap()
+            .add_service(service.clone().into_query_server())
+            .add_service(service.into_write_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Anonymous client: server-CA only, no client identity.
+    let anonymous = meshdb_rpc::tls::build_client_tls_config(&ca_path).unwrap();
+    let anon_uri = format!(
+        "https://localhost:{}",
+        addr.to_string().split(':').nth(1).unwrap()
+    );
+    let anon_endpoint = Endpoint::from_shared(anon_uri.clone())
+        .unwrap()
+        .tls_config(anonymous)
+        .unwrap()
+        .connect_timeout(Duration::from_secs(2));
+    let anon_result = match anon_endpoint.connect().await {
+        Ok(channel) => {
+            let mut client = MeshQueryClient::new(channel);
+            client.health(HealthRequest {}).await.map(|_| ())
+        }
+        Err(e) => Err(tonic::Status::unauthenticated(e.to_string())),
+    };
+    assert!(
+        anon_result.is_err(),
+        "mTLS listener must reject clients with no identity"
+    );
+
+    // Authenticated client: CA + client cert.
+    let mtls = meshdb_rpc::tls::build_client_tls_config_mtls(
+        &ca_path,
+        &client_cert_path,
+        &client_key_path,
+    )
+    .unwrap();
+    let auth_endpoint = Endpoint::from_shared(anon_uri)
+        .unwrap()
+        .tls_config(mtls)
+        .unwrap();
+    let mut client = MeshQueryClient::new(auth_endpoint.connect().await.unwrap());
+    let resp = client.health(HealthRequest {}).await.unwrap();
+    assert!(resp.into_inner().serving);
+}
+
 /// gRPC TLS hot-reload swaps the server cert without dropping
 /// the listener. Connect once → see cert A. Replace cert files
 /// in place. Wait past the reload interval. Connect again → see

@@ -25,11 +25,56 @@
 
 use anyhow::Context;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::ResolvesServerCert;
+use rustls::server::{ResolvesServerCert, WebPkiClientVerifier};
+use rustls::RootCertStore;
 use rustls::ServerConfig;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
+
+/// Build a [`RootCertStore`] from a PEM CA bundle. Used by the
+/// mTLS path to construct the client-cert verifier.
+fn load_root_store(client_ca_path: &Path) -> anyhow::Result<RootCertStore> {
+    let bytes = std::fs::read(client_ca_path)
+        .with_context(|| format!("reading tls client-ca {}", client_ca_path.display()))?;
+    let mut roots = RootCertStore::empty();
+    let mut count = 0usize;
+    for cert in rustls_pemfile::certs(&mut bytes.as_slice()) {
+        let cert =
+            cert.with_context(|| format!("parsing tls client-ca {}", client_ca_path.display()))?;
+        roots
+            .add(cert)
+            .with_context(|| format!("adding cert from {}", client_ca_path.display()))?;
+        count += 1;
+    }
+    if count == 0 {
+        anyhow::bail!(
+            "tls client-ca {} contained no CERTIFICATE PEM blocks",
+            client_ca_path.display()
+        );
+    }
+    Ok(roots)
+}
+
+fn server_config_builder(
+    resolver: Arc<HotReloadingCertResolver>,
+    client_ca_path: Option<&Path>,
+) -> anyhow::Result<ServerConfig> {
+    Ok(match client_ca_path {
+        Some(p) => {
+            let roots = load_root_store(p)?;
+            let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .context("building client cert verifier")?;
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(resolver)
+        }
+        None => ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver),
+    })
+}
 
 /// Load + parse a PEM cert chain and private key into a
 /// rustls-ready `CertifiedKey`. Used by both the initial build
@@ -101,14 +146,33 @@ impl ResolvesServerCert for HotReloadingCertResolver {
 }
 
 /// Build a static [`TlsAcceptor`] that loads its cert + key once
-/// and never rotates. The caller is responsible for installing a
-/// rustls crypto provider before this runs.
+/// and never rotates. When `client_ca_path` is `Some`, every
+/// inbound TLS handshake must present a client cert that
+/// validates against the bundle (mTLS). The caller is responsible
+/// for installing a rustls crypto provider before this runs.
 pub fn build_static_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAcceptor> {
+    build_static_tls_acceptor_inner(cert_path, key_path, None)
+}
+
+/// mTLS variant: same as [`build_static_tls_acceptor`] but
+/// requires inbound clients to present a cert validating against
+/// the CA bundle at `client_ca_path`.
+pub fn build_static_tls_acceptor_mtls(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca_path: &Path,
+) -> anyhow::Result<TlsAcceptor> {
+    build_static_tls_acceptor_inner(cert_path, key_path, Some(client_ca_path))
+}
+
+fn build_static_tls_acceptor_inner(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca_path: Option<&Path>,
+) -> anyhow::Result<TlsAcceptor> {
     let certified = load_certified_key(cert_path, key_path)?;
     let resolver = Arc::new(HotReloadingCertResolver::new(certified));
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
+    let config = server_config_builder(resolver, client_ca_path)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
@@ -123,11 +187,36 @@ pub fn build_hot_reloading_tls_acceptor(
     key_path: &Path,
     reload_interval: std::time::Duration,
 ) -> anyhow::Result<(TlsAcceptor, tokio::task::JoinHandle<()>)> {
+    build_hot_reloading_tls_acceptor_inner(cert_path, key_path, reload_interval, None)
+}
+
+/// mTLS variant: same as [`build_hot_reloading_tls_acceptor`] but
+/// requires every inbound handshake to present a client cert
+/// validating against `client_ca_path`. The client CA itself is
+/// loaded once at construction; only the server cert hot-reloads.
+pub fn build_hot_reloading_tls_acceptor_mtls(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca_path: &Path,
+    reload_interval: std::time::Duration,
+) -> anyhow::Result<(TlsAcceptor, tokio::task::JoinHandle<()>)> {
+    build_hot_reloading_tls_acceptor_inner(
+        cert_path,
+        key_path,
+        reload_interval,
+        Some(client_ca_path),
+    )
+}
+
+fn build_hot_reloading_tls_acceptor_inner(
+    cert_path: &Path,
+    key_path: &Path,
+    reload_interval: std::time::Duration,
+    client_ca_path: Option<&Path>,
+) -> anyhow::Result<(TlsAcceptor, tokio::task::JoinHandle<()>)> {
     let certified = load_certified_key(cert_path, key_path)?;
     let resolver = Arc::new(HotReloadingCertResolver::new(certified));
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver.clone());
+    let config = server_config_builder(resolver.clone(), client_ca_path)?;
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
     let cert_path: PathBuf = cert_path.to_path_buf();

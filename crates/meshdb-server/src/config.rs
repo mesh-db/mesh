@@ -440,6 +440,26 @@ pub struct GrpcTlsConfig {
     pub key_path: PathBuf,
     pub ca_path: PathBuf,
 
+    /// When set, the listener requires every inbound gRPC
+    /// connection to present a client certificate that validates
+    /// against this CA bundle (PEM). Outgoing peer connections
+    /// also start presenting `cert_path` as the client identity
+    /// — every peer must hold a cert chained to the same CA, or
+    /// the TLS handshake fails before any RPC bytes flow.
+    ///
+    /// Combined with the shared-secret `cluster_auth` token this
+    /// gives both transport-level peer authentication (mTLS) and
+    /// application-level authentication. Recommended for any
+    /// production deploy that exposes the gRPC listener outside
+    /// a trusted network; in single-CA setups this can equal
+    /// `ca_path`.
+    ///
+    /// Omitted → server-side cert is presented but the client
+    /// is not asked to authenticate (the historical default,
+    /// suitable only for trusted-network deployments).
+    #[serde(default)]
+    pub client_ca_path: Option<PathBuf>,
+
     /// When set, the gRPC listener spawns a background reload task
     /// that polls the cert + key files at the given interval (in
     /// seconds) and hot-swaps the certificate when either file's
