@@ -1,0 +1,108 @@
+# Prometheus alert rules for a MeshDB multi-raft cluster.
+#
+# Drop this file under Prometheus's `rule_files:` glob and reload.
+# Adapt thresholds to your cluster size + latency budget; the
+# defaults below are tuned for a 3-peer / rf=3 / num_partitions=4
+# topology and should be revisited for larger clusters.
+#
+# Severity levels:
+#   page    — wake an oncall engineer
+#   ticket  — file an issue, address within business hours
+groups:
+  - name: meshdb-availability
+    interval: 30s
+    rules:
+      - alert: MeshdbPeerDown
+        # The metrics endpoint is the canonical "alive" signal —
+        # if Prometheus can't scrape, Bolt and gRPC clients can't
+        # reach the peer either.
+        expr: up{job="meshdb"} == 0
+        for: 2m
+        labels:
+          severity: page
+          component: meshdb
+        annotations:
+          summary: "MeshDB peer {{ $labels.instance }} is down"
+          description: "Prometheus has been unable to scrape {{ $labels.instance }} for 2 minutes. Check process, gRPC listener, and metrics endpoint."
+
+      - alert: MeshdbMetaWithoutLeader
+        # Multi-raft mode only. /readyz already returns 503 when
+        # this is true, so the kubelet pulls the peer out of
+        # rotation; the alert tells operators why traffic
+        # vanished.
+        expr: |
+          (sum by (instance) (rate(meshdb_cypher_queries_total{mode="multi-raft"}[5m])) > 0)
+          and on (instance) absent(mesh_multiraft_partitions_led{instance=~".+"}) == 0
+          and on (instance) (mesh_multiraft_partitions_led + ignoring(instance) group_left() (count by (instance) (mesh_multiraft_apply_lag) - count by (instance) (mesh_multiraft_apply_lag))) == 0
+        for: 1m
+        labels:
+          severity: page
+          component: meshdb-multiraft
+        annotations:
+          summary: "MeshDB peer {{ $labels.instance }} leads no partitions"
+          description: "Possible meta election in flight or peer drained. Check `/readyz` and recent SIGTERM history."
+
+  - name: meshdb-replication
+    interval: 30s
+    rules:
+      - alert: MeshdbApplyLagHigh
+        # The applier is falling behind replication. Common causes:
+        # disk saturation, CPU contention, very large batches,
+        # snapshot install in progress.
+        expr: max by (instance, group) (mesh_multiraft_apply_lag) > 1000
+        for: 5m
+        labels:
+          severity: ticket
+          component: meshdb-multiraft
+        annotations:
+          summary: "MeshDB apply lag > 1000 entries on {{ $labels.instance }}/{{ $labels.group }}"
+          description: "Local applier is more than 1000 log entries behind the latest committed index. Investigate disk I/O and CPU. If this is a new replica catching up, the alert clears once snapshot+log replay finishes."
+
+      - alert: MeshdbInDoubtPreparesStuck
+        # Cross-partition PREPAREs that haven't resolved within
+        # the periodic recovery interval. A coordinator crash
+        # mid-flight is the typical cause; if this stays high,
+        # the recovery loop isn't making progress.
+        expr: max by (instance) (mesh_multiraft_pending_tx_staged) > 0
+        for: 5m
+        labels:
+          severity: ticket
+          component: meshdb-multiraft
+        annotations:
+          summary: "MeshDB has in-doubt PREPAREs staged on {{ $labels.instance }}"
+          description: "Pending tx staging stayed non-zero for 5 minutes. Check the periodic recovery loop logs and `ResolveTransaction` round-trips between peers."
+
+  - name: meshdb-ddl
+    interval: 1m
+    rules:
+      - alert: MeshdbDdlGateTimeout
+        # The DDL strict-apply gate timed out — at least one peer
+        # is too slow to apply. The DDL itself committed, but
+        # follow-up writes that depend on the new index may
+        # observe a stale catalog.
+        expr: rate(mesh_multiraft_ddl_gate_total{outcome="timeout"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: ticket
+          component: meshdb-multiraft
+        annotations:
+          summary: "MeshDB DDL strict-apply gate timed out on {{ $labels.instance }}"
+          description: "Operator-issued CREATE INDEX / CREATE CONSTRAINT didn't propagate within the configured deadline. Check peer health; the DDL is durably committed and will eventually apply."
+
+  - name: meshdb-perf
+    interval: 1m
+    rules:
+      - alert: MeshdbHighQueryLatency
+        # p99 over 1s for any cluster mode for sustained 10
+        # minutes. Tune the threshold to your latency budget.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (mode, le) (rate(meshdb_cypher_query_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: ticket
+          component: meshdb
+        annotations:
+          summary: "MeshDB p99 query latency > 1s on mode={{ $labels.mode }}"
+          description: "Sustained high latency. Check disk, CPU, leader-skew (`mesh_multiraft_partitions_led`), and replication lag."

@@ -1,0 +1,153 @@
+# StatefulSet for a 3-peer multi-raft MeshDB cluster.
+#
+# Each pod gets:
+#   * Stable hostname (meshdb-0, meshdb-1, meshdb-2) via the
+#     headless Service (deploy/k8s/service.yaml).
+#   * A persistent volume mounted at /var/lib/meshdb. The Raft
+#     log, snapshot, and graph data all live here.
+#   * The shared TOML config from the ConfigMap, plus a per-pod
+#     `self_id` patched in by an init container based on the
+#     pod ordinal (Hostname `meshdb-2` → self_id 3).
+#
+# Rolling-update strategy: `OrderedReady`, one pod at a time.
+# Combined with `terminationGracePeriodSeconds: 60` and the
+# server's SIGTERM-driven leadership drain, a deploy cycles each
+# peer through `/readyz = 503 → drain → exit → new pod →
+# /readyz = 200` without dropping below quorum.
+#
+# Anti-affinity: hard rule that no two peers share a node. With
+# 3 peers / rf=3, losing a node never breaks quorum.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: meshdb
+  namespace: meshdb
+  labels:
+    app: meshdb
+spec:
+  serviceName: meshdb
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: meshdb
+  template:
+    metadata:
+      labels:
+        app: meshdb
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 60
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: meshdb
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        # Patch `self_id` from the pod ordinal. mesh-0 -> 1,
+        # mesh-1 -> 2, etc. The bundled config carries
+        # `self_id = 0` as a placeholder; sed rewrites it into
+        # the per-pod copy that lives on the writable
+        # emptyDir volume.
+        - name: patch-self-id
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              ORD=$(echo "$HOSTNAME" | awk -F- '{print $NF}')
+              SELF_ID=$((ORD + 1))
+              sed "s/^self_id = 0/self_id = $SELF_ID/" /etc/meshdb-shared/meshdb.toml \
+                > /etc/meshdb-rendered/meshdb.toml
+              # Peer ordinal 0 is the bootstrap seed. Idempotent:
+              # only the very first start of meshdb-0 actually
+              # bootstraps; subsequent starts are no-ops.
+              if [ "$ORD" = "0" ]; then
+                echo "bootstrap = true" >> /etc/meshdb-rendered/meshdb.toml
+              fi
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: shared-config
+              mountPath: /etc/meshdb-shared
+              readOnly: true
+            - name: rendered-config
+              mountPath: /etc/meshdb-rendered
+      containers:
+        - name: meshdb
+          image: ghcr.io/mesh-db/meshdb-server:latest  # set to your registry
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config
+            - /etc/meshdb/meshdb.toml
+          ports:
+            - name: grpc
+              containerPort: 7001
+            - name: bolt
+              containerPort: 7687
+            - name: metrics
+              containerPort: 9090
+          livenessProbe:
+            # Always-200 endpoint. Failure here means the axum
+            # task itself is wedged; kubelet kills the pod.
+            httpGet:
+              path: /livez
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            # Returns 503 during shutdown drain and when the
+            # meta replica has no leader. Kubelet pulls the pod
+            # out of the Service before the in-flight drain
+            # finishes.
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/meshdb
+            - name: rendered-config
+              mountPath: /etc/meshdb
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: shared-config
+          configMap:
+            name: meshdb-config
+        - name: rendered-config
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+        # storageClassName: <your-fast-block-storage>  # uncomment + set

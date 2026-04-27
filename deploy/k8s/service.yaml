@@ -1,0 +1,51 @@
+# Headless Service for the StatefulSet's per-pod DNS records.
+# Bolt drivers and gRPC clients reach individual peers via
+# `meshdb-N.meshdb.meshdb.svc.cluster.local`. The peers'
+# `peers[].address` config entries reference these hostnames.
+#
+# A separate `meshdb-bolt` LoadBalancer/ClusterIP Service in
+# front of this StatefulSet (omitted from the sample because
+# the right shape depends on your environment — internal ELB,
+# IngressGateway, MetalLB, etc.) is what end-user apps actually
+# connect to.
+apiVersion: v1
+kind: Service
+metadata:
+  name: meshdb
+  namespace: meshdb
+  labels:
+    app: meshdb
+spec:
+  clusterIP: None  # headless — required by the StatefulSet's stable DNS
+  selector:
+    app: meshdb
+  ports:
+    - name: grpc
+      port: 7001
+      targetPort: 7001
+    - name: bolt
+      port: 7687
+      targetPort: 7687
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+# ClusterIP Service that fronts every peer for Bolt clients.
+# Drivers connect here and the cluster's server-side write
+# forwarding (multi-raft mode) routes each write to the right
+# partition leader internally — no driver-visible redirects.
+apiVersion: v1
+kind: Service
+metadata:
+  name: meshdb-bolt
+  namespace: meshdb
+  labels:
+    app: meshdb
+spec:
+  type: ClusterIP
+  selector:
+    app: meshdb
+  ports:
+    - name: bolt
+      port: 7687
+      targetPort: 7687

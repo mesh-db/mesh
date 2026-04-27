@@ -1,0 +1,18 @@
+# PodDisruptionBudget — voluntary disruptions (node drains, k8s
+# upgrades, cluster-autoscaler scale-down) can never take more
+# than one peer of a 3-peer / rf=3 cluster down at once. Quorum
+# is preserved.
+#
+# Adjust `maxUnavailable` if you scale to 5+ peers (a 5-peer
+# cluster tolerates 2 unavailable; tune to your replication
+# factor minus 1).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: meshdb
+  namespace: meshdb
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: meshdb
