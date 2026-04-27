@@ -2027,6 +2027,96 @@ impl MeshService {
         (stepped_down, errors)
     }
 
+    /// Cluster-wide consistent backup. Triggers a snapshot on every
+    /// Raft group across every peer — meta + every partition group
+    /// (each replica's snapshot is built independently, but
+    /// snapshots within a group are at the same consistent commit
+    /// index, and the existing 2PC recovery loop handles any
+    /// in-doubt PREPAREs at restore time so cross-partition
+    /// transactions converge after a restore).
+    ///
+    /// Coordinator pattern:
+    /// 1. Take a local backup on this peer (covers groups this
+    ///    peer hosts).
+    /// 2. For every other peer in the meta-cluster membership,
+    ///    issue `MeshWrite::TakeBackup` so they take their local
+    ///    backup too.
+    /// 3. Merge all manifests into one combined manifest the
+    ///    operator can use to identify which on-disk snapshots to
+    ///    archive.
+    ///
+    /// Each peer's snapshot lives in its own
+    /// `data_dir/raft/<group>/` rocksdb under stable keys
+    /// (`SNAPSHOT_META_KEY` / `SNAPSHOT_DATA_KEY`). Operators
+    /// archive the data_dirs after this returns.
+    pub async fn take_cluster_backup(
+        &self,
+    ) -> std::result::Result<crate::MultiRaftBackupManifest, Status> {
+        let Some(multi_raft) = self.multi_raft.as_ref() else {
+            return Err(Status::failed_precondition(
+                "take_cluster_backup requires multi-raft mode",
+            ));
+        };
+
+        // Local first.
+        let mut combined = multi_raft.take_local_backup().await;
+
+        // Fan out to other peers via TakeBackup RPC.
+        let state = multi_raft.meta.current_state().await;
+        let peers: Vec<(u64, String)> = state
+            .membership
+            .iter()
+            .filter(|(id, _)| id.0 != multi_raft.self_id)
+            .map(|(id, addr)| (id.0, addr.to_string()))
+            .collect();
+        drop(state);
+
+        for (peer_id, addr) in peers {
+            let mut client = match self.leader_write_client(&addr) {
+                Ok(c) => c,
+                Err(e) => {
+                    combined.errors.push(crate::MultiRaftBackupError {
+                        group: crate::MultiRaftBackupGroup::Meta,
+                        peer_id,
+                        message: format!("build client for {addr}: {e}"),
+                    });
+                    continue;
+                }
+            };
+            match client.take_backup(crate::proto::TakeBackupRequest {}).await {
+                Ok(resp) => {
+                    let r = resp.into_inner();
+                    for e in r.entries {
+                        if let Some(group) = parse_backup_group(&e.group) {
+                            combined.entries.push(crate::MultiRaftBackupEntry {
+                                group,
+                                peer_id: e.peer_id,
+                            });
+                        }
+                    }
+                    for e in r.errors {
+                        if let Some(group) = parse_backup_group(&e.group) {
+                            combined.errors.push(crate::MultiRaftBackupError {
+                                group,
+                                peer_id: e.peer_id,
+                                message: e.message,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    combined.errors.push(crate::MultiRaftBackupError {
+                        group: crate::MultiRaftBackupGroup::Meta,
+                        peer_id,
+                        message: format!("TakeBackup RPC: {e}"),
+                    });
+                }
+            }
+        }
+
+        Ok(combined)
+    }
+
     /// Resolve the leader of `partition` by polling other peers'
     /// `PartitionLeader` RPC. Used as a fallback when the local
     /// replica can't answer (shutdown, freshly-restarted, doesn't
@@ -6288,5 +6378,62 @@ impl MeshWrite for MeshService {
                 },
             )),
         }
+    }
+
+    #[tracing::instrument(skip_all, fields(rpc = "take_backup"))]
+    async fn take_backup(
+        &self,
+        _request: Request<crate::proto::TakeBackupRequest>,
+    ) -> Result<Response<crate::proto::TakeBackupResponse>, Status> {
+        let Some(multi_raft) = self.multi_raft.as_ref() else {
+            return Err(Status::failed_precondition(
+                "TakeBackup called on a peer not running multi-raft",
+            ));
+        };
+        let manifest = multi_raft.take_local_backup().await;
+        Ok(Response::new(backup_manifest_to_proto(&manifest)))
+    }
+}
+
+fn backup_group_label(g: crate::MultiRaftBackupGroup) -> String {
+    match g {
+        crate::MultiRaftBackupGroup::Meta => "meta".to_string(),
+        crate::MultiRaftBackupGroup::Partition(p) => format!("partition:{p}"),
+    }
+}
+
+fn parse_backup_group(s: &str) -> Option<crate::MultiRaftBackupGroup> {
+    if s == "meta" {
+        Some(crate::MultiRaftBackupGroup::Meta)
+    } else if let Some(rest) = s.strip_prefix("partition:") {
+        rest.parse::<u32>()
+            .ok()
+            .map(crate::MultiRaftBackupGroup::Partition)
+    } else {
+        None
+    }
+}
+
+fn backup_manifest_to_proto(
+    m: &crate::MultiRaftBackupManifest,
+) -> crate::proto::TakeBackupResponse {
+    crate::proto::TakeBackupResponse {
+        entries: m
+            .entries
+            .iter()
+            .map(|e| crate::proto::BackupEntryProto {
+                group: backup_group_label(e.group),
+                peer_id: e.peer_id,
+            })
+            .collect(),
+        errors: m
+            .errors
+            .iter()
+            .map(|e| crate::proto::BackupErrorProto {
+                group: backup_group_label(e.group),
+                peer_id: e.peer_id,
+                message: e.message.clone(),
+            })
+            .collect(),
     }
 }

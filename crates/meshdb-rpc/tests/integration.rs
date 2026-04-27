@@ -2451,6 +2451,12 @@ impl meshdb_rpc::proto::mesh_write_server::MeshWrite for StallingMeshWrite {
     {
         std::future::pending().await
     }
+    async fn take_backup(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::TakeBackupRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::TakeBackupResponse>, tonic::Status> {
+        std::future::pending().await
+    }
 }
 
 /// Spawn a two-peer cluster where peer A is a real `MeshService`

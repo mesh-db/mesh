@@ -50,6 +50,8 @@ pub use executor_writer::{BufferingGraphWriter, RaftGraphWriter};
 pub use fault_points::FaultPoints;
 pub use multi_raft_applier::{MetaGraphApplier, PartitionGraphApplier};
 pub use multi_raft_cluster::{
+    BackupEntry as MultiRaftBackupEntry, BackupError as MultiRaftBackupError,
+    BackupGroup as MultiRaftBackupGroup, BackupManifest as MultiRaftBackupManifest,
     MultiRaftCluster, PartitionLeaderCache, DEFAULT_DDL_STRICT_TIMEOUT, DEFAULT_RECOVERY_INTERVAL,
 };
 pub use multi_raft_reader::MultiRaftGraphReader;

@@ -22,6 +22,59 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+/// Identifier of a Raft group within a backup manifest. The
+/// metadata group spans every peer; partition groups are scoped
+/// to the replica set of a specific partition id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupGroup {
+    Meta,
+    Partition(u32),
+}
+
+/// One row of a backup manifest — a snapshot built on a specific
+/// peer for a specific Raft group.
+#[derive(Debug, Clone)]
+pub struct BackupEntry {
+    pub group: BackupGroup,
+    pub peer_id: NodeId,
+}
+
+/// Per-group failure surfaced during backup. The other groups
+/// still snapshot; this entry tells the operator which ones to
+/// retry.
+#[derive(Debug, Clone)]
+pub struct BackupError {
+    pub group: BackupGroup,
+    pub peer_id: NodeId,
+    pub message: String,
+}
+
+/// Result of a `take_local_backup` or `take_cluster_backup` call.
+/// Operators read `entries` to know which on-disk snapshots to
+/// archive (the snapshot itself lives in the peer's
+/// `data_dir/raft/<group>/` rocksdb under a stable key, written
+/// synchronously when the trigger returns).
+#[derive(Debug, Clone, Default)]
+pub struct BackupManifest {
+    pub entries: Vec<BackupEntry>,
+    pub errors: Vec<BackupError>,
+}
+
+impl BackupManifest {
+    /// Merge another peer's manifest into this one. Used by the
+    /// cluster-wide orchestrator to fold per-peer responses into
+    /// one combined manifest.
+    pub fn extend(&mut self, other: BackupManifest) {
+        self.entries.extend(other.entries);
+        self.errors.extend(other.errors);
+    }
+
+    /// True when every group reported success.
+    pub fn is_clean(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
 /// Default interval for the periodic in-doubt recovery loop. Matches
 /// the spirit of [`crate::DEFAULT_ROTATION_INTERVAL`] — frequent
 /// enough to catch a stale PREPARE within a minute, infrequent
@@ -726,6 +779,61 @@ impl MultiRaftCluster {
             }
         }
         (drained, errors)
+    }
+
+    /// Take a local snapshot of every Raft group hosted on this
+    /// peer (the meta group + every partition replica). Each group's
+    /// snapshot is built at its own current commit index — that's
+    /// the "consistent point" within that group. Cross-group
+    /// consistency is not guaranteed by a single peer's call (a
+    /// partition snapshot at index X on peer A and a meta snapshot
+    /// at index Y on peer A reflect independent commit timelines);
+    /// for cluster-wide consistency, the caller fans this out
+    /// across every peer that leads a partition (see the cluster
+    /// backup orchestration on
+    /// [`crate::server::MeshService::take_cluster_backup`]).
+    ///
+    /// Returns a manifest listing each group, the peer hosting it,
+    /// and the snapshot identifier (a stable string the operator
+    /// can grep for in the rocksdb store). Errors are collected per
+    /// group rather than aborting — partial backups are still
+    /// useful for operators (they just need to know which groups
+    /// missed).
+    pub async fn take_local_backup(&self) -> BackupManifest {
+        let mut entries = Vec::new();
+        let mut errors = Vec::new();
+
+        match self.meta.trigger_snapshot().await {
+            Ok(()) => entries.push(BackupEntry {
+                group: BackupGroup::Meta,
+                peer_id: self.self_id,
+            }),
+            Err(e) => errors.push(BackupError {
+                group: BackupGroup::Meta,
+                peer_id: self.self_id,
+                message: e.to_string(),
+            }),
+        }
+
+        let partitions: Vec<(PartitionId, Arc<RaftCluster>)> = {
+            let g = self.partitions.read().expect("partitions lock poisoned");
+            g.iter().map(|(p, r)| (*p, r.clone())).collect()
+        };
+        for (p, raft) in partitions {
+            match raft.trigger_snapshot().await {
+                Ok(()) => entries.push(BackupEntry {
+                    group: BackupGroup::Partition(p.0),
+                    peer_id: self.self_id,
+                }),
+                Err(e) => errors.push(BackupError {
+                    group: BackupGroup::Partition(p.0),
+                    peer_id: self.self_id,
+                    message: e.to_string(),
+                }),
+            }
+        }
+
+        BackupManifest { entries, errors }
     }
 
     /// Publish the partition's current voter set through the meta

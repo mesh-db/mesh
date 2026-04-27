@@ -957,6 +957,26 @@ impl RaftCluster {
             .map_err(|e| Error::Raft(e.to_string()))
     }
 
+    /// Force this peer's Raft replica to build a snapshot at the
+    /// current commit index. Wraps openraft's
+    /// `Raft::trigger().snapshot()`. The returned future resolves
+    /// once the snapshot builder finishes — for the persistent
+    /// storage backend that means the snapshot bytes are durable in
+    /// rocksdb and the in-memory snapshot field on the state
+    /// machine has been updated.
+    ///
+    /// Caller is responsible for fanning this out across every
+    /// peer / group when a cluster-wide consistent backup is wanted
+    /// — see `MultiRaftCluster::take_cluster_backup` for the
+    /// orchestration.
+    pub async fn trigger_snapshot(&self) -> Result<()> {
+        self.raft
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|e| Error::Raft(e.to_string()))
+    }
+
     /// Force this peer's Raft replica to start an election right
     /// now, bypassing the normal election timer. Wraps openraft's
     /// `Raft::trigger().elect()`.

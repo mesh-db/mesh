@@ -2781,6 +2781,68 @@ async fn multi_raft_metrics_increment_on_forward_write_and_ddl_gate() {
     );
 }
 
+/// Cluster-wide backup orchestrator triggers a snapshot on every
+/// Raft group across every peer. Manifest must cover meta on
+/// every peer + every (partition, peer) pair where the peer hosts
+/// a replica. With rf = num_peers (rf=3 across 3 peers), that's
+/// `num_peers * (1 meta + num_partitions)` entries.
+#[tokio::test]
+async fn multi_raft_take_cluster_backup_covers_every_group_on_every_peer() {
+    let peers = spawn_multi_raft_cluster(3, 2, 3).await;
+    wait_for_leaders(&peers, Duration::from_secs(10)).await;
+
+    let manifest = peers[0]
+        .service
+        .take_cluster_backup()
+        .await
+        .expect("cluster backup succeeds");
+
+    assert!(
+        manifest.is_clean(),
+        "expected zero errors, got {} ({:?})",
+        manifest.errors.len(),
+        manifest.errors
+    );
+
+    // 3 peers × (1 meta + 2 partitions replicated everywhere) = 9.
+    let expected = 3 * (1 + 2);
+    assert_eq!(
+        manifest.entries.len(),
+        expected,
+        "expected {expected} manifest entries, got {} ({:?})",
+        manifest.entries.len(),
+        manifest.entries
+    );
+
+    // Every peer appears in a meta entry.
+    for peer in &peers {
+        let has_meta = manifest.entries.iter().any(|e| {
+            e.peer_id == peer.config.self_id
+                && matches!(e.group, meshdb_rpc::MultiRaftBackupGroup::Meta)
+        });
+        assert!(
+            has_meta,
+            "peer {} missing meta backup entry",
+            peer.config.self_id
+        );
+    }
+
+    // Every (peer, partition) pair appears.
+    for peer in &peers {
+        for p in 0..2 {
+            let hit = manifest.entries.iter().any(|e| {
+                e.peer_id == peer.config.self_id
+                    && matches!(e.group, meshdb_rpc::MultiRaftBackupGroup::Partition(q) if q == p)
+            });
+            assert!(
+                hit,
+                "peer {} missing partition {p} backup entry",
+                peer.config.self_id
+            );
+        }
+    }
+}
+
 /// Linearizable point-read on a non-leader peer transparently
 /// forwards to the partition leader, fences on
 /// `ensure_linearizable`, and observes a write that committed on

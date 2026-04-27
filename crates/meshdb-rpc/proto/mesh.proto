@@ -144,6 +144,29 @@ service MeshQuery {
   rpc ExecuteCypher(ExecuteCypherRequest) returns (ExecuteCypherResponse);
 }
 
+/// Triggers a local snapshot of every Raft group hosted on the
+/// receiving peer (the meta group + every partition replica).
+/// Responses carry one entry per group with whether the snapshot
+/// trigger succeeded. Used by the cluster-wide backup
+/// orchestrator on a coordinator peer to fan out to every other
+/// peer.
+message TakeBackupRequest {}
+message TakeBackupResponse {
+  repeated BackupEntryProto entries = 1;
+  repeated BackupErrorProto errors = 2;
+}
+message BackupEntryProto {
+  // Stable string identifier for the group:
+  // "meta" or "partition:<id>".
+  string group = 1;
+  uint64 peer_id = 2;
+}
+message BackupErrorProto {
+  string group = 1;
+  uint64 peer_id = 2;
+  string message = 3;
+}
+
 message GetNodeRequest {
   UuidBytes id = 1;
   // When true, the server answers only from its local store and does not
@@ -385,6 +408,13 @@ service MeshWrite {
   // partition (caller should pick a different target).
   rpc ForcePartitionElection(ForcePartitionElectionRequest)
       returns (ForcePartitionElectionResponse);
+  // Multi-raft mode only: trigger a local snapshot of every Raft
+  // group the receiver hosts (meta + every replicated partition).
+  // Used by the cluster-wide backup orchestrator on a coordinator
+  // peer to fan out to every other peer; combined the manifests
+  // give the operator a list of (group, peer) pairs whose
+  // on-disk snapshots are the consistent restore inputs.
+  rpc TakeBackup(TakeBackupRequest) returns (TakeBackupResponse);
 }
 
 enum BatchPhase {
