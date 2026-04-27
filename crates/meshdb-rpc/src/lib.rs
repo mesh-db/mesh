@@ -15,15 +15,22 @@ pub mod proto {
     tonic::include_proto!("mesh");
 }
 
+pub mod audit_log;
+pub mod cluster_auth;
 pub mod convert;
 mod coordinator_log;
 mod error;
 mod executor_writer;
 #[cfg(any(test, feature = "fault-inject"))]
 pub mod fault_points;
+mod idempotency;
 pub mod metrics;
+mod multi_raft_applier;
+mod multi_raft_cluster;
+mod multi_raft_reader;
 mod participant_log;
 mod partitioned_reader;
+pub mod plan_cache;
 mod raft_applier;
 mod raft_network;
 mod raft_service;
@@ -35,6 +42,7 @@ pub mod tls;
 mod tx_coordinator;
 mod tx_overlay;
 
+pub use audit_log::{AuditEntry, AuditLog};
 pub use coordinator_log::{
     CoordinatorLog, TxDecision, TxLogEntry, TxState, DEFAULT_MIN_COMPLETED,
     DEFAULT_ROTATION_INTERVAL,
@@ -43,14 +51,22 @@ pub use error::ConvertError;
 pub use executor_writer::{BufferingGraphWriter, RaftGraphWriter};
 #[cfg(any(test, feature = "fault-inject"))]
 pub use fault_points::FaultPoints;
+pub use multi_raft_applier::{MetaGraphApplier, PartitionGraphApplier};
+pub use multi_raft_cluster::{
+    BackupEntry as MultiRaftBackupEntry, BackupError as MultiRaftBackupError,
+    BackupGroup as MultiRaftBackupGroup, BackupManifest as MultiRaftBackupManifest,
+    MultiRaftCluster, PartitionLeaderCache, DEFAULT_DDL_STRICT_TIMEOUT, DEFAULT_RECOVERY_INTERVAL,
+};
+pub use multi_raft_reader::MultiRaftGraphReader;
 pub use participant_log::{
     replay_in_doubt_commands, replay_outcomes, ParticipantLog, ParticipantLogEntry,
     ParticipantOutcome, PARTICIPANT_LOG_MIN_TERMINAL, PARTICIPANT_LOG_ROTATION_INTERVAL,
 };
 pub use partitioned_reader::PartitionedGraphReader;
+pub use plan_cache::{fingerprint_schema, PlanCache, DEFAULT_PLAN_CACHE_CAPACITY};
 pub use raft_applier::StoreGraphApplier;
-pub use raft_network::{GrpcNetwork, GrpcNetworkError};
-pub use raft_service::MeshRaftService;
+pub use raft_network::{GrpcNetwork, GrpcNetworkError, RaftGroupTarget};
+pub use raft_service::{MeshRaftService, RaftGroupRegistry};
 pub use routing::{Routing, RoutingError};
 pub use routing_writer::RoutingGraphWriter;
 pub use server::MeshService;

@@ -17,13 +17,14 @@ of Cypher, and supports two wire protocols out of the box:
 - **gRPC** for service-to-service traffic and for the cluster's internal
   Raft / 2PC plumbing.
 
-It runs in three modes:
+It runs in four modes:
 
 | Mode | When | What it gives you |
 |---|---|---|
 | Single-node | One process, no `peers = [...]` | Local graph store, full Cypher subset, both Bolt and gRPC listeners. |
-| Routing (sharded) | Multiple peers, no Raft | Hash-partitioned nodes across peers, partition-aware reads via scatter-gather, 2PC writes for cross-peer atomicity. |
+| Routing (sharded) | Multiple peers, `mode = "routing"` | Hash-partitioned nodes across peers, partition-aware reads via scatter-gather, 2PC writes for cross-peer atomicity. |
 | Raft replicated | Multiple peers + `bootstrap = true` on the seed | Single Raft group replicates the full graph to every peer; reads cheap-local, writes go through `propose_graph`. |
+| Multi-Raft (sharded + replicated) | Multiple peers, `mode = "multi-raft"` | One openraft group per partition + a metadata Raft group spanning every peer. Shards data like routing, replicates each shard like raft. Cross-partition writes ride a Spanner-style 2PC where PREPARE and COMMIT both land in the partition Raft, so staged state is replicated by the time PREPARE-ACK returns — no participant-log fsync window. Bolt clients see one consistent endpoint; server-side proxying routes each write to its partition leader. |
 
 ---
 
@@ -279,6 +280,20 @@ map, temporal (`DateTime`, `LocalDateTime`, `Date`, `Time`, `LocalTime`,
 `Duration` — with IANA zone resolution via the `[Region/City]` suffix),
 and spatial `Point` (Cartesian 2D/3D, WGS-84 2D/3D, EPSG-tagged).
 
+### Operational hardening (0.2.0)
+
+- **Graceful drain on SIGTERM / SIGINT.** Every partition this peer leads steps down before the listener exits. Bounded by `shutdown_drain_timeout_seconds` (default 30). Pairs with k8s `terminationGracePeriodSeconds` for zero-drop rolling restarts.
+- **K8s liveness / readiness probes.** `/livez` and `/readyz` on the metrics endpoint. The shutdown path flips readiness *before* draining, so the kubelet pulls a peer out of rotation before it stops accepting traffic.
+- **Per-query budgets.** `query_timeout_seconds` (deadline on every Cypher RUN), `query_max_rows` (cap on result-set size — `ResourceExhausted` instead of OOM), `max_concurrent_queries` (per-peer concurrency cap).
+- **Cypher plan cache.** `plan_cache_size = N` skips parse + plan on repeated parametrised queries. Self-correcting on every peer when DDL changes the schema (cache entries are keyed on a fingerprint hashed from the local index registry).
+- **Cluster-wide consistent backup.** `MeshService::take_cluster_backup` snapshots every Raft group across every peer in parallel; the manifest serializes to JSON. `meshdb-server validate-backup --manifest=path --data-dir=path --peer-id=N` confirms a restored data_dir matches the manifest before you bring the cluster back up.
+- **TLS cert hot-reload.** Set `[bolt_tls] reload_interval_seconds` and / or `[grpc_tls] reload_interval_seconds` and the listener swaps in rotated certs without restarting. Pairs with cert-manager / ACME pipelines.
+- **gRPC mTLS.** `[grpc_tls] client_ca_path` requires every inbound TLS handshake to present a client cert chained to the bundle. Outbound peer endpoints automatically present the configured identity.
+- **Cluster auth.** `[cluster_auth] token` adds a shared-secret bearer token on every inter-peer + admin RPC, validated in constant time.
+- **OpenTelemetry / OTLP.** `[tracing] otlp_endpoint = "..."` exports every `tracing::span` (gRPC handlers, Raft applies, the Cypher executor) through the OpenTelemetry SDK's batch span processor. `service_name` and `sample_rate` operator-tunable.
+- **Audit log.** `audit_log_path` writes one fsync'd JSONL record per admin operation (drain, backup, …) with timestamp + initiator + structured args + success/error.
+- **RocksDB tuning.** `[storage]` exposes `max_open_files`, `write_buffer_size_bytes`, `max_write_buffer_number`, `bloom_filter_bits_per_key`, `keep_log_file_num`. Defaults match the historical hand-applied values.
+
 ### Distribution
 
 - Hash partitioning across peers
@@ -531,6 +546,29 @@ pair, `ca_path` to the shared CA bundle.
 
 ## Known limitations
 
+- **Result-set streaming through Bolt PULL is capped, not pull-based.** Set
+  `query_max_rows` to bound memory; the executor still materialises rows in
+  `Vec<Row>` before the response goes out. A 100M-row `MATCH` either trips the
+  cap with `ResourceExhausted` or, if uncapped, OOMs the peer. Pull-based
+  streaming through the executor is on the v3 roadmap.
+- **Online resharding (changing `num_partitions` without dump-and-restore) is
+  intentionally out of scope.** A `data_dir/num_partitions` marker refuses
+  silent reshards. The supported workflow is dump (`apoc.export.cypher.all`)
+  → wipe → re-import against a fresh cluster with the new partition count.
+- **Auto leader balancer is not shipped.** Operators monitor the
+  `mesh_multiraft_partitions_led` metric for skew and respond manually
+  (`drain_leadership` / restart). Blocked on openraft 0.9 not exposing
+  TimeoutNow / `transfer_leader`.
+- **Audit log only covers service-level admin paths today** (`drain_leadership`,
+  `take_cluster_backup`). Cluster-level paths (`add_partition_replica`,
+  `drain_peer`, learner ops) need the same `Arc<AuditLog>` threaded into
+  `MultiRaftCluster`. Mechanical follow-up.
+- **Mid-RUN Bolt RESET doesn't cancel the in-flight query.** RESET is read off
+  the same connection after the RUN returns. Per-query timeout (`query_timeout_seconds`)
+  is the correct lever today.
+- **Backup-trigger and peer-add are still gRPC-only.** No `meshdb-server backup`
+  / `meshdb-server cluster add-peer` CLI subcommands yet — operators drive
+  these through gRPC. Documented on the runbook roadmap.
 - **GQL quantified path patterns** — parenthesized-subpath form like
   `((a)-[:T]-(b))+` — aren't parsed. The Neo4j 5 relationship-level
   shorthand (`->+`, `->*`, `->{n,m}`) is fully supported.
@@ -579,7 +617,7 @@ self-signed certs.
 
 ## Cluster mode (multi-peer)
 
-Multi-peer configs pick one of two modes via the top-level `mode` field:
+Multi-peer configs pick one of three modes via the top-level `mode` field:
 
 - `mode = "raft"` — single Raft group replicates the full graph to every
   peer. Reads are cheap-local everywhere; writes go through the leader
@@ -594,6 +632,42 @@ Multi-peer configs pick one of two modes via the top-level `mode` field:
   recovery). No consensus, so a peer crash loses that peer's shard
   until it restarts — but the 2PC recovery logs guarantee no
   in-flight transaction is lost in the process.
+- `mode = "multi-raft"` — sharding **with** replication. Each partition
+  has its own openraft group, replicated across `replication_factor`
+  peers (default `min(3, peers.len())`). DDL and cluster membership
+  ride a separate metadata Raft group spanning every peer. Cross-
+  partition writes use a Spanner-style 2PC where both PREPARE and
+  COMMIT are proposed through the partition Raft, so staged state is
+  replicated by the time PREPARE-ACK returns and there's no in-doubt
+  window dependent on a participant log fsync. Single-partition writes
+  arriving on a non-leader peer are server-side proxied to the
+  partition leader via internal `MeshWrite::ForwardWrite`; DDL through
+  `MeshWrite::ForwardDdl` — Bolt clients see one consistent endpoint
+  for the lifetime of a session, no client-visible redirects. A
+  periodic recovery loop (default 60s) re-resolves any in-doubt
+  PREPAREs left by a coordinator that crashed mid-flight while the
+  cluster stayed up. **DDL barrier:** every peer tracks the highest
+  meta-Raft index it's seen committed; partition writes await the
+  local meta replica to catch up before applying, so a `CREATE INDEX`
+  issued through any peer is guaranteed visible by the time a
+  follow-up write lands. **Per-partition snapshots:** each partition's
+  applier packs only its own nodes + edges (~1/N of cluster data),
+  so a new replica catching up via `InstallSnapshot` doesn't download
+  the full graph. **Dynamic rebalancing:** `add_partition_replica` /
+  `remove_partition_replica` wrap openraft's per-partition
+  `change_membership` for voter changes; the cluster's persisted
+  view of placement (the `PartitionReplicaMap` in `ClusterState`)
+  updates atomically via `ClusterCommand::SetPartitionReplicas` so
+  a restart picks up the new replica set. **Runtime partition group
+  spin-up:** `instantiate_partition_group(...)` creates a partition
+  Raft + rocksdb dir + applier on a peer that didn't bootstrap
+  with that partition, registering it in both the live
+  `MultiRaftCluster` and the dispatch table without restart.
+  Combined with `add_partition_replica`, this is the foundation
+  for online rebalancing — openraft's InstallSnapshot handles
+  data catchup for the new replica. Combines the durability of `raft` with
+  the capacity scaling of `routing`. Never inferred — opting in
+  changes data placement, so the operator must request it explicitly.
 
 A three-peer Raft cluster, one bootstrap seed, all speaking Bolt:
 
@@ -704,6 +778,80 @@ address = "127.0.0.1:7002"
 id = 3
 address = "127.0.0.1:7003"
 ```
+
+For `mode = "multi-raft"`, set the mode plus an optional
+`replication_factor`, and keep `bootstrap = true` on the seed peer
+(it initializes the metadata Raft group; per-partition groups
+auto-seed on their lowest-id replica's first start):
+
+```toml
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/mesh-data-a"
+bolt_address = "127.0.0.1:7687"
+num_partitions = 4
+mode = "multi-raft"
+replication_factor = 3
+bootstrap = true
+
+[[peers]]
+id = 1
+address = "127.0.0.1:7001"
+
+[[peers]]
+id = 2
+address = "127.0.0.1:7002"
+
+[[peers]]
+id = 3
+address = "127.0.0.1:7003"
+```
+
+With the trio above, every peer is a replica of every partition (rf=3
+over 3 peers degenerates to "every replica everywhere"). Scaling out
+to 5 peers with `replication_factor = 3` puts each partition on 3 of
+the 5 — that's where capacity scaling kicks in (each peer holds 3/5
+of the partitions worth of data). Multi-raft requires `peers.len() >= 2`
+and `replication_factor` in `[1, peers.len()]`.
+
+---
+
+## Production deployment
+
+`deploy/` ships production-shaped artifacts for running a multi-raft
+MeshDB cluster on Kubernetes:
+
+```
+deploy/
+├── README.md                   # one-line index of every artifact
+├── RUNBOOK.md                  # day-2 ops: rolling upgrades, drain,
+│                               #   backup/restore, TLS rotation,
+│                               #   adding/removing peers, common pitfalls
+├── grafana/meshdb-cluster.json # importable dashboard: query rate,
+│                               #   p99 latency, leader skew, apply lag,
+│                               #   in-doubt PREPAREs, DDL gate, forward writes
+├── prometheus/alerts.yaml      # rule_files entry: peer-down,
+│                               #   meta-without-leader, apply lag,
+│                               #   in-doubt PREPAREs, DDL gate timeout,
+│                               #   sustained p99 > 1s
+└── k8s/
+    ├── configmap.yaml          # ServerConfig with operational knobs set
+    ├── service.yaml            # headless + Bolt ClusterIP
+    ├── statefulset.yaml        # 3 pods, anti-affinity, OrderedReady,
+    │                           #   livez/readyz probes,
+    │                           #   image: darkspar/meshdb-server:0.2.0
+    └── pdb.yaml                # max 1 unavailable
+```
+
+Start with `deploy/RUNBOOK.md` — it's the operator's first-day-on-call
+reference. The reference Docker image is published at
+**`darkspar/meshdb-server:0.2.0`** on Docker Hub; operators override
+`image:` in the StatefulSet to point at their own registry mirror or
+pinned digest for production rollouts.
+
+The container image builds from the project's root `Dockerfile`
+(multi-stage: `rust:1.95-bookworm` builder → `debian:bookworm-slim`
+runtime, non-root user, no APOC features stripped).
 
 ---
 

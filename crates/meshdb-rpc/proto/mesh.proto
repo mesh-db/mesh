@@ -144,12 +144,47 @@ service MeshQuery {
   rpc ExecuteCypher(ExecuteCypherRequest) returns (ExecuteCypherResponse);
 }
 
+/// Triggers a local snapshot of every Raft group hosted on the
+/// receiving peer (the meta group + every partition replica).
+/// Responses carry one entry per group with whether the snapshot
+/// trigger succeeded. Used by the cluster-wide backup
+/// orchestrator on a coordinator peer to fan out to every other
+/// peer.
+message TakeBackupRequest {}
+message TakeBackupResponse {
+  repeated BackupEntryProto entries = 1;
+  repeated BackupErrorProto errors = 2;
+}
+message BackupEntryProto {
+  // Stable string identifier for the group:
+  // "meta" or "partition:<id>".
+  string group = 1;
+  uint64 peer_id = 2;
+  // Index + term of the highest log entry applied at the moment
+  // the snapshot was built. Lets a validate-backup CLI confirm
+  // each replica's on-disk SNAPSHOT_META_KEY matches the
+  // manifest entry. Both 0 if the replica had applied nothing.
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+message BackupErrorProto {
+  string group = 1;
+  uint64 peer_id = 2;
+  string message = 3;
+}
+
 message GetNodeRequest {
   UuidBytes id = 1;
   // When true, the server answers only from its local store and does not
   // forward to the partition owner. Used by the partitioned reader to issue
   // direct point reads against a specific peer.
   bool local_only = 2;
+  // When true *and* the server is in multi-raft mode, the receiving peer
+  // ensures it is the leader of the relevant partition and gates the read
+  // on `Raft::ensure_linearizable` before answering. Ignored in other
+  // cluster modes (linearizability is implicit in single / single-Raft, and
+  // routing mode lacks the per-partition consensus to fence on).
+  bool linearizable = 3;
 }
 message GetNodeResponse {
   bool found = 1;
@@ -160,6 +195,12 @@ message AllNodeIdsRequest {
   // When true, the server returns only node ids on its local store and does
   // not scatter-gather to other peers.
   bool local_only = 1;
+  // When true *and* the server is in multi-raft mode, the receiver
+  // fences on every partition it leads via `Raft::ensure_linearizable`
+  // and then returns only ids whose partition is led by this peer —
+  // so the caller's union across peers covers every partition
+  // exactly once. See `GetNodeRequest.linearizable`.
+  bool linearizable = 2;
 }
 message AllNodeIdsResponse { repeated UuidBytes ids = 1; }
 
@@ -169,6 +210,11 @@ message GetEdgeRequest {
   // scatter-gather to other peers. Routed clients set this to false; servers
   // forwarding a scatter-gather hop set this to true on the forwarded request.
   bool local_only = 2;
+  // When true *and* the server is in multi-raft mode, the receiver
+  // only answers if it leads a partition that owns this edge (the
+  // edge's source partition or target partition); fences on those
+  // led partitions before reading. See `GetNodeRequest.linearizable`.
+  bool linearizable = 3;
 }
 message GetEdgeResponse {
   bool found = 1;
@@ -178,6 +224,11 @@ message GetEdgeResponse {
 message NodesByLabelRequest {
   string label = 1;
   bool local_only = 2;
+  // When true *and* the server is in multi-raft mode, the receiver
+  // fences on every partition it leads via `Raft::ensure_linearizable`
+  // and then filters its local-store result to only nodes whose
+  // partition is led by this peer. See `AllNodeIdsRequest.linearizable`.
+  bool linearizable = 3;
 }
 message NodesByLabelResponse { repeated UuidBytes ids = 1; }
 
@@ -190,6 +241,10 @@ message NodesByPropertyRequest {
   // across every peer call.
   bytes value_json = 3;
   bool local_only = 4;
+  // When true *and* the server is in multi-raft mode, the receiver
+  // fences on every partition it leads + filters by partition.
+  // See `AllNodeIdsRequest.linearizable`.
+  bool linearizable = 5;
 }
 message NodesByPropertyResponse { repeated UuidBytes ids = 1; }
 
@@ -200,6 +255,11 @@ message EdgesByPropertyRequest {
   // one encode per scatter, reused across every peer call.
   bytes value_json = 3;
   bool local_only = 4;
+  // When true *and* the server is in multi-raft mode, the receiver
+  // fences on partitions it leads + filters edge results to those
+  // whose source partition is led by this peer (edges live on the
+  // source-owner's partition). See `AllNodeIdsRequest.linearizable`.
+  bool linearizable = 5;
 }
 message EdgesByPropertyResponse { repeated UuidBytes ids = 1; }
 
@@ -208,6 +268,10 @@ message NeighborRequest {
   // When true, the server answers only from its local store and does not
   // forward to the partition owner.
   bool local_only = 2;
+  // See `GetNodeRequest.linearizable`. Same semantics for adjacency reads:
+  // multi-raft + linearizable forces the receiving peer to fence on the
+  // partition leader's read index before answering.
+  bool linearizable = 3;
 }
 message NeighborResponse { repeated NeighborInfo neighbors = 1; }
 
@@ -333,6 +397,55 @@ service MeshWrite {
   // expire.
   rpc ResolveTransaction(ResolveTransactionRequest)
       returns (ResolveTransactionResponse);
+  // Multi-raft mode only: forward a single-partition write to the
+  // partition's leader for proposal through that partition's Raft
+  // group. Used when a write lands on a non-leader peer — instead of
+  // returning ForwardToLeader to the client (which Bolt cannot
+  // transparently follow), the receiving peer proxies the proposal
+  // internally and the client sees one consistent gRPC endpoint for
+  // its session.
+  rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+  // Multi-raft mode only: forward a DDL command (CreateIndex,
+  // CreateConstraint, InstallTrigger, etc.) to the metadata Raft
+  // group's leader for proposal. Same shape as ForwardWrite but
+  // targets `meta` instead of a partition. Lets DDL issued from
+  // any peer transparently reach the meta leader without surfacing
+  // a ForwardToLeader to the client.
+  rpc ForwardDdl(ForwardDdlRequest) returns (ForwardDdlResponse);
+  // Multi-raft mode only: report this peer's meta-Raft applier
+  // `last_applied.index`. Used by the synchronous-DDL gate — after
+  // the meta leader proposes a DDL, it polls every peer via this
+  // RPC until they've all caught up past the DDL's log index, then
+  // returns OK to the user. Cheap — reads the local watch-channel
+  // metrics; no I/O. Returns 0 when the peer isn't running multi-
+  // raft (which the caller treats as "skip; not a meta replica").
+  rpc MetaLastApplied(MetaLastAppliedRequest)
+      returns (MetaLastAppliedResponse);
+  // Multi-raft mode only: report the leader the caller's local
+  // partition Raft replica observes for `partition`. Used as a
+  // fallback when the caller's own local replica can't resolve
+  // the leader (shut down, freshly-restarted, mid-election).
+  // Returns leader_id = 0 when the receiver doesn't host the
+  // partition or its replica doesn't know who leads. Cheap —
+  // reads the local watch-channel metrics; no I/O.
+  rpc PartitionLeader(PartitionLeaderRequest)
+      returns (PartitionLeaderResponse);
+  // Multi-raft mode only: ask the receiving peer to force an
+  // election on its local replica of `partition`. Used by the
+  // graceful-shutdown / drain-leadership path on the source peer:
+  // for each partition the source leads, it asks a follower replica
+  // to take over so the source can exit without leaving a dangling
+  // leader. Returns ok=false if the receiver doesn't host the
+  // partition (caller should pick a different target).
+  rpc ForcePartitionElection(ForcePartitionElectionRequest)
+      returns (ForcePartitionElectionResponse);
+  // Multi-raft mode only: trigger a local snapshot of every Raft
+  // group the receiver hosts (meta + every replicated partition).
+  // Used by the cluster-wide backup orchestrator on a coordinator
+  // peer to fan out to every other peer; combined the manifests
+  // give the operator a list of (group, peer) pairs whose
+  // on-disk snapshots are the consistent restore inputs.
+  rpc TakeBackup(TakeBackupRequest) returns (TakeBackupResponse);
 }
 
 enum BatchPhase {
@@ -353,6 +466,90 @@ message BatchWriteRequest {
 }
 
 message BatchWriteResponse {}
+
+message ForwardWriteRequest {
+  // Which partition's Raft group should propose these commands.
+  uint32 partition = 1;
+  // serde-json-serialized Vec<meshdb_cluster::GraphCommand>. The
+  // caller is responsible for ensuring every command targets the
+  // identified partition; the receiver applies them as a single
+  // proposed `GraphCommand::Batch` entry.
+  bytes commands_json = 2;
+  // Optional client-supplied idempotency key. The receiver can use
+  // it to dedupe a retry where the original RPC succeeded but the
+  // ack was lost. Currently unused — reserved for v2 once we add a
+  // dedupe table.
+  bytes idempotency_key = 3;
+  // DDL barrier: highest meta-Raft log index the caller has seen
+  // applied (or proposed). Receiver waits for its local meta
+  // replica to apply at least this index before proposing the
+  // write, so a CREATE INDEX issued through a different peer
+  // shortly before this write is guaranteed visible. `0` means
+  // the caller hasn't observed any DDL.
+  uint64 min_meta_index = 4;
+}
+
+message ForwardWriteResponse {
+  // True iff the receiver successfully proposed and the partition
+  // Raft committed the entry.
+  bool ok = 1;
+  // When `ok = false`, the NodeId the receiver believes is the
+  // current partition leader. Caller should refresh its leader
+  // cache and retry against this peer once. `0` means "leader
+  // unknown" — caller should retry shortly after a poll delay.
+  uint64 leader_hint = 2;
+  // Human-readable error message when `ok = false`. Empty on
+  // success.
+  string error_message = 3;
+}
+
+message ForwardDdlRequest {
+  // serde-json-serialized Vec<meshdb_cluster::GraphCommand>. Every
+  // command must be a DDL variant — the receiver proposes them
+  // through the metadata Raft group one by one. Mixed batches
+  // are accepted and proposed in order.
+  bytes commands_json = 1;
+}
+
+message ForwardDdlResponse {
+  // True iff every DDL command committed through the meta Raft.
+  bool ok = 1;
+  // When `ok = false`, the NodeId the receiver believes is the
+  // current meta leader. Caller refreshes its hint and retries.
+  // `0` means "leader unknown".
+  uint64 leader_hint = 2;
+  string error_message = 3;
+}
+
+message MetaLastAppliedRequest {}
+
+message MetaLastAppliedResponse {
+  // The peer's local meta-Raft `last_applied.index`. `0` when the
+  // peer isn't running multi-raft (no meta replica) or the meta
+  // applier hasn't applied any entry yet.
+  uint64 last_applied = 1;
+}
+
+message PartitionLeaderRequest {
+  uint32 partition = 1;
+}
+
+message PartitionLeaderResponse {
+  // The NodeId the receiver's local partition Raft replica
+  // observes as leader. `0` means the receiver doesn't host the
+  // partition, isn't running multi-raft, or its replica doesn't
+  // yet know who leads.
+  uint64 leader_id = 1;
+}
+
+message ForcePartitionElectionRequest {
+  uint32 partition = 1;
+}
+
+message ForcePartitionElectionResponse {
+  bool ok = 1;
+  string error_message = 2;
+}
 
 message PutNodeRequest {
   Node node = 1;
@@ -537,6 +734,16 @@ service MeshRaft {
 
 message RaftRpcRequest {
   bytes payload = 1;
+
+  // Which Raft group this RPC targets. Unset = the legacy single-Raft
+  // group, preserving the wire shape every pre-multi-raft peer expects.
+  // `meta = true` targets the multi-raft metadata group; `partition = N`
+  // targets per-partition Raft group N. Mutually exclusive — at most
+  // one is set.
+  oneof target {
+    bool meta = 2;
+    uint32 partition = 3;
+  }
 }
 
 message RaftRpcResponse {

@@ -4,6 +4,13 @@
 //! framing / encoding. Validates the full pipeline: handshake, HELLO,
 //! RUN (CREATE + MATCH), PULL, RECORD decoding, and GOODBYE.
 
+// Bolt's deeply-nested async dispatch (HELLO → BEGIN → RUN → PULL →
+// COMMIT, each its own `#[tracing::instrument]`-decorated async fn)
+// blows the default 128 query depth on stable rustc when this test
+// imports the meshdb_server lib's nested async stack. Same fix as
+// meshdb-server::lib's own `#![recursion_limit = "256"]`.
+#![recursion_limit = "256"]
+
 use meshdb_bolt::{
     perform_client_handshake, read_message, version_bytes, write_message, BoltMessage, BoltValue,
     BOLT_4_4,
@@ -38,6 +45,8 @@ async fn spawn_bolt_server() -> (String, TempDir) {
                 local_advertised: addr.to_string(),
                 peers: Arc::new(meshdb_cluster::Membership::new(std::iter::empty())),
                 raft: None,
+                multi_raft: None,
+                routing_ttl_seconds: None,
             }),
         )
         .await;
@@ -1071,6 +1080,8 @@ async fn spawn_bolt_server_with_auth(username: &str, password: &str) -> (String,
                 local_advertised: addr.to_string(),
                 peers: Arc::new(meshdb_cluster::Membership::new(std::iter::empty())),
                 raft: None,
+                multi_raft: None,
+                routing_ttl_seconds: None,
             }),
         )
         .await;
@@ -1200,6 +1211,8 @@ async fn spawn_bolt_server_with_bcrypt_auth(
                 local_advertised: addr.to_string(),
                 peers: Arc::new(meshdb_cluster::Membership::new(std::iter::empty())),
                 raft: None,
+                multi_raft: None,
+                routing_ttl_seconds: None,
             }),
         )
         .await;
@@ -1236,4 +1249,65 @@ async fn bolt_auth_rejects_wrong_password_against_bcrypt_hash() {
         }
         other => panic!("expected FAILURE, got {:?}", other),
     }
+}
+
+/// Bolt ROUTE response advertises the configured TTL so drivers
+/// re-fetch the routing table as topology drifts. Without an
+/// explicit override the response inherits the ~292y
+/// effectively-infinite TTL; a finite `routing_ttl_seconds` flows
+/// through to the `rt.ttl` field on the success metadata.
+#[tokio::test]
+async fn bolt_route_response_advertises_configured_ttl() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn StorageEngine> = Arc::new(Store::open(dir.path()).unwrap());
+    let service = Arc::new(MeshService::new(store));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = run_listener(
+            listener,
+            service,
+            None,
+            None,
+            None,
+            Arc::new(RouteContext {
+                local_advertised: addr.to_string(),
+                peers: Arc::new(meshdb_cluster::Membership::new(std::iter::empty())),
+                raft: None,
+                multi_raft: None,
+                routing_ttl_seconds: Some(30),
+            }),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let mut sock = connect_and_hello(&addr.to_string()).await;
+    write_message(
+        &mut sock,
+        &BoltMessage::Route {
+            routing: BoltValue::Map(vec![]),
+            bookmarks: BoltValue::List(vec![]),
+            extra: BoltValue::Map(vec![]),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let raw = read_message(&mut sock).await.unwrap();
+    let reply = BoltMessage::decode(&raw).unwrap();
+    let metadata = match reply {
+        BoltMessage::Success { metadata } => metadata,
+        other => panic!("expected SUCCESS, got {:?}", other),
+    };
+    let rt = metadata.get("rt").expect("rt metadata");
+    let ttl = match rt.get("ttl").expect("ttl field") {
+        BoltValue::Int(n) => *n,
+        other => panic!("ttl must be Int, got {:?}", other),
+    };
+    assert_eq!(
+        ttl, 30,
+        "configured TTL must flow through to ROUTE response"
+    );
 }

@@ -371,6 +371,18 @@ impl<'a> TxCoordinator<'a> {
                          it should have been split out by split_ddl"
                     );
                 }
+                // Multi-raft tx markers should never reach the
+                // routing coordinator — routing mode and multi-raft
+                // mode are mutually exclusive runtime paths.
+                GraphCommand::PreparedTx { .. }
+                | GraphCommand::CommitTx { .. }
+                | GraphCommand::AbortTx { .. } => {
+                    debug_assert!(
+                        false,
+                        "multi-raft tx command reached the routing coordinator; \
+                         the two modes are mutually exclusive"
+                    );
+                }
             }
         }
     }

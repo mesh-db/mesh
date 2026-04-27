@@ -59,6 +59,13 @@ const CF_EDGE_POINT_INDEX_META: &str = "edge_point_index_meta";
 /// this release — the trigger registry doesn't replicate
 /// across cluster peers, so each node holds its own set.
 const CF_TRIGGER_META: &str = "trigger_meta";
+/// Persisted multi-raft pending-tx staging. Keyed by partition-
+/// namespaced txid (4-byte LE partition + txid bytes), valued by
+/// the serde-encoded `Vec<GraphMutation>` to apply on `CommitTx`.
+/// Lets the partition applier reconstruct `pending_txs` after a
+/// restart instead of relying on openraft to re-replay entries
+/// past `last_applied` (which it doesn't).
+const CF_PENDING_TX_META: &str = "pending_tx_meta";
 
 const ALL_CFS: &[&str] = &[
     CF_NODES,
@@ -77,6 +84,7 @@ const ALL_CFS: &[&str] = &[
     CF_EDGE_POINT_INDEX,
     CF_EDGE_POINT_INDEX_META,
     CF_TRIGGER_META,
+    CF_PENDING_TX_META,
 ];
 
 const EMPTY: &[u8] = &[];
@@ -336,30 +344,91 @@ pub struct RocksDbStorageEngine {
     edge_point_indexes: RwLock<Vec<EdgePointIndexSpec>>,
 }
 
+/// Operator-tunable rocksdb options. Defaults match what
+/// [`RocksDbStorageEngine::open`] applied historically (modest
+/// `max_open_files`, capped LOG retention) — production
+/// deployments override via the [`storage]` config section.
+#[derive(Debug, Clone)]
+pub struct StorageOptions {
+    /// Cap on open SST files. RocksDB's default of -1 keeps
+    /// every SST in the table cache forever, which blows past
+    /// typical FD soft limits in CI / test setups. 64 is plenty
+    /// for the hot set in the foundational test suites; bump
+    /// for production read-heavy workloads.
+    pub max_open_files: i32,
+    /// Maximum number of historical INFO log files to keep on
+    /// disk. RocksDB's default is 1000 which produces a long
+    /// tail of LOG.old.* files that compounds disk pressure
+    /// when many databases run in parallel.
+    pub keep_log_file_num: usize,
+    /// Per-column-family memtable size (write buffer). Bigger
+    /// = fewer L0 files + more memory per CF. RocksDB's default
+    /// is 64MB; tuning below that helps small / many-tenant
+    /// deployments, above for write-heavy single-tenant ones.
+    /// `None` keeps the upstream default.
+    pub write_buffer_size_bytes: Option<usize>,
+    /// Maximum number of memtables before writes stall. Bigger
+    /// = more headroom for write bursts at the cost of memory.
+    /// RocksDB's default is 2; 4-8 is common for write-heavy
+    /// loads. `None` keeps the upstream default.
+    pub max_write_buffer_number: Option<i32>,
+    /// Bloom filter bits per key on the block-based table
+    /// format. Bigger = lower false-positive rate on point
+    /// reads at the cost of memory. RocksDB's default builds
+    /// no bloom filter unless explicitly configured; 10 bits
+    /// gives ~1% FP rate and is the typical recommendation.
+    /// `None` keeps the upstream default (no bloom filter).
+    pub bloom_filter_bits_per_key: Option<i32>,
+}
+
+impl Default for StorageOptions {
+    fn default() -> Self {
+        Self {
+            max_open_files: 64,
+            keep_log_file_num: 4,
+            write_buffer_size_bytes: None,
+            max_write_buffer_number: None,
+            bloom_filter_bits_per_key: None,
+        }
+    }
+}
+
 impl RocksDbStorageEngine {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, StorageOptions::default())
+    }
+
+    /// Open with operator-tunable rocksdb knobs. Applied to both
+    /// the database-level options (FD cap, LOG retention) and
+    /// every column family's table options (bloom filter, write
+    /// buffer). Defaults match [`RocksDbStorageEngine::open`].
+    pub fn open_with_options(path: impl AsRef<Path>, opts: StorageOptions) -> Result<Self> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        // RocksDB's default `max_open_files = -1` keeps every SST
-        // file cached in the table cache forever. With 15 column
-        // families per database and the cluster integration tests
-        // spawning multiple two-peer clusters in parallel, that
-        // unbounded cache blows past typical FD soft limits
-        // (`ulimit -n` of 1024 on stock Linux). 64 is plenty for
-        // the SST hot set; cold files get reopened on access.
-        // Production read-heavy workloads can override via tuning
-        // config later.
-        db_opts.set_max_open_files(64);
-        // Cap retained INFO log files at a small number — the
-        // default of 1000 produces a long tail of LOG.old.* files
-        // that, while not all open as FDs, do compound disk
-        // pressure when many test databases run in parallel.
-        db_opts.set_keep_log_file_num(4);
+        db_opts.set_max_open_files(opts.max_open_files);
+        db_opts.set_keep_log_file_num(opts.keep_log_file_num);
+
+        // Per-CF options. Same options applied to every column
+        // family — none of them have wildly different access
+        // patterns, and the cost of tuning each independently
+        // exceeds the win for v1.
+        let mut cf_opts = Options::default();
+        if let Some(sz) = opts.write_buffer_size_bytes {
+            cf_opts.set_write_buffer_size(sz);
+        }
+        if let Some(n) = opts.max_write_buffer_number {
+            cf_opts.set_max_write_buffer_number(n);
+        }
+        if let Some(bits) = opts.bloom_filter_bits_per_key {
+            let mut block_opts = rocksdb::BlockBasedOptions::default();
+            block_opts.set_bloom_filter(bits as f64, false);
+            cf_opts.set_block_based_table_factory(&block_opts);
+        }
 
         let cfs: Vec<ColumnFamilyDescriptor> = ALL_CFS
             .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+            .map(|name| ColumnFamilyDescriptor::new(*name, cf_opts.clone()))
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)?;
@@ -2908,6 +2977,27 @@ impl StorageEngine for RocksDbStorageEngine {
             // accepts `&str`. Lossy decode is defensive.
             let name = String::from_utf8_lossy(&k).into_owned();
             out.push((name, v.to_vec()));
+        }
+        Ok(out)
+    }
+
+    fn put_pending_tx(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let cf = self.cf(CF_PENDING_TX_META)?;
+        self.db.put_cf(cf, key, value).map_err(Error::from)
+    }
+
+    fn delete_pending_tx(&self, key: &[u8]) -> Result<()> {
+        let cf = self.cf(CF_PENDING_TX_META)?;
+        self.db.delete_cf(cf, key).map_err(Error::from)
+    }
+
+    fn list_pending_txs(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.cf(CF_PENDING_TX_META)?;
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        for entry in iter {
+            let (k, v) = entry.map_err(Error::from)?;
+            out.push((k.to_vec(), v.to_vec()));
         }
         Ok(out)
     }

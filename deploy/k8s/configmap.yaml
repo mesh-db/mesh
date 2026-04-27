@@ -1,0 +1,75 @@
+# Sample meshdb-server config for a 3-peer multi-raft cluster.
+#
+# Apply alongside the StatefulSet — the pods mount this at
+# /etc/meshdb/meshdb.toml and pass it via `--config`.
+#
+# Adapt to your cluster: every peer needs a unique `self_id` and
+# the `peers[]` list must enumerate every member. The
+# StatefulSet template renders `self_id` from the pod ordinal
+# (mesh-0 → 1, mesh-1 → 2, mesh-2 → 3) via an init container,
+# so this ConfigMap is per-cluster, not per-peer.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshdb-config
+  namespace: meshdb
+data:
+  meshdb.toml: |
+    listen_address = "0.0.0.0:7001"
+    data_dir = "/var/lib/meshdb"
+    bolt_address = "0.0.0.0:7687"
+    metrics_address = "0.0.0.0:9090"
+
+    mode = "multi-raft"
+    num_partitions = 8
+    replication_factor = 3
+    read_consistency = "local"
+
+    # Operational hardening (see CLAUDE.md tier-A/B sections).
+    shutdown_drain_timeout_seconds = 30
+    query_timeout_seconds = 60
+    query_max_rows = 1000000
+    max_concurrent_queries = 256
+    plan_cache_size = 1024
+    routing_ttl_seconds = 30
+    audit_log_path = "/var/lib/meshdb/audit-log.jsonl"
+
+    # Fill in via the init container (see StatefulSet).
+    self_id = 0  # PLACEHOLDER — patched per-pod
+
+    [[peers]]
+    id = 1
+    address = "meshdb-0.meshdb.meshdb.svc.cluster.local:7001"
+    bolt_address = "meshdb-0.meshdb.meshdb.svc.cluster.local:7687"
+
+    [[peers]]
+    id = 2
+    address = "meshdb-1.meshdb.meshdb.svc.cluster.local:7001"
+    bolt_address = "meshdb-1.meshdb.meshdb.svc.cluster.local:7687"
+
+    [[peers]]
+    id = 3
+    address = "meshdb-2.meshdb.meshdb.svc.cluster.local:7001"
+    bolt_address = "meshdb-2.meshdb.meshdb.svc.cluster.local:7687"
+
+    # Tuning that scales with workload. Tune in your overlay.
+    [storage]
+    max_open_files = 256
+    write_buffer_size_bytes = 67108864
+    bloom_filter_bits_per_key = 10
+
+    # Uncomment + populate when running on a non-trusted network.
+    # [grpc_tls]
+    # cert_path = "/etc/meshdb/tls/server.pem"
+    # key_path  = "/etc/meshdb/tls/server.key"
+    # ca_path   = "/etc/meshdb/tls/ca.pem"
+    # client_ca_path = "/etc/meshdb/tls/ca.pem"  # mTLS
+    # reload_interval_seconds = 60
+
+    # [cluster_auth]
+    # token = "REPLACE_WITH_HIGH_ENTROPY_SECRET"
+
+    # [tracing]
+    # otlp_endpoint = "http://otel-collector.observability:4317"
+    # service_name = "meshdb"
+    # sample_rate = 0.1

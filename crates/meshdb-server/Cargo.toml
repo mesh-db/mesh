@@ -28,12 +28,21 @@ anyhow = "1"
 thiserror = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = "0.8"
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.12"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OpenTelemetry / OTLP exporter — wired in `init_tracing` when
+# `[tracing] otlp_endpoint = "..."` is set in the server config.
+# Tonic-backed transport so it shares the same gRPC stack as the
+# rest of the inter-peer traffic.
+opentelemetry = { version = "0.27", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = { version = "0.28", default-features = false }
 axum = { version = "0.7", default-features = false, features = ["tokio", "http1"] }
 bcrypt = { workspace = true }
 rustls = "0.23"
@@ -42,7 +51,7 @@ rustls-pemfile = "2"
 
 [dev-dependencies]
 tempfile = "3"
-serde_json = { workspace = true }
+uuid = { workspace = true }
 meshdb-bolt = { workspace = true }
 # Activate meshdb-rpc's `fault-inject` feature for the
 # `two_pc_fault_injection` integration test. A dev-dependency row
@@ -53,6 +62,11 @@ reqwest = { version = "0.12", default-features = false }
 bcrypt = { workspace = true }
 rcgen = "0.13"
 rustls-pki-types = "1"
+criterion = { workspace = true }
+
+[[bench]]
+name = "multi_raft_bench"
+harness = false
 
 [features]
 # APOC-compatible scalars and procedures ship enabled by
@@ -81,4 +95,11 @@ apoc-cypher = ["meshdb-executor/apoc-cypher"]
 apoc-load = ["meshdb-executor/apoc-load"]
 apoc-export = ["meshdb-executor/apoc-export"]
 apoc-trigger = ["meshdb-executor/apoc-trigger", "meshdb-rpc/apoc-trigger"]
-apoc = ["meshdb-executor/apoc"]
+# `apoc` umbrella enables the executor's full apoc surface plus
+# the RPC-side trigger plumbing — so the default-features build
+# of meshdb-server has live `apoc.trigger.*` install/fire support
+# end-to-end. (Without `meshdb-rpc/apoc-trigger`, the
+# `MeshService` write path's trigger hooks compile out and
+# `apoc.trigger.install` would land in storage but no fires would
+# ever happen.)
+apoc = ["meshdb-executor/apoc", "apoc-trigger"]

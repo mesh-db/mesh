@@ -13,6 +13,10 @@
 //!
 //! Reports land in `target/criterion/<bench_name>/report/index.html`.
 
+// Same recursion_limit bump as the lib — `MeshService::execute_cypher_local`
+// nested async exceeds rustc's default 128.
+#![recursion_limit = "256"]
+
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use meshdb_executor::{ParamMap, Value};
 use meshdb_rpc::MeshService;

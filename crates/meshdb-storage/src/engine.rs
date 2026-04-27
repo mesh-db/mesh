@@ -472,6 +472,37 @@ pub trait StorageEngine: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Persist an in-doubt cross-partition transaction's staging
+    /// blob. Used by the multi-raft `PartitionGraphApplier` so
+    /// `pending_txs` survives a process restart — without
+    /// persistence, an applied `PreparedTx` would be invisible to
+    /// post-restart recovery (openraft replays only entries past
+    /// `last_applied`, and the staged commands live in memory).
+    ///
+    /// `key` is a partition-namespaced txid (e.g. `b"<u32 LE
+    /// partition><txid bytes>"`); `value` is the serde-encoded
+    /// `Vec<GraphMutation>` to apply on `CommitTx`. Default impl
+    /// errors so backends that don't host multi-raft surface the
+    /// gap immediately.
+    fn put_pending_tx(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+        Err(Error::Unsupported(
+            "pending-tx metadata is not supported by this backend".into(),
+        ))
+    }
+
+    /// Drop a pending-tx entry by key. Idempotent for unknown keys.
+    fn delete_pending_tx(&self, _key: &[u8]) -> Result<()> {
+        Err(Error::Unsupported(
+            "pending-tx metadata is not supported by this backend".into(),
+        ))
+    }
+
+    /// All pending-tx entries as `(key, value)` pairs. The applier
+    /// scans this on startup to rebuild its in-memory map.
+    fn list_pending_txs(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(Vec::new())
+    }
+
     // --- Snapshot / restore hooks ---
 
     /// Persist a point-in-time copy of the backend's on-disk state into

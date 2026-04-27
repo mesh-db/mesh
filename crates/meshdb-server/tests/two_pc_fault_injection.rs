@@ -71,11 +71,13 @@ fn make_peer_configs(addr_a: SocketAddr, addr_b: SocketAddr) -> Vec<PeerConfig> 
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ]
 }
@@ -101,6 +103,18 @@ fn make_server_config(
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: Some(ClusterMode::Routing),
+        replication_factor: None,
+        read_consistency: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
     }
@@ -128,6 +142,7 @@ async fn count_probes_local(addr: String) -> usize {
         .nodes_by_label(NodesByLabelRequest {
             label: "Probe".into(),
             local_only: true,
+            linearizable: false,
         })
         .await
         .unwrap();

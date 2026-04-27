@@ -54,7 +54,6 @@
 //! `meshdb-rpc/src/tx_overlay.rs` for the exact semantics.
 
 use crate::value_conv::{bolt_params_to_param_map, field_names_from_rows, row_to_bolt_fields};
-use anyhow::Context;
 use meshdb_bolt::{
     perform_server_handshake_with, read_message, write_message, BoltError, BoltMessage, BoltValue,
     BOLT_4_4, BOLT_5_0, BOLT_5_1, BOLT_5_2, BOLT_5_3, BOLT_5_4, SUPPORTED,
@@ -91,6 +90,21 @@ pub struct RouteContext {
     pub local_advertised: String,
     pub peers: Arc<Membership>,
     pub raft: Option<Arc<RaftCluster>>,
+    /// Multi-raft cluster handle when `mode = "multi-raft"`. Drives
+    /// the ROUTE response: WRITE / READ / ROUTE all list every
+    /// peer's Bolt address (multi-raft does server-side leader
+    /// forwarding so any peer can accept writes), and the TTL drops
+    /// to `routing_ttl_seconds` so drivers re-fetch as topology
+    /// drifts (membership changes, partition leader churn).
+    pub multi_raft: Option<Arc<meshdb_rpc::MultiRaftCluster>>,
+    /// TTL in seconds advertised on every ROUTE response. Bolt
+    /// drivers cache the routing table for this long before
+    /// re-fetching. `None` keeps the historical effectively-infinite
+    /// TTL (~292y); a finite value is recommended for any
+    /// multi-peer deployment so drivers pick up topology changes
+    /// without a manual session bounce. Defaults are wired through
+    /// [`ServerConfig::routing_ttl_seconds`].
+    pub routing_ttl_seconds: Option<u64>,
 }
 
 /// Current connection phase used by the message-dispatch loop.
@@ -187,48 +201,26 @@ pub async fn run_listener(
     }
 }
 
-/// Build a [`TlsAcceptor`] from PEM-encoded certificate + private key
-/// files. The certificate file may contain one or more X.509
-/// certificates (leaf first, then any intermediates); the private key
-/// file may hold a PKCS#8, SEC1 (EC), or RSA-format key — the first
-/// key found wins.
+/// Build a static [`TlsAcceptor`] from PEM-encoded cert + key
+/// files. Wraps [`crate::tls_reload::build_static_tls_acceptor`];
+/// this thin wrapper exists so existing callers in the test
+/// harness keep working with the older `bolt::` module path.
 ///
 /// The caller is responsible for installing a rustls crypto provider
 /// before calling this (see [`install_default_crypto_provider`]).
 pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAcceptor> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use rustls::ServerConfig;
+    crate::tls_reload::build_static_tls_acceptor(cert_path, key_path)
+}
 
-    let cert_bytes = std::fs::read(cert_path)
-        .with_context(|| format!("reading bolt tls cert {}", cert_path.display()))?;
-    let key_bytes = std::fs::read(key_path)
-        .with_context(|| format!("reading bolt tls key {}", key_path.display()))?;
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_bytes.as_slice())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("parsing bolt tls cert {}", cert_path.display()))?;
-    if certs.is_empty() {
-        anyhow::bail!(
-            "bolt tls cert {} contained no CERTIFICATE PEM blocks",
-            cert_path.display()
-        );
-    }
-
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_bytes.as_slice())
-        .with_context(|| format!("parsing bolt tls key {}", key_path.display()))?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "bolt tls key {} contained no PRIVATE KEY PEM block",
-                key_path.display()
-            )
-        })?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("building rustls ServerConfig")?;
-
-    Ok(TlsAcceptor::from(Arc::new(config)))
+/// Hot-reloading variant of [`build_tls_acceptor`]. Wraps
+/// [`crate::tls_reload::build_hot_reloading_tls_acceptor`]; see
+/// that module for the cadence + error semantics.
+pub fn build_tls_acceptor_with_reload(
+    cert_path: &Path,
+    key_path: &Path,
+    reload_interval: std::time::Duration,
+) -> anyhow::Result<(TlsAcceptor, tokio::task::JoinHandle<()>)> {
+    crate::tls_reload::build_hot_reloading_tls_acceptor(cert_path, key_path, reload_interval)
 }
 
 /// Install the default rustls crypto provider (aws-lc-rs). Delegates
@@ -829,10 +821,11 @@ fn route_success(ctx: &RouteContext) -> BoltMessage {
         }
     }
 
-    // WRITE list. Raft mode wants just the leader; routing and
-    // single-node accept the full advertised list. Any fallback path
-    // lands on `local_advertised` so the table always has at least
-    // one WRITE entry.
+    // WRITE list. Raft mode wants just the leader; routing,
+    // multi-raft, and single-node accept the full advertised list
+    // (multi-raft does server-side leader forwarding so any peer
+    // accepts writes). Any fallback lands on `local_advertised` so
+    // the table always has at least one WRITE entry.
     let write_addrs: Vec<String> = match ctx.raft.as_ref() {
         Some(raft) => {
             let leader_bolt = raft
@@ -855,8 +848,15 @@ fn route_success(ctx: &RouteContext) -> BoltMessage {
             ("role", BoltValue::String(role.to_string())),
         ])
     };
+    // TTL: long-cache historical default (~292y) when unset, finite
+    // value when configured. Multi-raft mode defaults to a finite
+    // TTL via `serve()` so drivers re-fetch as partitions reshuffle.
+    let ttl_seconds = ctx
+        .routing_ttl_seconds
+        .map(|t| t as i64)
+        .unwrap_or(9_223_372_036);
     let rt = BoltValue::map([
-        ("ttl", BoltValue::Int(9_223_372_036)),
+        ("ttl", BoltValue::Int(ttl_seconds)),
         (
             "servers",
             BoltValue::List(vec![

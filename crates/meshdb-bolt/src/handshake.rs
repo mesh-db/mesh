@@ -158,7 +158,7 @@ fn pick_version_from(slots: &[[u8; 4]; 4], allowed: &[[u8; 4]]) -> Option<[u8; 4
                 break;
             }
             let candidate = [0, 0, minor - offset, major];
-            if allowed.iter().any(|v| *v == candidate) {
+            if allowed.contains(&candidate) {
                 return Some(candidate);
             }
         }

@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
-use clap::Parser;
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, Subcommand};
 use meshdb_server::config::{ClusterMode, ServerConfig};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Common-case options exposed on the CLI / environment. Anything
 /// involving structured data (peer lists, bolt auth tables, TLS paths)
@@ -64,6 +64,41 @@ struct Cli {
     /// Cluster mode: `single`, `routing`, or `raft`.
     #[arg(long, env = "MESHDB_MODE", value_enum)]
     mode: Option<ClusterMode>,
+
+    /// Optional subcommand. Without one, `meshdb-server` runs the
+    /// graph-database server. Subcommands provide ops-time
+    /// utilities (validate-backup, ...) that don't bind a
+    /// listener.
+    #[command(subcommand)]
+    command: Option<Subcmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Subcmd {
+    /// Validate that an archived backup directory matches the
+    /// backup manifest produced by `MeshService::take_cluster_backup`.
+    ///
+    /// Walks every entry in the manifest and confirms that the
+    /// configured `data_dir` contains a `raft/<group>` subdirectory
+    /// for each (peer, group) pair. Hard-fails if any subdir is
+    /// missing — operators run this AFTER copying each peer's
+    /// data_dir into place but BEFORE starting the cluster, so a
+    /// half-restored cluster can't boot into split-brain.
+    ValidateBackup {
+        /// Path to the JSON manifest produced at backup time.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Path to the data_dir of the peer being validated.
+        /// Run this once per peer in your archive — each peer's
+        /// data_dir is independent.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Peer id this data_dir belongs to. The manifest carries
+        /// per-peer entries; the validator looks for entries
+        /// matching this id.
+        #[arg(long)]
+        peer_id: u64,
+    },
 }
 
 impl Cli {
@@ -98,8 +133,20 @@ impl Cli {
             bolt_advertised_address: None,
             grpc_tls: None,
             mode: self.mode,
+            replication_factor: None,
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
+            cluster_auth: None,
+            routing_ttl_seconds: None,
+            shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
+            query_max_rows: None,
+            max_concurrent_queries: None,
+            audit_log_path: None,
+            plan_cache_size: None,
+            storage: None,
+            tracing: None,
         })
     }
 
@@ -146,10 +193,15 @@ fn build_config(cli: Cli) -> Result<ServerConfig> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+
+    // Subcommands run synchronously without binding any listener.
+    if let Some(subcmd) = cli.command {
+        return run_subcommand(subcmd);
+    }
+
     let config = build_config(cli)?;
+    init_tracing(config.tracing.as_ref())?;
     tracing::info!(
         self_id = config.self_id,
         listen_address = %config.listen_address,
@@ -161,10 +213,157 @@ async fn main() -> Result<()> {
     meshdb_server::serve(config).await
 }
 
-fn init_tracing() {
+fn run_subcommand(subcmd: Subcmd) -> Result<()> {
+    match subcmd {
+        Subcmd::ValidateBackup {
+            manifest,
+            data_dir,
+            peer_id,
+        } => validate_backup(&manifest, &data_dir, peer_id),
+    }
+}
+
+/// Walk a backup manifest and confirm that `data_dir` contains a
+/// `raft/<group>` subdirectory for every entry that names this
+/// peer. Hard-fails if any subdir is missing or if the manifest
+/// is unparseable. Operators run this once per peer in their
+/// archive before starting the cluster, so a half-restored
+/// cluster can't boot into split-brain.
+fn validate_backup(manifest: &Path, data_dir: &Path, peer_id: u64) -> Result<()> {
+    let raw = std::fs::read_to_string(manifest)
+        .with_context(|| format!("reading manifest {}", manifest.display()))?;
+    let manifest: meshdb_rpc::MultiRaftBackupManifest = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing manifest {}", manifest.display()))?;
+
+    let raft_dir = data_dir.join("raft");
+    if !raft_dir.exists() {
+        return Err(anyhow!(
+            "data_dir {} has no raft/ subdirectory; this isn't a multi-raft archive",
+            data_dir.display()
+        ));
+    }
+
+    let entries_for_peer: Vec<_> = manifest
+        .entries
+        .iter()
+        .filter(|e| e.peer_id == peer_id)
+        .collect();
+    if entries_for_peer.is_empty() {
+        return Err(anyhow!(
+            "manifest carries no entries for peer {peer_id} — \
+             either the wrong --peer-id was passed or this peer was missing at backup time"
+        ));
+    }
+
+    let mut missing = Vec::new();
+    for entry in &entries_for_peer {
+        let dir = raft_dir.join(entry.group.dir_name());
+        if !dir.exists() {
+            missing.push((entry.group, dir));
+        }
+    }
+    if !missing.is_empty() {
+        eprintln!("validate-backup: missing snapshot directories:");
+        for (group, dir) in &missing {
+            eprintln!("  - {:?} expected at {}", group, dir.display());
+        }
+        return Err(anyhow!(
+            "{} expected snapshot directory(ies) missing in {}; cluster cannot be safely brought up",
+            missing.len(),
+            data_dir.display()
+        ));
+    }
+
+    if !manifest.errors.is_empty() {
+        eprintln!(
+            "validate-backup: manifest carries {} backup-time error(s):",
+            manifest.errors.len()
+        );
+        for err in &manifest.errors {
+            eprintln!(
+                "  - {:?} on peer {}: {}",
+                err.group, err.peer_id, err.message
+            );
+        }
+        return Err(anyhow!(
+            "manifest is dirty — backup ran but {} group(s) failed to snapshot; \
+             re-run take_cluster_backup before restoring",
+            manifest.errors.len()
+        ));
+    }
+
+    println!(
+        "validate-backup: peer {peer_id} OK — {} groups present, manifest clean",
+        entries_for_peer.len()
+    );
+    Ok(())
+}
+
+/// Set up the global tracing subscriber. Always installs the
+/// fmt-to-stdout layer (gated by `RUST_LOG` / fallback `info`).
+/// When `[tracing] otlp_endpoint = "..."` is configured, also
+/// installs an OpenTelemetry layer that exports spans to the
+/// collector via OTLP/gRPC.
+///
+/// The OTel pipeline uses a tokio-runtime batch span processor
+/// (`opentelemetry_sdk::runtime::Tokio`), so a tokio runtime must
+/// be active before this runs — that's why `main()` parses CLI
+/// inside `#[tokio::main]` first and only then calls this.
+fn init_tracing(tracing_cfg: Option<&meshdb_server::config::TracingConfig>) -> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    match tracing_cfg {
+        Some(cfg) => {
+            use opentelemetry::trace::TracerProvider as _;
+            use opentelemetry_otlp::WithExportConfig;
+
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(cfg.otlp_endpoint.clone())
+                .build()
+                .map_err(|e| {
+                    anyhow!("building OTLP span exporter for {}: {e}", cfg.otlp_endpoint)
+                })?;
+            let service_name = cfg
+                .service_name
+                .clone()
+                .unwrap_or_else(|| "meshdb-server".to_string());
+            let resource = opentelemetry_sdk::Resource::new([opentelemetry::KeyValue::new(
+                "service.name",
+                service_name,
+            )]);
+            let sampler = match cfg.sample_rate {
+                Some(r) if (0.0..=1.0).contains(&r) => {
+                    opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(r)
+                }
+                Some(r) => {
+                    return Err(anyhow!(
+                        "tracing.sample_rate must be in [0.0, 1.0], got {r}"
+                    ));
+                }
+                None => opentelemetry_sdk::trace::Sampler::AlwaysOn,
+            };
+            let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_resource(resource)
+                .with_sampler(sampler)
+                .build();
+            let tracer = provider.tracer("meshdb");
+            opentelemetry::global::set_tracer_provider(provider);
+            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+            registry.with(otel_layer).init();
+        }
+        None => registry.init(),
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -248,8 +447,20 @@ mod tests {
             bolt_advertised_address: None,
             grpc_tls: None,
             mode: None,
+            replication_factor: None,
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
+            cluster_auth: None,
+            routing_ttl_seconds: None,
+            shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
+            query_max_rows: None,
+            max_concurrent_queries: None,
+            audit_log_path: None,
+            plan_cache_size: None,
+            storage: None,
+            tracing: None,
         };
         cli.apply_to(&mut cfg);
         assert!(!cfg.bootstrap);
@@ -273,8 +484,20 @@ mod tests {
             bolt_advertised_address: None,
             grpc_tls: None,
             mode: None,
+            replication_factor: None,
+            read_consistency: None,
             #[cfg(feature = "apoc-load")]
             apoc_import: None,
+            cluster_auth: None,
+            routing_ttl_seconds: None,
+            shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
+            query_max_rows: None,
+            max_concurrent_queries: None,
+            audit_log_path: None,
+            plan_cache_size: None,
+            storage: None,
+            tracing: None,
         };
         cli.apply_to(&mut cfg);
         assert_eq!(cfg.listen_address, "0.0.0.0:9000"); // overridden
@@ -293,5 +516,123 @@ mod tests {
             let cli = parse(&["meshdb-server", "--mode", arg]);
             assert_eq!(cli.mode, Some(expected));
         }
+    }
+
+    #[test]
+    fn validate_backup_passes_when_every_group_has_a_subdir() {
+        use meshdb_rpc::{MultiRaftBackupEntry, MultiRaftBackupGroup, MultiRaftBackupManifest};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // Create the data_dir layout the manifest expects.
+        let raft_dir = dir.path().join("raft");
+        std::fs::create_dir_all(raft_dir.join("meta")).unwrap();
+        std::fs::create_dir_all(raft_dir.join("p-0")).unwrap();
+        std::fs::create_dir_all(raft_dir.join("p-1")).unwrap();
+
+        let manifest = MultiRaftBackupManifest {
+            entries: vec![
+                MultiRaftBackupEntry {
+                    group: MultiRaftBackupGroup::Meta,
+                    peer_id: 1,
+                    last_log_index: Some(10),
+                    last_log_term: Some(1),
+                },
+                MultiRaftBackupEntry {
+                    group: MultiRaftBackupGroup::Partition { id: 0 },
+                    peer_id: 1,
+                    last_log_index: Some(20),
+                    last_log_term: Some(1),
+                },
+                MultiRaftBackupEntry {
+                    group: MultiRaftBackupGroup::Partition { id: 1 },
+                    peer_id: 1,
+                    last_log_index: Some(15),
+                    last_log_term: Some(1),
+                },
+                // Entry for a different peer — must be ignored
+                // when validating peer 1.
+                MultiRaftBackupEntry {
+                    group: MultiRaftBackupGroup::Meta,
+                    peer_id: 99,
+                    last_log_index: Some(10),
+                    last_log_term: Some(1),
+                },
+            ],
+            errors: vec![],
+        };
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        validate_backup(&manifest_path, dir.path(), 1).expect("validate succeeds");
+    }
+
+    #[test]
+    fn validate_backup_fails_when_a_subdir_is_missing() {
+        use meshdb_rpc::{MultiRaftBackupEntry, MultiRaftBackupGroup, MultiRaftBackupManifest};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("raft").join("meta")).unwrap();
+        // p-0 deliberately missing.
+
+        let manifest = MultiRaftBackupManifest {
+            entries: vec![
+                MultiRaftBackupEntry {
+                    group: MultiRaftBackupGroup::Meta,
+                    peer_id: 1,
+                    last_log_index: Some(10),
+                    last_log_term: Some(1),
+                },
+                MultiRaftBackupEntry {
+                    group: MultiRaftBackupGroup::Partition { id: 0 },
+                    peer_id: 1,
+                    last_log_index: Some(20),
+                    last_log_term: Some(1),
+                },
+            ],
+            errors: vec![],
+        };
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let err =
+            validate_backup(&manifest_path, dir.path(), 1).expect_err("missing subdir must fail");
+        assert!(
+            err.to_string().contains("missing"),
+            "expected missing-subdir error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_backup_fails_when_manifest_carries_errors() {
+        use meshdb_rpc::{
+            MultiRaftBackupEntry, MultiRaftBackupError, MultiRaftBackupGroup,
+            MultiRaftBackupManifest,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("raft").join("meta")).unwrap();
+
+        let manifest = MultiRaftBackupManifest {
+            entries: vec![MultiRaftBackupEntry {
+                group: MultiRaftBackupGroup::Meta,
+                peer_id: 1,
+                last_log_index: Some(10),
+                last_log_term: Some(1),
+            }],
+            errors: vec![MultiRaftBackupError {
+                group: MultiRaftBackupGroup::Partition { id: 0 },
+                peer_id: 1,
+                message: "snapshot trigger failed".into(),
+            }],
+        };
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let err =
+            validate_backup(&manifest_path, dir.path(), 1).expect_err("dirty manifest must fail");
+        assert!(
+            err.to_string().contains("manifest is dirty"),
+            "expected dirty-manifest error, got: {err}"
+        );
     }
 }

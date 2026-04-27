@@ -752,6 +752,12 @@ pub struct RaftCluster {
     pub id: NodeId,
     pub raft: Raft<MeshRaftConfig>,
     store: MemStore,
+    /// Human-readable label distinguishing this Raft group's log
+    /// output. Single-Raft mode leaves this at `"single"`; multi-raft
+    /// mode sets it to `"meta"` for the metadata group and `"p-<N>"`
+    /// for partition groups, so `tracing` spans on adjacent groups
+    /// don't collide.
+    label: Arc<str>,
 }
 
 impl RaftCluster {
@@ -813,7 +819,31 @@ impl RaftCluster {
         let raft = Raft::new(id, config, network, log_store, state_machine)
             .await
             .map_err(|e| Error::Raft(e.to_string()))?;
-        Ok(Self { id, raft, store })
+        Ok(Self {
+            id,
+            raft,
+            store,
+            label: Arc::from("single"),
+        })
+    }
+
+    /// Set the tracing label on this cluster instance. Used by the
+    /// multi-raft bootstrap to distinguish per-group log output:
+    ///
+    ///   * `with_label("meta")` for the metadata group.
+    ///   * `with_label("p-3")` for partition group 3.
+    ///
+    /// Single-Raft mode skips this and leaves the default `"single"`
+    /// label so existing log greps keep matching.
+    pub fn with_label(mut self, label: impl Into<Arc<str>>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// The tracing label for this cluster's Raft group. See
+    /// [`with_label`].
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Bootstrap the cluster with the provided member set. Only call on the
@@ -848,12 +878,31 @@ impl RaftCluster {
     /// now"; the Bolt ROUTE handler falls back to the local advertised
     /// address in that case, which yields `ForwardToLeader` redirects
     /// via the normal write path once elections settle.
+    /// Borrow this replica's most recently-applied log id, as
+    /// known to the in-memory metrics watcher. Returns `(index,
+    /// term)` of the highest applied entry, or `None` when the
+    /// replica is fresh / has applied nothing yet. Used by the
+    /// backup orchestrator to record "snapshot taken at log index
+    /// X" so an operator can match restored snapshots against the
+    /// manifest.
+    pub fn last_applied_log(&self) -> Option<(u64, u64)> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        m.last_applied.map(|id| (id.index, id.leader_id.term))
+    }
+
     pub fn current_leader(&self) -> Option<crate::PeerId> {
-        self.raft
-            .metrics()
-            .borrow()
-            .current_leader
-            .map(crate::PeerId)
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        // After `shutdown_in_place`, openraft's metrics watcher is
+        // closed but `borrow()` still returns the last published
+        // value — including a stale `current_leader` pointing at a
+        // dead replica. Treat any non-running state as no-leader so
+        // routing falls through to the forward path.
+        if m.state == openraft::ServerState::Shutdown || m.running_state.is_err() {
+            return None;
+        }
+        m.current_leader.map(crate::PeerId)
     }
 
     /// Propose a [`ClusterCommand`] entry. Wraps internally as
@@ -874,7 +923,11 @@ impl RaftCluster {
     /// caller can route the request to the actual leader, and
     /// [`Error::Apply`] when the entry committed through Raft but the
     /// local state machine rejected it (e.g. duplicate AddPeer).
-    #[tracing::instrument(level = "debug", skip_all, fields(node_id = self.id))]
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(node_id = self.id, group = %self.label)
+    )]
     pub async fn propose_entry(&self, entry: MeshLogEntry) -> Result<ApplyResponse> {
         use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
         match self.raft.client_write(entry).await {
@@ -901,6 +954,58 @@ impl RaftCluster {
     pub async fn shutdown(self) -> Result<()> {
         self.raft
             .shutdown()
+            .await
+            .map_err(|e| Error::Raft(e.to_string()))
+    }
+
+    /// Stop this Raft replica without consuming the wrapper. Useful
+    /// for tests that simulate a crash on a peer reachable through
+    /// an `Arc`. Once shut down, the openraft handle stops sending
+    /// heartbeats and rejects further proposals — followers will
+    /// elect a new leader.
+    pub async fn shutdown_in_place(&self) -> Result<()> {
+        self.raft
+            .shutdown()
+            .await
+            .map_err(|e| Error::Raft(e.to_string()))
+    }
+
+    /// Force this peer's Raft replica to build a snapshot at the
+    /// current commit index. Wraps openraft's
+    /// `Raft::trigger().snapshot()`. The returned future resolves
+    /// once the snapshot builder finishes — for the persistent
+    /// storage backend that means the snapshot bytes are durable in
+    /// rocksdb and the in-memory snapshot field on the state
+    /// machine has been updated.
+    ///
+    /// Caller is responsible for fanning this out across every
+    /// peer / group when a cluster-wide consistent backup is wanted
+    /// — see `MultiRaftCluster::take_cluster_backup` for the
+    /// orchestration.
+    pub async fn trigger_snapshot(&self) -> Result<()> {
+        self.raft
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|e| Error::Raft(e.to_string()))
+    }
+
+    /// Force this peer's Raft replica to start an election right
+    /// now, bypassing the normal election timer. Wraps openraft's
+    /// `Raft::trigger().elect()`.
+    ///
+    /// **Does not guarantee success.** If the current leader is
+    /// healthy and its heartbeats are still reaching a quorum, the
+    /// triggered election fails (the leader retains its term). The
+    /// realistic use case is composing this with leader stepdown
+    /// or membership change to transfer leadership: the operator
+    /// quiesces the current leader (e.g., temporarily pauses its
+    /// heartbeat, or removes it from voters), then triggers an
+    /// election on the desired target.
+    pub async fn force_election(&self) -> Result<()> {
+        self.raft
+            .trigger()
+            .elect()
             .await
             .map_err(|e| Error::Raft(e.to_string()))
     }

@@ -106,8 +106,20 @@ async fn spawn_single_node_server() -> Harness {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let service = meshdb_server::build_service(&config).unwrap();
@@ -145,11 +157,13 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
 
@@ -168,8 +182,20 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -186,8 +212,20 @@ async fn spawn_two_peer_cluster() -> (Harness, Harness) {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let service_a = meshdb_server::build_service(&config_a).unwrap();
@@ -256,6 +294,7 @@ async fn server_write_then_read_single_node() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -293,6 +332,7 @@ async fn two_peer_cluster_via_config_routes_writes_and_reads() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();
@@ -564,8 +604,20 @@ async fn build_components_single_node_has_no_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_none());
@@ -585,11 +637,13 @@ async fn build_components_multi_peer_builds_raft() {
                 id: 1,
                 address: "127.0.0.1:7001".into(),
                 bolt_address: None,
+                weight: None,
             },
             PeerConfig {
                 id: 2,
                 address: "127.0.0.1:7002".into(),
                 bolt_address: None,
+                weight: None,
             },
         ],
         bootstrap: false,
@@ -601,8 +655,20 @@ async fn build_components_multi_peer_builds_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_some());
@@ -625,11 +691,13 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
                 id: 1,
                 address: "127.0.0.1:7001".into(),
                 bolt_address: None,
+                weight: None,
             },
             PeerConfig {
                 id: 2,
                 address: "127.0.0.1:7002".into(),
                 bolt_address: None,
+                weight: None,
             },
         ],
         bootstrap: false,
@@ -641,8 +709,20 @@ async fn build_components_routing_mode_has_coordinator_log_and_no_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: Some(meshdb_server::config::ClusterMode::Routing),
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let components = meshdb_server::build_components(&config).await.unwrap();
     assert!(components.raft.is_none());
@@ -679,11 +759,13 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -701,8 +783,20 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -719,8 +813,20 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -732,11 +838,13 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -796,6 +904,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -815,6 +924,7 @@ async fn write_to_follower_is_forwarded_to_leader_and_replicates() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(node_id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();
@@ -854,11 +964,13 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -876,8 +988,20 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -894,8 +1018,20 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -907,11 +1043,13 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
 
     let raft_service_a = raft_service_a.unwrap();
@@ -975,6 +1113,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -991,6 +1130,7 @@ async fn write_via_grpc_replicates_through_raft_to_follower() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(node_id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();
@@ -1024,6 +1164,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
             service,
             raft: _,
             raft_service,
+            multi_raft: _,
         } = components;
         let raft_service = raft_service.unwrap();
         let join = tokio::spawn(async move {
@@ -1054,6 +1195,7 @@ async fn peer_restart_recovers_persistent_raft_state() {
                 .get_node(GetNodeRequest {
                     id: Some(uuid_to_proto(id.as_uuid())),
                     local_only: false,
+                    linearizable: false,
                 })
                 .await
                 .unwrap();
@@ -1076,11 +1218,13 @@ async fn peer_restart_recovers_persistent_raft_state() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1098,8 +1242,20 @@ async fn peer_restart_recovers_persistent_raft_state() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1116,8 +1272,20 @@ async fn peer_restart_recovers_persistent_raft_state() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1258,11 +1426,13 @@ async fn cypher_create_replicates_through_raft_to_follower() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1280,8 +1450,20 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1298,8 +1480,20 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1310,11 +1504,13 @@ async fn cypher_create_replicates_through_raft_to_follower() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -1420,11 +1616,13 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1442,8 +1640,20 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1460,8 +1670,20 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1472,11 +1694,13 @@ async fn cypher_create_index_replicates_through_raft_and_is_used_on_follower() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -1645,6 +1869,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
             service,
             raft: _,
             raft_service,
+            multi_raft: _,
         } = components;
         let raft_service = raft_service.unwrap();
         let join = tokio::spawn(async move {
@@ -1677,11 +1902,13 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1699,8 +1926,20 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b1 = ServerConfig {
         self_id: 2,
@@ -1717,8 +1956,20 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -1818,8 +2069,20 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let listener_b2 = TcpListener::bind(addr_b).await.unwrap();
@@ -1858,6 +2121,7 @@ async fn wiped_follower_catches_up_via_install_snapshot() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(pinned_id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();
@@ -1914,6 +2178,7 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
             service,
             raft: _,
             raft_service,
+            multi_raft: _,
         } = components;
         let raft_service = raft_service.unwrap();
         let join = tokio::spawn(async move {
@@ -1956,11 +2221,13 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -1978,8 +2245,20 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -1996,8 +2275,20 @@ async fn auto_snapshot_fires_and_persists_graph_data() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -2143,11 +2434,13 @@ async fn cypher_merge_replicates_through_raft() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2165,8 +2458,20 @@ async fn cypher_merge_replicates_through_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2183,8 +2488,20 @@ async fn cypher_merge_replicates_through_raft() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -2195,11 +2512,13 @@ async fn cypher_merge_replicates_through_raft() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -2309,11 +2628,13 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2331,8 +2652,20 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2349,8 +2682,20 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let components_a = meshdb_server::build_components(&config_a).await.unwrap();
@@ -2361,11 +2706,13 @@ async fn cypher_multi_write_query_commits_as_single_raft_entry() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -2478,11 +2825,13 @@ async fn two_peer_raft_replicates_via_server_components() {
             id: 1,
             address: addr_a.to_string(),
             bolt_address: None,
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: addr_b.to_string(),
             bolt_address: None,
+            weight: None,
         },
     ];
     let config_a = ServerConfig {
@@ -2500,8 +2849,20 @@ async fn two_peer_raft_replicates_via_server_components() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_b = ServerConfig {
         self_id: 2,
@@ -2518,8 +2879,20 @@ async fn two_peer_raft_replicates_via_server_components() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     // Build components for both peers.
@@ -2534,11 +2907,13 @@ async fn two_peer_raft_replicates_via_server_components() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
 
     let raft_service_a = raft_service_a.unwrap();
@@ -2763,11 +3138,13 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
             id: 1,
             address: grpc_addr_a.clone(),
             bolt_address: Some(bolt_addr_a.clone()),
+            weight: None,
         },
         PeerConfig {
             id: 2,
             address: grpc_addr_b.clone(),
             bolt_address: Some(bolt_addr_b.clone()),
+            weight: None,
         },
     ];
     let mk_config = |self_id: u64, data_dir: PathBuf, grpc: &str, bootstrap: bool| ServerConfig {
@@ -2785,8 +3162,20 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let config_a = mk_config(1, dir_a.path().to_path_buf(), &grpc_addr_a, true);
     let config_b = mk_config(2, dir_b.path().to_path_buf(), &grpc_addr_b, false);
@@ -2800,11 +3189,13 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
         service: service_a,
         raft: _,
         raft_service: raft_service_a,
+        multi_raft: _,
     } = components_a;
     let ServerComponents {
         service: service_b,
         raft: _,
         raft_service: raft_service_b,
+        multi_raft: _,
     } = components_b;
     let raft_service_a = raft_service_a.unwrap();
     let raft_service_b = raft_service_b.unwrap();
@@ -2852,6 +3243,8 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
             local_advertised: bolt_addr_a.clone(),
             peers: membership_for_route.clone(),
             raft: Some(raft_a.clone()),
+            multi_raft: None,
+            routing_ttl_seconds: None,
         });
         async move {
             let _ = run_listener(bolt_a_listener, service, None, None, None, ctx).await;
@@ -2863,6 +3256,8 @@ async fn route_success_lists_peers_and_leader_under_the_right_roles() {
             local_advertised: bolt_addr_b.clone(),
             peers: membership_for_route.clone(),
             raft: Some(raft_b.clone()),
+            multi_raft: None,
+            routing_ttl_seconds: None,
         });
         async move {
             let _ = run_listener(bolt_b_listener, service, None, None, None, ctx).await;
@@ -2954,6 +3349,7 @@ async fn route_write_role_tracks_raft_leader_across_handoff() {
             id: (i + 1) as u64,
             address: grpc_addrs[i].clone(),
             bolt_address: Some(bolt_addrs[i].clone()),
+            weight: None,
         })
         .collect::<Vec<_>>();
 
@@ -2972,8 +3368,20 @@ async fn route_write_role_tracks_raft_leader_across_handoff() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
     let configs = [
         mk_config(1, dirs[0].path().to_path_buf(), &grpc_addrs[0], true),
@@ -2992,6 +3400,7 @@ async fn route_write_role_tracks_raft_leader_across_handoff() {
             service,
             raft: _,
             raft_service,
+            multi_raft: _,
         } = comp;
         services.push(Arc::new(service));
         raft_services.push(raft_service.unwrap());
@@ -3031,6 +3440,8 @@ async fn route_write_role_tracks_raft_leader_across_handoff() {
             local_advertised: bolt_addrs[i].clone(),
             peers: membership_for_route.clone(),
             raft: Some(rafts[i].clone()),
+            multi_raft: None,
+            routing_ttl_seconds: None,
         });
         tokio::spawn(async move {
             let _ = run_listener(bolt_l, service, None, None, None, ctx).await;
@@ -3149,8 +3560,20 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
         bolt_advertised_address: None,
         grpc_tls: None,
         mode: None,
+        replication_factor: None,
+        read_consistency: None,
         #[cfg(feature = "apoc-load")]
         apoc_import: None,
+        cluster_auth: None,
+        routing_ttl_seconds: None,
+        shutdown_drain_timeout_seconds: None,
+        query_timeout_seconds: None,
+        query_max_rows: None,
+        max_concurrent_queries: None,
+        audit_log_path: None,
+        plan_cache_size: None,
+        storage: None,
+        tracing: None,
     };
 
     let service = meshdb_server::build_service(&config).unwrap();
@@ -3168,9 +3591,12 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
             .unwrap();
     });
     tokio::spawn(async move {
-        meshdb_server::metrics::run_listener(metrics_listener)
-            .await
-            .unwrap();
+        meshdb_server::metrics::run_listener(
+            metrics_listener,
+            meshdb_server::metrics::ReadinessState::new(),
+        )
+        .await
+        .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -3236,4 +3662,61 @@ async fn metrics_endpoint_serves_prometheus_text_with_workload() {
         body.contains("meshdb_cypher_query_duration_seconds"),
         "metrics body missing query duration histogram"
     );
+}
+
+/// /livez always returns 200 — the kubelet's TCP probe alone
+/// would catch a process crash; this endpoint exists so an
+/// HTTP-level liveness probe (which kubelet supports for richer
+/// signals) is also wired up.
+#[tokio::test]
+async fn livez_endpoint_returns_ok() {
+    let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_addr = metrics_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        meshdb_server::metrics::run_listener(
+            metrics_listener,
+            meshdb_server::metrics::ReadinessState::new(),
+        )
+        .await
+        .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp = reqwest::get(format!("http://{}/livez", metrics_addr))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(resp.text().await.unwrap().trim() == "ok");
+}
+
+/// /readyz returns 200 by default and 503 once draining is
+/// flagged. The shutdown path flips the bit before draining so
+/// the kubelet stops sending traffic before the in-flight drain
+/// completes.
+#[tokio::test]
+async fn readyz_endpoint_flips_to_unavailable_during_drain() {
+    let readiness = meshdb_server::metrics::ReadinessState::new();
+    let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_addr = metrics_listener.local_addr().unwrap();
+    let readiness_for_listener = readiness.clone();
+    tokio::spawn(async move {
+        meshdb_server::metrics::run_listener(metrics_listener, readiness_for_listener)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Default — ready.
+    let resp = reqwest::get(format!("http://{}/readyz", metrics_addr))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Flip the drain bit; next probe must report unavailable.
+    readiness.mark_draining();
+    let resp = reqwest::get(format!("http://{}/readyz", metrics_addr))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    assert!(resp.text().await.unwrap().contains("draining"));
 }

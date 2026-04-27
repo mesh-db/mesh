@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn float_roundtrip() {
         roundtrip(BoltValue::Float(0.0));
-        roundtrip(BoltValue::Float(3.14));
+        roundtrip(BoltValue::Float(std::f64::consts::PI));
         roundtrip(BoltValue::Float(-1.5e200));
     }
 

@@ -62,6 +62,14 @@ fn read_pem(role: &'static str, path: &Path) -> Result<Vec<u8>, TlsConfigError> 
 /// files. The certificate file may hold a leaf certificate followed
 /// by any intermediates (leaf first); the key file holds the private
 /// key matching the leaf.
+///
+/// When `client_ca_path` is `Some`, the listener requires every
+/// inbound connection to present a client certificate that
+/// validates against the CA bundle — this is mTLS, every peer
+/// must hold a cert chained to the same CA. Combined with the
+/// shared-secret `cluster_auth` token this gives both
+/// transport-level peer authentication and application-level
+/// authentication.
 pub fn build_server_tls_config(
     cert_path: &Path,
     key_path: &Path,
@@ -70,6 +78,24 @@ pub fn build_server_tls_config(
     let key = read_pem("grpc tls key", key_path)?;
     let identity = Identity::from_pem(cert, key);
     Ok(ServerTlsConfig::new().identity(identity))
+}
+
+/// Build a [`ServerTlsConfig`] that pairs the server's identity
+/// with a client-CA bundle for mTLS. Every inbound connection
+/// must present a cert chain validating against `client_ca_path`
+/// or the TLS handshake fails before any gRPC bytes flow.
+pub fn build_server_tls_config_mtls(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca_path: &Path,
+) -> Result<ServerTlsConfig, TlsConfigError> {
+    let cert = read_pem("grpc tls cert", cert_path)?;
+    let key = read_pem("grpc tls key", key_path)?;
+    let client_ca = read_pem("grpc tls client ca bundle", client_ca_path)?;
+    let identity = Identity::from_pem(cert, key);
+    Ok(ServerTlsConfig::new()
+        .identity(identity)
+        .client_ca_root(Certificate::from_pem(client_ca)))
 }
 
 /// Build a [`ClientTlsConfig`] that verifies peer certificates against
@@ -81,4 +107,21 @@ pub fn build_server_tls_config(
 pub fn build_client_tls_config(ca_path: &Path) -> Result<ClientTlsConfig, TlsConfigError> {
     let ca = read_pem("grpc tls ca bundle", ca_path)?;
     Ok(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca)))
+}
+
+/// mTLS variant of [`build_client_tls_config`]: also presents
+/// `cert_path` / `key_path` as the client identity. Required
+/// whenever the server is configured with
+/// [`build_server_tls_config_mtls`] — both ends have to opt in.
+pub fn build_client_tls_config_mtls(
+    ca_path: &Path,
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<ClientTlsConfig, TlsConfigError> {
+    let ca = read_pem("grpc tls ca bundle", ca_path)?;
+    let cert = read_pem("grpc tls client cert", cert_path)?;
+    let key = read_pem("grpc tls client key", key_path)?;
+    Ok(ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca))
+        .identity(Identity::from_pem(cert, key)))
 }

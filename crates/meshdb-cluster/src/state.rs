@@ -1,6 +1,14 @@
-use crate::{Error, Membership, PartitionMap, Peer, PeerId, Result};
+use crate::{Error, Membership, PartitionMap, PartitionReplicaMap, Peer, PeerId, Result};
 use meshdb_core::{Edge, EdgeId, Node, NodeId};
 use serde::{Deserialize, Serialize};
+
+/// Transaction identifier for cross-partition writes in multi-raft
+/// mode. The coordinator generates one per Cypher write that touches
+/// more than one partition, embeds it in every `GraphCommand::*Tx`
+/// variant, and uses it to correlate the `coordinator_log` with the
+/// per-partition Raft entries. String-typed for compatibility with
+/// the existing `coordinator_log` / `participant_log` shape.
+pub type TxId = String;
 
 /// The replicated portion of a cluster: who the members are and which peer
 /// owns each partition. This is the type a consensus layer (Raft) will
@@ -16,6 +24,18 @@ use serde::{Deserialize, Serialize};
 pub struct ClusterState {
     pub membership: Membership,
     pub partition_map: PartitionMap,
+    /// Multi-raft mode only — the per-partition voter set (which
+    /// peers replicate each partition's Raft group). `None` in
+    /// single-Raft and routing modes; `Some` in multi-raft. Updated
+    /// at runtime via `ClusterCommand::SetPartitionReplicas` so a
+    /// rebalance survives restart: each peer reads it on bootstrap
+    /// to know which partition Raft groups to instantiate.
+    ///
+    /// `#[serde(default)]` keeps existing on-disk `cluster_state`
+    /// blobs from pre-multi-raft binaries decodable — they get
+    /// `None`, which is the correct legacy behavior.
+    #[serde(default)]
+    pub partition_replica_map: Option<PartitionReplicaMap>,
 }
 
 /// Log entries that a consensus layer will replay against [`ClusterState`].
@@ -27,10 +47,29 @@ pub struct ClusterState {
 /// round-robin across the remaining members.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClusterCommand {
-    AddPeer { id: PeerId, address: String },
-    RemovePeer { id: PeerId },
-    UpdatePeerAddress { id: PeerId, address: String },
+    AddPeer {
+        id: PeerId,
+        address: String,
+    },
+    RemovePeer {
+        id: PeerId,
+    },
+    UpdatePeerAddress {
+        id: PeerId,
+        address: String,
+    },
     Rebalance,
+    /// Multi-raft only — replace the voter set for one partition's
+    /// Raft group in the cluster's persisted view. Proposed by
+    /// `MultiRaftCluster::add_partition_replica` /
+    /// `remove_partition_replica` after `change_membership`
+    /// succeeds, so a restart picks up the new placement and
+    /// instantiates the right partition Raft groups on each peer.
+    /// Idempotent — applying the same `replicas` twice is a no-op.
+    SetPartitionReplicas {
+        partition: u32,
+        replicas: Vec<u64>,
+    },
 }
 
 /// Mutations applied to the graph store. Replicated through Raft so every
@@ -157,6 +196,32 @@ pub enum GraphCommand {
     DropTrigger {
         name: String,
     },
+    /// Multi-raft only — stage a partition's slice of a
+    /// cross-partition transaction. The PartitionGraphApplier
+    /// inserts the carried commands into its `pending_txs` map
+    /// keyed by `txid`; subsequent `CommitTx` applies them, `AbortTx`
+    /// drops them. Replicates through the partition Raft, so the
+    /// staged state survives a leader crash with no in-doubt
+    /// window. Single-Raft mode never sees this variant — the
+    /// legacy applier returns `unreachable!`-style errors if it
+    /// somehow does.
+    PreparedTx {
+        txid: TxId,
+        commands: Vec<GraphCommand>,
+    },
+    /// Multi-raft only — finalize a previously-staged transaction.
+    /// The PartitionGraphApplier moves the staged commands from
+    /// `pending_txs` into a single atomic `apply_batch`. Idempotent
+    /// when no matching staging exists (treats it as already-applied
+    /// or already-aborted).
+    CommitTx {
+        txid: TxId,
+    },
+    /// Multi-raft only — drop a previously-staged transaction
+    /// without applying it. Idempotent for unknown txids.
+    AbortTx {
+        txid: TxId,
+    },
 }
 
 /// Cluster-visible scope for a constraint. Mirrors
@@ -281,6 +346,22 @@ impl ClusterState {
         Self {
             membership,
             partition_map,
+            partition_replica_map: None,
+        }
+    }
+
+    /// Like [`new`] but seeds the multi-raft replica map. Used by
+    /// `mode = "multi-raft"` bootstrap so the very first
+    /// `cluster_state` snapshot already carries the placement.
+    pub fn with_replica_map(
+        membership: Membership,
+        partition_map: PartitionMap,
+        replica_map: PartitionReplicaMap,
+    ) -> Self {
+        Self {
+            membership,
+            partition_map,
+            partition_replica_map: Some(replica_map),
         }
     }
 
@@ -292,7 +373,36 @@ impl ClusterState {
                 self.apply_update_address(*id, address.clone())
             }
             ClusterCommand::Rebalance => self.apply_rebalance(),
+            ClusterCommand::SetPartitionReplicas {
+                partition,
+                replicas,
+            } => self.apply_set_partition_replicas(*partition, replicas),
         }
+    }
+
+    fn apply_set_partition_replicas(&mut self, partition: u32, replicas: &[u64]) -> Result<()> {
+        // The replica map is multi-raft state; this command is a
+        // no-op in modes that don't track it. We lazily initialize
+        // an empty map if absent so `apply` is stable across modes.
+        let new_replicas: Vec<PeerId> = replicas.iter().copied().map(PeerId).collect();
+        let mut replica_map = self
+            .partition_replica_map
+            .clone()
+            .unwrap_or_else(|| PartitionReplicaMap::new(Vec::new()));
+        // Grow the inner Vec if needed (in case a partition id beyond
+        // the current map's length lands here). New rows default to
+        // an empty replica set until they're explicitly populated.
+        let target = partition as usize;
+        let mut rows: Vec<Vec<PeerId>> = (0..replica_map.num_partitions() as usize)
+            .map(|p| replica_map.replicas(crate::PartitionId(p as u32)).to_vec())
+            .collect();
+        while rows.len() <= target {
+            rows.push(Vec::new());
+        }
+        rows[target] = new_replicas;
+        replica_map = PartitionReplicaMap::new(rows);
+        self.partition_replica_map = Some(replica_map);
+        Ok(())
     }
 
     fn apply_add_peer(&mut self, id: PeerId, address: String) -> Result<()> {

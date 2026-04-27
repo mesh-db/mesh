@@ -1,6 +1,111 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// RocksDB tuning knobs. Set in `[storage]`. Every field is
+/// optional — leave them unset to inherit the
+/// [`meshdb_storage::StorageOptions`] defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Cap on open SST files. RocksDB's default is -1 which
+    /// retains every SST forever.
+    #[serde(default)]
+    pub max_open_files: Option<i32>,
+    /// Maximum historical INFO log files retained on disk.
+    #[serde(default)]
+    pub keep_log_file_num: Option<usize>,
+    /// Per-CF write-buffer (memtable) size in bytes.
+    #[serde(default)]
+    pub write_buffer_size_bytes: Option<usize>,
+    /// Maximum number of memtables before writes stall.
+    #[serde(default)]
+    pub max_write_buffer_number: Option<i32>,
+    /// Bloom filter bits per key on the block-based table
+    /// format. ~10 gives ~1% false-positive rate; set on
+    /// point-read-heavy workloads.
+    #[serde(default)]
+    pub bloom_filter_bits_per_key: Option<i32>,
+}
+
+impl StorageConfig {
+    /// Apply this config on top of the storage crate's
+    /// defaults, returning a [`meshdb_storage::StorageOptions`]
+    /// suitable for `RocksDbStorageEngine::open_with_options`.
+    pub fn resolved(&self) -> meshdb_storage::StorageOptions {
+        let mut opts = meshdb_storage::StorageOptions::default();
+        if let Some(v) = self.max_open_files {
+            opts.max_open_files = v;
+        }
+        if let Some(v) = self.keep_log_file_num {
+            opts.keep_log_file_num = v;
+        }
+        if let Some(v) = self.write_buffer_size_bytes {
+            opts.write_buffer_size_bytes = Some(v);
+        }
+        if let Some(v) = self.max_write_buffer_number {
+            opts.max_write_buffer_number = Some(v);
+        }
+        if let Some(v) = self.bloom_filter_bits_per_key {
+            opts.bloom_filter_bits_per_key = Some(v);
+        }
+        opts
+    }
+}
+
+/// OpenTelemetry / OTLP tracing exporter configuration. Set in
+/// `[tracing]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracingConfig {
+    /// OTLP-over-gRPC endpoint of the collector (e.g.
+    /// `http://otel-collector:4317`). Required — the only knob
+    /// that gates the exporter on.
+    pub otlp_endpoint: String,
+
+    /// Logical service name attached to every span. Surfaces in the
+    /// collector's `service.name` resource attribute. Defaults to
+    /// `"meshdb-server"`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+
+    /// Head-based sampler ratio in [0.0, 1.0]. `1.0` (default)
+    /// exports every trace; `0.1` exports a random 10%. Use a
+    /// fraction for high-throughput production clusters where the
+    /// collector budget can't absorb every span.
+    #[serde(default)]
+    pub sample_rate: Option<f64>,
+}
+
+/// Shared-secret cluster authentication. Set in `[cluster_auth]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAuthConfig {
+    /// Bearer token every inbound gRPC RPC must present in
+    /// `authorization: Bearer <token>` metadata. Outgoing RPCs to
+    /// peers carry the same token automatically.
+    pub token: String,
+}
+
+/// Read-consistency policy for multi-raft mode. Defaults to
+/// [`ReadConsistency::Local`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum ReadConsistency {
+    /// Read from the closest replica's local store, no Raft round-trip.
+    /// Default. Eventually consistent — a read may miss a very
+    /// recently committed write that hasn't yet applied to this
+    /// peer's replica.
+    #[default]
+    Local,
+    /// Linearizable reads via openraft's read-index protocol. Every
+    /// partition read goes through the partition leader's
+    /// `ensure_linearizable` quorum check before the local store
+    /// is consulted, so the read observes every write that
+    /// committed before the call.
+    Linearizable,
+}
+
 /// How a multi-peer server operates on top of its peer list. See
 /// [`ServerConfig::resolved_mode`] for the defaulting rules that apply
 /// when the TOML config omits `mode` entirely.
@@ -25,6 +130,18 @@ pub enum ClusterMode {
     /// when `peers` is non-empty and `mode` is unset, for
     /// backward compatibility with configs from before `mode` existed.
     Raft,
+    /// Multi-Raft: per-partition Raft groups plus a metadata group.
+    /// Each partition is replicated across `replication_factor` peers
+    /// via its own openraft group; cross-partition writes ride a
+    /// Spanner-style 2PC where PREPARE and COMMIT are both proposed
+    /// through the partition Raft (so staged state survives a leader
+    /// crash without a separate participant log). DDL and cluster
+    /// membership go through a single metadata Raft group spanning
+    /// every peer. Selected explicitly via `mode = "multi-raft"`.
+    /// Never inferred — opting in is a placement-changing decision.
+    #[serde(rename = "multi-raft")]
+    #[clap(name = "multi-raft")]
+    MultiRaft,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,9 +256,57 @@ pub struct ServerConfig {
     /// → Single, non-empty → Raft) for backward compatibility with
     /// configs from before this field existed. Set explicitly to
     /// `"routing"` to run a hash-partitioned non-Raft cluster that
-    /// uses the 2PC coordinator + recovery log.
+    /// uses the 2PC coordinator + recovery log, or `"multi-raft"`
+    /// to run per-partition Raft groups (never inferred — opting in
+    /// changes data placement so the user must request it).
     #[serde(default)]
     pub mode: Option<ClusterMode>,
+
+    /// Number of replicas per partition Raft group. Only consulted
+    /// when `mode = "multi-raft"`; ignored in every other mode.
+    /// Omitted → defaults to `min(3, peers.len())` — the
+    /// production-standard quorum size, which degenerates to
+    /// "every replica everywhere" on a 3-peer cluster (same
+    /// durability shape as single-Raft) and to 3-of-N on larger
+    /// clusters (where the capacity-scaling win materializes).
+    /// Must be in `[1, peers.len()]`.
+    #[serde(default)]
+    pub replication_factor: Option<usize>,
+
+    /// Optional shared cluster auth token. When set, every inbound
+    /// gRPC RPC (MeshWrite, MeshQuery, MeshRaftService) must carry
+    /// `authorization: Bearer <token>` metadata; mismatches are
+    /// rejected with `Unauthenticated`. Outgoing RPCs to peers
+    /// inject the same token automatically.
+    ///
+    /// Bolt traffic is not affected — Bolt has its own
+    /// authentication (`bolt_auth`).
+    ///
+    /// Omitted → no auth check (current default behaviour, suitable
+    /// only for trusted-network deployments). Production clusters
+    /// should set this to a high-entropy secret distributed via the
+    /// operator's secret-management tooling.
+    #[serde(default)]
+    pub cluster_auth: Option<ClusterAuthConfig>,
+
+    /// Read-consistency policy for `mode = "multi-raft"`. Omitted →
+    /// `Local`, which lets any peer that holds a partition replica
+    /// serve reads from its local rocksdb (cheap, fast, no Raft
+    /// round-trip). Setting `Linearizable` opts callers into
+    /// stricter semantics: a partition read goes through the
+    /// partition leader's `ensure_linearizable` quorum check before
+    /// the local store is consulted, so the read observes every
+    /// write that committed before the call.
+    ///
+    /// **Status:** the primitive is exposed via
+    /// `MultiRaftCluster::ensure_partition_linearizable`; the full
+    /// executor-side rewrite that automatically routes reads
+    /// through partition leaders is future work. For now this knob
+    /// records the operator's intent and is consulted by call
+    /// sites that opt in (Bolt-level consistency hints, gRPC
+    /// extensions, etc.).
+    #[serde(default)]
+    pub read_consistency: Option<ReadConsistency>,
 
     /// Configuration for `apoc.load.*` (and, in the future,
     /// `apoc.export.*`). Omitted → every load call fails with a
@@ -152,6 +317,102 @@ pub struct ServerConfig {
     #[cfg(feature = "apoc-load")]
     #[serde(default)]
     pub apoc_import: Option<meshdb_executor::ImportConfig>,
+
+    /// OpenTelemetry / OTLP tracing exporter configuration. When
+    /// set, every `tracing::span` from the server (and from
+    /// `#[tracing::instrument]` annotations on the gRPC handlers,
+    /// Raft applies, and the Cypher executor) is exported to the
+    /// configured collector via gRPC-OTLP. Omitted → only the
+    /// existing fmt layer (stdout logs) is active.
+    #[serde(default)]
+    pub tracing: Option<TracingConfig>,
+
+    /// RocksDB tuning knobs. Defaults are conservative and
+    /// match the historical hand-applied values; production
+    /// deployments tune via the `[storage]` TOML section.
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+
+    /// Cypher plan cache size. When set to `Some(n)` the
+    /// service caches up to `n` parsed + planned Cypher
+    /// queries; subsequent runs of the same query (with any
+    /// parameters) skip parse + plan and go straight to
+    /// execution. Bolt session patterns ("run the same
+    /// parametrised MATCH thousands of times") win the most.
+    /// `Some(0)` is a config error; use `None` to disable.
+    /// Default — disabled.
+    #[serde(default)]
+    pub plan_cache_size: Option<usize>,
+
+    /// Path to a durable, append-only audit log of admin
+    /// operations. When set, every `drain_leadership` /
+    /// `take_cluster_backup` (and future cluster-level admin
+    /// calls) appends one JSONL record before returning. Each
+    /// record carries timestamp + peer id + structured args +
+    /// success/error. Compliance regimes that mandate an audit
+    /// trail of privileged operations want this on; for
+    /// dev/test setups it's safe to leave omitted.
+    ///
+    /// Default — no audit log. Operations succeed normally and
+    /// emit `tracing::info` only.
+    #[serde(default)]
+    pub audit_log_path: Option<PathBuf>,
+
+    /// Per-peer concurrency cap on Cypher execution. Bolt
+    /// sessions and gRPC `ExecuteCypher` callers all share one
+    /// semaphore — once `max_concurrent_queries` runs are in
+    /// flight the next call fails fast with `ResourceExhausted`
+    /// rather than queue and contend on the executor / Raft
+    /// propose path. `None` (default) leaves no cap.
+    /// Recommended for any production deploy that exposes Bolt
+    /// to untrusted clients.
+    #[serde(default)]
+    pub max_concurrent_queries: Option<usize>,
+
+    /// Maximum row count returned from any one Cypher run.
+    /// Today the gRPC / Bolt layer accumulates rows in memory
+    /// before responding, so an unbounded `MATCH` over a huge
+    /// graph OOMs the peer. Caller gets `ResourceExhausted`
+    /// when this cap trips. `None` (default) keeps the
+    /// historical unbounded behaviour. Recommended for any
+    /// production deploy that exposes Bolt to untrusted clients.
+    #[serde(default)]
+    pub query_max_rows: Option<usize>,
+
+    /// Per-query budget (in seconds). Every Cypher execution
+    /// path — gRPC `ExecuteCypher`, Bolt `RUN`, and the in-process
+    /// `MeshService::execute_cypher_local` — wraps its future in
+    /// `tokio::time::timeout` and returns `DeadlineExceeded` on
+    /// expiry. `None` (default) leaves the historical "runaway
+    /// queries hang their session" behaviour. Recommended for any
+    /// production deploy that exposes Bolt to untrusted clients.
+    #[serde(default)]
+    pub query_timeout_seconds: Option<u64>,
+
+    /// Total deadline (in seconds) the server gives a shutdown
+    /// drain — every partition this peer leads is asked to step
+    /// down before the gRPC listener exits. Default 30 seconds.
+    /// Operators with very high partition counts may want a
+    /// higher value; CI/dev setups can drop it to 1 to make the
+    /// teardown fast.
+    ///
+    /// Has no effect outside multi-raft mode.
+    #[serde(default)]
+    pub shutdown_drain_timeout_seconds: Option<u64>,
+
+    /// TTL (in seconds) advertised on every Bolt ROUTE response.
+    /// Drivers cache the routing table for this long before
+    /// re-fetching. Tradeoff is staleness vs. ROUTE-handler load:
+    /// shorter TTL means drivers pick up topology changes (peer
+    /// join, leader transfer) faster but issue more ROUTE traffic.
+    ///
+    /// `None` keeps the historical effectively-infinite TTL
+    /// (~292 years) for single-node and routing modes. Multi-raft
+    /// mode defaults to 30 seconds via `serve()` so drivers
+    /// observe partition rebalancing without operator intervention.
+    /// Set explicitly to override.
+    #[serde(default)]
+    pub routing_ttl_seconds: Option<u64>,
 }
 
 fn default_num_partitions() -> u32 {
@@ -176,6 +437,19 @@ pub struct PeerConfig {
     /// listener, so drivers can't derive one from the other.
     #[serde(default)]
     pub bolt_address: Option<String>,
+    /// Optional placement weight for this peer in `mode = "multi-raft"`.
+    /// Larger weights attract more partition replicas — useful when
+    /// peers have heterogeneous CPU / disk capacity. The default
+    /// (`None`, treated as 1.0) gives every peer the same weight,
+    /// in which case placement is bit-identical to the v1 round-
+    /// robin algorithm. As soon as any peer specifies an explicit
+    /// weight, multi-raft falls back to weighted placement for the
+    /// whole cluster.
+    ///
+    /// Must be > 0 and finite. Validation rejects 0, negative,
+    /// NaN, and infinity.
+    #[serde(default)]
+    pub weight: Option<f64>,
 }
 
 /// Authentication table for the Bolt listener. Enabled by adding a
@@ -229,6 +503,16 @@ pub struct BoltUser {
 pub struct BoltTlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+
+    /// When set, the listener spawns a background reload task that
+    /// polls the cert + key files at the given interval (in
+    /// seconds) and hot-swaps the certificate when either file's
+    /// mtime changes. New TLS handshakes pick up the rotated cert
+    /// immediately; in-flight handshakes keep the old cert.
+    /// Recommended for any deployment where certs are auto-rotated
+    /// (cert-manager, ACME, etc.). Omit for static certs.
+    #[serde(default)]
+    pub reload_interval_seconds: Option<u64>,
 }
 
 /// TLS material for the gRPC listener and outbound peer channels.
@@ -258,6 +542,41 @@ pub struct GrpcTlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub ca_path: PathBuf,
+
+    /// When set, the listener requires every inbound gRPC
+    /// connection to present a client certificate that validates
+    /// against this CA bundle (PEM). Outgoing peer connections
+    /// also start presenting `cert_path` as the client identity
+    /// — every peer must hold a cert chained to the same CA, or
+    /// the TLS handshake fails before any RPC bytes flow.
+    ///
+    /// Combined with the shared-secret `cluster_auth` token this
+    /// gives both transport-level peer authentication (mTLS) and
+    /// application-level authentication. Recommended for any
+    /// production deploy that exposes the gRPC listener outside
+    /// a trusted network; in single-CA setups this can equal
+    /// `ca_path`.
+    ///
+    /// Omitted → server-side cert is presented but the client
+    /// is not asked to authenticate (the historical default,
+    /// suitable only for trusted-network deployments).
+    #[serde(default)]
+    pub client_ca_path: Option<PathBuf>,
+
+    /// When set, the gRPC listener spawns a background reload task
+    /// that polls the cert + key files at the given interval (in
+    /// seconds) and hot-swaps the certificate when either file's
+    /// mtime changes. New TLS handshakes pick up the rotated cert
+    /// immediately; in-flight handshakes keep the old cert.
+    /// Recommended for any deployment where certs are auto-rotated
+    /// (cert-manager, ACME, etc.). Omit for static certs.
+    ///
+    /// When this is set, the gRPC server bypasses tonic's built-in
+    /// `ServerTlsConfig` (which doesn't expose a cert resolver) and
+    /// terminates TLS in a custom `tokio_rustls::TlsAcceptor` in
+    /// front of `serve_with_incoming_shutdown`.
+    #[serde(default)]
+    pub reload_interval_seconds: Option<u64>,
 }
 
 impl BoltAuthConfig {
@@ -378,6 +697,124 @@ mod tests {
         println!("HASH={}", hash);
     }
 
+    /// Build a minimal `ServerConfig` for validation tests.
+    /// Defaults to two peers (the floor for multi-raft) so individual
+    /// tests only override the fields they care about.
+    fn cfg_with_peers(n: usize, mode: Option<ClusterMode>) -> ServerConfig {
+        ServerConfig {
+            self_id: 1,
+            listen_address: "127.0.0.1:7001".into(),
+            data_dir: "/tmp/d".into(),
+            num_partitions: 4,
+            peers: (1..=n as u64)
+                .map(|id| PeerConfig {
+                    id,
+                    address: format!("127.0.0.1:700{id}"),
+                    bolt_address: None,
+                    weight: None,
+                })
+                .collect(),
+            bootstrap: false,
+            bolt_address: None,
+            metrics_address: None,
+            bolt_auth: None,
+            bolt_tls: None,
+            bolt_advertised_versions: None,
+            bolt_advertised_address: None,
+            grpc_tls: None,
+            mode,
+            replication_factor: None,
+            read_consistency: None,
+            cluster_auth: None,
+            routing_ttl_seconds: None,
+            shutdown_drain_timeout_seconds: None,
+            query_timeout_seconds: None,
+            query_max_rows: None,
+            max_concurrent_queries: None,
+            audit_log_path: None,
+            plan_cache_size: None,
+            storage: None,
+            tracing: None,
+            #[cfg(feature = "apoc-load")]
+            apoc_import: None,
+        }
+    }
+
+    #[test]
+    fn multi_raft_requires_at_least_two_peers() {
+        let cfg = cfg_with_peers(1, Some(ClusterMode::MultiRaft));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("at least 2 peers"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_raft_rejects_replication_factor_above_peer_count() {
+        let mut cfg = cfg_with_peers(3, Some(ClusterMode::MultiRaft));
+        cfg.replication_factor = Some(4);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("replication_factor"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_raft_rejects_replication_factor_zero() {
+        let mut cfg = cfg_with_peers(3, Some(ClusterMode::MultiRaft));
+        cfg.replication_factor = Some(0);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("replication_factor"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_raft_with_unset_rf_validates_and_resolves_to_min_three_peers() {
+        let cfg = cfg_with_peers(5, Some(ClusterMode::MultiRaft));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.resolved_replication_factor(), Some(3));
+    }
+
+    #[test]
+    fn multi_raft_with_two_peers_resolves_rf_to_two() {
+        let cfg = cfg_with_peers(2, Some(ClusterMode::MultiRaft));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.resolved_replication_factor(), Some(2));
+    }
+
+    #[test]
+    fn replication_factor_rejected_outside_multi_raft() {
+        let mut cfg = cfg_with_peers(3, Some(ClusterMode::Raft));
+        cfg.replication_factor = Some(2);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("only valid with mode"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_raft_is_never_inferred() {
+        let cfg = cfg_with_peers(3, None);
+        // Three peers + unset mode → Raft (legacy default), never MultiRaft.
+        assert_eq!(cfg.resolved_mode(), ClusterMode::Raft);
+    }
+
+    #[test]
+    fn multi_raft_parses_from_toml_with_dashed_name() {
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+mode = "multi-raft"
+replication_factor = 3
+[[peers]]
+id = 1
+address = "127.0.0.1:7001"
+[[peers]]
+id = 2
+address = "127.0.0.1:7002"
+[[peers]]
+id = 3
+address = "127.0.0.1:7003"
+"#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.resolved_mode(), ClusterMode::MultiRaft);
+        assert_eq!(cfg.resolved_replication_factor(), Some(3));
+    }
+
     #[test]
     fn is_bcrypt_hash_recognizes_all_canonical_prefixes() {
         assert!(is_bcrypt_hash("$2a$10$abc"));
@@ -387,6 +824,87 @@ mod tests {
         assert!(!is_bcrypt_hash("plaintext"));
         assert!(!is_bcrypt_hash("$1$md5-ish"));
         assert!(!is_bcrypt_hash(""));
+    }
+
+    #[test]
+    fn storage_config_parses_from_toml_and_resolves_defaults() {
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+
+[storage]
+max_open_files = 256
+write_buffer_size_bytes = 67108864
+bloom_filter_bits_per_key = 10
+"#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        let s = cfg.storage.expect("storage section parsed");
+        assert_eq!(s.max_open_files, Some(256));
+        assert_eq!(s.write_buffer_size_bytes, Some(67_108_864));
+        assert_eq!(s.bloom_filter_bits_per_key, Some(10));
+        // Unset fields fall through.
+        assert_eq!(s.keep_log_file_num, None);
+        assert_eq!(s.max_write_buffer_number, None);
+
+        // Resolved options apply set fields, leave the rest at defaults.
+        let resolved = s.resolved();
+        assert_eq!(resolved.max_open_files, 256);
+        assert_eq!(resolved.write_buffer_size_bytes, Some(67_108_864));
+        assert_eq!(resolved.bloom_filter_bits_per_key, Some(10));
+        // Defaults preserved on un-set fields.
+        let default = meshdb_storage::StorageOptions::default();
+        assert_eq!(resolved.keep_log_file_num, default.keep_log_file_num);
+    }
+
+    #[test]
+    fn tracing_config_parses_from_toml() {
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+
+[tracing]
+otlp_endpoint = "http://otel-collector:4317"
+service_name = "mesh-prod"
+sample_rate = 0.25
+"#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        let t = cfg.tracing.expect("tracing section parsed");
+        assert_eq!(t.otlp_endpoint, "http://otel-collector:4317");
+        assert_eq!(t.service_name.as_deref(), Some("mesh-prod"));
+        assert_eq!(t.sample_rate, Some(0.25));
+    }
+
+    #[test]
+    fn tracing_config_omitted_is_none() {
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+"#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.tracing.is_none());
+    }
+
+    #[test]
+    fn tracing_config_endpoint_required() {
+        // No `otlp_endpoint` in `[tracing]` → parse error. Catches the
+        // common operator mistake of writing the section header but
+        // forgetting to fill in the URL.
+        let toml = r#"
+self_id = 1
+listen_address = "127.0.0.1:7001"
+data_dir = "/tmp/d"
+
+[tracing]
+service_name = "mesh-prod"
+"#;
+        let err = ServerConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("otlp_endpoint"),
+            "expected missing-field error to mention otlp_endpoint, got: {err}"
+        );
     }
 }
 
@@ -442,7 +960,8 @@ impl ServerConfig {
 
     /// Resolve the cluster mode, falling back to the legacy implicit
     /// rules when `mode` is unset. Empty `peers` implies Single;
-    /// non-empty `peers` implies Raft. The fallback preserves every
+    /// non-empty `peers` implies Raft. MultiRaft is never inferred —
+    /// it must be requested explicitly. The fallback preserves every
     /// pre-`mode` config's behavior unchanged.
     pub fn resolved_mode(&self) -> ClusterMode {
         if let Some(mode) = self.mode {
@@ -453,6 +972,21 @@ impl ServerConfig {
         } else {
             ClusterMode::Raft
         }
+    }
+
+    /// Replication factor for `mode = "multi-raft"`. Falls back to
+    /// `min(3, peers.len())` — the production-standard quorum size.
+    /// Returns `None` for any other mode since the field is unused
+    /// outside multi-raft. Callers are expected to call `validate()`
+    /// first; this getter does not range-check the explicit value.
+    pub fn resolved_replication_factor(&self) -> Option<usize> {
+        if self.resolved_mode() != ClusterMode::MultiRaft {
+            return None;
+        }
+        if let Some(rf) = self.replication_factor {
+            return Some(rf);
+        }
+        Some(self.peers.len().min(3))
     }
 
     /// Check that the chosen mode and the peer list are consistent.
@@ -474,7 +1008,31 @@ impl ServerConfig {
             (ClusterMode::Raft, false) => {
                 Err("mode = \"raft\" requires a non-empty `peers` list".into())
             }
+            (ClusterMode::MultiRaft, false) => {
+                Err("mode = \"multi-raft\" requires a non-empty `peers` list".into())
+            }
+            (ClusterMode::MultiRaft, true) if self.peers.len() < 2 => Err(
+                "mode = \"multi-raft\" requires at least 2 peers (rf=1 over a single \
+                 peer is single-node with extra steps; pick mode = \"single\" instead)"
+                    .into(),
+            ),
             _ => {
+                if mode == ClusterMode::MultiRaft {
+                    let rf = self
+                        .replication_factor
+                        .unwrap_or_else(|| self.peers.len().min(3));
+                    if rf == 0 || rf > self.peers.len() {
+                        return Err(format!(
+                            "replication_factor {rf} is invalid: must be in [1, {}]",
+                            self.peers.len()
+                        ));
+                    }
+                } else if self.replication_factor.is_some() {
+                    return Err(format!(
+                        "replication_factor is only valid with mode = \"multi-raft\" \
+                         (current mode: {mode:?})"
+                    ));
+                }
                 if has_peers && !self.peers.iter().any(|p| p.id == self.self_id) {
                     return Err(format!("self_id {} is not in the peers list", self.self_id));
                 }

@@ -1,3 +1,7 @@
+// Same recursion_limit bump as the lib — async stack depth from
+// `MeshService::execute_cypher_local` exceeds rustc's default 128.
+#![recursion_limit = "256"]
+
 use meshdb_cluster::{Cluster, Peer, PeerId};
 use meshdb_core::{Edge, Node, Property};
 use meshdb_executor::{ParamMap, Value};
@@ -82,6 +86,7 @@ async fn get_node_roundtrips_labels_and_properties() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(node_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -104,6 +109,7 @@ async fn get_node_missing_returns_not_found() {
         .get_node(GetNodeRequest {
             id: Some(fake),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -133,6 +139,7 @@ async fn nodes_by_label_returns_all_ids_for_label() {
         .nodes_by_label(NodesByLabelRequest {
             label: "Person".into(),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -155,6 +162,7 @@ async fn outgoing_returns_edge_and_neighbor() {
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(a.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -180,6 +188,7 @@ async fn incoming_mirrors_outgoing() {
         .incoming(NeighborRequest {
             node_id: Some(uuid_to_proto(b.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -203,6 +212,7 @@ async fn get_edge_roundtrip() {
         .get_edge(GetEdgeRequest {
             id: Some(uuid_to_proto(edge_id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -407,6 +417,7 @@ async fn routed_get_node_crosses_peers() {
             .get_node(GetNodeRequest {
                 id: Some(uuid_to_proto(node.id.as_uuid())),
                 local_only: false,
+                linearizable: false,
             })
             .await
             .unwrap();
@@ -446,6 +457,7 @@ async fn nodes_by_label_scatter_gathers_across_peers() {
         .nodes_by_label(NodesByLabelRequest {
             label: "Worker".into(),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -474,6 +486,7 @@ async fn nodes_by_label_local_only_skips_remote() {
         .nodes_by_label(NodesByLabelRequest {
             label: "Flag".into(),
             local_only: true,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -538,6 +551,7 @@ async fn edges_by_property_scatter_gathers_across_peers() {
             property: "k".into(),
             value_json: value_json.clone(),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -552,6 +566,7 @@ async fn edges_by_property_scatter_gathers_across_peers() {
             property: "k".into(),
             value_json,
             local_only: true,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -585,6 +600,7 @@ async fn routed_outgoing_forwards_to_source_owner() {
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(src.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1245,6 +1261,7 @@ async fn routed_get_node_missing_returns_not_found_on_either_peer() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(meshdb_core::NodeId::new().as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1514,6 +1531,7 @@ async fn write_then_routed_read_full_cycle() {
         .get_node(GetNodeRequest {
             id: Some(uuid_to_proto(src.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1523,6 +1541,7 @@ async fn write_then_routed_read_full_cycle() {
         .outgoing(NeighborRequest {
             node_id: Some(uuid_to_proto(src.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1532,6 +1551,7 @@ async fn write_then_routed_read_full_cycle() {
         .incoming(NeighborRequest {
             node_id: Some(uuid_to_proto(dst.id.as_uuid())),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap();
@@ -1549,6 +1569,7 @@ async fn invalid_uuid_length_returns_invalid_argument() {
         .get_node(GetNodeRequest {
             id: Some(bad),
             local_only: false,
+            linearizable: false,
         })
         .await
         .unwrap_err();
@@ -2403,6 +2424,43 @@ impl meshdb_rpc::proto::mesh_write_server::MeshWrite for StallingMeshWrite {
         &self,
         _req: tonic::Request<meshdb_rpc::proto::DropTriggerRequest>,
     ) -> Result<tonic::Response<meshdb_rpc::proto::DropTriggerResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn forward_write(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::ForwardWriteRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::ForwardWriteResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn forward_ddl(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::ForwardDdlRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::ForwardDdlResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn meta_last_applied(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::MetaLastAppliedRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::MetaLastAppliedResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn partition_leader(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::PartitionLeaderRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::PartitionLeaderResponse>, tonic::Status> {
+        std::future::pending().await
+    }
+    async fn force_partition_election(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::ForcePartitionElectionRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::ForcePartitionElectionResponse>, tonic::Status>
+    {
+        std::future::pending().await
+    }
+    async fn take_backup(
+        &self,
+        _req: tonic::Request<meshdb_rpc::proto::TakeBackupRequest>,
+    ) -> Result<tonic::Response<meshdb_rpc::proto::TakeBackupResponse>, tonic::Status> {
         std::future::pending().await
     }
 }

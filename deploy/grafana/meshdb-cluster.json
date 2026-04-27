@@ -1,0 +1,164 @@
+{
+  "title": "MeshDB Cluster",
+  "uid": "meshdb-cluster",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["meshdb"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(meshdb_cypher_queries_total, instance)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Cluster mode",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "count by (mode) (meshdb_cypher_queries_total{instance=~\"$instance\"})",
+          "legendFormat": "{{mode}}"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["last"] } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Query rate (per second, by mode)",
+      "description": "Steady-state load. A sudden drop after a deploy means the kubelet pulled a peer out of rotation.",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum by (mode) (rate(meshdb_cypher_queries_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{mode}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Query latency p99 (ms, by mode)",
+      "description": "Top SLI. Sustained increase signals saturation, slow disk, or a leader-skew imbalance.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "1000 * histogram_quantile(0.99, sum by (mode, le) (rate(meshdb_cypher_query_duration_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p99 {{mode}}"
+        },
+        {
+          "expr": "1000 * histogram_quantile(0.50, sum by (mode, le) (rate(meshdb_cypher_query_duration_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p50 {{mode}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Multi-raft: partitions led per peer",
+      "description": "Skew. A single peer holding all partitions starves the others. Run drain_peer or restart to rebalance.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "mesh_multiraft_partitions_led{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Multi-raft: apply lag (entries, by group)",
+      "description": "Distance between last_log_index and last_applied. Sustained rise = applier slower than replication; investigate disk / CPU.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "mesh_multiraft_apply_lag{instance=~\"$instance\"}",
+          "legendFormat": "{{group}} on {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "In-doubt PREPAREs staged",
+      "description": "Cross-partition tx staging. Brief spikes are normal; sustained non-zero means coordinator crashed and the periodic recovery loop hasn't resolved yet.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "mesh_multiraft_pending_tx_staged{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        },
+        {
+          "expr": "rate(mesh_multiraft_indoubt_resolved_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "resolved/sec {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Forward-write rate",
+      "description": "Single-partition writes that landed on a non-leader and were proxied. High rate means client load is uneven across peers; a higher Bolt routing TTL refresh cadence helps.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(mesh_multiraft_forward_writes_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Cross-partition 2PC outcomes",
+      "description": "Spanner-style PREPARE-Raft commits. Aborts under steady load suggest write-write conflicts; investigate.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(mesh_multiraft_cross_partition_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "DDL strict-apply gate outcomes",
+      "description": "ok = every peer applied within deadline; timeout = at least one lagged. Sustained timeouts mean a peer is unhealthy.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(mesh_multiraft_ddl_gate_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Index seek rate",
+      "description": "Rises when CREATE INDEX adoption increases. Falls if cached plans use scan; check that DDL fan-out is healthy.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        {
+          "expr": "rate(meshdb_cypher_index_seeks_total{instance=~\"$instance\"}[1m])",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    }
+  ]
+}
