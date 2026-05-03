@@ -1,4 +1,4 @@
-module github.com/mesh-db/mesh/drivers/go
+module github.com/mesh-db/meshdb/drivers/go
 
 go 1.22
 

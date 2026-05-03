@@ -102,19 +102,19 @@ No action required beyond a binary restart. No data migration,
 no config changes, no protocol changes. Alpha releases have been
 wire- and storage-compatible with 0.1.0 throughout.
 
-## [0.1.0-alpha.5](https://github.com/mesh-db/mesh/compare/v0.1.0-alpha.3...v0.1.0-alpha.5) - 2026-04-21
+## [0.1.0-alpha.5](https://github.com/mesh-db/meshdb/compare/v0.1.0-alpha.3...v0.1.0-alpha.5) - 2026-04-21
 
 ### Other
 
 - add relationship-scope property indexes
 
-## [0.1.0-alpha.4](https://github.com/mesh-db/mesh/compare/v0.1.0-alpha.3...v0.1.0-alpha.4) - 2026-04-21
+## [0.1.0-alpha.4](https://github.com/mesh-db/meshdb/compare/v0.1.0-alpha.3...v0.1.0-alpha.4) - 2026-04-21
 
 ### Other
 
 - add relationship-scope property indexes
 
-## [0.1.0-alpha.3](https://github.com/mesh-db/mesh/compare/v0.1.0-alpha.2...v0.1.0-alpha.3) - 2026-04-21
+## [0.1.0-alpha.3](https://github.com/mesh-db/meshdb/compare/v0.1.0-alpha.2...v0.1.0-alpha.3) - 2026-04-21
 
 ### Other
 

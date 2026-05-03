@@ -19,7 +19,7 @@ version = "0.2.0"
 edition = "2021"
 description = "A distributed, Cypher-compliant graph database written in Rust."
 license = "MIT"
-repository = "https://github.com/mesh-db/mesh"
+repository = "https://github.com/mesh-db/meshdb"
 
 [workspace.dependencies]
 # Internal crates. Version is required (in addition to `path`) so
