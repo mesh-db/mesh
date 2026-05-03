@@ -1,0 +1,451 @@
+# GitLab CI for meshdb
+#
+# Mirrors the three GitHub Actions workflows in .github/workflows/:
+#   - ci.yml                  -> build-and-test + driver-matrix-{python,js,go,java}
+#   - driver-matrix-full.yml  -> build-release-server + full-matrix-{python,js,go,java} + report
+#   - release.yml             -> release (manual; set $RELEASE_VERSION when running pipeline)
+#
+# Trigger model:
+#   - Per-MR / default-branch CI runs the test + per-PR driver matrix stages.
+#   - Full-axis driver matrix runs on any pipeline whose source is "schedule"
+#     (configure under Settings -> CI/CD -> Schedules).
+#   - Release runs only when $RELEASE_VERSION is set on a manually dispatched
+#     pipeline (Run Pipeline -> add variable RELEASE_VERSION=0.3.0).
+#
+# CI/CD variables to define in Settings -> CI/CD -> Variables:
+#   - CARGO_REGISTRY_TOKEN    crates.io publish token (masked, protected)
+#   - GITLAB_API_TOKEN        project access token w/ api scope (masked) — only needed
+#                             for the report job's issue open/close
+#
+# Homelab runner notes:
+#   - Defaults to the docker executor with rust:latest. If your runner is
+#     shell-based, drop the `image:` lines and ensure the host has rustup,
+#     clang, libclang-dev, openssl, plus the per-language toolchains.
+#   - If you have multiple runner pools, add `tags: [your-tag]` to default:
+#     to pin every job, or to individual jobs that need specific hardware.
+
+stages:
+  - test
+  - driver-matrix
+  - build-release
+  - driver-matrix-full
+  - report
+  - release
+
+variables:
+  CARGO_TERM_COLOR: always
+  # Same warning-as-error policy as the GitHub workflows.
+  RUSTFLAGS: "-D warnings"
+  # Park CARGO_HOME inside the project dir so cache: paths can pick it up
+  # (GitLab cache paths must live under $CI_PROJECT_DIR).
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  GIT_DEPTH: "20"
+
+default:
+  image: rust:latest
+  cache:
+    # Per-branch cache keyed on Cargo.lock — same idea as Swatinem/rust-cache
+    # in the GitHub workflows. Long-lived homelab runners will see the
+    # cold-build saving on every subsequent run.
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry/cache/
+      - .cargo/registry/index/
+      - .cargo/git/db/
+      - target/
+
+# ---------------------------------------------------------------------------
+# ci.yml :: build-and-test
+# ---------------------------------------------------------------------------
+
+build-and-test:
+  stage: test
+  timeout: 30m
+  before_script:
+    # rust-rocksdb's build.rs uses bindgen, which needs libclang. protoc is
+    # vendored via protoc-bin-vendored in meshdb-rpc's build.rs, so we
+    # deliberately don't install protoc here.
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends clang libclang-dev
+    - rustup component add rustfmt
+  script:
+    # fmt first — it's seconds and fails fast on a stray unformatted change.
+    - cargo fmt --all -- --check
+    - cargo build --workspace --all-targets
+    - cargo test --workspace --all-targets
+    # All-features pass guards meshdb-server's apoc-load / apoc-export /
+    # apoc-trigger sub-features — they don't transitively flip on under
+    # the default profile, so feature-gated code in the server crate
+    # would otherwise rot undetected.
+    - cargo test --workspace --all-targets --all-features
+    # Full TCK (the default test only runs Match1.feature). Release mode
+    # keeps it under a minute and avoids the pest parser thread-stack
+    # overflow on deeper expressions in debug builds.
+    - TCK_FEATURES="$CI_PROJECT_DIR/tck/opencypher/tck/features" cargo test --release -p meshdb-tck --test tck
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ---------------------------------------------------------------------------
+# ci.yml :: per-PR driver matrix (2 representative cells per language)
+# ---------------------------------------------------------------------------
+
+.driver-matrix-pr:
+  stage: driver-matrix
+  timeout: 15m
+  needs:
+    - build-and-test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  parallel:
+    matrix:
+      # Baseline + production-shape — same two cells the GitHub workflow runs
+      # per language. The full axis lives in the scheduled job below.
+      - { AUTH: "none",  TLS: "off" }
+      - { AUTH: "basic", TLS: "on" }
+  artifacts:
+    when: on_failure
+    name: "logs-$CI_JOB_NAME_SLUG"
+    paths:
+      - drivers/.run/logs/
+    expire_in: 1 week
+
+driver-matrix-python:
+  extends: .driver-matrix-pr
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends clang libclang-dev openssl python3 python3-venv python3-pip
+    - cargo build --release -p meshdb-server
+    - python3 -m venv drivers/python/.venv
+    - drivers/python/.venv/bin/pip install -q -r drivers/python/requirements.txt
+  script:
+    - drivers/run-matrix.sh --lang=py --auth=$AUTH --tls=$TLS --bolt=5.4
+
+driver-matrix-js:
+  extends: .driver-matrix-pr
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends clang libclang-dev openssl curl ca-certificates gnupg
+    - curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    - apt-get install -y --no-install-recommends nodejs
+    - cargo build --release -p meshdb-server
+    - npm install --prefix drivers/js
+  script:
+    - drivers/run-matrix.sh --lang=js --auth=$AUTH --tls=$TLS --bolt=5.4
+
+driver-matrix-go:
+  extends: .driver-matrix-pr
+  variables:
+    GO_VERSION: "1.22.10"
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends clang libclang-dev openssl curl ca-certificates
+    - curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz
+    - export PATH="/usr/local/go/bin:$PATH"
+    - cargo build --release -p meshdb-server
+    - (cd drivers/go && go mod download)
+  script:
+    - export PATH="/usr/local/go/bin:$PATH"
+    - drivers/run-matrix.sh --lang=go --auth=$AUTH --tls=$TLS --bolt=5.4
+
+driver-matrix-java:
+  extends: .driver-matrix-pr
+  before_script:
+    - apt-get update -qq
+    # default-jdk is openjdk-17 on Debian Bookworm/Trixie (rust:latest's base).
+    - apt-get install -y --no-install-recommends clang libclang-dev openssl default-jdk maven
+    - cargo build --release -p meshdb-server
+  script:
+    - drivers/run-matrix.sh --lang=java --auth=$AUTH --tls=$TLS --bolt=5.4
+
+# ---------------------------------------------------------------------------
+# driver-matrix-full.yml :: build the release server once, reused below
+# ---------------------------------------------------------------------------
+
+build-release-server:
+  stage: build-release
+  timeout: 30m
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends clang libclang-dev openssl
+  script:
+    - cargo build --release -p meshdb-server
+  artifacts:
+    paths:
+      - target/release/meshdb-server
+    expire_in: 7 days
+
+# ---------------------------------------------------------------------------
+# driver-matrix-full.yml :: per-language full-axis matrix
+# 3 bolt × 2 auth × 2 tls × 2 mode = 24 cells per language, 96 cells total.
+# ---------------------------------------------------------------------------
+
+.driver-matrix-full:
+  stage: driver-matrix-full
+  timeout: 10m
+  needs:
+    - job: build-release-server
+      artifacts: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  parallel:
+    matrix:
+      - BOLT: ["5.4", "5.0", "4.4"]
+        AUTH: ["none", "basic"]
+        TLS:  ["off", "on"]
+        MODE: ["single", "routing"]
+  artifacts:
+    when: on_failure
+    name: "logs-$CI_JOB_NAME_SLUG"
+    paths:
+      - drivers/.run/logs/
+    expire_in: 1 week
+
+full-matrix-python:
+  extends: .driver-matrix-full
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends openssl python3 python3-venv python3-pip
+    - chmod +x target/release/meshdb-server
+    - python3 -m venv drivers/python/.venv
+    - drivers/python/.venv/bin/pip install -q -r drivers/python/requirements.txt
+  script:
+    - drivers/run-matrix.sh --lang=py --bolt=$BOLT --auth=$AUTH --tls=$TLS --mode=$MODE
+
+full-matrix-js:
+  extends: .driver-matrix-full
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends openssl curl ca-certificates gnupg
+    - curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    - apt-get install -y --no-install-recommends nodejs
+    - chmod +x target/release/meshdb-server
+    - npm install --prefix drivers/js
+  script:
+    - drivers/run-matrix.sh --lang=js --bolt=$BOLT --auth=$AUTH --tls=$TLS --mode=$MODE
+
+full-matrix-go:
+  extends: .driver-matrix-full
+  variables:
+    GO_VERSION: "1.22.10"
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends openssl curl ca-certificates
+    - curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz
+    - export PATH="/usr/local/go/bin:$PATH"
+    - chmod +x target/release/meshdb-server
+    - (cd drivers/go && go mod download)
+  script:
+    - export PATH="/usr/local/go/bin:$PATH"
+    - drivers/run-matrix.sh --lang=go --bolt=$BOLT --auth=$AUTH --tls=$TLS --mode=$MODE
+
+full-matrix-java:
+  extends: .driver-matrix-full
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends openssl default-jdk maven
+    - chmod +x target/release/meshdb-server
+  script:
+    - drivers/run-matrix.sh --lang=java --bolt=$BOLT --auth=$AUTH --tls=$TLS --mode=$MODE
+
+# ---------------------------------------------------------------------------
+# driver-matrix-full.yml :: report job
+# Opens (or closes) a tracking issue so a flake doesn't silently vanish into
+# the pipeline log. Mirrors the gh-issue dance from the GH workflow against
+# the GitLab Issues API.
+# ---------------------------------------------------------------------------
+
+report-full-matrix:
+  stage: report
+  image: alpine:3.20
+  needs:
+    - job: full-matrix-python
+      optional: false
+    - job: full-matrix-js
+      optional: false
+    - job: full-matrix-go
+      optional: false
+    - job: full-matrix-java
+      optional: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: always
+  cache: []
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      set -eu
+      if [ -z "${GITLAB_API_TOKEN:-}" ]; then
+        echo "GITLAB_API_TOKEN unset — skipping issue management."
+        exit 0
+      fi
+      TITLE_PREFIX="Driver matrix (full axis) failure"
+      EXISTING_IID=$(curl -sf -H "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues?state=opened&search=${TITLE_PREFIX// /+}&in=title&per_page=1" \
+        | jq -r '.[0].iid // empty')
+      # CI_JOB_STATUS isn't set inside the bash for upstream needs results; derive
+      # from $CI_PIPELINE_STATUS via the pipeline endpoint to keep the logic
+      # simple. (Falls back to "failure" if the jobs we depend on weren't all
+      # successful — same shape as the GH `STATUS` env in driver-matrix-full.)
+      PIPELINE_STATUS=$(curl -sf -H "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/pipelines/$CI_PIPELINE_ID/jobs?per_page=100" \
+        | jq -r '[.[] | select(.name | startswith("full-matrix-")) | .status] | if all(. == "success") then "success" else "failure" end')
+      RUN_URL="$CI_PIPELINE_URL"
+      if [ "$PIPELINE_STATUS" = "success" ]; then
+        if [ -n "$EXISTING_IID" ]; then
+          echo "Full-axis run green; closing issue !$EXISTING_IID"
+          curl -sf -X PUT -H "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+            "$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues/$EXISTING_IID?state_event=close" >/dev/null
+          curl -sf -X POST -H "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+            --data-urlencode "body=All cells passed on $RUN_URL. Closing." \
+            "$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues/$EXISTING_IID/notes" >/dev/null
+        else
+          echo "Full-axis run green; no issue to close."
+        fi
+        exit 0
+      fi
+      BODY="Full-axis driver matrix failed: $RUN_URL
+
+      Server logs for failing cells are attached as artifacts named \`logs-full-matrix-<lang>-<idx>\`."
+      if [ -n "$EXISTING_IID" ]; then
+        echo "Refreshing issue !$EXISTING_IID"
+        curl -sf -X POST -H "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+          --data-urlencode "body=$BODY" \
+          "$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues/$EXISTING_IID/notes" >/dev/null
+      else
+        TITLE="$TITLE_PREFIX ($(date -u +%Y-%m-%d))"
+        curl -sf -X POST -H "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+          --data-urlencode "title=$TITLE" \
+          --data-urlencode "description=$BODY" \
+          "$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues" >/dev/null
+      fi
+
+# ---------------------------------------------------------------------------
+# release.yml :: manual publish
+# Run via "Run Pipeline" in the GitLab UI with variable RELEASE_VERSION set
+# (e.g. 0.3.0). Pushes the version bump back to origin, tags the commit,
+# publishes every workspace crate to crates.io, and creates a GitLab Release.
+# ---------------------------------------------------------------------------
+
+release:
+  stage: release
+  rules:
+    - if: $RELEASE_VERSION
+  resource_group: publish-release  # serialize so two clicks don't race
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: "0"
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends clang libclang-dev curl jq
+  script:
+    - |
+      set -euo pipefail
+      RAW_VERSION="$RELEASE_VERSION"
+      VERSION="${RAW_VERSION#v}"
+      if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+        echo "'$RAW_VERSION' is not a valid semver." >&2
+        exit 1
+      fi
+      echo "Releasing v$VERSION"
+
+      git config --global user.name  "gitlab-ci"
+      git config --global user.email "gitlab-ci@$CI_SERVER_HOST"
+
+      current=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -1)
+      if [ "$current" != "$VERSION" ]; then
+        # Bump the umbrella workspace version every crate inherits via
+        # `version.workspace = true`.
+        sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version = .*/version = "'"$VERSION"'"/;}' Cargo.toml
+        # Keep [workspace.dependencies] in lockstep so the crate-to-crate
+        # version requirements bump alongside the package version.
+        sed -i -E '/^\[workspace\.dependencies\]/,/^\[/{
+          s|^(meshdb-[a-zA-Z0-9_-]+ = \{ path = "crates/meshdb-[a-zA-Z0-9_-]+", version = )"[^"]*"|\1"'"$VERSION"'"|
+        }' Cargo.toml
+        # Promote the [Unreleased] CHANGELOG section to a dated [$VERSION]
+        # header — same Keep-a-Changelog dance as the GitHub release workflow.
+        if [ -f CHANGELOG.md ] && grep -q '^## \[Unreleased\]$' CHANGELOG.md; then
+          release_date=$(date -u '+%Y-%m-%d')
+          awk -v ver="$VERSION" -v date="$release_date" '
+            /^## \[Unreleased\]$/ && !done {
+              print "## [Unreleased]"
+              print ""
+              print "## [" ver "] - " date
+              done=1
+              next
+            }
+            { print }
+          ' CHANGELOG.md > CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
+        fi
+        cargo update --workspace --quiet
+        git add Cargo.toml Cargo.lock CHANGELOG.md
+        git commit -m "chore: release v$VERSION"
+        # Push back to origin via a project-access-token-authenticated URL so
+        # the runner doesn't need ssh keys. Set GIT_PUSH_TOKEN as a masked
+        # variable (project access token w/ write_repository scope).
+        if [ -z "${GIT_PUSH_TOKEN:-}" ]; then
+          echo "GIT_PUSH_TOKEN unset — cannot push version bump." >&2
+          exit 1
+        fi
+        git push "https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
+      else
+        echo "Workspace already at $VERSION — skipping bump."
+      fi
+
+      if git ls-remote --exit-code --tags origin "v$VERSION" >/dev/null 2>&1; then
+        echo "Tag v$VERSION already exists — skipping tag push."
+      else
+        git tag -a "v$VERSION" -m "Release v$VERSION"
+        git push "https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "v$VERSION"
+      fi
+
+      # Crates publish — same dependency order as release.yml. meshdb-tck is
+      # publish=false and is intentionally absent.
+      crates="meshdb-core meshdb-bolt meshdb-storage meshdb-cluster meshdb-cypher meshdb-client meshdb-apoc meshdb-executor meshdb-rpc meshdb-server"
+      for crate in $crates; do
+        echo "::: publish $crate $VERSION"
+        if curl -fsSL "https://crates.io/api/v1/crates/$crate/$VERSION" \
+             -H 'User-Agent: meshdb-publish-workflow/1.0' >/dev/null 2>&1; then
+          echo "$crate $VERSION already on crates.io — skipping."
+        else
+          cargo publish -p "$crate" --token "$CARGO_REGISTRY_TOKEN"
+        fi
+      done
+
+      # Carve the version's CHANGELOG section for the release notes; fall
+      # back to a git-log bullet list if the section is empty.
+      body=""
+      if [ -f CHANGELOG.md ]; then
+        body=$(awk -v header="## [$VERSION]" '
+          index($0, header) == 1 { found=1; next }
+          /^## \[/ && found { exit }
+          found { print }
+        ' CHANGELOG.md)
+      fi
+      if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+        prev_tag=$(git describe --tags --abbrev=0 "v$VERSION^" 2>/dev/null || true)
+        if [ -n "$prev_tag" ]; then
+          body=$(git log --pretty=format:'- %s' "${prev_tag}..v${VERSION}")
+        else
+          body=$(git log --pretty=format:'- %s' "v$VERSION")
+        fi
+      fi
+
+      # Create the GitLab Release. Idempotent — ignore 409 conflict.
+      http_status=$(curl -s -o /tmp/release.out -w '%{http_code}' \
+        -X POST -H "PRIVATE-TOKEN: ${GITLAB_API_TOKEN:-$GIT_PUSH_TOKEN}" \
+        --data-urlencode "name=v$VERSION" \
+        --data-urlencode "tag_name=v$VERSION" \
+        --data-urlencode "description=$body" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases")
+      case "$http_status" in
+        2*) echo "Created GitLab Release v$VERSION." ;;
+        409) echo "GitLab Release v$VERSION already exists — skipping." ;;
+        *) echo "Failed to create release (HTTP $http_status):"; cat /tmp/release.out; exit 1 ;;
+      esac
