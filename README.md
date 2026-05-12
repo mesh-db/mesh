@@ -112,6 +112,29 @@ first and any set flags override the corresponding fields. Structured
 settings — `peers`, `bolt_auth`, `bolt_tls`, `grpc_tls` — stay TOML-only.
 `meshdb-server --help` lists every flag.
 
+#### Running from the published image
+
+If you'd rather not build, the reference image is on Docker Hub:
+
+```sh
+docker run --rm \
+  -p 7001:7001 -p 7687:7687 \
+  -v meshdb-data:/var/lib/meshdb \
+  -e MESHDB_SELF_ID=1 \
+  -e MESHDB_LISTEN_ADDRESS=0.0.0.0:7001 \
+  -e MESHDB_BOLT_ADDRESS=0.0.0.0:7687 \
+  darkspar/meshdb-server:0.2.0
+```
+
+The entrypoint fixes ownership of `/var/lib/meshdb` on every start
+before dropping to the `meshdb` user via `gosu`, so a fresh named
+volume (which Docker always creates root-owned) just works — no
+pre-flight `chown` needed. To bind-mount a directory you control,
+either pre-create it owned by UID 999 or pass `--user "$(id -u):$(id -g)"`
+(the entrypoint skips the chown when started non-root and trusts the
+caller's permissions). Override the bundled config by mounting your own
+TOML over `/etc/meshdb/meshdb.toml`.
+
 ### 4. Connect from a Bolt client
 
 The easiest path is the official Python driver:

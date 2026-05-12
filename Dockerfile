@@ -28,6 +28,14 @@
 #       -e MESHDB_METRICS_ADDRESS=0.0.0.0:9090 \
 #       -v meshdb-data:/var/lib/meshdb \
 #       meshdb-server
+#
+# The entrypoint script (docker/entrypoint.sh) starts as root, chowns
+# /var/lib/meshdb to the meshdb user, then drops privileges via gosu
+# before exec'ing the server. This lets a freshly-created named volume
+# (which Docker always creates root-owned) work on first start without
+# any pre-flight setup. If you pass --user to run as non-root, the
+# entrypoint skips the chown and trusts the caller's permissions —
+# pre-chown your bind-mounted directory to a UID the container can write.
 
 # ---------- build ----------
 # Pin to a specific Rust toolchain so the image is reproducible. 1.95+
@@ -63,9 +71,13 @@ FROM debian:bookworm-slim AS runtime
 # ca-certificates is here for any future outbound TLS; libgcc + libstdc++
 # are needed by rocksdb's C++ runtime. Everything else the static-ish
 # release binary carries in itself.
+# gosu is used by the entrypoint to drop from root → meshdb after
+# fixing volume ownership. It's a single static binary (~1.8MB) and
+# is the recommended replacement for `su` / `sudo` in containers.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        gosu \
         libgcc-s1 \
         libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
@@ -75,16 +87,19 @@ RUN apt-get update \
     && chown -R meshdb:meshdb /var/lib/meshdb /etc/meshdb
 
 COPY --from=builder /build/target/release/meshdb-server /usr/local/bin/meshdb-server
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Bundled single-node config. Bind-mount over this path to override.
 COPY docker/meshdb.toml /etc/meshdb/meshdb.toml
 
-USER meshdb
+# Container starts as root so the entrypoint can chown the volume
+# (named volumes are always created root:root regardless of image
+# USER). The entrypoint immediately drops to meshdb via gosu.
 VOLUME ["/var/lib/meshdb"]
 
 # 7001: gRPC.  7687: Bolt (standard Neo4j driver port).
 EXPOSE 7001 7687
 
 ENV RUST_LOG=info
-ENTRYPOINT ["/usr/local/bin/meshdb-server"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["--config", "/etc/meshdb/meshdb.toml"]
